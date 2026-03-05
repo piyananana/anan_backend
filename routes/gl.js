@@ -8,6 +8,7 @@ const glFinancialReportEngineController = require('../controllers/gl/glFinancial
 const glGeneralLedgerReportController = require('../controllers/gl/glGeneralLedgerReportController');
 const glPeriodController = require('../controllers/gl/glPeriodController');
 const glTrialBalanceReportController = require('../controllers/gl/glTrialBalanceReportController');
+const glFinancialReportBuilderController = require('../controllers/gl/glFinancialReportBuilderController');
 
 // กำหนดที่เก็บไฟล์ชั่วคราวสำหรับอัปโหลด
 const multer = require('multer');
@@ -61,5 +62,20 @@ router.put('/gl_posting_period/:id/status', glPeriodController.updateStatusDetai
 router.delete('/gl_posting_period/:id', glPeriodController.deleteDetailRow); 
 // Router สำหรับจัดการข้อมูลรายงาน Trial Balance
 router.get('/gl_trial_balance', glTrialBalanceReportController.getTrialBalance);
+
+// Router สำหรับออกแบบงบการเงิน (Financial Report Builder)
+router.get('/gl_fin_report', glFinancialReportBuilderController.getReports);
+router.post('/gl_fin_report', glFinancialReportBuilderController.createReport);
+router.put('/gl_fin_report/:id', glFinancialReportBuilderController.updateReport);
+router.delete('/gl_fin_report/:id', glFinancialReportBuilderController.deleteReport);
+
+router.get('/gl_fin_report_row/:report_id', glFinancialReportBuilderController.getRows);
+router.post('/gl_fin_report_row', glFinancialReportBuilderController.createRow);
+router.put('/gl_fin_report_row/:id', glFinancialReportBuilderController.updateRow);
+router.delete('/gl_fin_report_row/:id', glFinancialReportBuilderController.deleteRow);
+
+router.post('/gl_fin_report_column', glFinancialReportBuilderController.createColumn);
+router.put('/gl_fin_report_column/:id', glFinancialReportBuilderController.updateColumn);
+router.delete('/gl_fin_report_column/:id', glFinancialReportBuilderController.deleteColumn);
 
 module.exports = router;
