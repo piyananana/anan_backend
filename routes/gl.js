@@ -25,6 +25,7 @@ router.post('/gl_account/import', fileUpload.single('excelFile'), glAccountContr
 router.get('/gl_account/export', glAccountController.exportDataExcel);
 
 // Router สำหรับจัดการข้อมูลยอดยกมา
+router.get('/gl_beginning_balance/accum', glBeginningBalanceController.getBalancesFromAccum);
 router.get('/gl_beginning_balance/year/:year', glBeginningBalanceController.getBalancesByYearId);
 router.get('/gl_beginning_balance/period/:periodId', glBeginningBalanceController.getBalancesByPeriodId);
 router.post('/gl_beginning_balance/save', glBeginningBalanceController.saveBeginningBalances);
@@ -58,8 +59,9 @@ router.post('/gl_posting_period', glPeriodController.addDetailRow);
 // PUT สำหรับแก้ไขรายละเอียดรอบบัญชี (ชื่อ, วันที่เริ่มต้น/สิ้นสุด)
 router.put('/gl_posting_period/:id', glPeriodController.updateDetailRow); 
 // PUT สำหรับอัปเดตสถานะรอบบัญชี (ใช้สำหรับปิดรอบบัญชี)
-router.put('/gl_posting_period/:id/status', glPeriodController.updateStatusDetailRow); 
-router.delete('/gl_posting_period/:id', glPeriodController.deleteDetailRow); 
+router.put('/gl_posting_period/:id/status', glPeriodController.updateStatusDetailRow);
+router.delete('/gl_posting_period/:id', glPeriodController.deleteDetailRow);
+router.get('/gl_posting_period/open', glPeriodController.fetchOpenGlPeriods);
 // Router สำหรับจัดการข้อมูลรายงาน Trial Balance
 router.get('/gl_trial_balance', glTrialBalanceReportController.getTrialBalance);
 

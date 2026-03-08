@@ -71,7 +71,7 @@ const fetchHeaderRows = async (req, res) => {
             SELECT 
                 fy.*, 
                 COUNT(p.id) AS total_periods,
-                SUM(CASE WHEN p.gl_status = 'HARD_CLOSE' THEN 1 ELSE 0 END) AS closed_periods
+                SUM(CASE WHEN p.gl_status = 'CLOSED' THEN 1 ELSE 0 END) AS closed_periods
             FROM gl_fiscal_year fy
             LEFT JOIN gl_posting_period p ON fy.id = p.fiscal_year_id
             GROUP BY fy.id
@@ -256,8 +256,23 @@ const updateStatusDetailRow = async (req, res) => {
     const { gl_status, ap_status, ar_status, im_status } = req.body;
     const userId = req.headers.userid;
     const userName = req.headers.username;
-    
+
     try {
+        // ตรวจสอบรายการ Draft ก่อน CLOSED
+        const hasClose = [gl_status, ap_status, ar_status, im_status].some(s => s === 'CLOSED');
+        if (hasClose) {
+            const draftCheck = await req.dbPool.query(
+                `SELECT COUNT(*) FROM gl_entry_header WHERE period_id = $1 AND status = 'Draft'`,
+                [id]
+            );
+            const draftCount = parseInt(draftCheck.rows[0].count);
+            if (draftCount > 0) {
+                return res.status(400).json({
+                    error: `มีรายการบัญชีที่ยังอยู่ในสถานะ Draft จำนวน ${draftCount} รายการ ไม่สามารถเปลี่ยนสถานะเป็น CLOSED ได้`
+                });
+            }
+        }
+
         // SQL: อนุญาตให้อัปเดตสถานะ GL, AP, AR พร้อมกัน
         const sql = `
             UPDATE gl_posting_period SET 
@@ -306,7 +321,7 @@ const addDetailRow = async (req, res) => {
             
         const values = [
             fiscal_year_id, period_number, period_name, period_start_date, 
-            period_end_date, gl_status || 'OPEN', ap_status || 'OPEN', ar_status || 'OPEN', im_status || 'OPEN', userId
+            period_end_date, gl_status || 'LOCKED', ap_status || 'LOCKED', ar_status || 'LOCKED', im_status || 'LOCKED', userId
         ];
         
         const result = await req.dbPool.query(sql, values);
@@ -391,6 +406,22 @@ const deleteDetailRow = async (req, res) => {
     }
 };
 
+// GET All Posting Periods where gl_status = 'OPEN' and fiscal year is_active = true
+const fetchOpenGlPeriods = async (req, res) => {
+    try {
+        const result = await req.dbPool.query(
+            `SELECT p.* FROM gl_posting_period p
+             JOIN gl_fiscal_year fy ON fy.id = p.fiscal_year_id
+             WHERE p.gl_status = 'OPEN' AND fy.is_active = true
+             ORDER BY p.period_start_date`
+        );
+        res.status(200).json(result.rows);
+    } catch (error) {
+        console.error('Error fetching open GL periods:', error);
+        res.status(500).json({ message: 'Error fetching open GL periods.', error: error.message });
+    }
+};
+
 module.exports = {
     fetchHeaderRows,
     fetchHeaderRowById,
@@ -402,6 +433,7 @@ module.exports = {
     updateDetailRow,
     updateStatusDetailRow,
     deleteDetailRow,
+    fetchOpenGlPeriods,
 };
 //     fetchRows,
 //     addRow,
