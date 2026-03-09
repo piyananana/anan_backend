@@ -72,7 +72,7 @@ router.delete('/backup/files/:filename', saBackupController.deleteBackupFile);
 router.post('/backup/instant/start', saBackupController.startInstantBackup);
 router.post('/backup/instant/stop', saBackupController.stopInstantBackup);
 router.get('/backup/instant/status', saBackupController.checkInstantBackupStatus);
-router.post('/backup/instant/retore/:filename', saBackupController.restoreFromInstantBackup);
+router.post('/backup/instant/restore', saBackupController.restoreFromInstantBackup);
 
 // For saCompanyController
 router.get('/sa_company', saCompanyController.getCompanyInfo);

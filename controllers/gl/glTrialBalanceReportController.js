@@ -18,17 +18,22 @@ const getTrialBalance = async (req, res) => {
       );
       if (periodsRes.rows.length === 0) return res.status(400).json({ error: 'No periods found' });
 
-      const allPeriods = periodsRes.rows;
+      const allPeriods = periodsRes.rows; // เรียงตาม period_number ASC
+      // งวดแรกสุด = งวดยกยอด, งวดที่เหลือ = งวดปกติ
+      const begPeriod = allPeriods[0];
+      const normalPeriods = allPeriods.slice(1);
+      const begPeriodIds = begPeriod ? [begPeriod.id] : [];
+
       let targetPeriodIds = [];
       let prevPeriodIds = [];
 
       if (period_id) {
-        const pIndex = allPeriods.findIndex(p => p.id == period_id);
+        const pIndex = normalPeriods.findIndex(p => p.id == period_id);
         if (pIndex === -1) return res.status(400).json({ error: 'Period not found' });
         targetPeriodIds = [period_id];
-        prevPeriodIds = allPeriods.slice(0, pIndex).map(p => p.id);
+        prevPeriodIds = normalPeriods.slice(0, pIndex).map(p => p.id);
       } else {
-        targetPeriodIds = allPeriods.map(p => p.id);
+        targetPeriodIds = normalPeriods.map(p => p.id);
         prevPeriodIds = [];
       }
 
@@ -69,12 +74,11 @@ const getTrialBalance = async (req, res) => {
         : '';
 
       const sql = `
-        WITH 
+        WITH
         year_beg AS (
-          SELECT account_id ${dimFields}, SUM(amount_dr) as dr, SUM(amount_cr) as cr
-          FROM gl_beginning_balance t
-          JOIN gl_posting_period p ON t.posting_period_id = p.id
-          WHERE p.fiscal_year_id = $1
+          SELECT account_id ${dimFields}, SUM(debit_amount) as dr, SUM(credit_amount) as cr
+          FROM gl_balance_accum t
+          WHERE period_id = ANY($1::int[])
           GROUP BY account_id ${dimFields}
         ),
         prev_mvmt AS (
@@ -119,7 +123,7 @@ const getTrialBalance = async (req, res) => {
         ORDER BY a.account_code ASC
       `;
 
-      const balancesRes = await client.query(sql, [fiscal_year_id, prevPeriodIds, targetPeriodIds]);
+      const balancesRes = await client.query(sql, [begPeriodIds, prevPeriodIds, targetPeriodIds]);
       const balances = balancesRes.rows;
 
       // 4. Merge Data & Calculate Rollup (In-Memory)
@@ -198,8 +202,12 @@ const getTrialBalance = async (req, res) => {
       // 5. Flatten Result
       let resultList = allAccounts.map(a => {
         const d = accMap[a.id];
-        // Net Ending
-        const netEnd = (d.beg_dr - d.beg_cr) + (d.mvmt_dr - d.mvmt_cr);
+        // Net Beginning Balance (แสดงในฝั่งเดียวเหมือนยอดยกไป)
+        const netBeg = d.beg_dr - d.beg_cr;
+        const beg_dr_net = netBeg > 0 ? netBeg : 0;
+        const beg_cr_net = netBeg < 0 ? Math.abs(netBeg) : 0;
+        // Net Ending Balance
+        const netEnd = netBeg + (d.mvmt_dr - d.mvmt_cr);
         const end_dr = netEnd > 0 ? netEnd : 0;
         const end_cr = netEnd < 0 ? Math.abs(netEnd) : 0;
 
@@ -210,11 +218,18 @@ const getTrialBalance = async (req, res) => {
           parent_id: d.parent_id, // ส่งกลับไปให้ Frontend
           is_header: !d.is_control_account,
           // Values
-          beg_dr: d.beg_dr, beg_cr: d.beg_cr,
+          beg_dr: beg_dr_net, beg_cr: beg_cr_net,
           mvmt_dr: d.mvmt_dr, mvmt_cr: d.mvmt_cr,
           end_dr: end_dr, end_cr: end_cr,
-          // Dimensions
-          dimension_rows: d.dimension_rows || []
+          // Dimensions (net beg ด้วยเช่นกัน)
+          dimension_rows: (d.dimension_rows || []).map(dim => {
+            const dimNetBeg = dim.beg_dr - dim.beg_cr;
+            return {
+              ...dim,
+              beg_dr: dimNetBeg > 0 ? dimNetBeg : 0,
+              beg_cr: dimNetBeg < 0 ? Math.abs(dimNetBeg) : 0,
+            };
+          })
         };
       });
 

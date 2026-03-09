@@ -36,7 +36,7 @@ class BackupService {
             const filePath = path.join(backupDir, filename);
 
             const dbConfig = await dbService.getPool(databaseName);
-            const pgDumpCmd = `pg_dump -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} > "${filePath}"`;
+            const pgDumpCmd = `pg_dump --clean --if-exists -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} > "${filePath}"`;
 
             return new Promise((resolve, reject) => {
                 const child = exec(pgDumpCmd, { env: { ...process.env, PGPASSWORD: dbConfig.options.password } }, (error, stdout, stderr) => {
@@ -118,7 +118,7 @@ class BackupService {
             const filePath = path.join(backupDir, filename);
 
             const dbConfig = await dbService.getPool(databaseName);
-            const pgDumpCmd = `pg_dump -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} > "${filePath}"`;
+            const pgDumpCmd = `pg_dump --clean --if-exists -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} > "${filePath}"`;
             // สร้าง environment object เพื่อส่งรหัสผ่าน
             const options = {
                 env: { ...process.env, PGPASSWORD: dbConfig.options.password },

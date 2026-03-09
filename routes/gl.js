@@ -2,13 +2,15 @@
 const express = require('express');
 const router = express.Router();
 const glAccountController = require('../controllers/gl/glAccountController');
-const glBeginningBalanceController = require('../controllers/gl/glBeginningBalanceController');
 const glEntryController = require('../controllers/gl/glEntryController');
 const glFinancialReportEngineController = require('../controllers/gl/glFinancialReportEngineController');
 const glGeneralLedgerReportController = require('../controllers/gl/glGeneralLedgerReportController');
 const glPeriodController = require('../controllers/gl/glPeriodController');
 const glTrialBalanceReportController = require('../controllers/gl/glTrialBalanceReportController');
 const glFinancialReportBuilderController = require('../controllers/gl/glFinancialReportBuilderController');
+const glClosingConfigController = require('../controllers/gl/glClosingConfigController');
+const glAdjustingTemplateController = require('../controllers/gl/glAdjustingTemplateController');
+const glYearEndClosingController = require('../controllers/gl/glYearEndClosingController');
 
 // กำหนดที่เก็บไฟล์ชั่วคราวสำหรับอัปโหลด
 const multer = require('multer');
@@ -23,12 +25,6 @@ router.delete('/gl_account/:id', glAccountController.deleteRow);
 router.delete('/gl_account', glAccountController.deleteRows);
 router.post('/gl_account/import', fileUpload.single('excelFile'), glAccountController.importDataExcel);
 router.get('/gl_account/export', glAccountController.exportDataExcel);
-
-// Router สำหรับจัดการข้อมูลยอดยกมา
-router.get('/gl_beginning_balance/accum', glBeginningBalanceController.getBalancesFromAccum);
-router.get('/gl_beginning_balance/year/:year', glBeginningBalanceController.getBalancesByYearId);
-router.get('/gl_beginning_balance/period/:periodId', glBeginningBalanceController.getBalancesByPeriodId);
-router.post('/gl_beginning_balance/save', glBeginningBalanceController.saveBeginningBalances);
 
 // // Router สำหรับจัดการข้อมูลรายการบัญชี
 // router.get('/gl_entry', glEntryController.fetchRows);
@@ -47,6 +43,7 @@ router.get('/gl_financial_report_master_list', glFinancialReportEngineController
 router.post('/gl_financial_report_engine', glFinancialReportEngineController.generateFinancialReport);
 // Router สำหรับจัดการข้อมูลรายงาน General Ledger (GL Report)
 router.get('/gl_general_ledger', glGeneralLedgerReportController.getGeneralLedgerTransactions);
+router.get('/gl_report_beginning_balance', glGeneralLedgerReportController.getReportBeginningBalance);
 // Router สำหรับจัดการปีงบประมาณและรอบบัญชี
 router.get('/gl_fiscal_year', glPeriodController.fetchHeaderRows);
 router.get('/gl_fiscal_year/:id', glPeriodController.fetchHeaderRowById);
@@ -79,5 +76,27 @@ router.delete('/gl_fin_report_row/:id', glFinancialReportBuilderController.delet
 router.post('/gl_fin_report_column', glFinancialReportBuilderController.createColumn);
 router.put('/gl_fin_report_column/:id', glFinancialReportBuilderController.updateColumn);
 router.delete('/gl_fin_report_column/:id', glFinancialReportBuilderController.deleteColumn);
+
+// Year-End Closing Config
+router.get('/gl_closing_config', glClosingConfigController.getConfig);
+router.post('/gl_closing_config', glClosingConfigController.saveConfig);
+
+// Adjusting Templates
+router.get('/gl_adjusting_template', glAdjustingTemplateController.fetchRows);
+router.post('/gl_adjusting_template', glAdjustingTemplateController.addRow);
+router.put('/gl_adjusting_template/:id', glAdjustingTemplateController.updateRow);
+router.delete('/gl_adjusting_template/:id', glAdjustingTemplateController.deleteRow);
+
+// Year-End Closing Wizard
+router.get('/gl_year_end_closing/:fiscalYearId', glYearEndClosingController.getOrInitClosing);
+router.post('/gl_year_end_closing/:id/step1', glYearEndClosingController.runStep1);
+router.post('/gl_year_end_closing/:id/step2/confirm', glYearEndClosingController.confirmStep2);
+router.get('/gl_year_end_closing/:id/step3/preview', glYearEndClosingController.previewStep3);
+router.post('/gl_year_end_closing/:id/step3/confirm', glYearEndClosingController.confirmStep3);
+router.get('/gl_year_end_closing/:id/step4/preview', glYearEndClosingController.previewStep4);
+router.post('/gl_year_end_closing/:id/step4/confirm', glYearEndClosingController.confirmStep4);
+router.get('/gl_year_end_closing/:id/step5/preview', glYearEndClosingController.previewStep5);
+router.post('/gl_year_end_closing/:id/step5/confirm', glYearEndClosingController.confirmStep5);
+router.post('/gl_year_end_closing/:id/step6/confirm', glYearEndClosingController.confirmStep6);
 
 module.exports = router;

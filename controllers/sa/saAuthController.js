@@ -188,7 +188,7 @@ const changePassword = async (req, res) => {
         const newPasswordHash = await PasswordPolicyService.hashPassword(newPassword);
 
         // 2. ตรวจสอบว่ารหัสผ่านใหม่ซ้ำกับประวัติหรือไม่
-        const historyError = await PasswordPolicyService.checkPasswordHistory(req, userId, newPasswordHash, policy.password_history_count);
+        const historyError = await PasswordPolicyService.checkPasswordHistory(req, userId, newPassword, policy.password_history_count);
         if (historyError) {
             return res.status(400).json({ message: historyError });
         }

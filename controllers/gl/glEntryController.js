@@ -313,13 +313,20 @@ const reverseTransaction = async (req, res) => {
 
 // --- 5. Search / List ---
 const getTransactions = async (req, res) => {
-    const { search, status } = req.query;
-    let sql = `SELECT h.*, d.doc_code, d.doc_name_thai 
+    const { search, status, period_id, fiscal_year_id } = req.query;
+    let sql = `SELECT h.*, d.doc_code, d.doc_name_thai
                FROM gl_entry_header h
                JOIN sa_module_document d ON h.doc_id = d.id
                WHERE h.status != 'Deleted' `;
     const params = [];
 
+    if (period_id) {
+        sql += ` AND h.period_id = $${params.length + 1}`;
+        params.push(period_id);
+    } else if (fiscal_year_id) {
+        sql += ` AND h.period_id IN (SELECT id FROM gl_posting_period WHERE fiscal_year_id = $${params.length + 1})`;
+        params.push(fiscal_year_id);
+    }
     if (search) {
         sql += ` AND (h.doc_no ILIKE $${params.length + 1} OR h.ref_no ILIKE $${params.length + 1})`;
         params.push(`%${search}%`);

@@ -38,7 +38,7 @@ class PasswordPolicyService {
     }
 
     // ตรวจสอบประวัติรหัสผ่าน
-    static async checkPasswordHistory(req, userId, newPasswordHash, historyCount) {
+    static async checkPasswordHistory(req, userId, newPassword, historyCount) {
         if (historyCount <= 0) return null; // ไม่ต้องตรวจสอบประวัติ
 
         const res = await req.dbPool.query(
@@ -47,7 +47,7 @@ class PasswordPolicyService {
         );
 
         for (const row of res.rows) {
-            if (await bcrypt.compare(newPasswordHash, row.password_hash)) {
+            if (await bcrypt.compare(newPassword, row.password_hash)) {
                 return `รหัสผ่านใหม่ซ้ำกับ ${historyCount} ครั้งที่ผ่านมา`;
             }
         }
