@@ -32,11 +32,11 @@ class BackupService {
             if (!fs.existsSync(backupDir)) {
                 fs.mkdirSync(backupDir);
             }
-            const filename = `Backup_${scheduleType}_${databaseName}_${timestamp}.sql`;
+            const filename = `Backup_${scheduleType}_${databaseName}_${timestamp}.backup`;
             const filePath = path.join(backupDir, filename);
 
             const dbConfig = await dbService.getPool(databaseName);
-            const pgDumpCmd = `pg_dump --clean --if-exists -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} > "${filePath}"`;
+            const pgDumpCmd = `pg_dump -Fc --clean --if-exists -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} -f "${filePath}"`;
 
             return new Promise((resolve, reject) => {
                 const child = exec(pgDumpCmd, { env: { ...process.env, PGPASSWORD: dbConfig.options.password } }, (error, stdout, stderr) => {
@@ -72,20 +72,29 @@ class BackupService {
             throw new Error('Backup file not found.');
         }
 
-        const restoreCmd = `psql -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} < "${filePath}"`;
+        const dropSchemaCmd = `psql -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"`;
+        const restoreCmd = `pg_restore -Fc --no-owner --no-privileges -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} "${filePath}"`;
+        const env = { ...process.env, PGPASSWORD: dbConfig.options.password };
 
         return new Promise((resolve, reject) => {
-            exec(restoreCmd, { env: { ...process.env, PGPASSWORD: dbConfig.options.password } }, (error, stdout, stderr) => {
-                if (error) {
-                    console.error(`exec error: ${error}`);
-                    return reject(new Error('Restore command failed.'));
+            exec(dropSchemaCmd, { env }, (dropError, dropStdout, dropStderr) => {
+                if (dropError) {
+                    console.error(`drop schema error: ${dropError}`);
+                    return reject(new Error('Failed to drop schema before restore.'));
                 }
-                if (stderr) {
-                    console.error(`stderr: ${stderr}`);
-                }
-                console.log(`stdout: ${stdout}`);
-                console.log(`Restore completed successfully from: ${filePath}`);
-                resolve('Restore completed successfully.');
+                console.log(`Schema dropped and recreated for: ${dbConfig.options.database}`);
+                exec(restoreCmd, { env }, (error, stdout, stderr) => {
+                    if (error) {
+                        console.error(`exec error: ${error}`);
+                        return reject(new Error('Restore command failed.'));
+                    }
+                    if (stderr) {
+                        console.error(`stderr: ${stderr}`);
+                    }
+                    console.log(`stdout: ${stdout}`);
+                    console.log(`Restore completed successfully from: ${filePath}`);
+                    resolve('Restore completed successfully.');
+                });
             });
         });
     }
@@ -114,11 +123,11 @@ class BackupService {
                               '-' + now.getMinutes().toString().padStart(2, '0') +
                               '-' + now.getSeconds().toString().padStart(2, '0');
             const backupDir = path.join(__dirname, '..', 'backups');
-            const filename = `instant_backup_${databaseName}_${timestamp}.sql`;
+            const filename = `instant_backup_${databaseName}_${timestamp}.backup`;
             const filePath = path.join(backupDir, filename);
 
             const dbConfig = await dbService.getPool(databaseName);
-            const pgDumpCmd = `pg_dump --clean --if-exists -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} > "${filePath}"`;
+            const pgDumpCmd = `pg_dump -Fc --clean --if-exists -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} -f "${filePath}"`;
             // สร้าง environment object เพื่อส่งรหัสผ่าน
             const options = {
                 env: { ...process.env, PGPASSWORD: dbConfig.options.password },
@@ -178,20 +187,29 @@ class BackupService {
             throw new Error('Instant backup file not found.');
         }
 
-        const restoreCmd = `psql -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} < "${filePath}"`;
+        const dropSchemaCmd = `psql -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"`;
+        const restoreCmd = `pg_restore -Fc --no-owner --no-privileges -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} "${filePath}"`;
+        const env = { ...process.env, PGPASSWORD: dbConfig.options.password };
 
         return new Promise((resolve, reject) => {
-            exec(restoreCmd, { env: { ...process.env, PGPASSWORD: dbConfig.options.password } }, (error, stdout, stderr) => {
-                if (error) {
-                    console.error(`exec error: ${error}`);
-                    return reject(new Error('Restore command failed.'));
+            exec(dropSchemaCmd, { env }, (dropError, dropStdout, dropStderr) => {
+                if (dropError) {
+                    console.error(`drop schema error: ${dropError}`);
+                    return reject(new Error('Failed to drop schema before restore.'));
                 }
-                if (stderr) {
-                    console.error(`stderr: ${stderr}`);
-                }
-                console.log(`stdout: ${stdout}`);
-                console.log(`Restore completed successfully from: ${filePath}`);
-                resolve('Instant restore completed successfully.');
+                console.log(`Schema dropped and recreated for: ${dbConfig.options.database}`);
+                exec(restoreCmd, { env }, (error, stdout, stderr) => {
+                    if (error) {
+                        console.error(`exec error: ${error}`);
+                        return reject(new Error('Restore command failed.'));
+                    }
+                    if (stderr) {
+                        console.error(`stderr: ${stderr}`);
+                    }
+                    console.log(`stdout: ${stdout}`);
+                    console.log(`Restore completed successfully from: ${filePath}`);
+                    resolve('Instant restore completed successfully.');
+                });
             });
         });
     }
@@ -364,12 +382,10 @@ class BackupService {
             const files = fs.readdirSync(backupDir).filter(file => {
                 if (scheduleType === 'instant') {
                     var str = `instant_backup_${databaseName}_`;
-                    // console.log('Filter string for instant backup:', str);
-                    return file.startsWith(str) && file.endsWith('.sql');
+                    return file.startsWith(str) && file.endsWith('.backup');
                 } else {
                     var str = `Backup_${scheduleType}_${databaseName}_`;
-                    // console.log('Filter string for scheduled backup:', str);
-                    return file.includes(str) && file.endsWith('.sql');
+                    return file.includes(str) && file.endsWith('.backup');
                 }
             }).sort().reverse();
             return files;

@@ -11,6 +11,9 @@ const glFinancialReportBuilderController = require('../controllers/gl/glFinancia
 const glClosingConfigController = require('../controllers/gl/glClosingConfigController');
 const glAdjustingTemplateController = require('../controllers/gl/glAdjustingTemplateController');
 const glYearEndClosingController = require('../controllers/gl/glYearEndClosingController');
+const glBalanceSheetController = require('../controllers/gl/glBalanceSheetController');
+const glIncomeStatementController = require('../controllers/gl/glIncomeStatementController');
+const glDailyTransactionController = require('../controllers/gl/glDailyTransactionController');
 
 // กำหนดที่เก็บไฟล์ชั่วคราวสำหรับอัปโหลด
 const multer = require('multer');
@@ -61,6 +64,13 @@ router.delete('/gl_posting_period/:id', glPeriodController.deleteDetailRow);
 router.get('/gl_posting_period/open', glPeriodController.fetchOpenGlPeriods);
 // Router สำหรับจัดการข้อมูลรายงาน Trial Balance
 router.get('/gl_trial_balance', glTrialBalanceReportController.getTrialBalance);
+// Router สำหรับรายงานงบดุล (Balance Sheet)
+router.get('/gl_balance_sheet', glBalanceSheetController.getBalanceSheet);
+// Router สำหรับรายงานงบกำไรขาดทุน (Income Statement)
+router.get('/gl_income_statement', glIncomeStatementController.getIncomeStatement);
+// Router สำหรับรายงานบันทึกรายการบัญชี (Daily Transaction)
+router.get('/gl_daily_transaction/doc_types', glDailyTransactionController.getDocTypes);
+router.get('/gl_daily_transaction', glDailyTransactionController.getDailyTransactions);
 
 // Router สำหรับออกแบบงบการเงิน (Financial Report Builder)
 router.get('/gl_fin_report', glFinancialReportBuilderController.getReports);
