@@ -56,7 +56,7 @@ const fetchRows = async (req, res) => {
 
 const fetchRowsControlAccount = async (req, res) => {
     try {
-        const result = await req.dbPool.query('SELECT * FROM gl_account WHERE is_active = TRUE AND is_control_account = TRUE ORDER BY parent_id ASC, account_code ASC');
+        const result = await req.dbPool.query('SELECT * FROM gl_account WHERE is_active = TRUE AND is_normal_account = TRUE ORDER BY parent_id ASC, account_code ASC');
         res.json(result.rows);
     } catch (err) {
         console.error('Error fetching all accounts:', err);
@@ -67,18 +67,18 @@ const fetchRowsControlAccount = async (req, res) => {
 // POST new row
 const addRow = async (req, res) => {
     const { account_code, account_name_thai, account_name_eng, parent_id, account_type, account_subtype,
-        normal_balance, is_control_account, is_reconcilable, currency_code, module_link_code, cost_center_required,
-        project_required, branch_required, is_active } = req.body;
+        normal_balance, is_normal_account, is_control_account, is_reconcilable, currency_code, module_link_code,
+        cost_center_required, project_required, branch_required, is_active } = req.body;
     const userName = req.headers.username;
     try {
         const result = await req.dbPool.query(
             `INSERT INTO gl_account (account_code, account_name_thai, account_name_eng, parent_id, account_type, account_subtype,
-             normal_balance, is_control_account, is_reconcilable, currency_code, module_link_code, cost_center_required,
-             project_required, branch_required, is_active, created_at, created_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, CURRENT_TIMESTAMP, $16) RETURNING *`,
+             normal_balance, is_normal_account, is_control_account, is_reconcilable, currency_code, module_link_code,
+             cost_center_required, project_required, branch_required, is_active, created_at, created_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, CURRENT_TIMESTAMP, $17) RETURNING *`,
             [account_code, account_name_thai, account_name_eng, parent_id, account_type, account_subtype,
-                normal_balance, is_control_account, is_reconcilable, currency_code, module_link_code, cost_center_required,
-                project_required, branch_required, is_active, userName]
+                normal_balance, is_normal_account, is_control_account ?? false, is_reconcilable, currency_code,
+                module_link_code, cost_center_required, project_required, branch_required, is_active, userName]
         );
         const newRow = result.rows[0];
 
@@ -93,8 +93,8 @@ const addRow = async (req, res) => {
 const updateRow = async (req, res) => {
     const { id } = req.params;
     const { account_code, account_name_thai, account_name_eng, parent_id, account_type, account_subtype,
-        normal_balance, is_control_account, is_reconcilable, currency_code, module_link_code, cost_center_required,
-        project_required, branch_required, is_active } = req.body;
+        normal_balance, is_normal_account, is_control_account, is_reconcilable, currency_code, module_link_code,
+        cost_center_required, project_required, branch_required, is_active } = req.body;
     const userId = req.headers.userid;
     const userName = req.headers.username;
 
@@ -113,20 +113,21 @@ const updateRow = async (req, res) => {
                 account_type = $5,
                 account_subtype = $6,
                 normal_balance = $7,
-                is_control_account = $8,
-                is_reconcilable = $9,
-                currency_code = $10,
-                module_link_code = $11,
-                cost_center_required = $12,
-                project_required = $13,
-                branch_required = $14,
-                is_active = $15,
+                is_normal_account = $8,
+                is_control_account = $9,
+                is_reconcilable = $10,
+                currency_code = $11,
+                module_link_code = $12,
+                cost_center_required = $13,
+                project_required = $14,
+                branch_required = $15,
+                is_active = $16,
                 updated_at = CURRENT_TIMESTAMP,
-                updated_by = $16
-             WHERE id = $17 RETURNING *`,
+                updated_by = $17
+             WHERE id = $18 RETURNING *`,
             [account_code, account_name_thai, account_name_eng, parent_id, account_type, account_subtype,
-                normal_balance, is_control_account, is_reconcilable, currency_code, module_link_code, cost_center_required,
-                project_required, branch_required, is_active, userName, id]
+                normal_balance, is_normal_account, is_control_account ?? false, is_reconcilable, currency_code,
+                module_link_code, cost_center_required, project_required, branch_required, is_active, userName, id]
         );
 
         await unlock(req, id, userId);
@@ -301,7 +302,7 @@ const exportDataExcel = async (req, res) => {
                 accountNameEng: row.account_name_eng,
                 accountType: row.account_type,
                 normalBalance: row.normal_balance,
-                isControlAccount: row.is_control_account,
+                isNormalAccount: row.is_normal_account,
                 isReconcilable: row.is_reconcilable,
                 currencyCode: row.currency_code,
                 moduleLinkCode: row.module_link_code,

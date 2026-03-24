@@ -38,7 +38,7 @@ const getIncomeStatement = async (req, res) => {
       // 2. Fetch REVENUE and EXPENSE accounts
       const accountsRes = await client.query(`
         SELECT id, account_code, account_name_thai, parent_id,
-               is_control_account, account_type, normal_balance
+               is_normal_account, account_type, normal_balance
         FROM gl_account
         WHERE account_type IN ('REVENUE', 'EXPENSE')
         ORDER BY account_code ASC
@@ -80,7 +80,7 @@ const getIncomeStatement = async (req, res) => {
 
       // 6. Rollup header accounts
       const calculateRollup = (node) => {
-        if (!node.is_control_account) {
+        if (!node.is_normal_account) {
           let h_dr = 0, h_cr = 0;
           node.children.forEach(child => {
             calculateRollup(child);
@@ -108,7 +108,7 @@ const getIncomeStatement = async (req, res) => {
           account_code:      d.account_code,
           account_name_thai: d.account_name_thai,
           parent_id:         d.parent_id,
-          is_header:         !d.is_control_account,
+          is_header:         !d.is_normal_account,
           account_type:      d.account_type,
           normal_balance:    d.normal_balance,
           end_balance:       endBalance,

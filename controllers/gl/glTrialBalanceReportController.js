@@ -39,7 +39,7 @@ const getTrialBalance = async (req, res) => {
 
       // 2. ดึงผังบัญชีทั้งหมด (เพิ่ม parent_id)
       const accountsRes = await client.query(`
-        SELECT id, account_code, account_name_thai, parent_id, is_control_account 
+        SELECT id, account_code, account_name_thai, parent_id, is_normal_account 
         FROM gl_account 
         ORDER BY account_code ASC
       `);
@@ -104,7 +104,7 @@ const getTrialBalance = async (req, res) => {
           a.account_code, 
           a.account_name_thai,
           a.parent_id,         -- [สำคัญ] สำหรับคำนวณ Level ที่ Frontend
-          a.is_control_account 
+          a.is_normal_account 
           ${dimFields}
           ${masterSelects},    -- [สำคัญ] รหัส BU/Branch/Project
           
@@ -177,7 +177,7 @@ const getTrialBalance = async (req, res) => {
 
       // Recursive Roll-up Function (รวมยอดลูกสู่แม่)
       const calculateRollup = (node) => {
-        if (!node.is_control_account) {
+        if (!node.is_normal_account) {
            let h_beg_dr = 0, h_beg_cr = 0, h_mvmt_dr = 0, h_mvmt_cr = 0;
            
            node.children.forEach(child => {
@@ -216,7 +216,7 @@ const getTrialBalance = async (req, res) => {
           account_code: d.account_code,
           account_name_thai: d.account_name_thai,
           parent_id: d.parent_id, // ส่งกลับไปให้ Frontend
-          is_header: !d.is_control_account,
+          is_header: !d.is_normal_account,
           // Values
           beg_dr: beg_dr_net, beg_cr: beg_cr_net,
           mvmt_dr: d.mvmt_dr, mvmt_cr: d.mvmt_cr,
@@ -288,7 +288,7 @@ module.exports = { getTrialBalance };
 
 //       // 2. ดึงผังบัญชีทั้งหมด (เรียงตามรหัส)
 //       const accountsRes = await client.query(`
-//         SELECT id, account_code, account_name_thai, parent_id, is_control_account 
+//         SELECT id, account_code, account_name_thai, parent_id, is_normal_account 
 //         FROM gl_account 
 //         ORDER BY account_code ASC
 //       `);
@@ -404,7 +404,7 @@ module.exports = { getTrialBalance };
 //       const calculateRollup = (node) => {
 //         // ถ้าเป็น Control Account (Detail) ให้ใช้ยอดตัวเอง (ซึ่งบวกมาจาก Balance Query แล้ว)
 //         // ถ้าเป็น Header Account (Parent) ให้รวมยอดจากลูก
-//         if (!node.is_control_account) {
+//         if (!node.is_normal_account) {
 //           // Reset Header Value ก่อนรวม (เผื่อมีขยะ) แต่ถ้า Switch OFF อาจจะอยากให้เป็น 0
 //           // แต่เราคำนวณไว้ก่อน แล้วไปซ่อนตอน Display ง่ายกว่า
 //            let h_beg_dr = 0, h_beg_cr = 0, h_mvmt_dr = 0, h_mvmt_cr = 0;
@@ -442,7 +442,7 @@ module.exports = { getTrialBalance };
 //           account_id: d.id,
 //           account_code: d.account_code,
 //           account_name_thai: d.account_name_thai,
-//           is_header: !d.is_control_account,
+//           is_header: !d.is_normal_account,
 //           // Values
 //           beg_dr: d.beg_dr, beg_cr: d.beg_cr,
 //           mvmt_dr: d.mvmt_dr, mvmt_cr: d.mvmt_cr,

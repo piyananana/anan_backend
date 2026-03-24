@@ -56,7 +56,7 @@ const getBalanceSheet = async (req, res) => {
       if (incomeSummaryId) {
         const plAccountsRes = await client.query(`
           SELECT id FROM gl_account
-          WHERE account_type IN ('REVENUE', 'EXPENSE') AND is_control_account = true
+          WHERE account_type IN ('REVENUE', 'EXPENSE') AND is_normal_account = true
         `);
 
         if (plAccountsRes.rows.length > 0) {
@@ -91,7 +91,7 @@ const getBalanceSheet = async (req, res) => {
       // 4. Fetch Balance Sheet accounts (ASSET, LIABILITY, EQUITY)
       const accountsRes = await client.query(`
         SELECT id, account_code, account_name_thai, parent_id,
-               is_control_account, account_type, normal_balance
+               is_normal_account, account_type, normal_balance
         FROM gl_account
         WHERE account_type IN ('ASSET', 'LIABILITY', 'EQUITY')
         ORDER BY account_code ASC
@@ -180,7 +180,7 @@ const getBalanceSheet = async (req, res) => {
 
       // 9. Roll-up header accounts (now includes overridden net income)
       const calculateRollup = (node) => {
-        if (!node.is_control_account) {
+        if (!node.is_normal_account) {
           let h_beg_dr = 0, h_beg_cr = 0, h_mvmt_dr = 0, h_mvmt_cr = 0;
           node.children.forEach(child => {
             calculateRollup(child);
@@ -212,7 +212,7 @@ const getBalanceSheet = async (req, res) => {
           account_code:      d.account_code,
           account_name_thai: d.account_name_thai,
           parent_id:         d.parent_id,
-          is_header:         !d.is_control_account,
+          is_header:         !d.is_normal_account,
           account_type:      d.account_type,
           normal_balance:    d.normal_balance,
           end_balance:       endBalance,

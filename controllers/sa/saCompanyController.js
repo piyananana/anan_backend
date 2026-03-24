@@ -34,7 +34,7 @@ const getCompanyInfo = async (req, res) => {
 const createCompanyInfo = async (req, res) => {
     const {
         thai_name, english_name, address_no, address_building_village,
-        address_soi, address_road, address_sub_district, address_district,
+        address_alley, address_road, address_sub_district, address_district,
         address_province, address_country, address_zip_code, tax_id_number,
         start_date, maintenance_contract_date, serial_number,
         phone_number, fax_number, email, website, primary_contact_person, is_active
@@ -59,7 +59,7 @@ const createCompanyInfo = async (req, res) => {
         const result = await client.query(
             'INSERT INTO sa_company ( '+
                 'thai_name, english_name, address_no, address_building_village, '+
-                'address_soi, address_road, address_sub_district, address_district, '+
+                'address_alley, address_road, address_sub_district, address_district, '+
                 'address_province, address_country, address_zip_code, tax_id_number, '+
                 'logo_url, start_date, maintenance_contract_date, serial_number, '+
                 'phone_number, fax_number, email, website, primary_contact_person, is_active )'+
@@ -67,7 +67,7 @@ const createCompanyInfo = async (req, res) => {
             'RETURNING *',
             [
                 thai_name, english_name, address_no, address_building_village,
-                address_soi, address_road, address_sub_district, address_district,
+                address_alley, address_road, address_sub_district, address_district,
                 address_province, address_country, address_zip_code, tax_id_number,
                 logo_url, parsed_start_date, parsed_maintenance_contract_date, serial_number,
                 phone_number, fax_number, email, website, primary_contact_person, is_active === 'true'
@@ -92,7 +92,7 @@ const updateCompanyInfo = async (req, res) => {
     const companyId = parseInt(req.params.id);
     const {
         thai_name, english_name, address_no, address_building_village,
-        address_soi, address_road, address_sub_district, address_district,
+        address_alley, address_road, address_sub_district, address_district,
         address_province, address_country, address_zip_code, tax_id_number,
         start_date, maintenance_contract_date, serial_number,
         phone_number, fax_number, email, website, primary_contact_person, is_active
@@ -123,7 +123,7 @@ const updateCompanyInfo = async (req, res) => {
 
         const updateFields = [
             'thai_name=$1', 'english_name=$2', 'address_no=$3', 'address_building_village=$4',
-            'address_soi=$5', 'address_road=$6', 'address_sub_district=$7', 'address_district=$8',
+            'address_alley=$5', 'address_road=$6', 'address_sub_district=$7', 'address_district=$8',
             'address_province=$9', 'address_country=$10', 'address_zip_code=$11', 'tax_id_number=$12',
             'start_date=$13', 'maintenance_contract_date=$14', 'serial_number=$15',
             'phone_number=$16', 'fax_number=$17', 'email=$18', 'website=$19',
@@ -131,7 +131,7 @@ const updateCompanyInfo = async (req, res) => {
         ];
         const queryParams = [
             thai_name, english_name, address_no, address_building_village,
-            address_soi, address_road, address_sub_district, address_district,
+            address_alley, address_road, address_sub_district, address_district,
             address_province, address_country, address_zip_code, tax_id_number,
             parsed_start_date, parsed_maintenance_contract_date, serial_number,
             phone_number, fax_number, email, website,

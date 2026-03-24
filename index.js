@@ -49,6 +49,11 @@ const glRoutes = require('./routes/gl');
 app.use('/api/gl', glRoutes);
 // ----------------
 
+// ar = Accounts Receivable
+const arRoutes = require('./routes/ar');
+app.use('/api/ar', arRoutes);
+// ----------------
+
 // sa = System Administration
 const saRoutes = require('./routes/sa');
 const saPasswordPolicyController = require('./controllers/sa/saPasswordPolicyController');

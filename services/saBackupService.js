@@ -32,7 +32,7 @@ class BackupService {
             if (!fs.existsSync(backupDir)) {
                 fs.mkdirSync(backupDir);
             }
-            const filename = `Backup_${scheduleType}_${databaseName}_${timestamp}.backup`;
+            const filename = `${databaseName}_Backup_${scheduleType}_${timestamp}.backup`;
             const filePath = path.join(backupDir, filename);
 
             const dbConfig = await dbService.getPool(databaseName);
@@ -63,7 +63,7 @@ class BackupService {
     static async runPgRestore(req, filename) {
         console.log(`Running pg_restore for file: ${filename}`);
 
-        const databaseName = req.selectedDatabase;
+        const databaseName = req.header('X-Database-Name');
         const dbConfig = await dbService.getPool(databaseName);
         const backupDir = path.join(__dirname, '..', 'backups');
         const filePath = path.join(backupDir, filename);
@@ -123,7 +123,7 @@ class BackupService {
                               '-' + now.getMinutes().toString().padStart(2, '0') +
                               '-' + now.getSeconds().toString().padStart(2, '0');
             const backupDir = path.join(__dirname, '..', 'backups');
-            const filename = `instant_backup_${databaseName}_${timestamp}.backup`;
+            const filename = `${databaseName}_instant_backup_${timestamp}.backup`;
             const filePath = path.join(backupDir, filename);
 
             const dbConfig = await dbService.getPool(databaseName);
@@ -178,7 +178,7 @@ class BackupService {
 
     static async restoreFromInstantBackup(req, filename) {
         console.log(`Running instant restore for file: ${filename}`);
-        const databaseName = req.selectedDatabase;
+        const databaseName = req.header('X-Database-Name');
         const dbConfig = await dbService.getPool(databaseName);
         const backupDir = path.join(__dirname, '..', 'backups');
         const filePath = path.join(backupDir, filename);
@@ -381,11 +381,11 @@ class BackupService {
             }
             const files = fs.readdirSync(backupDir).filter(file => {
                 if (scheduleType === 'instant') {
-                    var str = `instant_backup_${databaseName}_`;
+                    var str = `${databaseName}_instant_backup_`;
                     return file.startsWith(str) && file.endsWith('.backup');
                 } else {
-                    var str = `Backup_${scheduleType}_${databaseName}_`;
-                    return file.includes(str) && file.endsWith('.backup');
+                    var str = `${databaseName}_Backup_${scheduleType}_`;
+                    return file.startsWith(str) && file.endsWith('.backup');
                 }
             }).sort().reverse();
             return files;
