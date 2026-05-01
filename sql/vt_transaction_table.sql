@@ -6,7 +6,7 @@
 CREATE TABLE IF NOT EXISTS vt_transaction (
     id                   SERIAL PRIMARY KEY,
     module_code          VARCHAR(10) NOT NULL,   -- 'AR', 'AP', 'GL', 'IC'
-    vat_type             VARCHAR(15) NOT NULL,   -- 'OUTPUT_VAT', 'INPUT_VAT'
+    vat_type             VARCHAR(30) NOT NULL,   -- 'OUTPUT_VAT', 'INPUT_VAT', 'VAT_DEFERRED'
     -- อ้างอิงเอกสารต้นทาง
     doc_id               INTEGER,               -- FK -> sa_module_document.id
     source_header_id     INTEGER NOT NULL,      -- ar_transaction.id, ap_transaction.id, gl_entry_header.id

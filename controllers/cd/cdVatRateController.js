@@ -4,7 +4,12 @@
 const fetchRows = async (req, res) => {
     try {
         const result = await req.dbPool.query(
-            `SELECT * FROM cd_vat_rate ORDER BY vat_code ASC, effective_date DESC`
+            `SELECT v.*,
+                    a.account_code AS gl_account_code,
+                    a.account_name_thai AS gl_account_name
+             FROM cd_vat_rate v
+             LEFT JOIN gl_account a ON a.id = v.gl_account_id
+             ORDER BY v.vat_code ASC, v.effective_date DESC`
         );
         res.status(200).json(result.rows);
     } catch (error) {
@@ -58,13 +63,13 @@ const fetchVatCodes = async (req, res) => {
 
 // POST new row
 const addRow = async (req, res) => {
-    const { vat_code, vat_name_th, vat_name_en, rate, effective_date, end_date, is_active, remark } = req.body;
+    const { vat_code, vat_name_th, vat_name_en, rate, effective_date, end_date, is_active, remark, gl_account_id } = req.body;
     const userName = req.headers.username;
     try {
         const result = await req.dbPool.query(
             `INSERT INTO cd_vat_rate
-                (vat_code, vat_name_th, vat_name_en, rate, effective_date, end_date, is_active, remark, created_by, updated_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
+                (vat_code, vat_name_th, vat_name_en, rate, effective_date, end_date, is_active, remark, gl_account_id, created_by, updated_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
              RETURNING *`,
             [
                 vat_code.toUpperCase(),
@@ -75,6 +80,7 @@ const addRow = async (req, res) => {
                 end_date || null,
                 is_active !== undefined ? is_active : true,
                 remark || null,
+                gl_account_id || null,
                 userName,
             ]
         );
@@ -91,7 +97,7 @@ const addRow = async (req, res) => {
 // PUT update row
 const updateRow = async (req, res) => {
     const { id } = req.params;
-    const { vat_code, vat_name_th, vat_name_en, rate, effective_date, end_date, is_active, remark } = req.body;
+    const { vat_code, vat_name_th, vat_name_en, rate, effective_date, end_date, is_active, remark, gl_account_id } = req.body;
     const userName = req.headers.username;
     try {
         const result = await req.dbPool.query(
@@ -104,9 +110,10 @@ const updateRow = async (req, res) => {
                 end_date = $6,
                 is_active = $7,
                 remark = $8,
-                updated_by = $9,
+                gl_account_id = $9,
+                updated_by = $10,
                 updated_at = NOW()
-             WHERE id = $10
+             WHERE id = $11
              RETURNING *`,
             [
                 vat_code.toUpperCase(),
@@ -117,6 +124,7 @@ const updateRow = async (req, res) => {
                 end_date || null,
                 is_active,
                 remark || null,
+                gl_account_id || null,
                 userName,
                 id,
             ]

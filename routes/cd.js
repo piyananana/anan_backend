@@ -12,6 +12,7 @@ const cdBankController = require('../controllers/cd/cdBankController');
 const cdBankBranchController = require('../controllers/cd/cdBankBranchController');
 const cdSalesTerritoryController = require('../controllers/cd/cdSalesTerritoryController');
 const cdSalespersonController = require('../controllers/cd/cdSalespersonController');
+const cdWhtTypeController = require('../controllers/cd/cdWhtTypeController');
 
 // กำหนดที่เก็บไฟล์ชั่วคราวสำหรับอัปโหลด
 const multer = require('multer');
@@ -107,5 +108,13 @@ router.get('/cd_salesperson/:id', cdSalespersonController.fetchRow);
 router.post('/cd_salesperson', cdSalespersonController.addRow);
 router.put('/cd_salesperson/:id', cdSalespersonController.updateRow);
 router.delete('/cd_salesperson/:id', cdSalespersonController.deleteRow);
+
+// Router สำหรับจัดการประเภทภาษีหัก ณ ที่จ่าย (ใช้ร่วม AR + AP)
+router.get('/cd_wht_type/active', cdWhtTypeController.fetchActiveRows);
+router.get('/cd_wht_type', cdWhtTypeController.fetchRows);
+router.get('/cd_wht_type/:id', cdWhtTypeController.fetchRow);
+router.post('/cd_wht_type', cdWhtTypeController.addRow);
+router.put('/cd_wht_type/:id', cdWhtTypeController.updateRow);
+router.delete('/cd_wht_type/:id', cdWhtTypeController.deleteRow);
 
 module.exports = router;

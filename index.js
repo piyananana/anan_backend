@@ -11,8 +11,8 @@ const port = process.env.PORT || 8888;
 const host = '0.0.0.0'; // ฟังทุก interface
 
 app.use(cors()); 
-app.use(express.json()); 
-app.use(express.urlencoded({ extended: true })); 
+app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
 // *** เพิ่มการจัดการ Static Files สำหรับ Flutter Web ***
 const flutterWebPath = path.join(__dirname, 'build', 'web');    // กำหนด path ไปยังโฟลเดอร์ build/web ของโปรเจกต์ Flutter ของคุณ
@@ -54,6 +54,11 @@ const arRoutes = require('./routes/ar');
 app.use('/api/ar', arRoutes);
 // ----------------
 
+// cm = Cash Management
+const cmRoutes = require('./routes/cm');
+app.use('/api/cm', cmRoutes);
+// ----------------
+
 // sa = System Administration
 const saRoutes = require('./routes/sa');
 const saPasswordPolicyController = require('./controllers/sa/saPasswordPolicyController');
@@ -64,10 +69,14 @@ app.use('/api/sa', saRoutes);
 
 app.use('/public', express.static(path.join(__dirname, 'public')));
 
-// Error handling middleware (optional but recommended)
+// Error handling middleware
 app.use((err, req, res, next) => {
     console.error(err.stack);
-    res.status(500).send('Something broke!');
+    const status = err.status || err.statusCode || 500;
+    const message = err.type === 'entity.too.large'
+        ? 'ข้อมูลมีขนาดใหญ่เกินไป กรุณาแบ่งนำเข้าเป็นชุดย่อย'
+        : (err.message || 'เกิดข้อผิดพลาดภายในระบบ');
+    res.status(status).json({ message });
 });
 
 const startServer = async (databaseName) => {

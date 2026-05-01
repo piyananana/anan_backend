@@ -291,8 +291,19 @@ const reverseTransaction = async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // Check Status
-        const checkRes = await client.query('SELECT status FROM gl_entry_header WHERE id = $1', [id]);
+        // Check Status and source
+        const checkRes = await client.query(
+            'SELECT status, external_source_id FROM gl_entry_header WHERE id = $1', [id]
+        );
+        if (!checkRes.rows[0]) return res.status(404).json({ error: 'Not found' });
+
+        // ถ้าสร้างมาจากโมดูลอื่น (AR, AP ฯลฯ) → ห้ามถอยจาก GL โดยตรง
+        if (checkRes.rows[0].external_source_id) {
+            return res.status(403).json({
+                error: 'รายการนี้สร้างจากโมดูลอื่น ไม่สามารถถอยจาก GL ได้ กรุณายกเลิกจากโมดูลต้นทาง'
+            });
+        }
+
         if (checkRes.rows[0].status !== 'Posted') throw new Error('Only Posted can be reversed');
 
         // Reverse Accumulators
