@@ -19,7 +19,13 @@ const getReportMasterList = async (req, res) => {
 };
 
 const generateFinancialReport = async (req, res) => {
-    const { report_id, base_period_id } = req.body;
+    const { report_id, base_period_id, branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id } = req.body;
+    const branchId = branch_id  ? parseInt(branch_id)  : null;
+    const d1 = dim1_id ? parseInt(dim1_id) : null;
+    const d2 = dim2_id ? parseInt(dim2_id) : null;
+    const d3 = dim3_id ? parseInt(dim3_id) : null;
+    const d4 = dim4_id ? parseInt(dim4_id) : null;
+    const d5 = dim5_id ? parseInt(dim5_id) : null;
     const client = await req.dbPool.connect();
 
     try {
@@ -112,13 +118,20 @@ const generateFinancialReport = async (req, res) => {
         let glData = [];
         
         if (reqPeriodArr.length > 0) {
-            // ดึง branch_id, project_id, business_unit_id มาเผื่อต้องการกรอง
+            // กรอง global branch + dimension filter จาก request
             const glDataRes = await client.query(`
-                SELECT a.account_code, b.period_id, b.end_balance, b.branch_id, b.project_id, b.business_unit_id
+                SELECT a.account_code, b.period_id, b.end_balance, c.branch_id, c.dim1_id, c.dim2_id, c.dim3_id, c.dim4_id, c.dim5_id
                 FROM gl_balance_accum b
+                JOIN gl_dim_combination c ON c.id = b.combo_id
                 JOIN gl_account a ON b.account_id = a.id
                 WHERE b.period_id = ANY($1::int[])
-            `, [reqPeriodArr]);
+                  AND ($2::int IS NULL OR c.branch_id = $2)
+                  AND ($3::int IS NULL OR c.dim1_id = $3)
+                  AND ($4::int IS NULL OR c.dim2_id = $4)
+                  AND ($5::int IS NULL OR c.dim3_id = $5)
+                  AND ($6::int IS NULL OR c.dim4_id = $6)
+                  AND ($7::int IS NULL OR c.dim5_id = $7)
+            `, [reqPeriodArr, branchId, d1, d2, d3, d4, d5]);
             glData = glDataRes.rows;
         }
 
@@ -156,8 +169,11 @@ const generateFinancialReport = async (req, res) => {
                             }
                             // กรองตาม Dimension ถ้ามีระบุไว้ในบรรทัดนั้น
                             if (row.branch_id && g.branch_id !== row.branch_id) isMatch = false;
-                            if (row.project_id && g.project_id !== row.project_id) isMatch = false;
-                            if (row.business_unit_id && g.business_unit_id !== row.business_unit_id) isMatch = false;
+                            if (row.dim1_id && g.dim1_id !== row.dim1_id) isMatch = false;
+                            if (row.dim2_id && g.dim2_id !== row.dim2_id) isMatch = false;
+                            if (row.dim3_id && g.dim3_id !== row.dim3_id) isMatch = false;
+                            if (row.dim4_id && g.dim4_id !== row.dim4_id) isMatch = false;
+                            if (row.dim5_id && g.dim5_id !== row.dim5_id) isMatch = false;
                             
                             return isMatch;
                         });

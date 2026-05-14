@@ -11,6 +11,8 @@ const saGroupUserController = require('../controllers/sa/saGroupUserController')
 const saMenuController = require('../controllers/sa/saMenuController');
 const saModuleDocumentController = require('../controllers/sa/saModuleDocumentController');
 const saPasswordPolicyController = require('../controllers/sa/saPasswordPolicyController');
+const saDocNumberBranchController = require('../controllers/sa/saDocNumberBranchController');
+const saUserBranchController = require('../controllers/sa/saUserBranchController');
 const saUserController = require('../controllers/sa/saUserController');
 const saUserDocumentController = require('../controllers/sa/saUserDocumentController');
 const saUserMenuController = require('../controllers/sa/saUserMenuController');
@@ -127,6 +129,17 @@ router.get('/sa_module_document/export', saModuleDocumentController.exportDataEx
 router.get('/sa_policy', saPasswordPolicyController.getPolicy);
 router.get('/sa_password_policy', saPasswordPolicyController.getPasswordPolicy);
 router.put('/sa_password_policy/:policy', saPasswordPolicyController.updatePolicy);
+
+// For saDocNumberBranchController
+router.get('/sa_doc_number_branch', saDocNumberBranchController.fetchByBranch);
+router.put('/sa_doc_number_branch/:branchId', saDocNumberBranchController.upsertByBranch);
+router.put('/sa_doc_number_branch/:branchId/:docId', saDocNumberBranchController.upsertSingle);
+router.delete('/sa_doc_number_branch/:branchId/:docId', saDocNumberBranchController.deleteSingle);
+router.post('/sa_doc_number_branch/reset', saDocNumberBranchController.resetCounter);
+
+// For saUserBranchController
+router.get('/sa_user_branch/:userId', saUserBranchController.getBranchesByUserId);
+router.put('/sa_user_branch/:userId', saUserBranchController.updateBranchesByUserId);
 
 // For saUserController
 router.get('/sa_user', saUserController.getAllUser);

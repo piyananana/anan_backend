@@ -43,10 +43,24 @@ const unlock = async (req, id, userId) => {
     }
 };
 
+const DIM_RULES_SQL = `
+    COALESCE(
+        json_agg(json_build_object('type_code', dr.type_code, 'is_required', dr.is_required))
+        FILTER (WHERE dr.type_code IS NOT NULL),
+        '[]'::json
+    ) AS dim_rules
+`;
+
 // GET all rows with lock info
 const fetchRows = async (req, res) => {
     try {
-        const result = await req.dbPool.query('SELECT * FROM gl_account WHERE is_active = TRUE ORDER BY parent_id ASC, account_code ASC');
+        const result = await req.dbPool.query(`
+            SELECT a.*, ${DIM_RULES_SQL}
+            FROM gl_account a
+            LEFT JOIN gl_account_dim_rule dr ON dr.account_id = a.id
+            WHERE a.is_active = TRUE
+            GROUP BY a.id
+            ORDER BY a.parent_id ASC, a.account_code ASC`);
         res.json(result.rows);
     } catch (err) {
         console.error('Error fetching all accounts:', err);
@@ -56,7 +70,13 @@ const fetchRows = async (req, res) => {
 
 const fetchRowsControlAccount = async (req, res) => {
     try {
-        const result = await req.dbPool.query('SELECT * FROM gl_account WHERE is_active = TRUE AND is_normal_account = TRUE ORDER BY parent_id ASC, account_code ASC');
+        const result = await req.dbPool.query(`
+            SELECT a.*, ${DIM_RULES_SQL}
+            FROM gl_account a
+            LEFT JOIN gl_account_dim_rule dr ON dr.account_id = a.id
+            WHERE a.is_active = TRUE AND a.is_normal_account = TRUE
+            GROUP BY a.id
+            ORDER BY a.parent_id ASC, a.account_code ASC`);
         res.json(result.rows);
     } catch (err) {
         console.error('Error fetching all accounts:', err);
@@ -64,14 +84,30 @@ const fetchRowsControlAccount = async (req, res) => {
     }
 };
 
+const _saveDimRules = async (client, accountId, dimRules) => {
+    await client.query('DELETE FROM gl_account_dim_rule WHERE account_id = $1', [accountId]);
+    if (Array.isArray(dimRules)) {
+        for (const rule of dimRules) {
+            if (rule.type_code) {
+                await client.query(
+                    'INSERT INTO gl_account_dim_rule (account_id, type_code, is_required) VALUES ($1, $2, $3)',
+                    [accountId, rule.type_code, rule.is_required ?? true]
+                );
+            }
+        }
+    }
+};
+
 // POST new row
 const addRow = async (req, res) => {
     const { account_code, account_name_thai, account_name_eng, parent_id, account_type, account_subtype,
         normal_balance, is_normal_account, is_control_account, is_reconcilable, currency_code, module_link_code,
-        cost_center_required, project_required, branch_required, is_active } = req.body;
+        cost_center_required, project_required, branch_required, is_active, dim_rules } = req.body;
     const userName = req.headers.username;
+    const client = await req.dbPool.connect();
     try {
-        const result = await req.dbPool.query(
+        await client.query('BEGIN');
+        const result = await client.query(
             `INSERT INTO gl_account (account_code, account_name_thai, account_name_eng, parent_id, account_type, account_subtype,
              normal_balance, is_normal_account, is_control_account, is_reconcilable, currency_code, module_link_code,
              cost_center_required, project_required, branch_required, is_active, created_at, created_by)
@@ -81,11 +117,16 @@ const addRow = async (req, res) => {
                 module_link_code, cost_center_required, project_required, branch_required, is_active, userName]
         );
         const newRow = result.rows[0];
-
+        await _saveDimRules(client, newRow.id, dim_rules);
+        await client.query('COMMIT');
+        newRow.dim_rules = dim_rules ?? [];
         res.status(201).json(newRow);
     } catch (err) {
+        await client.query('ROLLBACK');
         console.error('Error creating:', err);
         res.status(500).json({ error: 'Internal server error' });
+    } finally {
+        client.release();
     }
 };
 
@@ -94,17 +135,20 @@ const updateRow = async (req, res) => {
     const { id } = req.params;
     const { account_code, account_name_thai, account_name_eng, parent_id, account_type, account_subtype,
         normal_balance, is_normal_account, is_control_account, is_reconcilable, currency_code, module_link_code,
-        cost_center_required, project_required, branch_required, is_active } = req.body;
+        cost_center_required, project_required, branch_required, is_active, dim_rules } = req.body;
     const userId = req.headers.userid;
     const userName = req.headers.username;
+    const client = await req.dbPool.connect();
 
     try {
         const lockResult = await lock(req, id, userId, userName);
         if (!lockResult.success) {
+            client.release();
             return res.status(409).json({ message: lockResult.message });
         }
 
-        const result = await req.dbPool.query(
+        await client.query('BEGIN');
+        const result = await client.query(
             `UPDATE gl_account SET
                 account_code = $1,
                 account_name_thai = $2,
@@ -130,16 +174,25 @@ const updateRow = async (req, res) => {
                 module_link_code, cost_center_required, project_required, branch_required, is_active, userName, id]
         );
 
-        await unlock(req, id, userId);
-
         if (result.rows.length === 0) {
+            await client.query('ROLLBACK');
+            client.release();
             return res.status(404).json({ message: 'Not found.' });
         }
 
-        res.json(result.rows[0]);
+        await _saveDimRules(client, id, dim_rules);
+        await client.query('COMMIT');
+        await unlock(req, id, userId);
+
+        const row = result.rows[0];
+        row.dim_rules = dim_rules ?? [];
+        res.json(row);
     } catch (err) {
+        await client.query('ROLLBACK');
         console.error('Error updating:', err);
         res.status(500).json({ error: 'Internal server error' });
+    } finally {
+        client.release();
     }
 };
 

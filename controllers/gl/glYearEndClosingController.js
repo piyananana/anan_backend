@@ -31,6 +31,16 @@ const generateDocNo = async (client, docId, date) => {
   return docNo;
 };
 
+const getOrCreateComboId = async (client, { branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id }) => {
+  const res = await client.query(`
+    INSERT INTO gl_dim_combination (branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+    VALUES ($1,$2,$3,$4,$5,$6)
+    ON CONFLICT (combo_key) DO UPDATE SET id = gl_dim_combination.id
+    RETURNING id
+  `, [branch_id || 0, dim1_id || 0, dim2_id || 0, dim3_id || 0, dim4_id || 0, dim5_id || 0]);
+  return res.rows[0].id;
+};
+
 const updateBalanceAccum = async (client, headerId, isReverse = false) => {
   const detailsRes = await client.query(`SELECT * FROM gl_entry_detail WHERE header_id = $1`, [headerId]);
   const headerRes  = await client.query(`SELECT * FROM gl_entry_header WHERE id = $1`, [headerId]);
@@ -39,29 +49,23 @@ const updateBalanceAccum = async (client, headerId, isReverse = false) => {
   const multiplier = isReverse ? -1 : 1;
 
   for (const row of details) {
+    const comboId  = await getOrCreateComboId(client, row);
     const debit    = (Number(row.debit_lc)  || 0) * multiplier;
     const credit   = (Number(row.credit_lc) || 0) * multiplier;
     const netChange = debit - credit;
     await client.query(`
       INSERT INTO gl_balance_accum
-        (period_id, account_id, branch_id, project_id, business_unit_id, currency_id,
+        (period_id, account_id, combo_id, currency_id,
          debit_amount, credit_amount, end_balance, updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
-      ON CONFLICT (period_id, account_id, branch_id, project_id, business_unit_id, currency_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+      ON CONFLICT (period_id, account_id, combo_id, currency_id)
       DO UPDATE SET
         debit_amount  = gl_balance_accum.debit_amount  + EXCLUDED.debit_amount,
         credit_amount = gl_balance_accum.credit_amount + EXCLUDED.credit_amount,
         end_balance   = gl_balance_accum.end_balance   + (EXCLUDED.debit_amount - EXCLUDED.credit_amount),
         updated_at    = NOW()
-    `, [
-      header.period_id,
-      row.account_id,
-      row.branch_id        || 0,
-      row.project_id       || 0,
-      row.business_unit_id || 0,
-      header.currency_id   || 1,
-      debit, credit, netChange,
-    ]);
+    `, [header.period_id, row.account_id, comboId, header.currency_id || 1,
+        debit, credit, netChange]);
   }
 };
 
@@ -85,8 +89,8 @@ const createClosingEntry = async (client, { docId, docNo, docDate, periodId, des
     await client.query(`
       INSERT INTO gl_entry_detail
         (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc,
-         branch_id, project_id, business_unit_id)
-      VALUES ($1,$2,$3,$4,$5,$6,$5,$6, NULL,NULL,NULL)
+         branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$5,$6, NULL,NULL,NULL,NULL,NULL,NULL)
     `, [headerId, lineNo++, d.account_id, d.description || description, d.debit_lc || 0, d.credit_lc || 0]);
   }
 

@@ -8,6 +8,7 @@ const arTransactionController = require('../controllers/ar/arTransactionControll
 const arCollectorController = require('../controllers/ar/arCollectorController');
 const arCustomerImportController = require('../controllers/ar/arCustomerImportController');
 const arGlAccountSetupController = require('../controllers/ar/arGlAccountSetupController');
+const arAgingReportController = require('../controllers/ar/arAgingReportController');
 
 // Router สำหรับตั้งค่ารหัสลูกหนี้อัตโนมัติ
 router.get('/ar_customer_running/preview_code', arCustomerRunningController.previewCode);
@@ -49,12 +50,17 @@ router.get('/ar_transaction/open_invoices', arTransactionController.fetchOpenInv
 router.get('/ar_transaction/open_advances', arTransactionController.fetchOpenAdvances);
 router.get('/ar_transaction/open_advances_for_refund', arTransactionController.fetchOpenAdvancesForRefund);
 router.get('/ar_transaction/open_credit_notes', arTransactionController.fetchOpenCreditNotes);
+router.get('/ar_transaction/invoice_billing_summary', arTransactionController.fetchInvoiceBillingSummary);
+router.get('/ar_transaction/bill_collection_by_doc_no', arTransactionController.fetchBillCollectionByDocNo);
 router.get('/ar_transaction', arTransactionController.fetchRows);
 router.get('/ar_transaction/:id', arTransactionController.fetchRow);
 router.post('/ar_transaction', arTransactionController.createTransaction);
 router.put('/ar_transaction/:id', arTransactionController.updateTransaction);
 router.put('/ar_transaction/:id/void', arTransactionController.voidTransaction);
 router.delete('/ar_transaction/:id', arTransactionController.deleteTransaction);
+
+// Router สำหรับรายงานลูกหนี้คงค้างตามอายุ
+router.get('/ar_aging_report', arAgingReportController.getAgingReport);
 
 // Router สำหรับตั้งค่ารหัสบัญชี GL ต่อ doc_code ของ AR
 router.get('/ar_gl_account_setup', arGlAccountSetupController.fetchRows);

@@ -60,7 +60,7 @@ const fetchRows = async (req, res) => {
       SELECT
         c.id, c.customer_code, c.old_customer_code, c.customer_name_th, c.customer_name_en,
         c.tax_id, c.credit_term_months, c.credit_term_days, c.credit_limit, c.discount_percent,
-        c.currency_code, c.is_active,
+        c.currency_code, c.is_active, c.requires_billing,
         c.business_type_id,  cbt.business_type_code, cbt.business_type_name_thai,
         c.customer_group_id, acg.group_code AS customer_group_code,
                              acg.group_name_thai AS customer_group_name,

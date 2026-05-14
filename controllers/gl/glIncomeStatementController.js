@@ -1,7 +1,8 @@
 // controllers/gl/glIncomeStatementController.js
 
 const getIncomeStatement = async (req, res) => {
-  const { fiscal_year_id, period_id } = req.query;
+  const { fiscal_year_id, period_id, branch_id } = req.query;
+  const branchId = branch_id ? parseInt(branch_id) : null;
 
   if (!fiscal_year_id) {
     return res.status(400).json({ error: 'fiscal_year_id is required' });
@@ -50,14 +51,16 @@ const getIncomeStatement = async (req, res) => {
 
       // 3. Query balances for target periods
       const balancesRes = await client.query(`
-        SELECT account_id,
-               COALESCE(SUM(debit_amount),  0) AS total_dr,
-               COALESCE(SUM(credit_amount), 0) AS total_cr
-        FROM gl_balance_accum
-        WHERE period_id  = ANY($1::int[])
-          AND account_id = ANY($2::int[])
-        GROUP BY account_id
-      `, [targetPeriodIds, allAccountIds]);
+        SELECT gba.account_id,
+               COALESCE(SUM(gba.debit_amount),  0) AS total_dr,
+               COALESCE(SUM(gba.credit_amount), 0) AS total_cr
+        FROM gl_balance_accum gba
+        JOIN gl_dim_combination gdc ON gdc.id = gba.combo_id
+        WHERE gba.period_id  = ANY($1::int[])
+          AND gba.account_id = ANY($2::int[])
+          AND ($3::int IS NULL OR gdc.branch_id = $3)
+        GROUP BY gba.account_id
+      `, [targetPeriodIds, allAccountIds, branchId]);
 
       // 4. Build accMap and hierarchy
       const accMap = {};

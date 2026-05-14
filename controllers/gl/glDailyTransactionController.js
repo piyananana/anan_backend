@@ -9,6 +9,7 @@ const getDailyTransactions = async (req, res) => {
     ref_doc_codes,
     ref_doc_no_from, ref_doc_no_to,
     ref_doc_date_from, ref_doc_date_to,
+    branch_id,
   } = req.query;
 
   if (!fiscal_year_id) {
@@ -52,8 +53,11 @@ const getDailyTransactions = async (req, res) => {
         det.debit_lc,
         det.credit_lc,
         det.branch_id,
-        det.business_unit_id,
-        det.project_id
+        det.dim1_id,
+        det.dim2_id,
+        det.dim3_id,
+        det.dim4_id,
+        det.dim5_id
       FROM gl_entry_header h
       JOIN  sa_module_document d   ON h.doc_id     = d.id
       LEFT JOIN sa_module_document rd  ON h.ref_doc_id = rd.id
@@ -84,6 +88,7 @@ const getDailyTransactions = async (req, res) => {
     if (ref_doc_no_to)     { params.push(ref_doc_no_to);     sql += ` AND h.ref_doc_no <= $${params.length}`; }
     if (ref_doc_date_from) { params.push(ref_doc_date_from); sql += ` AND h.ref_doc_date >= $${params.length}`; }
     if (ref_doc_date_to)   { params.push(ref_doc_date_to);   sql += ` AND h.ref_doc_date <= $${params.length}`; }
+    if (branch_id)         { params.push(parseInt(branch_id)); sql += ` AND h.branch_id = $${params.length}`; }
 
     // Order: by header (date, doc_code, doc_no), then detail (debit rows first, then by account_code)
     sql += `
@@ -123,8 +128,11 @@ const getDailyTransactions = async (req, res) => {
         debit_lc:           Number(row.debit_lc)  || 0,
         credit_lc:          Number(row.credit_lc) || 0,
         branch_id:          row.branch_id,
-        business_unit_id:   row.business_unit_id,
-        project_id:         row.project_id,
+        dim1_id:            row.dim1_id,
+        dim2_id:            row.dim2_id,
+        dim3_id:            row.dim3_id,
+        dim4_id:            row.dim4_id,
+        dim5_id:            row.dim5_id,
       });
     }
 

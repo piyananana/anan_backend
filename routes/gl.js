@@ -14,6 +14,8 @@ const glYearEndClosingController = require('../controllers/gl/glYearEndClosingCo
 const glBalanceSheetController = require('../controllers/gl/glBalanceSheetController');
 const glIncomeStatementController = require('../controllers/gl/glIncomeStatementController');
 const glDailyTransactionController = require('../controllers/gl/glDailyTransactionController');
+const glDimensionTypeController = require('../controllers/gl/glDimensionTypeController');
+const glDimensionValueController = require('../controllers/gl/glDimensionValueController');
 
 // กำหนดที่เก็บไฟล์ชั่วคราวสำหรับอัปโหลด
 const multer = require('multer');
@@ -86,6 +88,18 @@ router.delete('/gl_fin_report_row/:id', glFinancialReportBuilderController.delet
 router.post('/gl_fin_report_column', glFinancialReportBuilderController.createColumn);
 router.put('/gl_fin_report_column/:id', glFinancialReportBuilderController.updateColumn);
 router.delete('/gl_fin_report_column/:id', glFinancialReportBuilderController.deleteColumn);
+
+// Router สำหรับ GL Dimension Framework
+router.get('/gl_dimension_type/active', glDimensionTypeController.fetchActiveRows);
+router.get('/gl_dimension_type', glDimensionTypeController.fetchRows);
+router.get('/gl_dimension_type/:slot_no', glDimensionTypeController.fetchRow);
+router.post('/gl_dimension_type', glDimensionTypeController.upsert);
+
+router.get('/gl_dimension_value', glDimensionValueController.fetchRows);
+router.get('/gl_dimension_value/:id', glDimensionValueController.fetchRow);
+router.post('/gl_dimension_value', glDimensionValueController.addRow);
+router.put('/gl_dimension_value/:id', glDimensionValueController.updateRow);
+router.delete('/gl_dimension_value/:id', glDimensionValueController.deleteRow);
 
 // Year-End Closing Config
 router.get('/gl_closing_config', glClosingConfigController.getConfig);

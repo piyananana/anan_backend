@@ -1,6 +1,6 @@
 // ดึงข้อมูลรายการเคลื่อนไหวสำหรับบัญชีแยกประเภท (GL Report)
 const getGeneralLedgerTransactions = async (req, res) => {
-    const { period_id, fiscal_year_id, account_from, account_to } = req.query;
+    const { period_id, fiscal_year_id, account_from, account_to, branch_id } = req.query;
     const client = await req.dbPool.connect();
 
     try {
@@ -23,7 +23,7 @@ const getGeneralLedgerTransactions = async (req, res) => {
         let sql = `
             SELECT
                 d.account_id, a.account_code, a.account_name_thai, a.normal_balance,
-                d.branch_id, d.business_unit_id, d.project_id,
+                d.branch_id, d.dim1_id, d.dim2_id, d.dim3_id, d.dim4_id, d.dim5_id,
                 h.doc_date, doc.doc_code, h.doc_no, d.line_no,
                 ref_doc.doc_code AS ref_doc_code, h.ref_doc_no, h.ref_doc_date,
                 d.description, d.debit_lc, d.credit_lc
@@ -47,9 +47,13 @@ const getGeneralLedgerTransactions = async (req, res) => {
             params.push(account_to);
             sql += ` AND a.account_code <= $${params.length}`;
         }
+        if (branch_id) {
+            params.push(parseInt(branch_id));
+            sql += ` AND h.branch_id = $${params.length}`;
+        }
 
-        // เรียงลำดับตาม รหัสบัญชี -> สาขา -> หน่วยงาน -> โครงการ -> วันที่ -> เลขที่เอกสาร -> ลำดับ
-        sql += ` ORDER BY a.account_code ASC, d.branch_id ASC, d.business_unit_id ASC, d.project_id ASC, h.doc_date ASC, h.doc_no ASC, d.line_no ASC`;
+        // เรียงลำดับตาม รหัสบัญชี -> สาขา -> dim1 -> dim2 -> วันที่ -> เลขที่เอกสาร -> ลำดับ
+        sql += ` ORDER BY a.account_code ASC, d.branch_id ASC, d.dim1_id ASC, d.dim2_id ASC, h.doc_date ASC, h.doc_no ASC, d.line_no ASC`;
 
         const result = await client.query(sql, params);
         res.json(result.rows);
@@ -64,7 +68,8 @@ const getGeneralLedgerTransactions = async (req, res) => {
 // GET /gl_report_beginning_balance?fiscal_year_id=X&period_id=Y
 // ยอดยกมา = สะสม gl_balance_accum ของทุกงวดที่มี period_number < งวดที่เลือก
 const getReportBeginningBalance = async (req, res) => {
-  const { fiscal_year_id, period_id } = req.query;
+  const { fiscal_year_id, period_id, branch_id } = req.query;
+  const branchId = branch_id ? parseInt(branch_id) : null;
   const pool = req.dbPool;
   try {
     const periodsRes = await pool.query(
@@ -90,14 +95,16 @@ const getReportBeginningBalance = async (req, res) => {
     if (periodIds.length === 0) return res.json([]);
 
     const result = await pool.query(
-      `SELECT account_id, business_unit_id, branch_id, project_id,
-              SUM(debit_amount)  AS amount_dr,
-              SUM(credit_amount) AS amount_cr
-       FROM gl_balance_accum
-       WHERE period_id = ANY($1::int[])
-       GROUP BY account_id, business_unit_id, branch_id, project_id
-       HAVING SUM(debit_amount) > 0.001 OR SUM(credit_amount) > 0.001`,
-      [periodIds]
+      `SELECT b.account_id, c.branch_id, c.dim1_id, c.dim2_id, c.dim3_id, c.dim4_id, c.dim5_id,
+              SUM(b.debit_amount)  AS amount_dr,
+              SUM(b.credit_amount) AS amount_cr
+       FROM gl_balance_accum b
+       JOIN gl_dim_combination c ON c.id = b.combo_id
+       WHERE b.period_id = ANY($1::int[])
+         AND ($2::int IS NULL OR c.branch_id = $2)
+       GROUP BY b.account_id, c.branch_id, c.dim1_id, c.dim2_id, c.dim3_id, c.dim4_id, c.dim5_id
+       HAVING SUM(b.debit_amount) > 0.001 OR SUM(b.credit_amount) > 0.001`,
+      [periodIds, branchId]
     );
     res.json(result.rows);
   } catch (err) {

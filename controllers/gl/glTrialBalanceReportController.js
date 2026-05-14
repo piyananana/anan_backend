@@ -1,7 +1,8 @@
 // controllers/gl/glTrialBalanceReportController.js
 
 const getTrialBalance = async (req, res) => {
-  const { fiscal_year_id, period_id, show_dimensions, hide_zero, show_header_totals } = req.query;
+  const { fiscal_year_id, period_id, show_dimensions, hide_zero, show_header_totals, branch_id } = req.query;
+  const branchId = branch_id ? parseInt(branch_id) : null;
 
   // Convert string 'true'/'false' to boolean for easier logic
   const isShowDim = show_dimensions === 'true';
@@ -46,31 +47,40 @@ const getTrialBalance = async (req, res) => {
       const allAccounts = accountsRes.rows;
 
       // 3. เตรียม SQL Parts
-      // สำคัญ: ต้องระบุ table alias (t.) ให้ชัดเจนใน SELECT list
-      const dimFields = isShowDim 
-        ? ', t.business_unit_id, t.branch_id, t.project_id' 
+      // dimFields: ใช้ c. prefix ภายใน CTEs ที่มี JOIN gl_dim_combination c
+      const dimFields = isShowDim
+        ? ', c.branch_id, c.dim1_id, c.dim2_id, c.dim3_id, c.dim4_id, c.dim5_id'
         : '';
-      
-      const dimGroup = isShowDim 
-        ? ', account_id, business_unit_id, branch_id, project_id' 
-        : ', account_id';
+
+      // dimFieldsPlain: ใช้ใน all_keys CTE (ไม่มี alias)
+      const dimFieldsPlain = isShowDim
+        ? ', branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id'
+        : '';
+
+      // dimFieldsT: ใช้ใน main SELECT (FROM all_keys t)
+      const dimFieldsT = isShowDim
+        ? ', t.branch_id, t.dim1_id, t.dim2_id, t.dim3_id, t.dim4_id, t.dim5_id'
+        : '';
 
       // Join Condition สำหรับ CTEs (ต้อง handle NULL ด้วย IS NOT DISTINCT FROM)
       const dimJoinCondition = isShowDim
-        ? `AND t.business_unit_id IS NOT DISTINCT FROM alias.business_unit_id 
-           AND t.branch_id IS NOT DISTINCT FROM alias.branch_id 
-           AND t.project_id IS NOT DISTINCT FROM alias.project_id`
+        ? `AND t.branch_id IS NOT DISTINCT FROM alias.branch_id
+           AND t.dim1_id IS NOT DISTINCT FROM alias.dim1_id
+           AND t.dim2_id IS NOT DISTINCT FROM alias.dim2_id
+           AND t.dim3_id IS NOT DISTINCT FROM alias.dim3_id
+           AND t.dim4_id IS NOT DISTINCT FROM alias.dim4_id
+           AND t.dim5_id IS NOT DISTINCT FROM alias.dim5_id`
         : '';
 
-      // ส่วน Join ไปหา Master Data เพื่อเอารหัส (Code)
+      // ส่วน Join ไปหา Master Data เพื่อเอารหัส (Code) — ใช้ t. เพราะ FROM all_keys t
       const masterJoins = isShowDim
-        ? `LEFT JOIN cd_business_unit bu ON t.business_unit_id = bu.id
-           LEFT JOIN cd_branch br ON t.branch_id = br.id
-           LEFT JOIN cd_project pj ON t.project_id = pj.id`
+        ? `LEFT JOIN cd_branch br ON t.branch_id = br.id
+           LEFT JOIN gl_dimension_value v1 ON v1.id = t.dim1_id
+           LEFT JOIN gl_dimension_value v2 ON v2.id = t.dim2_id`
         : '';
-      
+
       const masterSelects = isShowDim
-        ? ', bu.bu_code, br.branch_code, pj.project_code'
+        ? ', br.branch_code, v1.value_code AS dim1_code, v1.value_name_thai AS dim1_name, v2.value_code AS dim2_code, v2.value_name_thai AS dim2_name'
         : '';
 
       const sql = `
@@ -78,34 +88,40 @@ const getTrialBalance = async (req, res) => {
         year_beg AS (
           SELECT account_id ${dimFields}, SUM(debit_amount) as dr, SUM(credit_amount) as cr
           FROM gl_balance_accum t
+          JOIN gl_dim_combination c ON c.id = t.combo_id
           WHERE period_id = ANY($1::int[])
+            AND ($4::int IS NULL OR c.branch_id = $4)
           GROUP BY account_id ${dimFields}
         ),
         prev_mvmt AS (
           SELECT account_id ${dimFields}, SUM(debit_amount) as dr, SUM(credit_amount) as cr
           FROM gl_balance_accum t
+          JOIN gl_dim_combination c ON c.id = t.combo_id
           WHERE period_id = ANY($2::int[])
+            AND ($4::int IS NULL OR c.branch_id = $4)
           GROUP BY account_id ${dimFields}
         ),
         curr_mvmt AS (
           SELECT account_id ${dimFields}, SUM(debit_amount) as dr, SUM(credit_amount) as cr
           FROM gl_balance_accum t
+          JOIN gl_dim_combination c ON c.id = t.combo_id
           WHERE period_id = ANY($3::int[])
+            AND ($4::int IS NULL OR c.branch_id = $4)
           GROUP BY account_id ${dimFields}
         ),
         -- รวม Keys ทั้งหมดที่เกิดขึ้นในระบบ (Union Distinct)
         all_keys AS (
-          SELECT account_id ${dimFields} FROM year_beg t
-          UNION SELECT account_id ${dimFields} FROM prev_mvmt t
-          UNION SELECT account_id ${dimFields} FROM curr_mvmt t
+          SELECT account_id ${dimFieldsPlain} FROM year_beg
+          UNION SELECT account_id ${dimFieldsPlain} FROM prev_mvmt
+          UNION SELECT account_id ${dimFieldsPlain} FROM curr_mvmt
         )
-        SELECT 
+        SELECT
           t.account_id,
-          a.account_code, 
+          a.account_code,
           a.account_name_thai,
           a.parent_id,         -- [สำคัญ] สำหรับคำนวณ Level ที่ Frontend
-          a.is_normal_account 
-          ${dimFields}
+          a.is_normal_account
+          ${dimFieldsT}
           ${masterSelects},    -- [สำคัญ] รหัส BU/Branch/Project
           
           -- คำนวณยอดรวม
@@ -123,7 +139,7 @@ const getTrialBalance = async (req, res) => {
         ORDER BY a.account_code ASC
       `;
 
-      const balancesRes = await client.query(sql, [begPeriodIds, prevPeriodIds, targetPeriodIds]);
+      const balancesRes = await client.query(sql, [begPeriodIds, prevPeriodIds, targetPeriodIds, branchId]);
       const balances = balancesRes.rows;
 
       // 4. Merge Data & Calculate Rollup (In-Memory)
@@ -159,9 +175,11 @@ const getTrialBalance = async (req, res) => {
           // เก็บข้อมูล Dimension แยกไว้ใน Array ของ Account นั้นๆ
           if (isShowDim) {
              acc.dimension_rows.push({
-               bu_code: row.bu_code,
                branch_code: row.branch_code,
-               project_code: row.project_code,
+               dim1_code: row.dim1_code,
+               dim1_name: row.dim1_name,
+               dim2_code: row.dim2_code,
+               dim2_name: row.dim2_name,
                beg_dr: bDr, beg_cr: bCr,
                mvmt_dr: mDr, mvmt_cr: mCr
              });

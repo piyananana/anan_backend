@@ -1,7 +1,8 @@
 // controllers/gl/glBalanceSheetController.js
 
 const getBalanceSheet = async (req, res) => {
-  const { fiscal_year_id, period_id } = req.query;
+  const { fiscal_year_id, period_id, branch_id } = req.query;
+  const branchId = branch_id ? parseInt(branch_id) : null;
 
   if (!fiscal_year_id) {
     return res.status(400).json({ error: 'fiscal_year_id is required' });
@@ -73,12 +74,14 @@ const getBalanceSheet = async (req, res) => {
           if (plPeriodIds.length > 0) {
             const plResult = await client.query(`
               SELECT
-                COALESCE(SUM(debit_amount),  0) AS total_dr,
-                COALESCE(SUM(credit_amount), 0) AS total_cr
-              FROM gl_balance_accum
-              WHERE period_id  = ANY($1::int[])
-                AND account_id = ANY($2::int[])
-            `, [plPeriodIds, plAccountIds]);
+                COALESCE(SUM(gba.debit_amount),  0) AS total_dr,
+                COALESCE(SUM(gba.credit_amount), 0) AS total_cr
+              FROM gl_balance_accum gba
+              JOIN gl_dim_combination gdc ON gdc.id = gba.combo_id
+              WHERE gba.period_id  = ANY($1::int[])
+                AND gba.account_id = ANY($2::int[])
+                AND ($3::int IS NULL OR gdc.branch_id = $3)
+            `, [plPeriodIds, plAccountIds, branchId]);
 
             // netRaw = Σ(dr − cr), netIncome = −netRaw = Σ(cr − dr)
             const netRaw = Number(plResult.rows[0].total_dr)
@@ -105,22 +108,28 @@ const getBalanceSheet = async (req, res) => {
       const balancesRes = await client.query(`
         WITH
         year_beg AS (
-          SELECT account_id, SUM(debit_amount) AS dr, SUM(credit_amount) AS cr
-          FROM gl_balance_accum
-          WHERE period_id = ANY($1::int[]) AND account_id = ANY($4::int[])
-          GROUP BY account_id
+          SELECT gba.account_id, SUM(gba.debit_amount) AS dr, SUM(gba.credit_amount) AS cr
+          FROM gl_balance_accum gba
+          JOIN gl_dim_combination gdc ON gdc.id = gba.combo_id
+          WHERE gba.period_id = ANY($1::int[]) AND gba.account_id = ANY($4::int[])
+            AND ($5::int IS NULL OR gdc.branch_id = $5)
+          GROUP BY gba.account_id
         ),
         prev_mvmt AS (
-          SELECT account_id, SUM(debit_amount) AS dr, SUM(credit_amount) AS cr
-          FROM gl_balance_accum
-          WHERE period_id = ANY($2::int[]) AND account_id = ANY($4::int[])
-          GROUP BY account_id
+          SELECT gba.account_id, SUM(gba.debit_amount) AS dr, SUM(gba.credit_amount) AS cr
+          FROM gl_balance_accum gba
+          JOIN gl_dim_combination gdc ON gdc.id = gba.combo_id
+          WHERE gba.period_id = ANY($2::int[]) AND gba.account_id = ANY($4::int[])
+            AND ($5::int IS NULL OR gdc.branch_id = $5)
+          GROUP BY gba.account_id
         ),
         curr_mvmt AS (
-          SELECT account_id, SUM(debit_amount) AS dr, SUM(credit_amount) AS cr
-          FROM gl_balance_accum
-          WHERE period_id = ANY($3::int[]) AND account_id = ANY($4::int[])
-          GROUP BY account_id
+          SELECT gba.account_id, SUM(gba.debit_amount) AS dr, SUM(gba.credit_amount) AS cr
+          FROM gl_balance_accum gba
+          JOIN gl_dim_combination gdc ON gdc.id = gba.combo_id
+          WHERE gba.period_id = ANY($3::int[]) AND gba.account_id = ANY($4::int[])
+            AND ($5::int IS NULL OR gdc.branch_id = $5)
+          GROUP BY gba.account_id
         ),
         all_keys AS (
           SELECT account_id FROM year_beg
@@ -137,7 +146,7 @@ const getBalanceSheet = async (req, res) => {
         LEFT JOIN year_beg yb ON t.account_id = yb.account_id
         LEFT JOIN prev_mvmt pm ON t.account_id = pm.account_id
         LEFT JOIN curr_mvmt cm ON t.account_id = cm.account_id
-      `, [begPeriodIds, prevPeriodIds, targetPeriodIds, allAccountIds]);
+      `, [begPeriodIds, prevPeriodIds, targetPeriodIds, allAccountIds, branchId]);
 
       // 6. Build accMap and hierarchy
       const accMap = {};

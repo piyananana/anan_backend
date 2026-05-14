@@ -100,15 +100,19 @@ const getRows = async (req, res) => {
 };
 
 const createRow = async (req, res) => {
-    const { report_id, row_seq_no, row_type, print_control, account_from, account_to, normal_sign, branch_id, project_id, business_unit_id } = req.body;
+    const { report_id, row_seq_no, row_type, print_control, account_from, account_to, normal_sign,
+            branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id } = req.body;
     const client = await req.dbPool.connect();
     try {
         const result = await client.query(
-            `INSERT INTO gl_fin_report_row (report_id, row_seq_no, row_type, print_control, account_from, account_to, normal_sign, branch_id, project_id, business_unit_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+            `INSERT INTO gl_fin_report_row
+             (report_id, row_seq_no, row_type, print_control, account_from, account_to, normal_sign,
+              branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
             [report_id, row_seq_no, row_type, print_control ?? 'SHOW',
              account_from || null, account_to || null, normal_sign,
-             branch_id || null, project_id || null, business_unit_id || null]
+             branch_id || null,
+             dim1_id || null, dim2_id || null, dim3_id || null, dim4_id || null, dim5_id || null]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -120,16 +124,21 @@ const createRow = async (req, res) => {
 
 const updateRow = async (req, res) => {
     const { id } = req.params;
-    const { row_seq_no, row_type, print_control, account_from, account_to, normal_sign, branch_id, project_id, business_unit_id } = req.body;
+    const { row_seq_no, row_type, print_control, account_from, account_to, normal_sign,
+            branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id } = req.body;
     const client = await req.dbPool.connect();
     try {
         const result = await client.query(
-            `UPDATE gl_fin_report_row SET row_seq_no=$1, row_type=$2, print_control=$3,
-             account_from=$4, account_to=$5, normal_sign=$6, branch_id=$7, project_id=$8, business_unit_id=$9
-             WHERE id=$10 RETURNING *`,
+            `UPDATE gl_fin_report_row SET
+             row_seq_no=$1, row_type=$2, print_control=$3,
+             account_from=$4, account_to=$5, normal_sign=$6,
+             branch_id=$7, dim1_id=$8, dim2_id=$9, dim3_id=$10, dim4_id=$11, dim5_id=$12
+             WHERE id=$13 RETURNING *`,
             [row_seq_no, row_type, print_control,
              account_from || null, account_to || null, normal_sign,
-             branch_id || null, project_id || null, business_unit_id || null, id]
+             branch_id || null,
+             dim1_id || null, dim2_id || null, dim3_id || null, dim4_id || null, dim5_id || null,
+             id]
         );
         res.status(200).json(result.rows[0]);
     } catch (err) {

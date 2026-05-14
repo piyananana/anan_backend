@@ -1,32 +1,75 @@
 // controllers/ar/arTransactionController.js
 
-// --- Helper: Generate Document Number (same pattern as GL) ---
-const generateDocNo = async (client, docId, date) => {
-    const docConfigRes = await client.query(
-        `SELECT * FROM sa_module_document WHERE id = $1 FOR UPDATE`, [docId]
-    );
-    const config = docConfigRes.rows[0];
-    if (!config.is_auto_numbering) return null;
+// --- Helper: Generate Document Number (supports per-branch counter) ---
+const generateDocNo = async (client, docId, date, branchId = null) => {
+    let config = null;
+    let useBranchCounter = false;
+    let branchRowId = null;
 
-    let docNo = config.format_prefix || '';
+    if (branchId) {
+        const branchRes = await client.query(
+            `SELECT * FROM sa_doc_number_branch WHERE doc_id = $1 AND branch_id = $2 FOR UPDATE`,
+            [docId, branchId]
+        );
+        if (branchRes.rows.length > 0) {
+            const globalRes = await client.query(
+                `SELECT * FROM sa_module_document WHERE id = $1`, [docId]
+            );
+            const global = globalRes.rows[0];
+            if (!global || !global.is_auto_numbering) return null;
+            const bc = branchRes.rows[0];
+            config = {
+                format_prefix:       bc.format_prefix      ?? global.format_prefix      ?? '',
+                format_separator:    bc.format_separator   ?? global.format_separator   ?? '',
+                format_suffix_date:  bc.format_suffix_date ?? global.format_suffix_date ?? '',
+                running_length:      bc.running_length     ?? global.running_length     ?? 4,
+                next_running_number: bc.next_running_number,
+            };
+            useBranchCounter = true;
+            branchRowId = bc.id;
+        }
+    }
+    if (!useBranchCounter) {
+        const globalRes = await client.query(
+            `SELECT * FROM sa_module_document WHERE id = $1 FOR UPDATE`, [docId]
+        );
+        const global = globalRes.rows[0];
+        if (!global || !global.is_auto_numbering) return null;
+        config = {
+            format_prefix:       global.format_prefix      || '',
+            format_separator:    global.format_separator   || '',
+            format_suffix_date:  global.format_suffix_date || '',
+            running_length:      global.running_length     || 4,
+            next_running_number: global.next_running_number,
+        };
+    }
+
+    let docNo = config.format_prefix;
     if (config.format_suffix_date) {
         const d = new Date(date);
-        const year = d.getFullYear().toString();
+        const year  = d.getFullYear().toString();
         const month = (d.getMonth() + 1).toString().padStart(2, '0');
-        const day = d.getDate().toString().padStart(2, '0');
-        if (config.format_suffix_date === 'YY') docNo += year.substring(2);
-        else if (config.format_suffix_date === 'YYYY') docNo += year;
-        else if (config.format_suffix_date === 'YYMM') docNo += year.substring(2) + month;
-        else if (config.format_suffix_date === 'YYYYMM') docNo += year + month;
+        const day   = d.getDate().toString().padStart(2, '0');
+        if      (config.format_suffix_date === 'YY')       docNo += year.substring(2);
+        else if (config.format_suffix_date === 'YYYY')     docNo += year;
+        else if (config.format_suffix_date === 'YYMM')     docNo += year.substring(2) + month;
+        else if (config.format_suffix_date === 'YYYYMM')   docNo += year + month;
         else if (config.format_suffix_date === 'YYYYMMDD') docNo += year + month + day;
     }
     if (config.format_separator) docNo += config.format_separator;
-    const running = config.next_running_number.toString().padStart(config.running_length, '0');
-    docNo += running;
-    await client.query(
-        `UPDATE sa_module_document SET next_running_number = next_running_number + 1 WHERE id = $1`,
-        [docId]
-    );
+    docNo += config.next_running_number.toString().padStart(config.running_length, '0');
+
+    if (useBranchCounter) {
+        await client.query(
+            `UPDATE sa_doc_number_branch SET next_running_number = next_running_number + 1 WHERE id = $1`,
+            [branchRowId]
+        );
+    } else {
+        await client.query(
+            `UPDATE sa_module_document SET next_running_number = next_running_number + 1 WHERE id = $1`,
+            [docId]
+        );
+    }
     return docNo;
 };
 
@@ -180,7 +223,7 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
         `SELECT sys_doc_type FROM sa_module_document WHERE id = $1 LIMIT 1`, [header.doc_id]
     );
     const sysDocType       = docTypeRes.rows[0]?.sys_doc_type || '';
-    const isReceipt        = sysDocType === '70';
+    const isReceipt        = sysDocType === '80'; // Receipt ใช้ '80' (BC='70' ไม่ลงบัญชี)
     const isCreditNote     = ['50', '55'].includes(sysDocType);
     const isAdvanceReceipt = sysDocType === '60';
     const isAdvanceRefund  = sysDocType === '65';
@@ -248,7 +291,7 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
     const glDocId = setup.gl_doc_id;
     if (!glDocId) throw new Error('ยังไม่ได้ตั้งค่า GL Document Type ใน ar_gl_account_setup สำหรับประเภทเอกสารนี้');
 
-    let glDocNo = await generateDocNo(client, glDocId, header.doc_date);
+    let glDocNo = await generateDocNo(client, glDocId, header.doc_date, header.branch_id);
     if (!glDocNo) glDocNo = `GL-${docNo}`;
 
     // บัญชี VAT output, VAT รอตัดบัญชี, ส่วนลด, เงินสด, มัดจำรับ
@@ -469,7 +512,7 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
             });
         }
     } else {
-        // ===== Receipt (70) =====
+        // ===== Receipt (80) =====
 
         // แยก applies ออกเป็น invoice applies, advance deductions และ CN deductions
         const allApplies = header._applies || [];
@@ -607,19 +650,65 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
         [totalDbLc, totalCrLc, totalDbFc, totalCrFc, glEntryId]
     );
 
+    // inject header-level dimensions ลงทุก GL line
+    const hDim1 = header.dim1_id || null;
+    const hDim2 = header.dim2_id || null;
+    const hDim3 = header.dim3_id || null;
+    const hDim4 = header.dim4_id || null;
+    const hDim5 = header.dim5_id || null;
+
+    // Validate required dimensions ก่อน insert GL lines
+    {
+        const dimTypeRes = await client.query(
+            `SELECT type_code, slot_no FROM gl_dimension_type WHERE is_active = true`
+        );
+        const slotByType = {};
+        for (const r of dimTypeRes.rows) slotByType[r.type_code] = r.slot_no;
+
+        const headerDims = { 1: hDim1, 2: hDim2, 3: hDim3, 4: hDim4, 5: hDim5 };
+        const accountIds = [...new Set(glDetails.map(r => r.account_id).filter(Boolean))];
+
+        if (accountIds.length > 0) {
+            const accRes = await client.query(
+                `SELECT id, account_code FROM gl_account WHERE id = ANY($1::int[])`, [accountIds]
+            );
+            const accCodeMap = {};
+            for (const r of accRes.rows) accCodeMap[r.id] = r.account_code;
+
+            const errors = [];
+            for (const accountId of accountIds) {
+                const rulesRes = await client.query(
+                    `SELECT type_code FROM gl_account_dim_rule WHERE account_id = $1 AND is_required = true`,
+                    [accountId]
+                );
+                for (const rule of rulesRes.rows) {
+                    const slot = slotByType[rule.type_code];
+                    if (!slot) continue;
+                    if (!headerDims[slot]) {
+                        errors.push(`บัญชี ${accCodeMap[accountId] || accountId}: ต้องระบุ ${rule.type_code}`);
+                    }
+                }
+            }
+            if (errors.length > 0) {
+                throw new Error(`Dimension ไม่ครบ:\n${errors.join('\n')}`);
+            }
+        }
+    }
+
     const detailSql = `
         INSERT INTO gl_entry_detail
         (header_id, line_no, account_id, description,
          debit_lc, credit_lc, debit_fc, credit_fc,
-         branch_id, project_id, business_unit_id)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
     `;
     let lineNo = 1;
     for (const row of glDetails) {
         await client.query(detailSql, [
             glEntryId, lineNo++, row.account_id, row.description,
             row.debit_lc, row.credit_lc, row.debit_fc, row.credit_fc,
-            null, null, null
+            row.branch_id || null,
+            hDim1, hDim2, hDim3, hDim4, hDim5,
         ]);
     }
 
@@ -708,7 +797,7 @@ const createTransaction = async (req, res) => {
         // Generate doc_no
         let finalDocNo = header.doc_no;
         if (!finalDocNo || finalDocNo === 'AUTO') {
-            finalDocNo = await generateDocNo(client, header.doc_id, header.doc_date);
+            finalDocNo = await generateDocNo(client, header.doc_id, header.doc_date, header.branch_id);
             if (!finalDocNo) throw new Error('Auto numbering failed or manual doc_no required');
         }
 
@@ -724,10 +813,11 @@ const createTransaction = async (req, res) => {
              subtotal_lc, discount_amount_lc, before_vat_lc, vat_amount_lc, total_amount_lc,
              paid_amount_lc, balance_amount_lc,
              ref_no, ref_doc_id, ref_doc_no, description, status,
-             created_by)
+             dim1_id, dim2_id, dim3_id, dim4_id, dim5_id,
+             branch_id, created_by)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
                     $13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
-                    $25,$26,$27,$28,$29,$30)
+                    $25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36)
             RETURNING id
         `;
         const hRes = await client.query(headerSql, [
@@ -739,10 +829,12 @@ const createTransaction = async (req, res) => {
             header.before_vat_fc || 0, header.vat_amount_fc || 0, header.total_amount_fc || 0,
             header.subtotal_lc || 0, header.discount_amount_lc || 0,
             header.before_vat_lc || 0, header.vat_amount_lc || 0, header.total_amount_lc || 0,
-            0, header.total_amount_lc || 0,  // paid=0, balance=total
+            0, header.total_amount_lc || 0,
             header.ref_no || null, header.ref_doc_id || null, header.ref_doc_no || null,
             header.description || null, status,
-            header.created_by || null
+            header.dim1_id || null, header.dim2_id || null,
+            header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
+            header.branch_id || null, header.created_by || null
         ]);
         const newHeaderId = hRes.rows[0].id;
 
@@ -789,6 +881,8 @@ const createTransaction = async (req, res) => {
                         updated_at = NOW()
                     WHERE id = $2
                 `, [a.applied_amount_lc || 0, a.applied_to_id]);
+            } else if (['bc_invoice', 'bc_advance', 'bc_cn'].includes(applyType)) {
+                // BC (วางบิล): เก็บความสัมพันธ์ไว้อ้างอิงเท่านั้น ไม่กระทบ balance ของเอกสารที่อ้างถึง
             } else {
                 await client.query(`
                     UPDATE ar_transaction SET
@@ -829,19 +923,31 @@ const createTransaction = async (req, res) => {
         // Post: create GL entry & VAT records
         let glEntryId = null;
         if (action === 'Post') {
-            const headerWithDocNo = { ...header, doc_no: finalDocNo, _applies: applies || [], _payments: payments || [] };
-            glEntryId = await postGlEntry(client, newHeaderId, headerWithDocNo, details || [], finalDocNo);
             const sysDocTypeRes1 = await client.query(
                 `SELECT sys_doc_type FROM sa_module_document WHERE id = $1 LIMIT 1`, [header.doc_id]
             );
             const sysDocType1 = sysDocTypeRes1.rows[0]?.sys_doc_type || '';
-            await insertVtRecords(client, newHeaderId, headerWithDocNo, details || [], sysDocType1);
-            await insertDeferredVtRecordsForReceipt(client, newHeaderId, headerWithDocNo, applies || []);
-            // Update GL entry reference
-            await client.query(`UPDATE ar_transaction SET gl_entry_id=$1 WHERE id=$2`, [glEntryId, newHeaderId]);
-            // DN-35, CN-55, RDP-65 ไม่มียอดค้างชำระตัวเอง (ยอดถูกรวมไว้ที่ใบแจ้งหนี้อ้างอิง หรือถูก apply ไปแล้ว)
-            if (['35', '55', '65'].includes(sysDocType1)) {
-                await client.query(`UPDATE ar_transaction SET balance_amount_lc=0 WHERE id=$1`, [newHeaderId]);
+            const isBcPost = sysDocType1 === '70'; // BC ไม่ลงบัญชี GL
+
+            if (!isBcPost) {
+                const headerWithDocNo = { ...header, doc_no: finalDocNo, _applies: applies || [], _payments: payments || [] };
+                glEntryId = await postGlEntry(client, newHeaderId, headerWithDocNo, details || [], finalDocNo);
+                await insertVtRecords(client, newHeaderId, headerWithDocNo, details || [], sysDocType1);
+                await insertDeferredVtRecordsForReceipt(client, newHeaderId, headerWithDocNo, applies || []);
+                await client.query(`UPDATE ar_transaction SET gl_entry_id=$1 WHERE id=$2`, [glEntryId, newHeaderId]);
+                // DN-35, CN-55, RDP-65 ไม่มียอดค้างชำระตัวเอง
+                if (['35', '55', '65'].includes(sysDocType1)) {
+                    await client.query(`UPDATE ar_transaction SET balance_amount_lc=0 WHERE id=$1`, [newHeaderId]);
+                }
+            }
+            // Receipt ที่ระบุเลขที่ใบวางบิล (BC) ใน ref_no → เคลียร์ยอดวางบิล
+            if (sysDocType1 === '80' && header.ref_no) {
+                await client.query(`
+                    UPDATE ar_transaction t SET balance_amount_lc = 0, updated_at = NOW()
+                    FROM sa_module_document d
+                    WHERE t.doc_id = d.id AND d.sys_doc_type = '70'
+                      AND t.doc_no = $1 AND t.status = 'Posted'
+                `, [header.ref_no]);
             }
         }
 
@@ -889,8 +995,9 @@ const updateTransaction = async (req, res) => {
             subtotal_lc=$13, discount_amount_lc=$14, before_vat_lc=$15, vat_amount_lc=$16, total_amount_lc=$17,
             balance_amount_lc=$18,
             ref_no=$19, ref_doc_id=$20, ref_doc_no=$21, description=$22, status=$23,
-            updated_by=$24, updated_at=NOW()
-            WHERE id=$25
+            dim1_id=$24, dim2_id=$25, dim3_id=$26, dim4_id=$27, dim5_id=$28,
+            branch_id=$29, updated_by=$30, updated_at=NOW()
+            WHERE id=$31
         `, [
             header.doc_date, header.due_date || null, periodId,
             header.ar_account_id || null, header.currency_id || null, header.currency_code || 'THB',
@@ -902,7 +1009,9 @@ const updateTransaction = async (req, res) => {
             header.total_amount_lc || 0,
             header.ref_no || null, header.ref_doc_id || null, header.ref_doc_no || null,
             header.description || null, status,
-            header.updated_by || null, id
+            header.dim1_id || null, header.dim2_id || null,
+            header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
+            header.branch_id || null, header.updated_by || null, id
         ]);
 
         // Replace details
@@ -930,7 +1039,10 @@ const updateTransaction = async (req, res) => {
             ]);
         }
 
-        // Replace applies (for Receipt/CN)
+        // Replace applies (for Receipt/CN) — capture old applies' IDs before deleting
+        const oldAppliesRes = await client.query(
+            `SELECT applied_to_id, apply_type FROM ar_transaction_apply WHERE transaction_id=$1`, [id]
+        );
         await client.query('DELETE FROM ar_transaction_apply WHERE transaction_id=$1', [id]);
         for (const a of (applies || [])) {
             const applyType = a.apply_type || 'invoice';
@@ -972,38 +1084,57 @@ const updateTransaction = async (req, res) => {
         // If Post: recalculate balances on applied invoices/advances and create GL + VAT
         let glEntryId = null;
         if (action === 'Post') {
-            // Recalculate balances for all referenced documents
-            // DN-35 (dn_ref): เพิ่ม balance ของใบแจ้งหนี้อ้างอิง (total + dn_ref - payments)
-            const affectedIds = [...new Set((applies || []).map(a => a.applied_to_id).filter(Boolean))];
+            const sysDocTypeRes2 = await client.query(
+                `SELECT sys_doc_type FROM sa_module_document WHERE id = $1 LIMIT 1`, [header.doc_id]
+            );
+            const sysDocType2 = sysDocTypeRes2.rows[0]?.sys_doc_type || '';
+            const isBcUpdate = sysDocType2 === '70'; // BC ไม่ลงบัญชี GL
+
+            // Recalculate balances — รวม IDs จาก old applies (ก่อน delete) + new applies
+            const nonBcApplies = (applies || []).filter(a => !['bc_invoice','bc_advance','bc_cn'].includes(a.apply_type));
+            const oldNonBcIds = oldAppliesRes.rows
+                .filter(a => !['bc_invoice','bc_advance','bc_cn'].includes(a.apply_type))
+                .map(a => a.applied_to_id).filter(Boolean);
+            const affectedIds = [...new Set([
+                ...oldNonBcIds,
+                ...nonBcApplies.map(a => a.applied_to_id).filter(Boolean),
+            ])];
             for (const invoiceId of affectedIds) {
                 await client.query(`
                     UPDATE ar_transaction t SET
                         paid_amount_lc = (
                             SELECT COALESCE(SUM(applied_amount_lc),0)
-                            FROM ar_transaction_apply WHERE applied_to_id = t.id AND apply_type != 'dn_ref'
+                            FROM ar_transaction_apply WHERE applied_to_id = t.id
+                              AND apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')
                         ),
                         balance_amount_lc = total_amount_lc
                             + COALESCE((SELECT SUM(applied_amount_lc) FROM ar_transaction_apply WHERE applied_to_id = t.id AND apply_type = 'dn_ref'), 0)
-                            - COALESCE((SELECT SUM(applied_amount_lc) FROM ar_transaction_apply WHERE applied_to_id = t.id AND apply_type != 'dn_ref'), 0),
+                            - COALESCE((SELECT SUM(applied_amount_lc) FROM ar_transaction_apply WHERE applied_to_id = t.id AND apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')), 0),
                         updated_at = NOW()
                     WHERE id = $1
                 `, [invoiceId]);
             }
 
-            const docNoRes = await client.query('SELECT doc_no FROM ar_transaction WHERE id=$1', [id]);
-            const docNo = docNoRes.rows[0].doc_no;
-            const headerWithDocNo = { ...header, doc_no: docNo, _applies: applies || [], _payments: payments || [] };
-            glEntryId = await postGlEntry(client, id, headerWithDocNo, details || [], docNo);
-            const sysDocTypeRes2 = await client.query(
-                `SELECT sys_doc_type FROM sa_module_document WHERE id = $1 LIMIT 1`, [header.doc_id]
-            );
-            const sysDocType2 = sysDocTypeRes2.rows[0]?.sys_doc_type || '';
-            await insertVtRecords(client, id, headerWithDocNo, details || [], sysDocType2);
-            await insertDeferredVtRecordsForReceipt(client, id, headerWithDocNo, applies || []);
-            await client.query(`UPDATE ar_transaction SET gl_entry_id=$1 WHERE id=$2`, [glEntryId, id]);
-            // DN-35, CN-55, RDP-65 ไม่มียอดค้างชำระตัวเอง
-            if (['35', '55', '65'].includes(sysDocType2)) {
-                await client.query(`UPDATE ar_transaction SET balance_amount_lc=0 WHERE id=$1`, [id]);
+            if (!isBcUpdate) {
+                const docNoRes = await client.query('SELECT doc_no FROM ar_transaction WHERE id=$1', [id]);
+                const docNo = docNoRes.rows[0].doc_no;
+                const headerWithDocNo = { ...header, doc_no: docNo, _applies: applies || [], _payments: payments || [] };
+                glEntryId = await postGlEntry(client, id, headerWithDocNo, details || [], docNo);
+                await insertVtRecords(client, id, headerWithDocNo, details || [], sysDocType2);
+                await insertDeferredVtRecordsForReceipt(client, id, headerWithDocNo, applies || []);
+                await client.query(`UPDATE ar_transaction SET gl_entry_id=$1 WHERE id=$2`, [glEntryId, id]);
+                if (['35', '55', '65'].includes(sysDocType2)) {
+                    await client.query(`UPDATE ar_transaction SET balance_amount_lc=0 WHERE id=$1`, [id]);
+                }
+            }
+            // Receipt ที่ระบุ ref_no เป็นเลขที่ BC → เคลียร์ยอดวางบิล
+            if (sysDocType2 === '80' && header.ref_no) {
+                await client.query(`
+                    UPDATE ar_transaction t SET balance_amount_lc = 0, updated_at = NOW()
+                    FROM sa_module_document d
+                    WHERE t.doc_id = d.id AND d.sys_doc_type = '70'
+                      AND t.doc_no = $1 AND t.status = 'Posted'
+                `, [header.ref_no]);
             }
         }
 
@@ -1051,18 +1182,23 @@ const voidTransaction = async (req, res) => {
 
         // 1. ตรวจสอบ status
         const checkRes = await client.query(
-            'SELECT status, gl_entry_id, doc_no FROM ar_transaction WHERE id=$1', [id]
+            `SELECT t.status, t.gl_entry_id, t.doc_no, t.ref_no, d.sys_doc_type
+             FROM ar_transaction t JOIN sa_module_document d ON t.doc_id = d.id
+             WHERE t.id = $1`, [id]
         );
         if (!checkRes.rows[0]) return res.status(404).json({ error: 'Not found' });
         if (checkRes.rows[0].status !== 'Posted') throw new Error('Only Posted can be voided');
 
-        const origGlId   = checkRes.rows[0].gl_entry_id;
-        const arDocNo    = checkRes.rows[0].doc_no;
-        const today      = new Date().toISOString().slice(0, 10);
+        const origGlId        = checkRes.rows[0].gl_entry_id;
+        const arDocNo         = checkRes.rows[0].doc_no;
+        const voidSysDocType  = checkRes.rows[0].sys_doc_type || '';
+        const isBcVoid        = voidSysDocType === '70'; // BC ไม่มี GL ให้ reverse
+        const isReceiptVoid   = voidSysDocType === '80';
+        const today           = new Date().toISOString().slice(0, 10);
 
-        // 2. สร้าง Reversing GL Entry จาก GL entry ต้นทาง
+        // 2. สร้าง Reversing GL Entry จาก GL entry ต้นทาง (ข้ามสำหรับ BC)
         let reversingGlId = null;
-        if (origGlId) {
+        if (origGlId && !isBcVoid) {
             // ดึง GL header ต้นทาง
             const origHdrRes = await client.query(
                 `SELECT * FROM gl_entry_header WHERE id=$1`, [origGlId]
@@ -1118,14 +1254,14 @@ const voidTransaction = async (req, res) => {
                     INSERT INTO gl_entry_detail
                     (header_id, line_no, account_id, description,
                      debit_lc, credit_lc, debit_fc, credit_fc,
-                     branch_id, project_id, business_unit_id)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                     branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
                 `, [
                     reversingGlId, lineNo++, d.account_id,
                     `[ยกเลิก] ${d.description || ''}`,
-                    d.credit_lc, d.debit_lc,    // สลับ DR↔CR
+                    d.credit_lc, d.debit_lc,
                     d.credit_fc, d.debit_fc,
-                    d.branch_id, d.project_id, d.business_unit_id
+                    d.branch_id, d.dim1_id, d.dim2_id, d.dim3_id, d.dim4_id, d.dim5_id,
                 ]);
             }
         }
@@ -1150,26 +1286,41 @@ const voidTransaction = async (req, res) => {
         );
 
         // 5. Reverse applied amounts — คืนยอด outstanding ให้ Invoice/Advance ที่ถูก Apply ไว้
+        // ข้าม bc_* apply types เพราะไม่ได้กระทบ balance ของเอกสารที่อ้างถึง
         const appliesRes = await client.query(
             `SELECT * FROM ar_transaction_apply WHERE transaction_id=$1`, [id]
         );
-        const affectedIds = [...new Set(appliesRes.rows.map(a => a.applied_to_id).filter(Boolean))];
+        const regularApplies = appliesRes.rows.filter(a =>
+            !['bc_invoice','bc_advance','bc_cn'].includes(a.apply_type)
+        );
+        const affectedIds = [...new Set(regularApplies.map(a => a.applied_to_id).filter(Boolean))];
         for (const invoiceId of affectedIds) {
             await client.query(`
                 UPDATE ar_transaction t SET
                     paid_amount_lc = (
                         SELECT COALESCE(SUM(applied_amount_lc),0)
                         FROM ar_transaction_apply
-                        WHERE applied_to_id = t.id AND transaction_id != $1 AND apply_type != 'dn_ref'
+                        WHERE applied_to_id = t.id AND transaction_id != $1
+                          AND apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')
                     ),
                     balance_amount_lc = total_amount_lc
                         + COALESCE((SELECT SUM(applied_amount_lc) FROM ar_transaction_apply
                                     WHERE applied_to_id = t.id AND transaction_id != $1 AND apply_type = 'dn_ref'), 0)
                         - COALESCE((SELECT SUM(applied_amount_lc) FROM ar_transaction_apply
-                                    WHERE applied_to_id = t.id AND transaction_id != $1 AND apply_type != 'dn_ref'), 0),
+                                    WHERE applied_to_id = t.id AND transaction_id != $1
+                                      AND apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')), 0),
                     updated_at = NOW()
                 WHERE id = $2
             `, [id, invoiceId]);
+        }
+        // Receipt ที่อ้าง BC ถูก Void → คืนยอดวางบิลให้ BC
+        if (isReceiptVoid && checkRes.rows[0].ref_no) {
+            await client.query(`
+                UPDATE ar_transaction t SET balance_amount_lc = total_amount_lc, updated_at = NOW()
+                FROM sa_module_document d
+                WHERE t.doc_id = d.id AND d.sys_doc_type = '70'
+                  AND t.doc_no = $1 AND t.status = 'Posted'
+            `, [checkRes.rows[0].ref_no]);
         }
 
         await client.query('COMMIT');
@@ -1185,28 +1336,82 @@ const voidTransaction = async (req, res) => {
 // --- 4. Delete Draft ---
 const deleteTransaction = async (req, res) => {
     const { id } = req.params;
+    const client = await req.dbPool.connect();
     try {
-        const result = await req.dbPool.query(
-            `UPDATE ar_transaction SET status='Deleted' WHERE id=$1 AND status='Draft' RETURNING id`, [id]
+        await client.query('BEGIN');
+
+        const checkRes = await client.query(
+            `SELECT status FROM ar_transaction WHERE id=$1`, [id]
         );
-        if (result.rowCount === 0) return res.status(400).json({ error: 'Cannot delete: Not Draft or not found' });
+        if (!checkRes.rows[0] || checkRes.rows[0].status !== 'Draft')
+            return res.status(400).json({ error: 'Cannot delete: Not Draft or not found' });
+
+        // Fetch applies before deleting, to restore invoice balances
+        const appliesRes = await client.query(
+            `SELECT applied_to_id, apply_type FROM ar_transaction_apply WHERE transaction_id=$1`, [id]
+        );
+        const regularIds = [...new Set(
+            appliesRes.rows
+                .filter(a => !['bc_invoice','bc_advance','bc_cn'].includes(a.apply_type))
+                .map(a => a.applied_to_id).filter(Boolean)
+        )];
+
+        await client.query('DELETE FROM ar_transaction_apply WHERE transaction_id=$1', [id]);
+        await client.query(`UPDATE ar_transaction SET status='Deleted' WHERE id=$1`, [id]);
+
+        // Recalculate balances for invoices that were referenced by the deleted Draft's applies
+        for (const invoiceId of regularIds) {
+            await client.query(`
+                UPDATE ar_transaction t SET
+                    paid_amount_lc = COALESCE((
+                        SELECT SUM(applied_amount_lc) FROM ar_transaction_apply
+                        WHERE applied_to_id = t.id
+                          AND apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')
+                    ), 0),
+                    balance_amount_lc = total_amount_lc
+                        + COALESCE((SELECT SUM(applied_amount_lc) FROM ar_transaction_apply
+                                    WHERE applied_to_id = t.id AND apply_type = 'dn_ref'), 0)
+                        - COALESCE((SELECT SUM(applied_amount_lc) FROM ar_transaction_apply
+                                    WHERE applied_to_id = t.id
+                                      AND apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')), 0),
+                    updated_at = NOW()
+                WHERE id = $1
+            `, [invoiceId]);
+        }
+
+        await client.query('COMMIT');
         res.json({ message: 'Deleted' });
     } catch (err) {
+        await client.query('ROLLBACK');
         res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
     }
 };
 
 // --- 5. Fetch List ---
 const fetchRows = async (req, res) => {
     const { search, status, doc_type, customer_id, date_from, date_to } = req.query;
+    const { branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id } = req.query;
     let sql = `
         SELECT t.id, t.doc_no, t.doc_date, t.due_date, t.status,
                t.customer_code, t.customer_name_th,
                t.total_amount_lc, t.paid_amount_lc, t.balance_amount_lc,
                t.currency_code, t.ref_no,
+               t.branch_id, b.branch_code, b.branch_name_thai,
+               t.dim1_id, t.dim2_id, t.dim3_id, t.dim4_id, t.dim5_id,
+               v1.value_name_thai AS dim1_name, v2.value_name_thai AS dim2_name,
+               v3.value_name_thai AS dim3_name, v4.value_name_thai AS dim4_name,
+               v5.value_name_thai AS dim5_name,
                d.doc_code, d.doc_name_thai, d.sys_doc_type
         FROM ar_transaction t
         JOIN sa_module_document d ON t.doc_id = d.id
+        LEFT JOIN cd_branch b ON b.id = t.branch_id
+        LEFT JOIN gl_dimension_value v1 ON v1.id = t.dim1_id
+        LEFT JOIN gl_dimension_value v2 ON v2.id = t.dim2_id
+        LEFT JOIN gl_dimension_value v3 ON v3.id = t.dim3_id
+        LEFT JOIN gl_dimension_value v4 ON v4.id = t.dim4_id
+        LEFT JOIN gl_dimension_value v5 ON v5.id = t.dim5_id
         WHERE t.status != 'Deleted' AND d.sys_module = '11'
     `;
     const params = [];
@@ -1235,6 +1440,15 @@ const fetchRows = async (req, res) => {
         sql += ` AND t.status = $${params.length + 1}`;
         params.push(status);
     }
+    if (branch_id) {
+        sql += ` AND t.branch_id = $${params.length + 1}`;
+        params.push(branch_id);
+    }
+    if (dim1_id) { sql += ` AND t.dim1_id = $${params.length + 1}`; params.push(dim1_id); }
+    if (dim2_id) { sql += ` AND t.dim2_id = $${params.length + 1}`; params.push(dim2_id); }
+    if (dim3_id) { sql += ` AND t.dim3_id = $${params.length + 1}`; params.push(dim3_id); }
+    if (dim4_id) { sql += ` AND t.dim4_id = $${params.length + 1}`; params.push(dim4_id); }
+    if (dim5_id) { sql += ` AND t.dim5_id = $${params.length + 1}`; params.push(dim5_id); }
 
     sql += ` ORDER BY CASE WHEN t.status='Draft' THEN 0 ELSE 1 END, t.doc_date DESC, t.doc_no DESC LIMIT 200`;
 
@@ -1251,9 +1465,19 @@ const fetchRow = async (req, res) => {
     const { id } = req.params;
     try {
         const hRes = await req.dbPool.query(`
-            SELECT t.*, d.doc_code, d.doc_name_thai, d.sys_doc_type, d.is_auto_numbering
+            SELECT t.*, d.doc_code, d.doc_name_thai, d.sys_doc_type, d.is_auto_numbering,
+                   v1.value_code AS dim1_code, v1.value_name_thai AS dim1_name,
+                   v2.value_code AS dim2_code, v2.value_name_thai AS dim2_name,
+                   v3.value_code AS dim3_code, v3.value_name_thai AS dim3_name,
+                   v4.value_code AS dim4_code, v4.value_name_thai AS dim4_name,
+                   v5.value_code AS dim5_code, v5.value_name_thai AS dim5_name
             FROM ar_transaction t
             JOIN sa_module_document d ON t.doc_id = d.id
+            LEFT JOIN gl_dimension_value v1 ON v1.id = t.dim1_id
+            LEFT JOIN gl_dimension_value v2 ON v2.id = t.dim2_id
+            LEFT JOIN gl_dimension_value v3 ON v3.id = t.dim3_id
+            LEFT JOIN gl_dimension_value v4 ON v4.id = t.dim4_id
+            LEFT JOIN gl_dimension_value v5 ON v5.id = t.dim5_id
             WHERE t.id = $1
         `, [id]);
         if (hRes.rows.length === 0) return res.status(404).json({ error: 'Not found' });
@@ -1308,7 +1532,7 @@ const fetchOpenInvoices = async (req, res) => {
             JOIN sa_module_document d ON t.doc_id = d.id
             WHERE t.customer_id = $1
               AND t.status = 'Posted'
-              AND t.balance_amount_lc <> 0
+              AND t.balance_amount_lc > 0
               AND d.sys_doc_type IN ('10', '30')
             ORDER BY t.doc_date ASC, t.doc_no ASC
         `, [customer_id]);
@@ -1387,6 +1611,82 @@ const fetchOpenCreditNotes = async (req, res) => {
     }
 };
 
+// --- Fetch billing summary per invoice for a customer ---
+// คืน: invoice_id → {bc_doc_no, billing_date, billed_amount} ของ BC ล่าสุดที่ยังไม่ได้ชำระ
+const fetchInvoiceBillingSummary = async (req, res) => {
+    const { customer_id } = req.query;
+    if (!customer_id) return res.status(400).json({ error: 'customer_id required' });
+    try {
+        const result = await req.dbPool.query(`
+            SELECT DISTINCT ON (a.applied_to_id)
+                   a.applied_to_id  AS invoice_id,
+                   t.doc_no         AS bc_doc_no,
+                   t.doc_date       AS billing_date,
+                   a.applied_amount_lc AS billed_amount
+            FROM ar_transaction_apply a
+            JOIN ar_transaction t ON t.id = a.transaction_id
+            JOIN sa_module_document d ON d.id = t.doc_id
+            WHERE t.customer_id = $1
+              AND d.sys_doc_type = '70'
+              AND t.status = 'Posted'
+              AND t.balance_amount_lc > 0
+              AND a.apply_type = 'bc_invoice'
+            ORDER BY a.applied_to_id, t.doc_date DESC
+        `, [customer_id]);
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+};
+
+// --- Fetch Bill Collection (BC) document by doc_no ---
+// ใช้ใน Receipt เพื่อ auto-fill apply rows จากใบวางบิล
+// คืน 409 พร้อม receipt_doc_no ถ้า BC ถูกชำระแล้ว
+const fetchBillCollectionByDocNo = async (req, res) => {
+    const { doc_no } = req.query;
+    if (!doc_no) return res.status(400).json({ error: 'doc_no required' });
+    try {
+        const hRes = await req.dbPool.query(`
+            SELECT t.*, d.doc_code, d.doc_name_thai, d.sys_doc_type, d.is_auto_numbering
+            FROM ar_transaction t
+            JOIN sa_module_document d ON t.doc_id = d.id
+            WHERE t.doc_no = $1 AND d.sys_doc_type = '70' AND t.status = 'Posted'
+            LIMIT 1
+        `, [doc_no]);
+        if (hRes.rows.length === 0) return res.status(404).json(null);
+
+        // ตรวจสอบว่า BC ถูกนำไปชำระแล้วหรือยัง (มี Posted Receipt ที่ ref_no ตรงกัน)
+        const rcRes = await req.dbPool.query(`
+            SELECT t.doc_no AS receipt_doc_no
+            FROM ar_transaction t
+            JOIN sa_module_document d ON d.id = t.doc_id
+            WHERE t.ref_no = $1
+              AND d.sys_doc_type = '80'
+              AND t.status = 'Posted'
+            ORDER BY t.doc_date DESC, t.id DESC
+            LIMIT 1
+        `, [doc_no]);
+        if (rcRes.rows.length > 0) {
+            return res.status(409).json({
+                error: 'BC_ALREADY_PAID',
+                receipt_doc_no: rcRes.rows[0].receipt_doc_no,
+            });
+        }
+
+        const bcId = hRes.rows[0].id;
+        const appliesRes = await req.dbPool.query(`
+            SELECT a.*, inv.doc_no AS applied_to_doc_no, inv.doc_date AS applied_to_doc_date,
+                   inv.total_amount_lc AS applied_to_total
+            FROM ar_transaction_apply a
+            JOIN ar_transaction inv ON a.applied_to_id = inv.id
+            WHERE a.transaction_id = $1 ORDER BY a.id
+        `, [bcId]);
+        res.json({ header: hRes.rows[0], details: [], applies: appliesRes.rows, payments: [] });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+};
+
 module.exports = {
     createTransaction,
     updateTransaction,
@@ -1398,4 +1698,6 @@ module.exports = {
     fetchOpenAdvances,
     fetchOpenAdvancesForRefund,
     fetchOpenCreditNotes,
+    fetchInvoiceBillingSummary,
+    fetchBillCollectionByDocNo,
 };
