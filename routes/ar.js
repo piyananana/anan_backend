@@ -9,6 +9,7 @@ const arCollectorController = require('../controllers/ar/arCollectorController')
 const arCustomerImportController = require('../controllers/ar/arCustomerImportController');
 const arGlAccountSetupController = require('../controllers/ar/arGlAccountSetupController');
 const arAgingReportController = require('../controllers/ar/arAgingReportController');
+const arResetController = require('../controllers/ar/arResetController');
 
 // Router สำหรับตั้งค่ารหัสลูกหนี้อัตโนมัติ
 router.get('/ar_customer_running/preview_code', arCustomerRunningController.previewCode);
@@ -66,5 +67,9 @@ router.get('/ar_aging_report', arAgingReportController.getAgingReport);
 router.get('/ar_gl_account_setup', arGlAccountSetupController.fetchRows);
 router.get('/ar_gl_account_setup/:doc_code', arGlAccountSetupController.fetchRow);
 router.post('/ar_gl_account_setup/:doc_code', arGlAccountSetupController.upsertRow);
+
+// Developer-only: reset AR transaction data
+router.get('/ar_reset_transactions/counts', arResetController.getCounts);
+router.delete('/ar_reset_transactions', arResetController.resetTransactions);
 
 module.exports = router;

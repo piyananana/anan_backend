@@ -412,10 +412,34 @@ class BackupService {
         }
     }
 
+    // Restore จากไฟล์ที่ upload มาจาก client ไปยัง targetDatabase ที่ระบุ
+    static async runPgRestoreFromUpload(uploadedFilePath, targetDatabaseName) {
+        console.log(`Restoring uploaded file to database: ${targetDatabaseName}`);
+        const dbConfig = await dbService.getPool(targetDatabaseName);
+        const dropSchemaCmd = `psql -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"`;
+        const restoreCmd = `pg_restore -Fc --no-owner --no-privileges -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} "${uploadedFilePath}"`;
+        const env = { ...process.env, PGPASSWORD: dbConfig.options.password };
+
+        return new Promise((resolve, reject) => {
+            exec(dropSchemaCmd, { env }, (dropErr) => {
+                if (dropErr) {
+                    fs.unlink(uploadedFilePath, () => {});
+                    return reject(new Error('Failed to drop schema before restore.'));
+                }
+                exec(restoreCmd, { env }, (err) => {
+                    fs.unlink(uploadedFilePath, () => {}); // ลบ temp file เสมอ
+                    if (err) return reject(new Error('Restore command failed.'));
+                    console.log(`Restore from upload completed to: ${targetDatabaseName}`);
+                    resolve('Restore completed successfully.');
+                });
+            });
+        });
+    }
+
     static async getFilePath(filename) {
         const backupDir = path.join(__dirname, '..', 'backups');
         const filePath = path.join(backupDir, filename);
-        
+
         if (!fs.existsSync(filePath) || !filePath.startsWith(backupDir)) {
             throw new Error('File not found or invalid path');
         }

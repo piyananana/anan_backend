@@ -2,7 +2,7 @@
 const express = require('express');
 const router = express.Router();
 const saAuthController = require('../controllers/sa/saAuthController');
-const saBackupController = require('../controllers/sa/saBackupController'); 
+const saBackupController = require('../controllers/sa/saBackupController');
 const saCompanyController = require('../controllers/sa/saCompanyController');
 const saDatabaseController = require('../controllers/sa/saDatabaseController');
 const saGroupController = require('../controllers/sa/saGroupController');
@@ -35,12 +35,12 @@ const imageStorage = multer.diskStorage({
     destination: function (req, file, cb) {
         cb(null, uploadsDir); // ไฟล์จะถูกเก็บในโฟลเดอร์ 'public/sa'
     },
-    filename: function (req, file, cb) {        
+    filename: function (req, file, cb) {
         const ext = path.extname(file.originalname);
         cb(null, 'company_logo_' + Date.now() + ext);   // ตั้งชื่อไฟล์ใหม่โดยไม่ให้ซ้ำกัน เช่น company_logo_timestamp.ext
     }
 });
-const imageUpload = multer({ 
+const imageUpload = multer({
     storage: imageStorage,
     limits: { fileSize: 5 * 1024 * 1024 }, // จำกัดขนาดไฟล์ 5MB
     fileFilter: (req, file, cb) => {
@@ -56,10 +56,13 @@ const imageUpload = multer({
 // Define routes for System Administration (SA)
 // These routes handle CRUD operations for system administration tasks such as managing users, roles, and permissions
 //
-// For saAuthController
+// Auth routes (public)
 router.post('/auth/login', saAuthController.login);
-router.post('/auth/change_password/:id', saAuthController.changePassword); 
-router.post('/auth/check_token', saAuthController.verifyToken); // Verify JWT token
+router.post('/auth/check_token', saAuthController.verifyToken);
+router.get('/databases', saDatabaseController.getDatabases);
+
+// Auth routes (protected)
+router.post('/auth/change_password/:id', saAuthController.changePassword);
 
 // For saBackupController
 router.get('/backup/schedules', saBackupController.getSchedules);
@@ -75,17 +78,15 @@ router.post('/backup/instant/start', saBackupController.startInstantBackup);
 router.post('/backup/instant/stop', saBackupController.stopInstantBackup);
 router.get('/backup/instant/status', saBackupController.checkInstantBackupStatus);
 router.post('/backup/instant/restore', saBackupController.restoreFromInstantBackup);
+router.post('/backup/restore-from-upload', fileUpload.single('backupFile'), saBackupController.restoreFromUpload);
 
 // For saCompanyController
 router.get('/sa_company', saCompanyController.getCompanyInfo);
 router.post('/sa_company', imageUpload.single('logo'), saCompanyController.createCompanyInfo);
 router.put('/sa_company/:id', imageUpload.single('logo'), saCompanyController.updateCompanyInfo);
 
-// For saDatabaseController
-router.get('/databases', saDatabaseController.getDatabases);
-
 // For saGroupController
-router.get('/sa_group', saGroupController.getAllGroup); 
+router.get('/sa_group', saGroupController.getAllGroup);
 router.get('/sa_group/:id', saGroupController.getGroupById);
 router.post('/sa_group', saGroupController.createGroup);
 router.put('/sa_group/:id', saGroupController.updateGroup);
@@ -99,25 +100,27 @@ router.delete('/sa_group_menu/:groupId', saGroupMenuController.deleteGroupMenu);
 router.get('/sa_group_user/:groupId', saGroupUserController.getGroupUsers);
 router.get('/sa_group_user/only/:groupId', saGroupUserController.getGroupOnlyUsers);
 router.post('/sa_group_user/:groupId/:userId', saGroupUserController.createGroupUserByUserId);
-router.delete('/sa_group_user/:groupId', saGroupUserController.deleteGroupUsers); 
+router.delete('/sa_group_user/:groupId', saGroupUserController.deleteGroupUsers);
 router.delete('/sa_group_user/:groupId/:userId', saGroupUserController.deleteGroupUserByUserId);
 
 // For saMenuController
-router.get('/sa_menu', saMenuController.getAllMenu);
-router.get('/sa_menu/user/:userId', saMenuController.getMenuByUserId); 
+// Read routes: inject role so filtering works, but do not require developer
+router.get('/sa_menu', saAuthController.injectUserRole, saMenuController.getAllMenu);
+router.get('/sa_menu/user/:userId', saAuthController.injectUserRole, saMenuController.getMenuByUserId);
 router.get('/sa_menu/group/:groupId', saMenuController.getMenuByGroupId);
 router.get('/sa_menu/content/:id', saMenuController.getMenuContentById);
-router.get('/sa_menu/export', saMenuController.exportMenu);
-router.post('/sa_menu', saMenuController.createMenu);
-router.post('/sa_menu/import', fileUpload.single('excelFile'), saMenuController.importMenu);
-router.put('/sa_menu/:id', saMenuController.updateMenu);
-router.delete('/sa_menu/:id', saMenuController.deleteMenu);
-router.delete('/sa_menu/all', saMenuController.deleteAllMenu);
+// Write routes: require developer
+router.get('/sa_menu/export', saAuthController.requireDeveloper, saMenuController.exportMenu);
+router.post('/sa_menu', saAuthController.requireDeveloper, saMenuController.createMenu);
+router.post('/sa_menu/import', saAuthController.requireDeveloper, fileUpload.single('excelFile'), saMenuController.importMenu);
+router.put('/sa_menu/:id', saAuthController.requireDeveloper, saMenuController.updateMenu);
+router.delete('/sa_menu/:id', saAuthController.requireDeveloper, saMenuController.deleteMenu);
+router.delete('/sa_menu/all', saAuthController.requireDeveloper, saMenuController.deleteAllMenu);
 
 // For saModuleDocumentController
 router.get('/sa_module_document', saModuleDocumentController.fetchRows);
-router.get('/sa_module_document/user/:userId', saModuleDocumentController.fetchRowsByUserId); 
-router.get('/sa_module_document/module_user/:docCode/:userId', saModuleDocumentController.fetchRowsByModuleUserId); 
+router.get('/sa_module_document/user/:userId', saModuleDocumentController.fetchRowsByUserId);
+router.get('/sa_module_document/module_user/:docCode/:userId', saModuleDocumentController.fetchRowsByModuleUserId);
 router.post('/sa_module_document', saModuleDocumentController.addRow);
 router.put('/sa_module_document/:id', saModuleDocumentController.updateRow);
 router.delete('/sa_module_document/:id', saModuleDocumentController.deleteRow);
@@ -141,11 +144,11 @@ router.post('/sa_doc_number_branch/reset', saDocNumberBranchController.resetCoun
 router.get('/sa_user_branch/:userId', saUserBranchController.getBranchesByUserId);
 router.put('/sa_user_branch/:userId', saUserBranchController.updateBranchesByUserId);
 
-// For saUserController
-router.get('/sa_user', saUserController.getAllUser);
-router.post('/sa_user', saUserController.createUser);
-router.put('/sa_user/:id', saUserController.updateUser);
-router.delete('/sa_user/:id', saUserController.deleteUser);
+// For saUserController — inject role for all user CRUD
+router.get('/sa_user', saAuthController.injectUserRole, saUserController.getAllUser);
+router.post('/sa_user', saAuthController.injectUserRole, saUserController.createUser);
+router.put('/sa_user/:id', saAuthController.injectUserRole, saUserController.updateUser);
+router.delete('/sa_user/:id', saAuthController.injectUserRole, saUserController.deleteUser);
 
 // For saUserDocumentController
 router.put('/sa_user_document/:userId', saUserDocumentController.updateRowsByUserId);

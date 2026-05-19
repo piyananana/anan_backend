@@ -16,6 +16,7 @@ const glIncomeStatementController = require('../controllers/gl/glIncomeStatement
 const glDailyTransactionController = require('../controllers/gl/glDailyTransactionController');
 const glDimensionTypeController = require('../controllers/gl/glDimensionTypeController');
 const glDimensionValueController = require('../controllers/gl/glDimensionValueController');
+const glResetController = require('../controllers/gl/glResetController');
 
 // กำหนดที่เก็บไฟล์ชั่วคราวสำหรับอัปโหลด
 const multer = require('multer');
@@ -43,6 +44,9 @@ router.post('/gl_entry', glEntryController.createTransaction);
 router.put('/gl_entry/:id', glEntryController.updateTransaction);
 router.delete('/gl_entry/:id', glEntryController.deleteTransaction);
 router.post('/gl_entry/reverse/:id', glEntryController.reverseTransaction);
+// Developer-only: reset transaction data
+router.get('/gl_reset_transactions/counts', glResetController.getCounts);
+router.delete('/gl_reset_transactions', glResetController.resetTransactions);
 // Router สำหรับสร้างรายงานทางการเงิน (Financial Report Engine)
 router.get('/gl_financial_report_master_list', glFinancialReportEngineController.getReportMasterList);
 router.post('/gl_financial_report_engine', glFinancialReportEngineController.generateFinancialReport);

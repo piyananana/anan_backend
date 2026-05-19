@@ -144,6 +144,23 @@ const restoreFromInstantBackup = async (req, res) => {
 };
 
 
+const restoreFromUpload = async (req, res) => {
+    if (!req.file) {
+        return res.status(400).json({ message: 'ไม่พบไฟล์ที่อัปโหลด' });
+    }
+    const targetDatabase = req.body.targetDatabase || req.headers['x-database-name'];
+    if (!targetDatabase) {
+        return res.status(400).json({ message: 'ไม่ระบุฐานข้อมูลปลายทาง' });
+    }
+    try {
+        const result = await saBackupService.runPgRestoreFromUpload(req.file.path, targetDatabase);
+        res.json({ message: result });
+    } catch (error) {
+        console.error('Error restoring from upload:', error);
+        res.status(500).json({ message: error.message });
+    }
+};
+
 module.exports = {
     getSchedules,
     getScheduleStatus,
@@ -158,6 +175,7 @@ module.exports = {
     stopInstantBackup,
     checkInstantBackupStatus,
     restoreFromInstantBackup,
+    restoreFromUpload,
 };
 
 

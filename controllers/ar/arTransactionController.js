@@ -803,6 +803,13 @@ const createTransaction = async (req, res) => {
 
         const status = action === 'Post' ? 'Posted' : 'Draft';
 
+        // Ensure date columns exist
+        await client.query(`
+            ALTER TABLE ar_transaction
+            ADD COLUMN IF NOT EXISTS billing_date DATE,
+            ADD COLUMN IF NOT EXISTS expected_payment_date DATE
+        `);
+
         // Insert header
         const headerSql = `
             INSERT INTO ar_transaction
@@ -814,10 +821,12 @@ const createTransaction = async (req, res) => {
              paid_amount_lc, balance_amount_lc,
              ref_no, ref_doc_id, ref_doc_no, description, status,
              dim1_id, dim2_id, dim3_id, dim4_id, dim5_id,
-             branch_id, created_by)
+             branch_id, created_by,
+             billing_date, expected_payment_date)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
                     $13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
-                    $25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36)
+                    $25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,
+                    $37,$38)
             RETURNING id
         `;
         const hRes = await client.query(headerSql, [
@@ -834,7 +843,8 @@ const createTransaction = async (req, res) => {
             header.description || null, status,
             header.dim1_id || null, header.dim2_id || null,
             header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
-            header.branch_id || null, header.created_by || null
+            header.branch_id || null, header.created_by || null,
+            header.billing_date || null, header.expected_payment_date || null
         ]);
         const newHeaderId = hRes.rows[0].id;
 
@@ -988,6 +998,11 @@ const updateTransaction = async (req, res) => {
         const status = action === 'Post' ? 'Posted' : 'Draft';
 
         await client.query(`
+            ALTER TABLE ar_transaction
+            ADD COLUMN IF NOT EXISTS billing_date DATE,
+            ADD COLUMN IF NOT EXISTS expected_payment_date DATE
+        `);
+        await client.query(`
             UPDATE ar_transaction SET
             doc_date=$1, due_date=$2, period_id=$3,
             ar_account_id=$4, currency_id=$5, currency_code=$6, exchange_rate=$7,
@@ -996,8 +1011,9 @@ const updateTransaction = async (req, res) => {
             balance_amount_lc=$18,
             ref_no=$19, ref_doc_id=$20, ref_doc_no=$21, description=$22, status=$23,
             dim1_id=$24, dim2_id=$25, dim3_id=$26, dim4_id=$27, dim5_id=$28,
-            branch_id=$29, updated_by=$30, updated_at=NOW()
-            WHERE id=$31
+            branch_id=$29, updated_by=$30, updated_at=NOW(),
+            billing_date=$31, expected_payment_date=$32
+            WHERE id=$33
         `, [
             header.doc_date, header.due_date || null, periodId,
             header.ar_account_id || null, header.currency_id || null, header.currency_code || 'THB',
@@ -1011,7 +1027,8 @@ const updateTransaction = async (req, res) => {
             header.description || null, status,
             header.dim1_id || null, header.dim2_id || null,
             header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
-            header.branch_id || null, header.updated_by || null, id
+            header.branch_id || null, header.updated_by || null,
+            header.billing_date || null, header.expected_payment_date || null, id
         ]);
 
         // Replace details

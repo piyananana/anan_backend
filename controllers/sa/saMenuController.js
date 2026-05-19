@@ -7,7 +7,14 @@ const xlsx = require('xlsx'); // Import xlsx
 // ไม่ต้องใช้ verifyToken เพราะเป็น public view
 const getAllMenu = async (req, res) => {
     try {
-        const result = await req.dbPool.query('SELECT * FROM sa_menu WHERE is_active = TRUE ORDER BY parent_id ASC, sort_order ASC');
+        // Ensure column exists
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS is_system BOOLEAN DEFAULT FALSE');
+
+        const isDeveloper = req.isDeveloper ?? false;
+        const query = isDeveloper
+            ? 'SELECT * FROM sa_menu WHERE is_active = TRUE ORDER BY parent_id ASC, sort_order ASC'
+            : 'SELECT * FROM sa_menu WHERE is_active = TRUE AND (is_system = FALSE OR is_system IS NULL) ORDER BY parent_id ASC, sort_order ASC';
+        const result = await req.dbPool.query(query);
         res.json(result.rows);
     } catch (err) {
         console.error('Error fetching sa_menu:', err);
@@ -20,9 +27,39 @@ const getAllMenu = async (req, res) => {
 const getMenuByUserId = async (req, res) => {
     const { userId } = req.params;
     try {
+        // Ensure columns exist
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS is_system BOOLEAN DEFAULT FALSE');
+        await req.dbPool.query(`
+            ALTER TABLE sa_user_menu ADD COLUMN IF NOT EXISTS can_view    BOOLEAN DEFAULT TRUE;
+            ALTER TABLE sa_user_menu ADD COLUMN IF NOT EXISTS can_create  BOOLEAN DEFAULT FALSE;
+            ALTER TABLE sa_user_menu ADD COLUMN IF NOT EXISTS can_edit    BOOLEAN DEFAULT FALSE;
+            ALTER TABLE sa_user_menu ADD COLUMN IF NOT EXISTS can_delete  BOOLEAN DEFAULT FALSE;
+            ALTER TABLE sa_user_menu ADD COLUMN IF NOT EXISTS can_approve BOOLEAN DEFAULT FALSE;
+            ALTER TABLE sa_user_menu ADD COLUMN IF NOT EXISTS can_print   BOOLEAN DEFAULT FALSE;
+            ALTER TABLE sa_user_menu ADD COLUMN IF NOT EXISTS can_export  BOOLEAN DEFAULT FALSE;
+        `);
+
+        // Look up target user's role
+        const userRole = await req.dbPool.query('SELECT user_type FROM sa_user WHERE id = $1', [userId]);
+        const targetIsDeveloper = userRole.rows[0]?.user_type === 'developer';
+
         const result = await req.dbPool.query(
-            'SELECT m.* FROM sa_menu m INNER JOIN sa_user_menu um ON m.id = um.menu_id WHERE um.user_id = $1 AND m.is_active = TRUE ORDER BY m.parent_id ASC, m.sort_order ASC',
-            [userId]);
+            `SELECT m.*,
+                COALESCE(um.can_view, TRUE) as can_view,
+                COALESCE(um.can_create, FALSE) as can_create,
+                COALESCE(um.can_edit, FALSE) as can_edit,
+                COALESCE(um.can_delete, FALSE) as can_delete,
+                COALESCE(um.can_approve, FALSE) as can_approve,
+                COALESCE(um.can_print, FALSE) as can_print,
+                COALESCE(um.can_export, FALSE) as can_export
+             FROM sa_menu m
+             INNER JOIN sa_user_menu um ON m.id = um.menu_id
+             WHERE um.user_id = $1
+             AND m.is_active = TRUE
+             AND ($2 = TRUE OR m.is_system = FALSE OR m.is_system IS NULL)
+             ORDER BY m.parent_id ASC, m.sort_order ASC`,
+            [userId, targetIsDeveloper]
+        );
         res.json(result.rows);
     } catch (err) {
         console.error('Error fetching User menus:', err);
@@ -34,16 +71,40 @@ const getMenuByUserId = async (req, res) => {
 const getMenuByGroupId = async (req, res) => {
     const groupId = req.params.groupId;
     try {
-        // ดึงข้อมูลเมนูของกลุ่มจากฐานข้อมูล
+        // Ensure columns exist
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS is_system BOOLEAN DEFAULT FALSE');
+        await req.dbPool.query(`
+            ALTER TABLE sa_group_menu ADD COLUMN IF NOT EXISTS can_view    BOOLEAN DEFAULT TRUE;
+            ALTER TABLE sa_group_menu ADD COLUMN IF NOT EXISTS can_create  BOOLEAN DEFAULT FALSE;
+            ALTER TABLE sa_group_menu ADD COLUMN IF NOT EXISTS can_edit    BOOLEAN DEFAULT FALSE;
+            ALTER TABLE sa_group_menu ADD COLUMN IF NOT EXISTS can_delete  BOOLEAN DEFAULT FALSE;
+            ALTER TABLE sa_group_menu ADD COLUMN IF NOT EXISTS can_approve BOOLEAN DEFAULT FALSE;
+            ALTER TABLE sa_group_menu ADD COLUMN IF NOT EXISTS can_print   BOOLEAN DEFAULT FALSE;
+            ALTER TABLE sa_group_menu ADD COLUMN IF NOT EXISTS can_export  BOOLEAN DEFAULT FALSE;
+        `);
+
         const result = await req.dbPool.query(
-            // 'SELECT m.menu_name, m.menu_type, m.target_path, m.sort_order FROM sa_menu m INNER JOIN sa_users_menus um ON m.id = um.menu_id WHERE um.user_id = $1',
-            'SELECT m.* FROM sa_menu m INNER JOIN sa_group_menu gm ON m.id = gm.menu_id WHERE gm.group_id = $1 AND m.is_active = TRUE ORDER BY m.parent_id ASC, m.sort_order ASC',
+            `SELECT m.*,
+                COALESCE(gm.can_view, TRUE) as can_view,
+                COALESCE(gm.can_create, FALSE) as can_create,
+                COALESCE(gm.can_edit, FALSE) as can_edit,
+                COALESCE(gm.can_delete, FALSE) as can_delete,
+                COALESCE(gm.can_approve, FALSE) as can_approve,
+                COALESCE(gm.can_print, FALSE) as can_print,
+                COALESCE(gm.can_export, FALSE) as can_export
+             FROM sa_menu m
+             INNER JOIN sa_group_menu gm ON m.id = gm.menu_id
+             WHERE gm.group_id = $1
+             AND m.is_active = TRUE
+             AND (m.is_system = FALSE OR m.is_system IS NULL)
+             ORDER BY m.parent_id ASC, m.sort_order ASC`,
             [groupId]
         );
+        // Return empty array instead of 404 — group simply has no menus
         if (result.rows.length > 0) {
             res.json(result.rows);
         } else {
-            res.status(404).json({ message: 'Group menu not found' });
+            res.json([]);
         }
     } catch (err) {
         console.error('Error fetching group menu ${groupId}:', err);
@@ -88,22 +149,20 @@ const getMenuContentById = async (req, res) => {
 
 // API สำหรับเพิ่มเมนูใหม่
 const createMenu = async (req, res) => {
-    const { parent_id, menu_name, menu_type, target_path, sort_order, content_type, content_data } = req.body;
+    const { parent_id, menu_name, menu_type, target_path, sort_order, is_system, content_type, content_data } = req.body;
     try {
-        // Find max sort_order if not provided
         let actual_sort_order = sort_order;
         if (actual_sort_order === undefined || actual_sort_order === null) {
             const maxOrderResult = await req.dbPool.query(
-                'SELECT MAX(sort_order) FROM sa_menu WHERE parent_id = $1',
-                [parent_id]
+                'SELECT MAX(sort_order) FROM sa_menu WHERE parent_id = $1', [parent_id]
             );
             actual_sort_order = (maxOrderResult.rows[0].max || 0) + 1;
         }
 
         const menuResult = await req.dbPool.query(
-            `INSERT INTO sa_menu (parent_id, menu_name, menu_type, target_path, sort_order, is_active)
-             VALUES ($1, $2, $3, $4, $5, TRUE) RETURNING *`,
-            [parent_id, menu_name, menu_type, target_path, actual_sort_order]
+            `INSERT INTO sa_menu (parent_id, menu_name, menu_type, target_path, sort_order, is_active, is_system)
+             VALUES ($1, $2, $3, $4, $5, TRUE, $6) RETURNING *`,
+            [parent_id, menu_name, menu_type, target_path, actual_sort_order, is_system ?? false]
         );
         const newMenu = menuResult.rows[0];
 
@@ -126,7 +185,7 @@ const createMenu = async (req, res) => {
 // API สำหรับแก้ไขเมนู
 const updateMenu = async (req, res) => {
     const { id } = req.params;
-    const { menu_name, menu_type, target_path, sort_order, is_active, content_type, content_data } = req.body;
+    const { menu_name, menu_type, target_path, sort_order, is_active, is_system, content_type, content_data } = req.body;
     try {
         const menuResult = await req.dbPool.query(
             `UPDATE sa_menu SET
@@ -135,9 +194,10 @@ const updateMenu = async (req, res) => {
                 target_path = $3,
                 sort_order = $4,
                 is_active = $5,
+                is_system = $6,
                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = $6 RETURNING *`,
-            [menu_name, menu_type, target_path, sort_order, is_active, id]
+             WHERE id = $7 RETURNING *`,
+            [menu_name, menu_type, target_path, sort_order, is_active, is_system ?? false, id]
         );
 
         if (menuResult.rows.length === 0) {
@@ -179,7 +239,9 @@ const deleteMenu = async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // ลบ content ที่เกี่ยวข้องก่อน
+        // ลบ FK references ทั้งหมดก่อน (group_menu, user_menu, content)
+        await client.query('DELETE FROM sa_group_menu WHERE menu_id = $1', [id]);
+        await client.query('DELETE FROM sa_user_menu WHERE menu_id = $1', [id]);
         await client.query('DELETE FROM sa_menu_content WHERE menu_id = $1', [id]);
 
         // ลบเมนูหลักและเมนูย่อยทั้งหมดที่เป็นลูกหลาน (recursive delete)
@@ -228,14 +290,15 @@ const importMenu = async (req, res) => {
         return res.status(400).json({ message: 'No Excel file uploaded.' });
     }
 
+    let client;
     try {
         const workbook = xlsx.readFile(req.file.path);
         const sheetName = workbook.SheetNames[0];
         const worksheet = workbook.Sheets[sheetName];
         const jsonData = xlsx.utils.sheet_to_json(worksheet);
 
-        const client = await req.dbPool.connect();
-        
+        client = await req.dbPool.connect();
+
         await client.query('BEGIN'); // เริ่ม transaction
 
         const importedMenu = [];

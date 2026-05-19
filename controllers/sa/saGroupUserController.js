@@ -4,26 +4,36 @@
 
 // API เพื่อดึงข้อมูลเมนูของกลุ่มตาม ID สำหรับ View
 // ไม่ต้องใช้ verifyToken เพราะเป็น public view
+const typeRank = (t) => ({ developer: 4, administrator: 3, user: 2, guest: 1 }[t] ?? 0);
+
 const getGroupUsers = async (req, res) => {
     const groupId = req.params.groupId;
-    // console.log('Received groupId:', groupId);
     try {
-        // ดึงข้อมูลเมนูของกลุ่มจากฐานข้อมูล
+        // หา type ของผู้ขอ เพื่อกรอง user_type ที่มี rank ≤ ตัวเอง
+        const userId = req.headers['userid'];
+        let requesterType = 'guest';
+        if (userId) {
+            const roleRes = await req.dbPool.query(
+                'SELECT user_type FROM sa_user WHERE id = $1', [userId]
+            );
+            requesterType = roleRes.rows[0]?.user_type ?? 'guest';
+        }
+        const rank = typeRank(requesterType);
+        const visibleTypes = ['developer', 'administrator', 'user', 'guest']
+            .filter(t => typeRank(t) <= rank);
+        const typePlaceholders = visibleTypes.map((_, i) => `$${i + 2}`).join(', ');
+
         const result = await req.dbPool.query(
             `SELECT u.*, CASE WHEN gu.group_id IS NOT NULL THEN TRUE ELSE FALSE END AS is_member
-            FROM sa_user u
-            LEFT JOIN sa_group_user gu ON u.id = gu.user_id AND gu.group_id = $1
-            WHERE u.status = 'active'
-            ORDER BY u.user_name`,
-            [groupId]
+             FROM sa_user u
+             LEFT JOIN sa_group_user gu ON u.id = gu.user_id AND gu.group_id = $1
+             WHERE u.status = 'active' AND u.user_type IN (${typePlaceholders})
+             ORDER BY u.user_name`,
+            [groupId, ...visibleTypes]
         );
-        if (result.rows.length > 0) {
-            res.json(result.rows);
-        } else {
-            res.status(404).json({ message: 'Group user not found' });
-        }
+        res.json(result.rows);
     } catch (err) {
-        console.error('Error fetching group user ${groupId}:', err);
+        console.error('Error fetching group user:', err);
         res.status(500).json({ error: 'Internal server error' });
     }
 };
@@ -35,25 +45,30 @@ const getGroupOnlyUsers = async (req, res) => {
     // console.log('Received groupId:', groupId);
     try {
         // ดึงข้อมูลเมนูของกลุ่มจากฐานข้อมูล
+        const userId = req.headers['userid'];
+        let requesterType = 'guest';
+        if (userId) {
+            const roleRes = await req.dbPool.query(
+                'SELECT user_type FROM sa_user WHERE id = $1', [userId]
+            );
+            requesterType = roleRes.rows[0]?.user_type ?? 'guest';
+        }
+        const rank = typeRank(requesterType);
+        const visibleTypes = ['developer', 'administrator', 'user', 'guest']
+            .filter(t => typeRank(t) <= rank);
+        const typePlaceholders = visibleTypes.map((_, i) => `$${i + 2}`).join(', ');
+
         const result = await req.dbPool.query(
-            `SELECT u.* 
-            FROM sa_user u
-            JOIN sa_group_user gu ON u.id = gu.user_id AND gu.group_id = $1
-            WHERE u.status = 'active'
-            ORDER BY u.user_name`,
-            [groupId]
+            `SELECT u.*
+             FROM sa_user u
+             JOIN sa_group_user gu ON u.id = gu.user_id AND gu.group_id = $1
+             WHERE u.status = 'active' AND u.user_type IN (${typePlaceholders})
+             ORDER BY u.user_name`,
+            [groupId, ...visibleTypes]
         );
-        if (result.rows.length > 0) {
-            res.json(result.rows);
-        } else 
-            if (result.rows.length === 0) {
-                res.status(200).json({}); // Return empty array if no users found
-            }
-            else {
-                res.status(404).json({ message: 'Group only user not found' });
-            }
+        res.json(result.rows);
     } catch (err) {
-        console.error('Error fetching group only user ${groupId}:', err);
+        console.error('Error fetching group only users:', err);
         res.status(500).json({ error: 'Internal server error' });
     }
 };

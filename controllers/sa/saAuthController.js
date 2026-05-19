@@ -19,26 +19,116 @@ const verifyToken = (req, res, next) => {
     });
 }
 
+// developer ถ้า user_type = 'developer' เท่านั้น
+const _isDeveloperRow = (row) => row?.user_type === 'developer';
+
+// Injects req.isDeveloper, req.authUserId — never blocks
+const injectUserRole = async (req, res, next) => {
+    req.isDeveloper = false;
+    req.authUserId = null;
+
+    // 1. Try JWT token for userId
+    let userId = null;
+    const token = req.headers.authorization?.split(' ')[1];
+    if (token) {
+        try {
+            const decoded = jwt.verify(token, process.env.JWT_SECRET);
+            userId = decoded.id;
+            req.isDeveloper = decoded.userType === 'developer'; // JWT fallback
+        } catch (err) {
+            console.error('injectUserRole JWT error:', err.message);
+        }
+    }
+
+    // 2. Fall back to UserId header (always sent by Flutter client)
+    if (!userId) {
+        const headerUserId = req.headers['userid'];
+        if (headerUserId) userId = parseInt(headerUserId, 10);
+    }
+
+    // 3. Verify against DB (most authoritative — role may have changed after login)
+    if (userId) {
+        req.authUserId = userId;
+        try {
+            const result = await req.dbPool.query(
+                'SELECT user_type FROM sa_user WHERE id = $1', [userId]
+            );
+            if (result.rows.length > 0) {
+                req.isDeveloper = result.rows[0].user_type === 'developer';
+            }
+        } catch (dbErr) {
+            console.error('injectUserRole DB error:', dbErr.message);
+        }
+    }
+
+    next();
+};
+
+// Blocks non-developer with 403; mirrors _checkDeveloper pattern used across controllers
+const requireDeveloper = async (req, res, next) => {
+    // Try JWT token first
+    let userId = null;
+    const token = req.headers.authorization?.split(' ')[1];
+    if (token) {
+        try {
+            const decoded = jwt.verify(token, process.env.JWT_SECRET);
+            userId = decoded.id;
+        } catch (_) {}
+    }
+    // Fall back to UserId header (always sent by Flutter client alongside JWT)
+    if (!userId) {
+        const headerUserId = req.headers['userid'];
+        if (headerUserId) userId = parseInt(headerUserId, 10);
+    }
+    if (!userId) {
+        return res.status(403).json({ message: 'ต้องการการยืนยันตัวตน' });
+    }
+    try {
+        const result = await req.dbPool.query(
+            'SELECT user_type FROM sa_user WHERE id = $1',
+            [userId]
+        );
+        if (result.rows[0]?.user_type !== 'developer') {
+            return res.status(403).json({ message: 'ต้องการสิทธิ์ผู้พัฒนาระบบ' });
+        }
+        req.isDeveloper = true;
+        req.authUserId = userId;
+        next();
+    } catch (err) {
+        console.error('requireDeveloper DB error:', err.message);
+        return res.status(500).json({ message: 'เกิดข้อผิดพลาดภายในระบบ' });
+    }
+};
+
 // ตรวจสอบและสร้างผู้ใช้คนแรกถ้ายังไม่มี
 async function ensureFirstUserExists(req, res) {
     try {
+        // Drop legacy columns if they still exist
+        await req.dbPool.query('ALTER TABLE sa_user DROP COLUMN IF EXISTS is_developer');
+        await req.dbPool.query('ALTER TABLE sa_user DROP COLUMN IF EXISTS is_admin');
+
         const countResult = await req.dbPool.query('SELECT COUNT(*) FROM sa_user');
         const userCount = parseInt(countResult.rows[0].count, 10);
 
         if (userCount === 0) {
             console.log('No user found. Creating the first administrator user...');
             const userName = 'anansoft';
-            const password = 'anansoft'; // รหัสผ่านเริ่มต้น
-            const hashedPassword = await bcrypt.hash(password, 10); // Hash รหัสผ่าน
-
+            const password = 'anansoft';
+            const hashedPassword = await bcrypt.hash(password, 10);
             const insertQuery = `
                 INSERT INTO sa_user (user_name, password_hash, first_name, last_name, user_type, status)
                 VALUES ($1, $2, $3, $4, $5, $6)
                 RETURNING *;
             `;
-            const values = [userName, hashedPassword, 'อนันต์ซอฟท์', 'บจก.', 'administrator', 'active'];
-            await req.dbPool.query(insertQuery, values);
-            console.log('First user "anansoft" created successfully.');
+            await req.dbPool.query(insertQuery, [userName, hashedPassword, 'อนันต์ซอฟท์', 'บจก.', 'developer', 'active']);
+            console.log('First user "anansoft" created as developer.');
+        }
+
+        // Bootstrap: ถ้าไม่มี user_type='developer' เลย ให้ผู้ใช้ที่สร้างก่อนสุดเป็น developer
+        const devCheck = await req.dbPool.query("SELECT COUNT(*) FROM sa_user WHERE user_type = 'developer'");
+        if (parseInt(devCheck.rows[0].count, 10) === 0) {
+            await req.dbPool.query("UPDATE sa_user SET user_type = 'developer' WHERE id = (SELECT MIN(id) FROM sa_user)");
+            console.log('Bootstrap: oldest user set as developer.');
         }
     } catch (err) {
         console.error('Error ensuring first user exists:', err);
@@ -46,46 +136,12 @@ async function ensureFirstUserExists(req, res) {
         throw new Error('Failed to ensure first user exists.');
     }
 }
-// API สำหรับ Login
-// const login = async (req, res) => {
-//     const { userName, password } = req.body;
-
-//     try {
-//         // ตรวจสอบและสร้างผู้ใช้คนแรกก่อนพยายาม Login
-//         await ensureFirstUserExists();
-
-//         const userResult = await req.dbPool.query('SELECT * FROM sa_user WHERE user_name = $1 AND status = \'active\'', [userName]);
-
-//         if (userResult.rows.length === 0) {
-//             return res.status(401).json({ message: 'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง' });
-//         }
-
-//         const user = userResult.rows[0];
-//         const isPasswordValid = await bcrypt.compare(password, user.password_hash);
-
-//         if (!isPasswordValid) {
-//             return res.status(401).json({ message: 'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง' });
-//         }
-
-//         // สร้าง JWT Token
-//         const token = jwt.sign(
-//             { id: user.id, userName: user.userName, userType: user.user_type },
-//             process.env.JWT_SECRET || 'your_super_secret_jwt_key',
-//             { expiresIn: '1h' }
-//         );
-
-//         res.json({ token, user });
-//     } catch (err) {
-//         console.error('Login error:', err);
-//         res.status(500).json({ message: 'เกิดข้อผิดพลาดในการเข้าสู่ระบบ' });
-//     }
-// }
 
 const login = async (req, res) => {
     const { userName, password, databaseName } = req.body;
     console.log(`Login attempt for user: ${userName} in database: ${databaseName}`);
 
-    if (!userName || !password || !databaseName) { 
+    if (!userName || !password || !databaseName) {
         return res.status(400).json({ message: 'Username, password, and database name are required.' });
     }
 
@@ -104,10 +160,16 @@ const login = async (req, res) => {
             return res.status(401).json({ message: 'Invalid Password!' });
         }
 
-        // Generate JWT Token
-        const token = jwt.sign({ id: user.id, userName: user.userName }, process.env.JWT_SECRET, {
-            expiresIn: 86400, // 24 hours
-        });
+        // isDeveloper: ตรวจจาก user_type เท่านั้น
+        const isDeveloper = user.user_type === 'developer';
+        const isAdmin = user.user_type === 'administrator';
+
+        // Generate JWT Token with role flags
+        const token = jwt.sign(
+            { id: user.id, userName: user.user_name, userType: user.user_type, isDeveloper, isAdmin },
+            process.env.JWT_SECRET,
+            { expiresIn: 86400 } // 24 hours
+        );
 
         // ตรวจสอบ Password Policy สำหรับการแจ้งเตือนและการบังคับเปลี่ยน
         const policy = await PolicyController.getPolicy(req, res);
@@ -139,17 +201,10 @@ const login = async (req, res) => {
             passwordStatus.forceChangePassword = true; // Force change for initial login
         }
 
-        // const compRes = await req.dbPool.query('SELECT * FROM sa_company WHERE is_active = TRUE LIMIT 1');
-        // if (compRes.rows.length === 0) {
-        //     return res.status(404).json({ message: 'company not found.' });
-        // }
-        // company = compRes.rows[0];
-
         res.status(200).json({
             token: token,
             user: user,
             passwordStatus: passwordStatus, // ส่งสถานะรหัสผ่านไปที่ Frontend
-            // company: company,
         });
 
     } catch (error) {
@@ -212,6 +267,8 @@ const changePassword = async (req, res) => {
 
 module.exports = {
     verifyToken,
+    injectUserRole,
+    requireDeveloper,
     ensureFirstUserExists,
     login,
     changePassword
