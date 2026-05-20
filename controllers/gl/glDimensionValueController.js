@@ -99,14 +99,38 @@ const updateRow = async (req, res) => {
 
 const deleteRow = async (req, res) => {
     const { id } = req.params;
+    const dimId = parseInt(id);
     try {
-        // soft delete
-        const result = await req.dbPool.query(`
-            UPDATE gl_dimension_value SET is_active = FALSE, updated_at = NOW()
-            WHERE id = $1 RETURNING id
-        `, [id]);
-        if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
-        res.json({ message: 'Deactivated' });
+        // 1. ตรวจว่ามีข้อมูลย่อย (children) หรือไม่
+        const childCheck = await req.dbPool.query(
+            `SELECT COUNT(*) FROM gl_dimension_value WHERE parent_id = $1`,
+            [dimId]
+        );
+        if (parseInt(childCheck.rows[0].count) > 0) {
+            return res.status(409).json({ error: 'ไม่สามารถลบได้ เนื่องจากมีข้อมูลย่อยอยู่ภายใต้ กรุณาลบข้อมูลย่อยก่อน' });
+        }
+
+        // 2. ตรวจว่าถูกใช้งานใน gl_dim_combination (= มีในธุรกรรม GL)
+        try {
+            const usedCheck = await req.dbPool.query(
+                `SELECT COUNT(*) FROM gl_dim_combination
+                 WHERE dim1_id = $1 OR dim2_id = $1 OR dim3_id = $1 OR dim4_id = $1 OR dim5_id = $1`,
+                [dimId]
+            );
+            if (parseInt(usedCheck.rows[0].count) > 0) {
+                return res.status(409).json({ error: 'ไม่สามารถลบได้ เนื่องจากมีการใช้งานในธุรกรรม GL' });
+            }
+        } catch (_) {
+            // gl_dim_combination อาจยังไม่มี — ข้ามไปได้
+        }
+
+        // 3. Hard delete
+        const result = await req.dbPool.query(
+            `DELETE FROM gl_dimension_value WHERE id = $1 RETURNING id`,
+            [dimId]
+        );
+        if (result.rows.length === 0) return res.status(404).json({ error: 'ไม่พบข้อมูล' });
+        res.json({ message: 'Deleted' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }

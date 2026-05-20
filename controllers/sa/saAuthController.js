@@ -100,6 +100,56 @@ const requireDeveloper = async (req, res, next) => {
     }
 };
 
+// ─── Session helpers ───────────────────────────────────────────────────────
+
+async function _ensureSessionTable(pool) {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS sa_user_session (
+            id              SERIAL PRIMARY KEY,
+            user_id         INT NOT NULL REFERENCES sa_user(id) ON DELETE CASCADE,
+            session_token   TEXT NOT NULL,
+            started_at      TIMESTAMPTZ DEFAULT NOW(),
+            last_active_at  TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE(user_id)
+        )
+    `);
+}
+
+async function _upsertSession(pool, userId, token) {
+    await pool.query(`
+        INSERT INTO sa_user_session (user_id, session_token, started_at, last_active_at)
+        VALUES ($1, $2, NOW(), NOW())
+        ON CONFLICT (user_id) DO UPDATE
+            SET session_token = EXCLUDED.session_token,
+                started_at    = NOW(),
+                last_active_at = NOW()
+    `, [userId, token]);
+}
+
+async function _deleteSession(pool, userId) {
+    await pool.query('DELETE FROM sa_user_session WHERE user_id = $1', [userId]);
+}
+
+async function _getExistingSession(pool, userId) {
+    const r = await pool.query(
+        'SELECT started_at FROM sa_user_session WHERE user_id = $1', [userId]
+    );
+    return r.rows[0] || null;
+}
+
+async function _getSingleSessionMode(pool) {
+    try {
+        const r = await pool.query(
+            "SELECT COALESCE(single_session_mode, 'dialog') AS mode FROM sa_password_policy ORDER BY id LIMIT 1"
+        );
+        return r.rows[0]?.mode ?? 'dialog';
+    } catch (_) {
+        return 'dialog';
+    }
+}
+
+// ─── First user bootstrap ──────────────────────────────────────────────────
+
 // ตรวจสอบและสร้างผู้ใช้คนแรกถ้ายังไม่มี
 async function ensureFirstUserExists(req, res) {
     try {
@@ -164,12 +214,39 @@ const login = async (req, res) => {
         const isDeveloper = user.user_type === 'developer';
         const isAdmin = user.user_type === 'administrator';
 
+        // ── Single Session Check ────────────────────────────────────────────
+        await _ensureSessionTable(req.dbPool);
+        const sessionMode = await _getSingleSessionMode(req.dbPool);
+        const existingSession = await _getExistingSession(req.dbPool, user.id);
+
+        if (existingSession && sessionMode === 'dialog') {
+            // ส่ง confirmToken (short-lived 2 min) ให้ frontend แสดง dialog
+            const confirmToken = jwt.sign(
+                { type: 'session_confirm', userId: user.id, dbName: databaseName },
+                process.env.JWT_SECRET,
+                { expiresIn: '2m' }
+            );
+            return res.status(200).json({
+                requiresConfirmation: true,
+                confirmToken,
+                sessionStartedAt: existingSession.started_at,
+            });
+        }
+
+        // force mode หรือไม่มี session เก่า: ลบ session เก่า (ถ้ามี) แล้ว login
+        if (existingSession) {
+            await _deleteSession(req.dbPool, user.id);
+        }
+
         // Generate JWT Token with role flags
         const token = jwt.sign(
             { id: user.id, userName: user.user_name, userType: user.user_type, isDeveloper, isAdmin },
             process.env.JWT_SECRET,
             { expiresIn: 86400 } // 24 hours
         );
+
+        // บันทึก session ใหม่
+        await _upsertSession(req.dbPool, user.id, token);
 
         // ตรวจสอบ Password Policy สำหรับการแจ้งเตือนและการบังคับเปลี่ยน
         const policy = await PolicyController.getPolicy(req, res);
@@ -265,11 +342,124 @@ const changePassword = async (req, res) => {
     }
 };
 
+// POST /auth/login/confirm — ยืนยันการ login เมื่อมี session เดิม
+const confirmLogin = async (req, res) => {
+    const { confirmToken, forceLogout } = req.body;
+    if (!confirmToken) {
+        return res.status(400).json({ message: 'confirmToken is required' });
+    }
+
+    let decoded;
+    try {
+        decoded = jwt.verify(confirmToken, process.env.JWT_SECRET);
+    } catch (err) {
+        return res.status(401).json({ message: 'confirmToken หมดอายุหรือไม่ถูกต้อง' });
+    }
+
+    if (decoded.type !== 'session_confirm') {
+        return res.status(400).json({ message: 'token ไม่ถูกต้อง' });
+    }
+
+    if (!forceLogout) {
+        // ผู้ใช้เลือกยกเลิก — ไม่ทำอะไร
+        return res.status(200).json({ success: false });
+    }
+
+    try {
+        const userRes = await req.dbPool.query(
+            'SELECT * FROM sa_user WHERE id = $1 AND status = $2', [decoded.userId, 'active']
+        );
+        if (userRes.rows.length === 0) {
+            return res.status(404).json({ message: 'User not found.' });
+        }
+        const user = userRes.rows[0];
+
+        // ลบ session เก่า แล้วสร้างใหม่
+        await _ensureSessionTable(req.dbPool);
+        await _deleteSession(req.dbPool, user.id);
+
+        const isDeveloper = user.user_type === 'developer';
+        const isAdmin = user.user_type === 'administrator';
+        const token = jwt.sign(
+            { id: user.id, userName: user.user_name, userType: user.user_type, isDeveloper, isAdmin },
+            process.env.JWT_SECRET,
+            { expiresIn: 86400 }
+        );
+        await _upsertSession(req.dbPool, user.id, token);
+
+        const policy = await PolicyController.getPolicy(req, res);
+        return res.status(200).json({
+            success: true,
+            token,
+            user,
+            passwordStatus: { isPasswordExpired: false, daysUntilExpiration: null, forceChangePassword: false },
+        });
+    } catch (error) {
+        console.error('confirmLogin error:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    }
+};
+
+// POST /auth/check_token — ตรวจ JWT + session validity
+const checkToken = async (req, res) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ message: 'No token provided' });
+
+    let decoded;
+    try {
+        decoded = jwt.verify(token, process.env.JWT_SECRET);
+    } catch (_) {
+        return res.status(401).json({ message: 'Invalid token' });
+    }
+
+    // ตรวจ session ใน DB
+    try {
+        await _ensureSessionTable(req.dbPool);
+        const r = await req.dbPool.query(
+            'SELECT session_token FROM sa_user_session WHERE user_id = $1', [decoded.id]
+        );
+        if (r.rows.length === 0 || r.rows[0].session_token !== token) {
+            return res.status(401).json({ message: 'SESSION_REPLACED', code: 'SESSION_REPLACED' });
+        }
+        // อัปเดต last_active_at
+        await req.dbPool.query(
+            'UPDATE sa_user_session SET last_active_at = NOW() WHERE user_id = $1', [decoded.id]
+        );
+        return res.status(200).json({ message: 'Token is valid' });
+    } catch (err) {
+        console.error('checkToken session error:', err.message);
+        // ถ้า DB error ให้ผ่านไปก่อน (session table อาจยังไม่ migrate)
+        return res.status(200).json({ message: 'Token is valid' });
+    }
+};
+
+// POST /auth/logout — ลบ session เฉพาะ token นี้เท่านั้น
+// (ไม่ลบ session ใหม่กว่า เช่น กรณีที่เครื่องนี้ถูก kick แล้วยัง logout ทีหลัง)
+const logout = async (req, res) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(200).json({ message: 'Logged out' });
+
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        await _ensureSessionTable(req.dbPool);
+        // ลบเฉพาะเมื่อ token ตรงกับที่เก็บไว้ — ป้องกันการลบ session ใหม่กว่า
+        await req.dbPool.query(
+            'DELETE FROM sa_user_session WHERE user_id = $1 AND session_token = $2',
+            [decoded.id, token]
+        );
+    } catch (_) {}
+
+    return res.status(200).json({ message: 'Logged out' });
+};
+
 module.exports = {
     verifyToken,
     injectUserRole,
     requireDeveloper,
     ensureFirstUserExists,
     login,
+    confirmLogin,
+    checkToken,
+    logout,
     changePassword
 };

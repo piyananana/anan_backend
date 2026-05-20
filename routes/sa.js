@@ -58,7 +58,9 @@ const imageUpload = multer({
 //
 // Auth routes (public)
 router.post('/auth/login', saAuthController.login);
-router.post('/auth/check_token', saAuthController.verifyToken);
+router.post('/auth/login/confirm', saAuthController.confirmLogin);
+router.post('/auth/check_token', saAuthController.checkToken);
+router.post('/auth/logout', saAuthController.logout);
 router.get('/databases', saDatabaseController.getDatabases);
 
 // Auth routes (protected)

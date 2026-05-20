@@ -16,10 +16,12 @@ const ensureDefaultPolicyExists = async (databaseName) =>{
     const alterQuery = `
         ALTER TABLE sa_password_policy
         ADD COLUMN IF NOT EXISTS session_timeout_minutes INTEGER DEFAULT 5;
+        ALTER TABLE sa_password_policy
+        ADD COLUMN IF NOT EXISTS single_session_mode VARCHAR(10) DEFAULT 'dialog';
     `;
     const query = `
-        INSERT INTO sa_password_policy (min_length, require_uppercase, require_lowercase, require_digits, require_special_chars, password_history_count, password_expiry_days, password_notification_days, force_password_change_on_expiry, session_timeout_minutes)
-        VALUES (8, TRUE, TRUE, TRUE, TRUE, 5, 90, 7, TRUE, 5)
+        INSERT INTO sa_password_policy (min_length, require_uppercase, require_lowercase, require_digits, require_special_chars, password_history_count, password_expiry_days, password_notification_days, force_password_change_on_expiry, session_timeout_minutes, single_session_mode)
+        VALUES (8, TRUE, TRUE, TRUE, TRUE, 5, 90, 7, TRUE, 5, 'dialog')
         ON CONFLICT (id) DO NOTHING;
     `;
     try {
@@ -69,7 +71,8 @@ const updatePolicy = async (req, res) => {
             password_expiry_days,
             password_notification_days,
             force_password_change_on_expiry,
-            session_timeout_minutes
+            session_timeout_minutes,
+            single_session_mode,
         } = policyData;
 
         // Validate numeric fields
@@ -78,6 +81,7 @@ const updatePolicy = async (req, res) => {
         const expiryDays = Math.min(3650, Math.max(1, parseInt(password_expiry_days, 10) || 90));
         const notifyDays = Math.min(expiryDays - 1, Math.max(0, parseInt(password_notification_days, 10) || 7));
         const timeout = Math.min(600, Math.max(1, parseInt(session_timeout_minutes, 10) || 5));
+        const sessionMode = ['dialog', 'force'].includes(single_session_mode) ? single_session_mode : 'dialog';
 
         // หา id จริงของ policy row (ไม่ hardcode id=1)
         const existing = await req.dbPool.query('SELECT id FROM sa_password_policy ORDER BY id LIMIT 1');
@@ -96,10 +100,11 @@ const updatePolicy = async (req, res) => {
              password_notification_days = $8,
              force_password_change_on_expiry = $9,
              session_timeout_minutes = $10,
+             single_session_mode = $11,
              updated_at = CURRENT_TIMESTAMP
-             WHERE id = $11 RETURNING *`,
+             WHERE id = $12 RETURNING *`,
             [minLen, require_uppercase, require_lowercase, require_digits, require_special_chars,
-             histCount, expiryDays, notifyDays, force_password_change_on_expiry, timeout, policyId]
+             histCount, expiryDays, notifyDays, force_password_change_on_expiry, timeout, sessionMode, policyId]
         );
         if (result.rows.length === 0) return res.status(404).json({ message: 'อัปเดตไม่สำเร็จ' });
         return res.status(200).json({ message: 'Password policy updated successfully', policy: result.rows[0] });
