@@ -1542,7 +1542,7 @@ const fetchOpenInvoices = async (req, res) => {
     if (!customer_id) return res.status(400).json({ error: 'customer_id required' });
     try {
         const result = await req.dbPool.query(`
-            SELECT t.id, t.doc_no, t.doc_date, t.due_date,
+            SELECT t.id, t.doc_no, t.doc_date, t.billing_date, t.due_date,
                    t.total_amount_lc, t.paid_amount_lc, t.balance_amount_lc,
                    d.doc_name_thai, d.sys_doc_type
             FROM ar_transaction t

@@ -100,3 +100,12 @@ CREATE INDEX IF NOT EXISTS idx_ar_apply_applied_to    ON ar_transaction_apply(ap
 ALTER TABLE ar_customer ADD COLUMN IF NOT EXISTS ar_account_id INTEGER;
 
 COMMENT ON COLUMN ar_customer.ar_account_id IS 'FK -> gl_account.id: บัญชีลูกหนี้สำหรับลูกค้ารายนี้ (ค่า default มาจาก ar_customer_group.gl_account_id)';
+
+-- 5. เพิ่มวันที่วางบิล วันที่ชำระ(คาดว่า) และ snapshot branch ใน ar_transaction
+ALTER TABLE ar_transaction ADD COLUMN IF NOT EXISTS billing_date           DATE;
+ALTER TABLE ar_transaction ADD COLUMN IF NOT EXISTS expected_payment_date  DATE;
+ALTER TABLE ar_transaction ADD COLUMN IF NOT EXISTS branch_id              INTEGER;
+
+COMMENT ON COLUMN ar_transaction.billing_date          IS 'วันที่วางบิล คำนวณจากเงื่อนไขการวางบิลของลูกค้า';
+COMMENT ON COLUMN ar_transaction.expected_payment_date IS 'วันที่ชำระ (คาดว่า) คำนวณจากเงื่อนไขการรับชำระของลูกค้า';
+COMMENT ON COLUMN ar_transaction.branch_id             IS 'FK -> cd_branch.id (snapshot สาขา ณ เวลาบันทึก)';
