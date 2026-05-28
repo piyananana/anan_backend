@@ -8,8 +8,13 @@ const arTransactionController = require('../controllers/ar/arTransactionControll
 const arCollectorController = require('../controllers/ar/arCollectorController');
 const arCustomerImportController = require('../controllers/ar/arCustomerImportController');
 const arGlAccountSetupController = require('../controllers/ar/arGlAccountSetupController');
-const arAgingReportController = require('../controllers/ar/arAgingReportController');
-const arResetController = require('../controllers/ar/arResetController');
+const arAgingReportController        = require('../controllers/ar/arAgingReportController');
+const arTransactionReportController  = require('../controllers/ar/arTransactionReportController');
+const arMovementReportController     = require('../controllers/ar/arMovementReportController');
+const arBillingPlanReportController   = require('../controllers/ar/arBillingPlanReportController');
+const arBillingStatusReportController = require('../controllers/ar/arBillingStatusReportController');
+const arBulkBillingController         = require('../controllers/ar/arBulkBillingController');
+const arResetController          = require('../controllers/ar/arResetController');
 
 // Router สำหรับตั้งค่ารหัสลูกหนี้อัตโนมัติ
 router.get('/ar_customer_running/preview_code', arCustomerRunningController.previewCode);
@@ -61,7 +66,13 @@ router.put('/ar_transaction/:id/void', arTransactionController.voidTransaction);
 router.delete('/ar_transaction/:id', arTransactionController.deleteTransaction);
 
 // Router สำหรับรายงานลูกหนี้คงค้างตามอายุ
-router.get('/ar_aging_report', arAgingReportController.getAgingReport);
+router.get('/ar_aging_report',             arAgingReportController.getAgingReport);
+router.get('/ar_transaction_report',       arTransactionReportController.getTransactionReport);
+router.get('/ar_movement_report',      arMovementReportController.getMovementReport);
+router.get('/ar_billing_plan_report',   arBillingPlanReportController.getBillingPlanReport);
+router.get('/ar_billing_status_report', arBillingStatusReportController.getBillingStatusReport);
+router.get('/ar_bc_document_types',    arBulkBillingController.getBcDocTypes);
+router.post('/ar_bulk_billing',        arBulkBillingController.createBulkBilling);
 
 // Router สำหรับตั้งค่ารหัสบัญชี GL ต่อ doc_code ของ AR
 router.get('/ar_gl_account_setup', arGlAccountSetupController.fetchRows);

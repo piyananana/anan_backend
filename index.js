@@ -54,6 +54,11 @@ const arRoutes = require('./routes/ar');
 app.use('/api/ar', arRoutes);
 // ----------------
 
+// vt = VAT Transactions
+const vtRoutes = require('./routes/vt');
+app.use('/api/vt', vtRoutes);
+// ----------------
+
 // cm = Cash Management
 const cmRoutes = require('./routes/cm');
 app.use('/api/cm', cmRoutes);
