@@ -14,6 +14,7 @@ const arMovementReportController     = require('../controllers/ar/arMovementRepo
 const arBillingPlanReportController   = require('../controllers/ar/arBillingPlanReportController');
 const arBillingStatusReportController = require('../controllers/ar/arBillingStatusReportController');
 const arBulkBillingController         = require('../controllers/ar/arBulkBillingController');
+const arReceiptPaymentReportController = require('../controllers/ar/arReceiptPaymentReportController');
 const arResetController          = require('../controllers/ar/arResetController');
 
 // Router สำหรับตั้งค่ารหัสลูกหนี้อัตโนมัติ
@@ -70,7 +71,8 @@ router.get('/ar_aging_report',             arAgingReportController.getAgingRepor
 router.get('/ar_transaction_report',       arTransactionReportController.getTransactionReport);
 router.get('/ar_movement_report',      arMovementReportController.getMovementReport);
 router.get('/ar_billing_plan_report',   arBillingPlanReportController.getBillingPlanReport);
-router.get('/ar_billing_status_report', arBillingStatusReportController.getBillingStatusReport);
+router.get('/ar_billing_status_report',   arBillingStatusReportController.getBillingStatusReport);
+router.get('/ar_receipt_payment_report', arReceiptPaymentReportController.getReceiptPaymentReport);
 router.get('/ar_bc_document_types',    arBulkBillingController.getBcDocTypes);
 router.post('/ar_bulk_billing',        arBulkBillingController.createBulkBilling);
 
