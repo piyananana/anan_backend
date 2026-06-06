@@ -15,7 +15,13 @@ const arBillingPlanReportController   = require('../controllers/ar/arBillingPlan
 const arBillingStatusReportController = require('../controllers/ar/arBillingStatusReportController');
 const arBulkBillingController         = require('../controllers/ar/arBulkBillingController');
 const arReceiptPaymentReportController = require('../controllers/ar/arReceiptPaymentReportController');
+const arCreditLimitReportController    = require('../controllers/ar/arCreditLimitReportController');
+const arFxGainLossReportController     = require('../controllers/ar/arFxGainLossReportController');
 const arResetController          = require('../controllers/ar/arResetController');
+const arYearEndSetupController   = require('../controllers/ar/arYearEndSetupController');
+const arPreCloseCheckController  = require('../controllers/ar/arPreCloseCheckController');
+const arFxRevaluationController  = require('../controllers/ar/arFxRevaluationController');
+const arAllowanceRunController   = require('../controllers/ar/arAllowanceRunController');
 
 // Router สำหรับตั้งค่ารหัสลูกหนี้อัตโนมัติ
 router.get('/ar_customer_running/preview_code', arCustomerRunningController.previewCode);
@@ -73,6 +79,8 @@ router.get('/ar_movement_report',      arMovementReportController.getMovementRep
 router.get('/ar_billing_plan_report',   arBillingPlanReportController.getBillingPlanReport);
 router.get('/ar_billing_status_report',   arBillingStatusReportController.getBillingStatusReport);
 router.get('/ar_receipt_payment_report', arReceiptPaymentReportController.getReceiptPaymentReport);
+router.get('/ar_credit_limit_report',   arCreditLimitReportController.getCreditLimitReport);
+router.get('/ar_fx_gain_loss_report',   arFxGainLossReportController.getFxGainLossReport);
 router.get('/ar_bc_document_types',    arBulkBillingController.getBcDocTypes);
 router.post('/ar_bulk_billing',        arBulkBillingController.createBulkBilling);
 
@@ -80,6 +88,35 @@ router.post('/ar_bulk_billing',        arBulkBillingController.createBulkBilling
 router.get('/ar_gl_account_setup', arGlAccountSetupController.fetchRows);
 router.get('/ar_gl_account_setup/:doc_code', arGlAccountSetupController.fetchRow);
 router.post('/ar_gl_account_setup/:doc_code', arGlAccountSetupController.upsertRow);
+
+// ── AR Year-End Closing ────────────────────────────────────────────────────────
+// Setup & Allowance Rules
+router.get('/ar_year_end_setup',    arYearEndSetupController.fetchSetup);
+router.put('/ar_year_end_setup',    arYearEndSetupController.upsertSetup);
+router.get('/ar_allowance_rule',    arYearEndSetupController.fetchAllowanceRules);
+router.put('/ar_allowance_rule',    arYearEndSetupController.saveAllowanceRules);
+
+// Pre-Close Validation
+router.get('/year_end/pre_close_check', arPreCloseCheckController.preCloseCheck);
+
+// FX Revaluation
+router.get('/ar_fx_revaluation',                        arFxRevaluationController.fetchRows);
+router.get('/ar_fx_revaluation/outstanding_currencies', arFxRevaluationController.fetchOutstandingCurrencies);
+router.post('/ar_fx_revaluation/preview',               arFxRevaluationController.previewReval);
+router.get('/ar_fx_revaluation/:id',          arFxRevaluationController.fetchRow);
+router.post('/ar_fx_revaluation',             arFxRevaluationController.createReval);
+router.post('/ar_fx_revaluation/:id/post',    arFxRevaluationController.postReval);
+router.post('/ar_fx_revaluation/:id/void',    arFxRevaluationController.voidReval);
+router.delete('/ar_fx_revaluation/:id',       arFxRevaluationController.deleteReval);
+
+// Allowance for Doubtful Accounts
+router.get('/ar_allowance_run',              arAllowanceRunController.fetchRows);
+router.post('/ar_allowance_run/preview',     arAllowanceRunController.previewRun);
+router.get('/ar_allowance_run/:id',          arAllowanceRunController.fetchRow);
+router.post('/ar_allowance_run',             arAllowanceRunController.createRun);
+router.post('/ar_allowance_run/:id/post',    arAllowanceRunController.postRun);
+router.post('/ar_allowance_run/:id/void',    arAllowanceRunController.voidRun);
+router.delete('/ar_allowance_run/:id',       arAllowanceRunController.deleteRun);
 
 // Developer-only: reset AR transaction data
 router.get('/ar_reset_transactions/counts', arResetController.getCounts);

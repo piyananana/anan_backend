@@ -279,7 +279,8 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
                 s.revenue_account_id,
                 s.check_account_id, s.transfer_account_id, s.credit_card_account_id,
                 s.debit_card_account_id, s.qr_code_account_id, s.mobile_banking_account_id,
-                s.bill_of_exchange_account_id
+                s.bill_of_exchange_account_id,
+                s.fx_gain_account_id, s.fx_loss_account_id
          FROM ar_gl_account_setup s
          JOIN sa_module_document d ON d.doc_code = s.doc_code
          WHERE d.id = $1 LIMIT 1`,
@@ -301,6 +302,8 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
     const cashAccountId           = Number(setup.cash_account_id)           || null;
     const advanceAccountId        = Number(setup.advance_account_id)        || null;
     const defaultRevenueAccountId = Number(setup.revenue_account_id)        || null;
+    const fxGainAccountId         = Number(setup.fx_gain_account_id)        || null;
+    const fxLossAccountId         = Number(setup.fx_loss_account_id)        || null;
     const exchangeRate        = Number(header.exchange_rate) || 1;
 
     // Resolve created_by เป็น integer user_id (gl_entry_header.created_by เป็น INT FK)
@@ -527,6 +530,21 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
         const totalAdvanceDeductedFc = advanceDeductions.reduce((s, a) => s + (Number(a.applied_amount_fc) || 0), 0);
         const totalCnDeductedFc      = cnDeductions.reduce((s, a) => s + (Number(a.applied_amount_fc) || 0), 0);
 
+        // ดึง exchange_rate ของ invoice แต่ละใบ สำหรับคำนวณ LC ที่อัตรา invoice (เพื่อล้างยอด AR และคำนวณ FX)
+        const invoiceRateMap = {};
+        for (const a of [...invoiceApplies, ...cnDeductions]) {
+            if (a.applied_to_id && !invoiceRateMap[a.applied_to_id]) {
+                const rr = await client.query(
+                    'SELECT exchange_rate FROM ar_transaction WHERE id=$1', [a.applied_to_id]);
+                invoiceRateMap[a.applied_to_id] = Number(rr.rows[0]?.exchange_rate || 1);
+            }
+        }
+        // LC ที่อัตรา invoice (ใช้ล้างยอด AR account)
+        const totalInvoiceAtInvRate = invoiceApplies.reduce((s, a) =>
+            s + (Number(a.applied_amount_fc) || 0) * (invoiceRateMap[a.applied_to_id] || 1), 0);
+        const totalCnAtInvRate = cnDeductions.reduce((s, a) =>
+            s + (Number(a.applied_amount_fc) || 0) * (invoiceRateMap[a.applied_to_id] || 1), 0);
+
         // DR: Cash/Bank Account — แยกตามวิธีรับชำระ (ถ้ามี) ถ้าไม่มีใช้ cash_account_id เดียว
         // totalDebit = header.total_amount_lc = cash component only
         // (Flutter คำนวณ total = invoiceApplied - advanceDeducted - cnDeducted แล้วส่งมา)
@@ -558,17 +576,13 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
             });
         }
 
-        // CR: AR Account
-        // cash + advance = invoice applied (advance ใช้แทนเงินสด ดังนั้น CR AR = invoice ทั้งหมด)
-        // CN ลด AR ไปแล้วตอน Post CN → หัก CN ออกจาก CR AR ไม่ให้ double-credit
-        // ใช้ explicit ternary แทน || เพื่อหลีกเลี่ยง 0 ถูกมองเป็น falsy ใน JS
-        const arCreditLc = totalInvoiceApplied > 0
-            ? (totalInvoiceApplied - totalCnDeducted)
+        // CR: AR Account — ใช้ยอด LC ที่อัตรา invoice (เพื่อล้างยอด AR ให้ถูกต้อง)
+        const arCreditLc = totalInvoiceAtInvRate > 0
+            ? (totalInvoiceAtInvRate - totalCnAtInvRate)
             : totalDebit;
         const arCreditFc = totalInvoiceAppliedFc > 0
             ? (totalInvoiceAppliedFc - totalCnDeductedFc)
             : (Number(header.total_amount_fc) || 0);
-        // บันทึก CR AR เฉพาะเมื่อมียอดจริง (กรณี DN+CN หักกลบ=0 ไม่มีรายการบัญชี แต่ GL header ยังคงอยู่เพื่อเป็นหลักฐาน)
         if (arAccountId && arCreditLc > 0) {
             glDetails.push({
                 account_id: arAccountId,
@@ -578,6 +592,27 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
                 debit_fc: 0,
                 credit_fc: arCreditFc,
             });
+        }
+
+        // FX Gain/Loss — ผลต่างจากอัตราแลกเปลี่ยนที่เปลี่ยนไประหว่าง invoice และ receipt
+        // fxNet > 0 = กำไร (receipt_rate > invoice_rate), fxNet < 0 = ขาดทุน
+        const fxNet = totalInvoiceApplied - totalInvoiceAtInvRate; // (FC×rec_rate) − (FC×inv_rate)
+        if (Math.abs(fxNet) >= 0.005) {
+            if (fxNet > 0 && fxGainAccountId) {
+                glDetails.push({
+                    account_id: fxGainAccountId,
+                    description: `กำไรจากอัตราแลกเปลี่ยน ${docNo}`,
+                    debit_lc: 0, credit_lc: fxNet,
+                    debit_fc: 0, credit_fc: 0,
+                });
+            } else if (fxNet < 0 && fxLossAccountId) {
+                glDetails.push({
+                    account_id: fxLossAccountId,
+                    description: `ขาดทุนจากอัตราแลกเปลี่ยน ${docNo}`,
+                    debit_lc: Math.abs(fxNet), credit_lc: 0,
+                    debit_fc: 0, credit_fc: 0,
+                });
+            }
         }
 
         // DR: เงินมัดจำรับ (ตัดมัดจำ)
@@ -597,16 +632,16 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
         let totalDeferredVatFc = 0;
         for (const a of invoiceApplies) {
             const invoiceId = a.applied_to_id;
-            const appliedAmount = Number(a.applied_amount_lc) || 0;
-            if (!invoiceId || appliedAmount === 0) continue;
+            const appliedFc = Number(a.applied_amount_fc) || 0;
+            if (!invoiceId || appliedFc === 0) continue;
 
             const invRes = await client.query(
-                `SELECT total_amount_lc FROM ar_transaction WHERE id = $1`, [invoiceId]
+                `SELECT total_amount_fc FROM ar_transaction WHERE id = $1`, [invoiceId]
             );
             if (invRes.rows.length === 0) continue;
-            const invoiceTotal = Number(invRes.rows[0].total_amount_lc) || 0;
-            if (invoiceTotal === 0) continue;
-            const ratio = appliedAmount / invoiceTotal;
+            const invoiceTotalFc = Number(invRes.rows[0].total_amount_fc) || 0;
+            if (invoiceTotalFc === 0) continue;
+            const ratio = appliedFc / invoiceTotalFc;
 
             const dRes = await client.query(
                 `SELECT vat_amount_lc, vat_amount_fc FROM ar_transaction_detail
@@ -883,25 +918,32 @@ const createTransaction = async (req, res) => {
             `, [newHeaderId, a.applied_to_id, a.applied_amount_lc || 0, a.applied_amount_fc || 0,
                 header.doc_date, applyType, header.created_by || null]);
 
-            if (applyType === 'dn_ref') {
-                // DN-35: เพิ่มยอดค้างชำระในใบแจ้งหนี้อ้างอิง (สมมาตรกับ CN-55 ที่ลดยอด)
-                await client.query(`
-                    UPDATE ar_transaction SET
-                        balance_amount_lc = balance_amount_lc + $1,
-                        updated_at = NOW()
-                    WHERE id = $2
-                `, [a.applied_amount_lc || 0, a.applied_to_id]);
-            } else if (['bc_invoice', 'bc_advance', 'bc_cn'].includes(applyType)) {
-                // BC (วางบิล): เก็บความสัมพันธ์ไว้อ้างอิงเท่านั้น ไม่กระทบ balance ของเอกสารที่อ้างถึง
-            } else {
-                await client.query(`
-                    UPDATE ar_transaction SET
-                        paid_amount_lc = paid_amount_lc + $1,
-                        balance_amount_lc = balance_amount_lc - $1,
-                        updated_at = NOW()
-                    WHERE id = $2
-                `, [a.applied_amount_lc || 0, a.applied_to_id]);
-            }
+        }
+        // Recalculate invoice balances (ใช้ applied_amount_fc × invoice.exchange_rate เพื่อความถูกต้องสำหรับ FC)
+        const createdAffectedIds = [...new Set(
+            (applies || []).filter(a => !['bc_invoice','bc_advance','bc_cn'].includes(a.apply_type || 'invoice'))
+                           .map(a => a.applied_to_id).filter(Boolean)
+        )];
+        for (const invoiceId of createdAffectedIds) {
+            await client.query(`
+                UPDATE ar_transaction t SET
+                    paid_amount_lc = (
+                        SELECT COALESCE(SUM(ata.applied_amount_fc * t.exchange_rate), 0)
+                        FROM ar_transaction_apply ata
+                        WHERE ata.applied_to_id = t.id
+                          AND ata.apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')
+                    ),
+                    balance_amount_lc = t.total_amount_lc
+                        + COALESCE((SELECT SUM(ata.applied_amount_fc * t.exchange_rate)
+                                    FROM ar_transaction_apply ata
+                                    WHERE ata.applied_to_id = t.id AND ata.apply_type = 'dn_ref'), 0)
+                        - COALESCE((SELECT SUM(ata.applied_amount_fc * t.exchange_rate)
+                                    FROM ar_transaction_apply ata
+                                    WHERE ata.applied_to_id = t.id
+                                      AND ata.apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')), 0),
+                    updated_at = NOW()
+                WHERE id = $1
+            `, [invoiceId]);
         }
 
         // Insert payment rows (ar_transaction_payment)
@@ -1120,13 +1162,19 @@ const updateTransaction = async (req, res) => {
                 await client.query(`
                     UPDATE ar_transaction t SET
                         paid_amount_lc = (
-                            SELECT COALESCE(SUM(applied_amount_lc),0)
-                            FROM ar_transaction_apply WHERE applied_to_id = t.id
-                              AND apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')
+                            SELECT COALESCE(SUM(ata.applied_amount_fc * t.exchange_rate), 0)
+                            FROM ar_transaction_apply ata
+                            WHERE ata.applied_to_id = t.id
+                              AND ata.apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')
                         ),
-                        balance_amount_lc = total_amount_lc
-                            + COALESCE((SELECT SUM(applied_amount_lc) FROM ar_transaction_apply WHERE applied_to_id = t.id AND apply_type = 'dn_ref'), 0)
-                            - COALESCE((SELECT SUM(applied_amount_lc) FROM ar_transaction_apply WHERE applied_to_id = t.id AND apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')), 0),
+                        balance_amount_lc = t.total_amount_lc
+                            + COALESCE((SELECT SUM(ata.applied_amount_fc * t.exchange_rate)
+                                        FROM ar_transaction_apply ata
+                                        WHERE ata.applied_to_id = t.id AND ata.apply_type = 'dn_ref'), 0)
+                            - COALESCE((SELECT SUM(ata.applied_amount_fc * t.exchange_rate)
+                                        FROM ar_transaction_apply ata
+                                        WHERE ata.applied_to_id = t.id
+                                          AND ata.apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')), 0),
                         updated_at = NOW()
                     WHERE id = $1
                 `, [invoiceId]);
@@ -1216,20 +1264,22 @@ const voidTransaction = async (req, res) => {
         // 2. สร้าง Reversing GL Entry จาก GL entry ต้นทาง (ข้ามสำหรับ BC)
         let reversingGlId = null;
         if (origGlId && !isBcVoid) {
+            // ตรวจสอบว่างวดของวันยกเลิก (today) เปิดอยู่
+            const voidPeriodRes = await client.query(
+                `SELECT id FROM gl_posting_period
+                 WHERE $1::date BETWEEN period_start_date AND period_end_date
+                 AND gl_status = 'OPEN' LIMIT 1`, [today]
+            );
+            if (voidPeriodRes.rows.length === 0)
+                throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่ยกเลิก ${today}`);
+
             // ดึง GL header ต้นทาง
             const origHdrRes = await client.query(
                 `SELECT * FROM gl_entry_header WHERE id=$1`, [origGlId]
             );
             const origHdr = origHdrRes.rows[0];
 
-            // หา period สำหรับวันนี้ (ถ้าไม่มีให้ใช้ period ของ doc_date ต้นทาง)
-            let reversePeriodId = origHdr.period_id;
-            const periodRes = await client.query(
-                `SELECT id FROM gl_posting_period
-                 WHERE $1::date BETWEEN period_start_date AND period_end_date
-                 AND gl_status='OPEN' LIMIT 1`, [today]
-            );
-            if (periodRes.rows.length > 0) reversePeriodId = periodRes.rows[0].id;
+            const reversePeriodId = voidPeriodRes.rows[0].id;
 
             // Generate doc_no ใหม่สำหรับ Reversing entry
             let reverseDocNo = null;
@@ -1315,17 +1365,20 @@ const voidTransaction = async (req, res) => {
             await client.query(`
                 UPDATE ar_transaction t SET
                     paid_amount_lc = (
-                        SELECT COALESCE(SUM(applied_amount_lc),0)
-                        FROM ar_transaction_apply
-                        WHERE applied_to_id = t.id AND transaction_id != $1
-                          AND apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')
+                        SELECT COALESCE(SUM(ata.applied_amount_fc * t.exchange_rate), 0)
+                        FROM ar_transaction_apply ata
+                        WHERE ata.applied_to_id = t.id AND ata.transaction_id != $1
+                          AND ata.apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')
                     ),
-                    balance_amount_lc = total_amount_lc
-                        + COALESCE((SELECT SUM(applied_amount_lc) FROM ar_transaction_apply
-                                    WHERE applied_to_id = t.id AND transaction_id != $1 AND apply_type = 'dn_ref'), 0)
-                        - COALESCE((SELECT SUM(applied_amount_lc) FROM ar_transaction_apply
-                                    WHERE applied_to_id = t.id AND transaction_id != $1
-                                      AND apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')), 0),
+                    balance_amount_lc = t.total_amount_lc
+                        + COALESCE((SELECT SUM(ata.applied_amount_fc * t.exchange_rate)
+                                    FROM ar_transaction_apply ata
+                                    WHERE ata.applied_to_id = t.id AND ata.transaction_id != $1
+                                      AND ata.apply_type = 'dn_ref'), 0)
+                        - COALESCE((SELECT SUM(ata.applied_amount_fc * t.exchange_rate)
+                                    FROM ar_transaction_apply ata
+                                    WHERE ata.applied_to_id = t.id AND ata.transaction_id != $1
+                                      AND ata.apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')), 0),
                     updated_at = NOW()
                 WHERE id = $2
             `, [id, invoiceId]);
@@ -1381,16 +1434,19 @@ const deleteTransaction = async (req, res) => {
             await client.query(`
                 UPDATE ar_transaction t SET
                     paid_amount_lc = COALESCE((
-                        SELECT SUM(applied_amount_lc) FROM ar_transaction_apply
-                        WHERE applied_to_id = t.id
-                          AND apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')
+                        SELECT SUM(ata.applied_amount_fc * t.exchange_rate)
+                        FROM ar_transaction_apply ata
+                        WHERE ata.applied_to_id = t.id
+                          AND ata.apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')
                     ), 0),
-                    balance_amount_lc = total_amount_lc
-                        + COALESCE((SELECT SUM(applied_amount_lc) FROM ar_transaction_apply
-                                    WHERE applied_to_id = t.id AND apply_type = 'dn_ref'), 0)
-                        - COALESCE((SELECT SUM(applied_amount_lc) FROM ar_transaction_apply
-                                    WHERE applied_to_id = t.id
-                                      AND apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')), 0),
+                    balance_amount_lc = t.total_amount_lc
+                        + COALESCE((SELECT SUM(ata.applied_amount_fc * t.exchange_rate)
+                                    FROM ar_transaction_apply ata
+                                    WHERE ata.applied_to_id = t.id AND ata.apply_type = 'dn_ref'), 0)
+                        - COALESCE((SELECT SUM(ata.applied_amount_fc * t.exchange_rate)
+                                    FROM ar_transaction_apply ata
+                                    WHERE ata.applied_to_id = t.id
+                                      AND ata.apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')), 0),
                     updated_at = NOW()
                 WHERE id = $1
             `, [invoiceId]);
@@ -1503,7 +1559,11 @@ const fetchRow = async (req, res) => {
             req.dbPool.query(`SELECT * FROM ar_transaction_detail WHERE header_id=$1 ORDER BY line_no`, [id]),
             req.dbPool.query(`
                 SELECT a.*, inv.doc_no AS applied_to_doc_no, inv.doc_date AS applied_to_doc_date,
-                       inv.total_amount_lc AS applied_to_total
+                       inv.total_amount_lc AS applied_to_total,
+                       inv.total_amount_fc AS applied_to_total_fc,
+                       inv.exchange_rate   AS applied_to_exchange_rate,
+                       inv.due_date        AS applied_to_due_date,
+                       inv.expected_payment_date AS applied_to_expected_payment_date
                 FROM ar_transaction_apply a
                 JOIN ar_transaction inv ON a.applied_to_id = inv.id
                 WHERE a.transaction_id=$1 ORDER BY a.id
@@ -1543,7 +1603,10 @@ const fetchOpenInvoices = async (req, res) => {
     try {
         const result = await req.dbPool.query(`
             SELECT t.id, t.doc_no, t.doc_date, t.billing_date, t.due_date,
-                   t.total_amount_lc, t.paid_amount_lc, t.balance_amount_lc,
+                   t.expected_payment_date,
+                   t.currency_code, t.exchange_rate,
+                   t.total_amount_fc, t.total_amount_lc,
+                   t.paid_amount_lc, t.balance_amount_lc,
                    d.doc_name_thai, d.sys_doc_type
             FROM ar_transaction t
             JOIN sa_module_document d ON t.doc_id = d.id
@@ -1660,7 +1723,8 @@ const fetchInvoiceBillingSummary = async (req, res) => {
 // ใช้ใน Receipt เพื่อ auto-fill apply rows จากใบวางบิล
 // คืน 409 พร้อม receipt_doc_no ถ้า BC ถูกชำระแล้ว
 const fetchBillCollectionByDocNo = async (req, res) => {
-    const { doc_no } = req.query;
+    const { doc_no, view } = req.query;
+    const isView = view === 'true'; // view=true: ข้ามการตรวจสอบสถานะชำระ (ใช้สำหรับเรียกดูเอกสาร)
     if (!doc_no) return res.status(400).json({ error: 'doc_no required' });
     try {
         const hRes = await req.dbPool.query(`
@@ -1672,28 +1736,34 @@ const fetchBillCollectionByDocNo = async (req, res) => {
         `, [doc_no]);
         if (hRes.rows.length === 0) return res.status(404).json(null);
 
-        // ตรวจสอบว่า BC ถูกนำไปชำระแล้วหรือยัง (มี Posted Receipt ที่ ref_no ตรงกัน)
-        const rcRes = await req.dbPool.query(`
-            SELECT t.doc_no AS receipt_doc_no
-            FROM ar_transaction t
-            JOIN sa_module_document d ON d.id = t.doc_id
-            WHERE t.ref_no = $1
-              AND d.sys_doc_type = '80'
-              AND t.status = 'Posted'
-            ORDER BY t.doc_date DESC, t.id DESC
-            LIMIT 1
-        `, [doc_no]);
-        if (rcRes.rows.length > 0) {
-            return res.status(409).json({
-                error: 'BC_ALREADY_PAID',
-                receipt_doc_no: rcRes.rows[0].receipt_doc_no,
-            });
+        // ตรวจสอบว่า BC ถูกนำไปชำระแล้วหรือยัง (ข้ามเมื่อ view=true)
+        if (!isView) {
+            const rcRes = await req.dbPool.query(`
+                SELECT t.doc_no AS receipt_doc_no
+                FROM ar_transaction t
+                JOIN sa_module_document d ON d.id = t.doc_id
+                WHERE t.ref_no = $1
+                  AND d.sys_doc_type = '80'
+                  AND t.status = 'Posted'
+                ORDER BY t.doc_date DESC, t.id DESC
+                LIMIT 1
+            `, [doc_no]);
+            if (rcRes.rows.length > 0) {
+                return res.status(409).json({
+                    error: 'BC_ALREADY_PAID',
+                    receipt_doc_no: rcRes.rows[0].receipt_doc_no,
+                });
+            }
         }
 
         const bcId = hRes.rows[0].id;
         const appliesRes = await req.dbPool.query(`
             SELECT a.*, inv.doc_no AS applied_to_doc_no, inv.doc_date AS applied_to_doc_date,
-                   inv.total_amount_lc AS applied_to_total
+                   inv.total_amount_lc AS applied_to_total,
+                   inv.total_amount_fc AS applied_to_total_fc,
+                   inv.exchange_rate   AS applied_to_exchange_rate,
+                   inv.due_date        AS applied_to_due_date,
+                   inv.expected_payment_date AS applied_to_expected_payment_date
             FROM ar_transaction_apply a
             JOIN ar_transaction inv ON a.applied_to_id = inv.id
             WHERE a.transaction_id = $1 ORDER BY a.id

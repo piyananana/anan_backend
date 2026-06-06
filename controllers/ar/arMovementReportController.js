@@ -72,7 +72,19 @@ const getMovementReport = async (req, res) => {
                     d.doc_name_thai,
                     d.sys_doc_type,
                     CASE WHEN d.sys_doc_type = ANY($3::text[]) THEN t.total_amount_lc ELSE 0 END AS debit_amount,
-                    CASE WHEN d.sys_doc_type = ANY($4::text[]) THEN t.total_amount_lc ELSE 0 END AS credit_amount,
+                    -- ใช้ยอดล้าง AR ที่อัตรา invoice (ไม่ใช่อัตราวันรับชำระ) เพื่อให้ running balance ตรงกับ balance_amount_lc
+                    CASE WHEN d.sys_doc_type = ANY($4::text[]) THEN
+                        COALESCE(
+                            NULLIF((
+                                SELECT SUM(ata.applied_amount_fc * ref_t.exchange_rate)
+                                FROM ar_transaction_apply ata
+                                JOIN ar_transaction ref_t ON ref_t.id = ata.applied_to_id
+                                WHERE ata.transaction_id = t.id
+                                  AND ata.apply_type IN ('invoice', 'cn')
+                            ), 0),
+                            t.total_amount_lc
+                        )
+                    ELSE 0 END AS credit_amount,
                     CASE
                         WHEN t.doc_date < $1::date THEN 'before'
                         ELSE 'in'
