@@ -10,13 +10,12 @@ const calcRevalDetails = async (client, revalDate, yearEndRates) => {
                t.currency_code, t.balance_amount_lc, t.exchange_rate AS original_rate,
                t.doc_no, t.ref_doc_no,
                c.customer_code, c.customer_name_th,
-               -- balance_fc = balance_amount_lc / original_rate (เพราะเก็บแค่ LC)
-               CASE WHEN t.exchange_rate > 0
-                    THEN t.balance_amount_lc / t.exchange_rate
+               -- ใช้ revaluation_rate ถ้ามี (realized method ปีก่อน) มิฉะนั้นใช้ original rate
+               COALESCE(t.revaluation_rate, t.exchange_rate) AS current_rate,
+               CASE WHEN COALESCE(t.revaluation_rate, t.exchange_rate) > 0
+                    THEN t.balance_amount_lc / COALESCE(t.revaluation_rate, t.exchange_rate)
                     ELSE 0
-               END AS balance_amount_fc,
-               -- ตรวจ revaluation_rate ที่บันทึกล่าสุด (realized method)
-               COALESCE(t.revaluation_rate, t.exchange_rate) AS current_rate
+               END AS balance_amount_fc
         FROM ar_transaction t
         JOIN sa_module_document d ON d.id = t.doc_id
         JOIN ar_customer c ON c.id = t.customer_id
@@ -334,11 +333,14 @@ const postReval = async (req, res) => {
         let reversalGlEntryId = null;
 
         if (reval.method === 'realized') {
-            // อัปเดต revaluation_rate ของแต่ละ invoice
+            // อัปเดต revaluation_rate และ balance_amount_lc ของแต่ละ invoice
+            // เพื่อให้ปีถัดไปคำนวณ gain/loss จากยอดที่ revalue แล้ว ไม่ใช่ยอดเดิม
             for (const d of details) {
                 await client.query(
-                    `UPDATE ar_transaction SET revaluation_rate=$1, updated_at=NOW()
-                     WHERE id=$2`, [d.year_end_rate, d.invoice_id]
+                    `UPDATE ar_transaction
+                     SET revaluation_rate=$1, balance_amount_lc=$2, updated_at=NOW()
+                     WHERE id=$3`,
+                    [d.year_end_rate, d.revalued_amount_lc, d.invoice_id]
                 );
             }
         } else {
@@ -433,14 +435,16 @@ const voidReval = async (req, res) => {
         const todayPeriodId = todayPeriod.rows[0].id;
 
         if (reval.method === 'realized') {
-            // คืนค่า revaluation_rate = NULL ของทุก invoice ใน detail
+            // คืน revaluation_rate และ balance_amount_lc กลับเป็นค่าก่อน revalue
             const details = (await client.query(
-                `SELECT invoice_id FROM ar_fx_revaluation_detail WHERE revaluation_id=$1`, [id]
+                `SELECT invoice_id, balance_amount_lc FROM ar_fx_revaluation_detail WHERE revaluation_id=$1`, [id]
             )).rows;
             for (const d of details) {
                 await client.query(
-                    `UPDATE ar_transaction SET revaluation_rate=NULL, updated_at=NOW() WHERE id=$1`,
-                    [d.invoice_id]
+                    `UPDATE ar_transaction
+                     SET revaluation_rate=NULL, balance_amount_lc=$1, updated_at=NOW()
+                     WHERE id=$2`,
+                    [d.balance_amount_lc, d.invoice_id]
                 );
             }
         }
