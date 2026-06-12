@@ -59,6 +59,11 @@ const vtRoutes = require('./routes/vt');
 app.use('/api/vt', vtRoutes);
 // ----------------
 
+// ap = Accounts Payable
+const apRoutes = require('./routes/ap');
+app.use('/api/ap', apRoutes);
+// ----------------
+
 // cm = Cash Management
 const cmRoutes = require('./routes/cm');
 app.use('/api/cm', cmRoutes);

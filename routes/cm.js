@@ -1,9 +1,10 @@
 // routes/cm.js — Cash Management
 const express = require('express');
 const router = express.Router();
-const cmBankController          = require('../controllers/cm/cmBankController');
-const cmBankAccountController   = require('../controllers/cm/cmBankAccountController');
-const cmPaymentMethodController = require('../controllers/cm/cmPaymentMethodController');
+const cmBankController            = require('../controllers/cm/cmBankController');
+const cmBankAccountController     = require('../controllers/cm/cmBankAccountController');
+const cmPaymentMethodController   = require('../controllers/cm/cmPaymentMethodController');
+const cmBankFileFormatController  = require('../controllers/cm/cmBankFileFormatController');
 
 // cm_bank
 router.get('/cm_bank',          cmBankController.fetchRows);
@@ -25,5 +26,12 @@ router.get('/cm_payment_method/:id',    cmPaymentMethodController.fetchRow);
 router.post('/cm_payment_method',       cmPaymentMethodController.createRow);
 router.put('/cm_payment_method/:id',    cmPaymentMethodController.updateRow);
 router.delete('/cm_payment_method/:id', cmPaymentMethodController.deleteRow);
+
+// cm_bank_file_format
+router.get('/cm_bank_file_format',        cmBankFileFormatController.fetchRows);
+router.get('/cm_bank_file_format/:id',    cmBankFileFormatController.fetchRow);
+router.post('/cm_bank_file_format',       cmBankFileFormatController.addRow);
+router.put('/cm_bank_file_format/:id',    cmBankFileFormatController.updateRow);
+router.delete('/cm_bank_file_format/:id', cmBankFileFormatController.deleteRow);
 
 module.exports = router;

@@ -16,6 +16,8 @@ const saUserBranchController = require('../controllers/sa/saUserBranchController
 const saUserController = require('../controllers/sa/saUserController');
 const saUserDocumentController = require('../controllers/sa/saUserDocumentController');
 const saUserMenuController = require('../controllers/sa/saUserMenuController');
+const saModuleApproverController = require('../controllers/sa/saModuleApproverController');
+const saSmtpConfigController     = require('../controllers/sa/saSmtpConfigController');
 // const saOrganizationController = require('../controllers/sa/saOrganizationController');
 
 const xlsx = require('xlsx'); // Import xlsx
@@ -159,6 +161,18 @@ router.delete('/sa_user_document/:userId', saUserDocumentController.deleteRowsBy
 // For saUserMenuController
 router.put('/sa_user_menu/:userId', saUserMenuController.updateUserMenu);
 router.delete('/sa_user_menu/:userId', saUserMenuController.deleteUserMenu);
+
+// For saModuleApproverController
+router.get('/sa_module_approver/by_module/:module_code/:doc_category', saModuleApproverController.fetchByModuleCategory);
+router.get('/sa_module_approver',      saModuleApproverController.fetchRows);
+router.get('/sa_module_approver/:id',  saModuleApproverController.fetchRow);
+router.post('/sa_module_approver',     saModuleApproverController.addRow);
+router.put('/sa_module_approver/:id',  saModuleApproverController.updateRow);
+router.delete('/sa_module_approver/:id', saModuleApproverController.deleteRow);
+
+// For saSmtpConfigController
+router.get('/sa_smtp_config',  saSmtpConfigController.getConfig);
+router.put('/sa_smtp_config',  saSmtpConfigController.upsertConfig);
 
 // router.get('/sa_organization', saOrganizationController.getAllOrganization); // Get all organizational units
 // router.get('/sa_organization/:id', saOrganizationController.getOrganizationById); // Get organizational unit by ID
