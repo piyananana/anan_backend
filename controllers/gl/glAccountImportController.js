@@ -18,7 +18,6 @@ const TEMPLATE_COLUMNS = [
   { key: 'is_normal_account',    label: 'หัวบัญชี (Y/N, ว่าง=Y; N=บัญชีรวม/หัวข้อ ลงรายการไม่ได้)',     required: false, example: 'Y' },
   { key: 'is_control_account',   label: 'บัญชีคุมยอด (Y/N, ว่าง=N)',                                   required: false, example: 'N' },
   { key: 'module_link_code',     label: 'โมดูลที่เชื่อมโยง (รหัส เช่น 11=AR, 21=AP, ว่าง=ไม่เชื่อมโยง)', required: false, example: '' },
-  { key: 'is_reconcilable',      label: 'บัญชีกระทบยอด (Y/N, ว่าง=N)',                                 required: false, example: 'N' },
   { key: 'currency_code',        label: 'สกุลเงิน (ว่าง=THB)',                                         required: false, example: 'THB' },
   { key: 'branch_required',      label: 'บังคับระบุสาขา (Y/N, ว่าง=N)',                                required: false, example: 'N' },
   { key: 'is_active',            label: 'ใช้งาน (Y/N, ว่าง=Y)',                                        required: false, example: 'Y' },
@@ -273,7 +272,6 @@ const validateFile = [
           is_normal_account: parseBoolDefault(get('is_normal_account'), true),
           is_control_account: parseBoolDefault(get('is_control_account'), false),
           module_link_code: moduleLinkSet.has(moduleLinkCodeRaw) ? moduleLinkCodeRaw : '',
-          is_reconcilable: parseBoolDefault(get('is_reconcilable'), false),
           currency_code: currencyCode,
           branch_required: parseBoolDefault(get('branch_required'), false),
           is_active: parseBoolDefault(get('is_active'), true),
@@ -372,16 +370,16 @@ const confirmImport = async (req, res) => {
           const result = await client.query(
             `INSERT INTO gl_account
                (account_code, account_name_thai, account_name_eng, parent_id, account_type, account_subtype,
-                normal_balance, is_normal_account, is_control_account, is_reconcilable, currency_code, module_link_code,
+                normal_balance, is_normal_account, is_control_account, currency_code, module_link_code,
                 branch_required, is_active, created_by, updated_by)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14)
              ON CONFLICT (account_code) DO NOTHING
              RETURNING id`,
             [
               trunc(r.account_code, 50), trunc(r.account_name_thai, 255), trunc(r.account_name_eng, 255),
               parentId, r.account_type, trunc(r.account_subtype, 50),
               r.normal_balance, r.is_normal_account ?? true, r.is_control_account ?? false,
-              r.is_reconcilable ?? false, trunc(r.currency_code, 3) || 'THB', r.module_link_code || '',
+              trunc(r.currency_code, 3) || 'THB', r.module_link_code || '',
               r.branch_required ?? false,
               r.is_active ?? true, userName,
             ]
