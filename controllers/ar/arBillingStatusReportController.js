@@ -38,8 +38,14 @@ const getBillingStatusReport = async (req, res) => {
             filters.push(`bc.branch_id = $${params.length}`);
         }
         if (customer_group_id) {
-            params.push(parseInt(customer_group_id));
-            filters.push(`c.customer_group_id = $${params.length}`);
+            const groupIds = String(customer_group_id)
+                .split(',')
+                .map(s => parseInt(s.trim()))
+                .filter(n => !isNaN(n));
+            if (groupIds.length > 0) {
+                params.push(groupIds);
+                filters.push(`c.customer_group_id = ANY($${params.length})`);
+            }
         }
         if (customer_code_from) {
             params.push(customer_code_from);

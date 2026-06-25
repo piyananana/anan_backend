@@ -24,9 +24,10 @@ router.put('/ap_vendor_group/:id',    apVendorGroupController.updateRow);
 router.delete('/ap_vendor_group/:id', apVendorGroupController.deleteRow);
 
 // ── Vendor Import ──────────────────────────────────────────────────────────
+router.get('/ap_vendor/import/template',          apVendorImportController.getTemplate);
 router.get('/ap_vendor/import/template/download', apVendorImportController.downloadTemplate);
-router.post('/ap_vendor/import/validate',          apVendorImportController.validateFile);
-router.post('/ap_vendor/import/confirm',           apVendorImportController.confirmImport);
+router.post('/ap_vendor/import/validate',         apVendorImportController.validateFile);
+router.post('/ap_vendor/import/confirm',          apVendorImportController.confirmImport);
 
 // ── Vendor master ──────────────────────────────────────────────────────────
 router.get('/ap_vendor/active', apVendorController.fetchActiveRows);

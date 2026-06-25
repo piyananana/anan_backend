@@ -184,19 +184,14 @@ const updateRow = async (req, res) => {
     // const userName = req.headers.username;
 
     const client = await req.dbPool.connect();
-    
-    try {
-        await client.query('BEGIN'); 
 
-        // const selectSql = `
-        //     SELECT * FROM sa_module_document 
-        //     WHERE id = $1 
-        //     FOR UPDATE`;
-        
+    try {
+        await client.query('BEGIN');
+
         const docTypeResult = await client.query(
-            `SELECT * FROM sa_module_document 
-            WHERE id = $1 
-            FOR UPDATE`, 
+            `SELECT * FROM sa_module_document
+            WHERE id = $1
+            FOR UPDATE`,
             [id]
         );
 
@@ -230,7 +225,7 @@ const updateRow = async (req, res) => {
                 is_active, sys_module, sys_doc_type, userId, id]
         );
 
-        await client.query('COMMIT'); // Commit Transaction
+        await client.query('COMMIT');
 
         if (result.rows.length === 0) {
             return res.status(404).json({ message: 'Not found.' });
@@ -238,8 +233,11 @@ const updateRow = async (req, res) => {
 
         res.json(result.rows[0]);
     } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
         console.error('Error updating:', err);
         res.status(500).json({ error: 'Internal server error' });
+    } finally {
+        client.release();
     }
 };
 

@@ -422,6 +422,51 @@ const fetchOpenGlPeriods = async (req, res) => {
     }
 };
 
+// ตรวจสอบ credentials + สิทธิ์อนุมัติการปิดงวดบัญชี
+const verifyCloseApprover = async (req, res) => {
+    const bcrypt = require('bcrypt');
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อผู้ใช้และรหัสผ่าน' });
+    }
+    try {
+        const userResult = await req.dbPool.query(
+            `SELECT id, password_hash, full_name, status FROM sa_user WHERE user_name = $1`,
+            [username.trim()]
+        );
+        if (userResult.rows.length === 0) {
+            return res.status(401).json({ success: false, message: 'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง' });
+        }
+        const user = userResult.rows[0];
+
+        if (user.status !== 'active') {
+            return res.status(403).json({ success: false, message: 'ผู้ใช้ถูกระงับการใช้งาน' });
+        }
+
+        const passwordMatch = await bcrypt.compare(password, user.password_hash);
+        if (!passwordMatch) {
+            return res.status(401).json({ success: false, message: 'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง' });
+        }
+
+        const permResult = await req.dbPool.query(
+            `SELECT 1 FROM sa_group_user gu
+             JOIN sa_group g ON g.id = gu.group_id
+             WHERE gu.user_id = $1 AND g.can_close_period = true
+             LIMIT 1`,
+            [user.id]
+        );
+        if (permResult.rows.length === 0) {
+            return res.status(403).json({ success: false, message: 'ผู้ใช้ไม่มีสิทธิ์อนุมัติการปิดงวดบัญชี' });
+        }
+
+        return res.json({ success: true, approverName: user.full_name });
+    } catch (error) {
+        console.error('Error verifying close approver:', error);
+        return res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดภายในระบบ' });
+    }
+};
+
 module.exports = {
     fetchHeaderRows,
     fetchHeaderRowById,
@@ -434,6 +479,7 @@ module.exports = {
     updateStatusDetailRow,
     deleteDetailRow,
     fetchOpenGlPeriods,
+    verifyCloseApprover,
 };
 //     fetchRows,
 //     addRow,

@@ -100,21 +100,21 @@ const _saveDimRules = async (client, accountId, dimRules) => {
 
 // POST new row
 const addRow = async (req, res) => {
-    const { account_code, account_name_thai, account_name_eng, parent_id, account_type, account_subtype,
-        normal_balance, is_normal_account, is_control_account, currency_code, module_link_code,
+    const { account_code, account_name_thai, account_name_eng, parent_id, account_type,
+        normal_balance, is_normal_account, is_control_account, currency_code,
         branch_required, is_active, dim_rules } = req.body;
     const userName = req.headers.username;
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
         const result = await client.query(
-            `INSERT INTO gl_account (account_code, account_name_thai, account_name_eng, parent_id, account_type, account_subtype,
-             normal_balance, is_normal_account, is_control_account, currency_code, module_link_code,
+            `INSERT INTO gl_account (account_code, account_name_thai, account_name_eng, parent_id, account_type,
+             normal_balance, is_normal_account, is_control_account, currency_code,
              branch_required, is_active, created_at, created_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP, $14) RETURNING *`,
-            [account_code, account_name_thai, account_name_eng, parent_id, account_type, account_subtype,
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP, $12) RETURNING *`,
+            [account_code, account_name_thai, account_name_eng, parent_id, account_type,
                 normal_balance, is_normal_account, is_control_account ?? false, currency_code,
-                module_link_code, branch_required, is_active, userName]
+                branch_required, is_active, userName]
         );
         const newRow = result.rows[0];
         await _saveDimRules(client, newRow.id, dim_rules);
@@ -133,8 +133,8 @@ const addRow = async (req, res) => {
 // PUT update row
 const updateRow = async (req, res) => {
     const { id } = req.params;
-    const { account_code, account_name_thai, account_name_eng, parent_id, account_type, account_subtype,
-        normal_balance, is_normal_account, is_control_account, currency_code, module_link_code,
+    const { account_code, account_name_thai, account_name_eng, parent_id, account_type,
+        normal_balance, is_normal_account, is_control_account, currency_code,
         branch_required, is_active, dim_rules } = req.body;
     const userId = req.headers.userid;
     const userName = req.headers.username;
@@ -155,20 +155,18 @@ const updateRow = async (req, res) => {
                 account_name_eng = $3,
                 parent_id = $4,
                 account_type = $5,
-                account_subtype = $6,
-                normal_balance = $7,
-                is_normal_account = $8,
-                is_control_account = $9,
-                currency_code = $10,
-                module_link_code = $11,
-                branch_required = $12,
-                is_active = $13,
+                normal_balance = $6,
+                is_normal_account = $7,
+                is_control_account = $8,
+                currency_code = $9,
+                branch_required = $10,
+                is_active = $11,
                 updated_at = CURRENT_TIMESTAMP,
-                updated_by = $14
-             WHERE id = $15 RETURNING *`,
-            [account_code, account_name_thai, account_name_eng, parent_id, account_type, account_subtype,
+                updated_by = $12
+             WHERE id = $13 RETURNING *`,
+            [account_code, account_name_thai, account_name_eng, parent_id, account_type,
                 normal_balance, is_normal_account, is_control_account ?? false, currency_code,
-                module_link_code, branch_required, is_active, userName, id]
+                branch_required, is_active, userName, id]
         );
 
         if (result.rows.length === 0) {
@@ -353,11 +351,9 @@ const exportDataExcel = async (req, res) => {
                 accountType: row.account_type,
                 normalBalance: row.normal_balance,
                 isNormalAccount: row.is_normal_account,
-                isReconcilable: row.is_reconcilable,
                 currencyCode: row.currency_code,
-                moduleLinkCode: row.module_link_code,
                 branchRequired: row.branch_required,
-                isActive: menu.is_active,
+                isActive: row.is_active,
             };
         });
 

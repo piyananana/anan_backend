@@ -13,11 +13,9 @@ const TEMPLATE_COLUMNS = [
   { key: 'account_name_thai',    label: 'ชื่อบัญชี (ไทย)',                                             required: true,  example: 'เงินสดย่อย' },
   { key: 'account_name_eng',     label: 'ชื่อบัญชี (อังกฤษ)',                                          required: false, example: 'Petty Cash' },
   { key: 'account_type',         label: 'ประเภทบัญชี (ASSET/LIABILITY/EQUITY/REVENUE/EXPENSE)',        required: true,  example: 'ASSET' },
-  { key: 'account_subtype',      label: 'ประเภทย่อย',                                                 required: false, example: 'Current Asset' },
   { key: 'normal_balance',       label: 'ยอดดุลปกติ (DR/CR)',                                          required: true,  example: 'DR' },
   { key: 'is_normal_account',    label: 'หัวบัญชี (Y/N, ว่าง=Y; N=บัญชีรวม/หัวข้อ ลงรายการไม่ได้)',     required: false, example: 'Y' },
   { key: 'is_control_account',   label: 'บัญชีคุมยอด (Y/N, ว่าง=N)',                                   required: false, example: 'N' },
-  { key: 'module_link_code',     label: 'โมดูลที่เชื่อมโยง (รหัส เช่น 11=AR, 21=AP, ว่าง=ไม่เชื่อมโยง)', required: false, example: '' },
   { key: 'currency_code',        label: 'สกุลเงิน (ว่าง=THB)',                                         required: false, example: 'THB' },
   { key: 'branch_required',      label: 'บังคับระบุสาขา (Y/N, ว่าง=N)',                                required: false, example: 'N' },
   { key: 'is_active',            label: 'ใช้งาน (Y/N, ว่าง=Y)',                                        required: false, example: 'Y' },
@@ -34,16 +32,6 @@ const ACCOUNT_TYPES = [
   { code: 'EXPENSE', label: 'ค่าใช้จ่าย' },
 ];
 
-const MODULE_LINK_CODES = [
-  { code: '01', label: 'บัญชีแยกประเภท - General Ledger (GL)' },
-  { code: '11', label: 'บัญชีลูกหนี้ - Accounts Receivable (AR)' },
-  { code: '21', label: 'บัญชีเจ้าหนี้ - Accounts Payable (AP)' },
-  { code: '31', label: 'สินค้าคงคลัง - Inventory Management (IM)' },
-  { code: '81', label: 'เงินสดและเช็ค - Cash and Check (CQ)' },
-  { code: '86', label: 'เงินมัดจำ - Deposit Management (DS)' },
-  { code: '91', label: 'ภาษีซื้อ - VAT Purchase (VP)' },
-  { code: '96', label: 'ภาษีขาย - VAT Sales (VS)' },
-];
 
 const YES_VALUES = ['y', 'yes', 'true', '1', 'ใช่'];
 
@@ -56,7 +44,6 @@ const getTemplate = async (req, res) => {
     res.json({
       sheet: { key: SHEET_DEF.key, name: SHEET_DEF.name, columns: TEMPLATE_COLUMNS },
       accountTypes: ACCOUNT_TYPES,
-      moduleLinkCodes: MODULE_LINK_CODES,
       dimensionTypes: dimTypesR.rows,
     });
   } catch (err) {
@@ -171,7 +158,6 @@ const validateFile = [
       const dimTypeSet = new Set(dimTypesR.rows.map(r => String(r.type_code).toUpperCase()));
       const currencySet = new Set(currenciesR.rows.map(r => String(r.currency_code).toUpperCase()));
       const accountTypeSet = new Set(ACCOUNT_TYPES.map(a => a.code));
-      const moduleLinkSet = new Set(MODULE_LINK_CODES.map(m => m.code));
 
       // ── First pass: นับจำนวนรหัสบัญชีในไฟล์ เพื่อตรวจรายการซ้ำ ─────────────
       const sheetCodeCount = {};
@@ -233,12 +219,6 @@ const validateFile = [
           rowErrors.push({ column: 'normal_balance', message: `ยอดดุลปกติ "${normalBalanceRaw}" ไม่ถูกต้อง ต้องเป็น DR หรือ CR` });
         }
 
-        // module_link_code
-        const moduleLinkCodeRaw = get('module_link_code').toUpperCase();
-        if (moduleLinkCodeRaw && !moduleLinkSet.has(moduleLinkCodeRaw)) {
-          rowErrors.push({ column: 'module_link_code', message: `ไม่พบโมดูล "${moduleLinkCodeRaw}"` });
-        }
-
         // currency_code
         const currencyCodeRaw = get('currency_code').toUpperCase();
         const currencyCode = currencyCodeRaw || 'THB';
@@ -267,11 +247,9 @@ const validateFile = [
           account_name_thai: nameThai,
           account_name_eng: trunc(get('account_name_eng'), 200),
           account_type: accountTypeRaw,
-          account_subtype: trunc(get('account_subtype'), 50),
           normal_balance: normalBalanceRaw,
           is_normal_account: parseBoolDefault(get('is_normal_account'), true),
           is_control_account: parseBoolDefault(get('is_control_account'), false),
-          module_link_code: moduleLinkSet.has(moduleLinkCodeRaw) ? moduleLinkCodeRaw : '',
           currency_code: currencyCode,
           branch_required: parseBoolDefault(get('branch_required'), false),
           is_active: parseBoolDefault(get('is_active'), true),
@@ -369,17 +347,17 @@ const confirmImport = async (req, res) => {
           const parentId = parentCode ? (resolved.get(parentCode) ?? null) : null;
           const result = await client.query(
             `INSERT INTO gl_account
-               (account_code, account_name_thai, account_name_eng, parent_id, account_type, account_subtype,
-                normal_balance, is_normal_account, is_control_account, currency_code, module_link_code,
+               (account_code, account_name_thai, account_name_eng, parent_id, account_type,
+                normal_balance, is_normal_account, is_control_account, currency_code,
                 branch_required, is_active, created_by, updated_by)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12)
              ON CONFLICT (account_code) DO NOTHING
              RETURNING id`,
             [
               trunc(r.account_code, 50), trunc(r.account_name_thai, 255), trunc(r.account_name_eng, 255),
-              parentId, r.account_type, trunc(r.account_subtype, 50),
+              parentId, r.account_type,
               r.normal_balance, r.is_normal_account ?? true, r.is_control_account ?? false,
-              trunc(r.currency_code, 3) || 'THB', r.module_link_code || '',
+              trunc(r.currency_code, 3) || 'THB',
               r.branch_required ?? false,
               r.is_active ?? true, userName,
             ]

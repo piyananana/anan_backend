@@ -89,12 +89,13 @@ const createGroupUserByUserId = async (req, res) => {
             [groupId, userId]
         );
 
-        // ขั้นตอนที่ 3: เพิ่มสิทธิ์เมนูของกลุ่มไปยังผู้ใช้ใหม่
+        // ขั้นตอนที่ 3: เพิ่มสิทธิ์เมนูของกลุ่มไปยังผู้ใช้ใหม่ (ไม่ลบเมนูที่มีอยู่แล้ว)
         await client.query(
             `INSERT INTO sa_user_menu (user_id, menu_id)
             SELECT $1, menu_id
             FROM sa_group_menu
-            WHERE group_id = $2`,
+            WHERE group_id = $2
+            ON CONFLICT (user_id, menu_id) DO NOTHING`,
             [userId, groupId]
         );
 
@@ -226,20 +227,15 @@ const deleteGroupUsers = async (req, res) => {
 
 const deleteGroupUserByUserId = async (req, res) => {
     const { groupId, userId } = req.params;
-    const client = await req.dbPool.connect(); // ใช้ transaction เพื่อความปลอดภัย
     try {
-        await client.query('BEGIN');
-        await client.query('DELETE FROM sa_group_user WHERE group_id = $1 AND user_id = $2 RETURNING *', [groupId, userId]);
-        await client.query('DELETE FROM sa_user_menu WHERE user_id = $1 RETURNING *', [userId]);
-        await client.query('COMMIT');
+        await req.dbPool.query(
+            'DELETE FROM sa_group_user WHERE group_id = $1 AND user_id = $2',
+            [groupId, userId]
+        );
         return res.status(200).json({ message: 'Group user deleted successfully' });
     } catch (err) {
-        await client.query('ROLLBACK');
-        throw err;
-        // console.error('Error deleting Group user:', err);
-        // res.status(500).json({ error: 'Internal server error' });
-    } finally {
-        client.release();
+        console.error('Error deleting group user:', err);
+        return res.status(500).json({ message: 'Failed to delete group user', error: err.message });
     }
 };
 

@@ -161,17 +161,17 @@ async function ensureFirstUserExists(req, res) {
         const userCount = parseInt(countResult.rows[0].count, 10);
 
         if (userCount === 0) {
-            console.log('No user found. Creating the first administrator user...');
-            const userName = 'anansoft';
-            const password = 'anansoft';
+            console.log('No user found. Creating the first system user...');
+            const userName = 'sys01';
+            const password = 'sys01';
             const hashedPassword = await bcrypt.hash(password, 10);
             const insertQuery = `
                 INSERT INTO sa_user (user_name, password_hash, first_name, last_name, user_type, status)
                 VALUES ($1, $2, $3, $4, $5, $6)
                 RETURNING *;
             `;
-            await req.dbPool.query(insertQuery, [userName, hashedPassword, 'อนันต์ซอฟท์', 'บจก.', 'developer', 'active']);
-            console.log('First user "anansoft" created as developer.');
+            await req.dbPool.query(insertQuery, [userName, hashedPassword, 'System', 'Admin', 'developer', 'active']);
+            console.log('First user "sys01" created as developer.');
         }
 
         // Bootstrap: ถ้าไม่มี user_type='developer' เลย ให้ผู้ใช้ที่สร้างก่อนสุดเป็น developer

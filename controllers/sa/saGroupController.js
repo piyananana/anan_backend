@@ -32,7 +32,7 @@ const getGroupById = async (req, res) => {
 
 // POST a new groupal unit
 const createGroup = async (req, res) => {
-    const { name, parent_id, is_active, have_sub_group, description } = req.body;
+    const { name, parent_id, is_active, have_sub_group, description, can_close_period } = req.body;
 
     if (!name) {
         return res.status(400).json({ message: 'Name is required' });
@@ -42,14 +42,15 @@ const createGroup = async (req, res) => {
         const result = await req.dbPool.query(
             `INSERT INTO sa_group (
                 name, parent_id, is_active, have_sub_group,
-                description
-            ) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+                description, can_close_period
+            ) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
             [
                 name,
-                parent_id || null, // Ensure parent_id is null if empty string or undefined
-                is_active !== undefined ? is_active : true, // Default to true if not provided
-                have_sub_group !== undefined ? have_sub_group : true, // Default to true if not provided
-                description || null
+                parent_id || null,
+                is_active !== undefined ? is_active : true,
+                have_sub_group !== undefined ? have_sub_group : true,
+                description || null,
+                can_close_period !== undefined ? can_close_period : false,
             ]
         );
         res.status(201).json({ message: 'Group created successfully', rowResult: result.rows[0] });
@@ -62,7 +63,7 @@ const createGroup = async (req, res) => {
 // PUT (update) an groupal unit by ID
 const updateGroup = async (req, res) => {
     const { id } = req.params;
-    const { name, parent_id, is_active, have_sub_group, description } = req.body;
+    const { name, parent_id, is_active, have_sub_group, description, can_close_period } = req.body;
 
     if (!name) {
         return res.status(400).json({ message: 'Name is required' });
@@ -76,14 +77,16 @@ const updateGroup = async (req, res) => {
                 is_active = $3,
                 have_sub_group = $4,
                 description = $5,
+                can_close_period = $6,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE id = $6 RETURNING *`,
+            WHERE id = $7 RETURNING *`,
             [
                 name,
-                parent_id, // Ensure parent_id is null if empty string or undefined
+                parent_id,
                 is_active,
                 have_sub_group,
                 description,
+                can_close_period !== undefined ? can_close_period : false,
                 id
             ]
         );

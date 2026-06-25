@@ -25,8 +25,14 @@ const getBillingPlanReport = async (req, res) => {
         const filters = [];
 
         if (customer_group_id) {
-            params.push(parseInt(customer_group_id));
-            filters.push(`c.customer_group_id = $${params.length}`);
+            const groupIds = String(customer_group_id)
+                .split(',')
+                .map(s => parseInt(s.trim()))
+                .filter(n => !isNaN(n));
+            if (groupIds.length > 0) {
+                params.push(groupIds);
+                filters.push(`c.customer_group_id = ANY($${params.length})`);
+            }
         }
         if (billing_collector_id) {
             params.push(parseInt(billing_collector_id));

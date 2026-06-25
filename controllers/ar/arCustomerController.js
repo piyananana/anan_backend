@@ -362,4 +362,4 @@ const deleteRow = async (req, res) => {
   }
 };
 
-module.exports = { fetchRows, fetchRow, addRow, updateRow, deleteRow };
+module.exports = { fetchRows, fetchRow, addRow, updateRow, deleteRow, insertRelated, fetchRowById };
