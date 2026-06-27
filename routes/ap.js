@@ -5,6 +5,8 @@ const router  = express.Router();
 const apVendorRunningController  = require('../controllers/ap/apVendorRunningController');
 const apVendorGroupController    = require('../controllers/ap/apVendorGroupController');
 const apVendorController         = require('../controllers/ap/apVendorController');
+const apVendorReportController   = require('../controllers/ap/apVendorReportController');
+const apWhtReportController      = require('../controllers/ap/apWhtReportController');
 const apGlAccountSetupController = require('../controllers/ap/apGlAccountSetupController');
 const apTransactionController    = require('../controllers/ap/apTransactionController');
 const apPaymentRunController     = require('../controllers/ap/apPaymentRunController');
@@ -29,9 +31,13 @@ router.get('/ap_vendor/import/template/download', apVendorImportController.downl
 router.post('/ap_vendor/import/validate',         apVendorImportController.validateFile);
 router.post('/ap_vendor/import/confirm',          apVendorImportController.confirmImport);
 
+// ── WHT Report ────────────────────────────────────────────────────────────
+router.get('/ap_wht_report', apWhtReportController.fetchWhtReport);
+
 // ── Vendor master ──────────────────────────────────────────────────────────
-router.get('/ap_vendor/active', apVendorController.fetchActiveRows);
-router.get('/ap_vendor',        apVendorController.fetchRows);
+router.get('/ap_vendor/active',  apVendorController.fetchActiveRows);
+router.get('/ap_vendor/report',  apVendorReportController.fetchReport);
+router.get('/ap_vendor',         apVendorController.fetchRows);
 router.get('/ap_vendor/:id',    apVendorController.fetchRow);
 router.post('/ap_vendor',       apVendorController.addRow);
 router.put('/ap_vendor/:id',    apVendorController.updateRow);
