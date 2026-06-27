@@ -2,6 +2,8 @@
 const { generateNextCode } = require('./apVendorRunningController');
 
 const fetchRowById = async (pool, id) => {
+  // เพิ่ม vendor_type column แบบ idempotent
+  await pool.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS vendor_type VARCHAR(20)`).catch(() => {});
   const [mainResult, addresses, contacts, banks] = await Promise.all([
     pool.query(`
       SELECT
@@ -38,7 +40,7 @@ const fetchRows = async (req, res) => {
       SELECT
         v.id, v.vendor_code, v.old_vendor_code, v.vendor_name_th, v.vendor_name_en,
         v.tax_id, v.credit_term_months, v.credit_term_days,
-        v.currency_code, v.is_active,
+        v.currency_code, v.is_active, v.vendor_type,
         v.vendor_group_id,   vg.group_code AS vendor_group_code, vg.group_name_thai AS vendor_group_name,
         v.business_type_id,  cbt.business_type_code, cbt.business_type_name_thai,
         v.ap_account_id,     ga.account_code  AS ap_account_code,
@@ -134,6 +136,7 @@ const addRow = async (req, res) => {
     vendor_code, old_vendor_code, vendor_name_th, vendor_name_en, tax_id,
     vendor_group_id,
     business_type_id,
+    vendor_type,
     credit_term_months, credit_term_days,
     currency_code, is_active, remark,
     ap_account_id,
@@ -158,11 +161,12 @@ const addRow = async (req, res) => {
          (vendor_code, old_vendor_code, vendor_name_th, vendor_name_en, tax_id,
           vendor_group_id,
           business_type_id,
+          vendor_type,
           credit_term_months, credit_term_days,
           currency_code, is_active, remark,
           ap_account_id,
           created_by, updated_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15)
        RETURNING id`,
       [
         finalCode, old_vendor_code || null,
@@ -170,6 +174,7 @@ const addRow = async (req, res) => {
         tax_id || null,
         vendor_group_id || null,
         business_type_id || null,
+        vendor_type || null,
         credit_term_months ?? 0, credit_term_days ?? 30,
         currency_code || 'THB',
         is_active !== undefined ? is_active : true,
@@ -200,6 +205,7 @@ const updateRow = async (req, res) => {
     vendor_code, old_vendor_code, vendor_name_th, vendor_name_en, tax_id,
     vendor_group_id,
     business_type_id,
+    vendor_type,
     credit_term_months, credit_term_days,
     currency_code, is_active, remark,
     ap_account_id,
@@ -216,12 +222,13 @@ const updateRow = async (req, res) => {
          tax_id              = $5,
          vendor_group_id     = $6,
          business_type_id    = $7,
-         credit_term_months  = $8,  credit_term_days    = $9,
-         currency_code       = $10, is_active           = $11,
-         remark              = $12,
-         ap_account_id       = $13,
-         updated_by          = $14, updated_at          = NOW()
-       WHERE id = $15
+         vendor_type         = $8,
+         credit_term_months  = $9,  credit_term_days    = $10,
+         currency_code       = $11, is_active           = $12,
+         remark              = $13,
+         ap_account_id       = $14,
+         updated_by          = $15, updated_at          = NOW()
+       WHERE id = $16
        RETURNING id`,
       [
         vendor_code.toUpperCase(), old_vendor_code || null,
@@ -229,6 +236,7 @@ const updateRow = async (req, res) => {
         tax_id || null,
         vendor_group_id || null,
         business_type_id || null,
+        vendor_type || null,
         credit_term_months ?? 0, credit_term_days ?? 30,
         currency_code || 'THB', is_active,
         remark || null,
@@ -279,4 +287,4 @@ const deleteRow = async (req, res) => {
   }
 };
 
-module.exports = { fetchRows, fetchActiveRows, fetchRow, addRow, updateRow, deleteRow };
+module.exports = { fetchRows, fetchActiveRows, fetchRow, addRow, updateRow, deleteRow, insertRelated };

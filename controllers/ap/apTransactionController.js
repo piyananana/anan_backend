@@ -938,17 +938,22 @@ const createTransaction = async (req, res) => {
                 id SERIAL PRIMARY KEY,
                 header_id INT NOT NULL REFERENCES ap_transaction(id) ON DELETE CASCADE,
                 wht_type VARCHAR(100),
+                wht_type_id INT REFERENCES cd_wht_type(id),
+                income_type VARCHAR(20),
                 wht_rate NUMERIC(5,2) DEFAULT 0,
                 base_amount_lc NUMERIC(15,2) DEFAULT 0,
                 wht_amount_lc NUMERIC(15,2) DEFAULT 0,
                 description TEXT
             )
         `);
+        await client.query(`ALTER TABLE ap_transaction_wht ADD COLUMN IF NOT EXISTS wht_type_id INT REFERENCES cd_wht_type(id)`).catch(() => {});
+        await client.query(`ALTER TABLE ap_transaction_wht ADD COLUMN IF NOT EXISTS income_type VARCHAR(20)`).catch(() => {});
         for (const w of (whts || [])) {
             await client.query(`
-                INSERT INTO ap_transaction_wht (header_id, wht_type, wht_rate, base_amount_lc, wht_amount_lc, description)
-                VALUES ($1,$2,$3,$4,$5,$6)
-            `, [newHeaderId, w.wht_type || null, w.wht_rate || 0, w.base_amount_lc || 0, w.wht_amount_lc || 0, w.description || null]);
+                INSERT INTO ap_transaction_wht (header_id, wht_type, wht_type_id, income_type, wht_rate, base_amount_lc, wht_amount_lc, description)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            `, [newHeaderId, w.wht_type || null, w.wht_type_id || null, w.income_type || null,
+                w.wht_rate || 0, w.base_amount_lc || 0, w.wht_amount_lc || 0, w.description || null]);
         }
         // Update header wht_amount_lc
         const totalWhtLc = (whts || []).reduce((s, w) => s + (Number(w.wht_amount_lc) || 0), 0);
@@ -1074,9 +1079,10 @@ const updateTransaction = async (req, res) => {
         }
         for (const w of (whts || [])) {
             await client.query(`
-                INSERT INTO ap_transaction_wht (header_id, wht_type, wht_rate, base_amount_lc, wht_amount_lc, description)
-                VALUES ($1,$2,$3,$4,$5,$6)
-            `, [id, w.wht_type || null, w.wht_rate || 0, w.base_amount_lc || 0, w.wht_amount_lc || 0, w.description || null]);
+                INSERT INTO ap_transaction_wht (header_id, wht_type, wht_type_id, income_type, wht_rate, base_amount_lc, wht_amount_lc, description)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            `, [id, w.wht_type || null, w.wht_type_id || null, w.income_type || null,
+                w.wht_rate || 0, w.base_amount_lc || 0, w.wht_amount_lc || 0, w.description || null]);
         }
         const totalWhtLc = (whts || []).reduce((s, w) => s + (Number(w.wht_amount_lc) || 0), 0);
         await client.query(`UPDATE ap_transaction SET wht_amount_lc=$1 WHERE id=$2`, [totalWhtLc, id]);
