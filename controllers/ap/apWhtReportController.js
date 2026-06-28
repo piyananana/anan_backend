@@ -19,6 +19,10 @@ const fetchWhtReport = async (req, res) => {
   const vendorType = pnd_form === 'pnd3' ? 'individual' : 'juristic';
 
   try {
+    // เพิ่มคอลัมน์ใหม่แบบ idempotent ก่อนใช้งาน
+    await req.dbPool.query(`ALTER TABLE ap_transaction_wht ADD COLUMN IF NOT EXISTS wht_type_id INT REFERENCES cd_wht_type(id)`).catch(() => {});
+    await req.dbPool.query(`ALTER TABLE ap_transaction_wht ADD COLUMN IF NOT EXISTS income_type VARCHAR(20)`).catch(() => {});
+
     const sql = `
       SELECT
         w.id,
