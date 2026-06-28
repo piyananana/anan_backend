@@ -796,6 +796,9 @@ const createTransaction = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
+        // idempotent schema migrations
+        await client.query(`ALTER TABLE ap_transaction_detail ADD COLUMN IF NOT EXISTS item_code VARCHAR(50)`).catch(() => {});
+        await client.query(`ALTER TABLE ap_transaction_detail ADD COLUMN IF NOT EXISTS item_name VARCHAR(200)`).catch(() => {});
 
         if (action === 'Post') {
             const periodRes = await client.query(
@@ -862,13 +865,13 @@ const createTransaction = async (req, res) => {
         for (const d of (details || [])) {
             await client.query(`
                 INSERT INTO ap_transaction_detail
-                (header_id, line_no, description,
+                (header_id, line_no, item_code, item_name, description,
                  quantity, unit_price_fc, discount_percent, discount_amount_fc,
                  subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
                  expense_account_id, subtotal_lc, vat_amount_lc, total_amount_lc, is_deferred_vat)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
             `, [
-                newHeaderId, lineNo++, d.description || null,
+                newHeaderId, lineNo++, d.item_code || null, d.item_name || null, d.description || null,
                 d.quantity ?? 1, d.unit_price_fc || 0, d.discount_percent || 0, d.discount_amount_fc || 0,
                 d.subtotal_fc || 0, d.vat_type || 'NOVAT', d.vat_rate ?? 0,
                 d.vat_amount_fc || 0, d.total_amount_fc || 0,
@@ -1002,6 +1005,9 @@ const updateTransaction = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
+        // idempotent schema migrations
+        await client.query(`ALTER TABLE ap_transaction_detail ADD COLUMN IF NOT EXISTS item_code VARCHAR(50)`).catch(() => {});
+        await client.query(`ALTER TABLE ap_transaction_detail ADD COLUMN IF NOT EXISTS item_name VARCHAR(200)`).catch(() => {});
 
         const existing = await client.query(`SELECT status FROM ap_transaction WHERE id=$1`, [id]);
         if (existing.rows.length === 0) throw new Error('Not found');
@@ -1054,13 +1060,13 @@ const updateTransaction = async (req, res) => {
         for (const d of (details || [])) {
             await client.query(`
                 INSERT INTO ap_transaction_detail
-                (header_id, line_no, description,
+                (header_id, line_no, item_code, item_name, description,
                  quantity, unit_price_fc, discount_percent, discount_amount_fc,
                  subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
                  expense_account_id, subtotal_lc, vat_amount_lc, total_amount_lc, is_deferred_vat)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
             `, [
-                id, lineNo++, d.description || null,
+                id, lineNo++, d.item_code || null, d.item_name || null, d.description || null,
                 d.quantity ?? 1, d.unit_price_fc || 0, d.discount_percent || 0, d.discount_amount_fc || 0,
                 d.subtotal_fc || 0, d.vat_type || 'NOVAT', d.vat_rate ?? 0,
                 d.vat_amount_fc || 0, d.total_amount_fc || 0,
