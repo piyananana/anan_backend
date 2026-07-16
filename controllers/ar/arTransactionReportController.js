@@ -61,6 +61,7 @@ const getTransactionReport = async (req, res) => {
                 t.customer_id,
                 t.customer_code,
                 t.customer_name_th,
+                c.customer_name_en,
                 t.id           AS txn_id,
                 t.doc_no,
                 t.doc_date,
@@ -90,6 +91,7 @@ const getTransactionReport = async (req, res) => {
                     customer_id:      cid,
                     customer_code:    row.customer_code,
                     customer_name_th: row.customer_name_th,
+                    customer_name_en: row.customer_name_en,
                     inv_amount:  0,  // sys_doc_type = '10'
                     dn_amount:   0,  // '30','35'
                     cn_amount:   0,  // '50','55'

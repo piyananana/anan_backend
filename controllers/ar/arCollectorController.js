@@ -2,11 +2,9 @@
 
 const COLLECTOR_SELECT = `
   SELECT ac.*,
-         br.branch_name_thai,
-         bu.bu_name_thai AS business_unit_name
+         br.branch_name_thai
     FROM ar_collector ac
-    LEFT JOIN cd_branch       br ON ac.branch_id       = br.id
-    LEFT JOIN cd_business_unit bu ON ac.business_unit_id = bu.id
+    LEFT JOIN cd_branch br ON ac.branch_id = br.id
 `;
 
 const fetchRowById = async (pool, id) => {
@@ -52,7 +50,7 @@ const fetchRow = async (req, res) => {
 const addRow = async (req, res) => {
   const {
     collector_code, collector_name_thai, collector_name_eng,
-    collector_type, tax_id, branch_id, business_unit_id,
+    collector_type, tax_id, branch_id,
     phone, email, address,
     effective_date_from, effective_date_to, is_active,
   } = req.body;
@@ -61,17 +59,17 @@ const addRow = async (req, res) => {
     const result = await req.dbPool.query(
       `INSERT INTO ar_collector
          (collector_code, collector_name_thai, collector_name_eng,
-          collector_type, tax_id, branch_id, business_unit_id,
+          collector_type, tax_id, branch_id,
           phone, email, address,
           effective_date_from, effective_date_to, is_active,
           created_by, updated_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13)
        RETURNING id`,
       [
         collector_code?.trim().toUpperCase(), collector_name_thai,
         collector_name_eng || null,
         collector_type || 'EMPLOYEE',
-        tax_id || null, branch_id || null, business_unit_id || null,
+        tax_id || null, branch_id || null,
         phone || null, email || null, address || null,
         effective_date_from || null, effective_date_to || null,
         is_active !== undefined ? is_active : true,
@@ -94,7 +92,7 @@ const updateRow = async (req, res) => {
   const { id } = req.params;
   const {
     collector_code, collector_name_thai, collector_name_eng,
-    collector_type, tax_id, branch_id, business_unit_id,
+    collector_type, tax_id, branch_id,
     phone, email, address,
     effective_date_from, effective_date_to, is_active,
   } = req.body;
@@ -108,22 +106,21 @@ const updateRow = async (req, res) => {
          collector_type       = $4,
          tax_id               = $5,
          branch_id            = $6,
-         business_unit_id     = $7,
-         phone                = $8,
-         email                = $9,
-         address              = $10,
-         effective_date_from  = $11,
-         effective_date_to    = $12,
-         is_active            = $13,
-         updated_by           = $14,
+         phone                = $7,
+         email                = $8,
+         address              = $9,
+         effective_date_from  = $10,
+         effective_date_to    = $11,
+         is_active            = $12,
+         updated_by           = $13,
          updated_at           = NOW()
-       WHERE id = $15
+       WHERE id = $14
        RETURNING id`,
       [
         collector_code?.trim().toUpperCase(), collector_name_thai,
         collector_name_eng || null,
         collector_type || 'EMPLOYEE',
-        tax_id || null, branch_id || null, business_unit_id || null,
+        tax_id || null, branch_id || null,
         phone || null, email || null, address || null,
         effective_date_from || null, effective_date_to || null,
         is_active, userName, id,

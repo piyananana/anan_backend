@@ -102,6 +102,7 @@ const getCreditLimitReport = async (req, res) => {
                 c.id              AS customer_id,
                 c.customer_code,
                 c.customer_name_th,
+                c.customer_name_en,
                 COALESCE(c.credit_limit, 0) AS credit_limit,
                 COALESCE(SUM(t.balance_amount_lc) FILTER (
                     WHERE t.status = 'Posted'
@@ -113,7 +114,7 @@ const getCreditLimitReport = async (req, res) => {
             LEFT JOIN sa_module_document d ON d.id = t.doc_id
             WHERE c.is_active = true
               ${extraFilters}
-            GROUP BY c.id, c.customer_code, c.customer_name_th, c.credit_limit
+            GROUP BY c.id, c.customer_code, c.customer_name_th, c.customer_name_en, c.credit_limit
             ${havingClause}
             ORDER BY ${orderExpr}
         `, params);
@@ -138,6 +139,7 @@ const getCreditLimitReport = async (req, res) => {
                 customer_id:      r.customer_id,
                 customer_code:    r.customer_code,
                 customer_name_th: r.customer_name_th,
+                customer_name_en: r.customer_name_en,
                 credit_limit:     creditLimit,
                 outstanding:      outstanding,
                 remaining:        remaining,

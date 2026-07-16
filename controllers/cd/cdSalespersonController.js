@@ -5,11 +5,9 @@ const fetchRowById = async (pool, id) => {
     pool.query(
       `SELECT sp.*,
               u.user_name AS user_name_ref,
-              bu.bu_name_thai AS business_unit_name,
               br.branch_name_thai AS branch_name_thai
          FROM cd_salesperson sp
          LEFT JOIN sa_user u ON sp.user_id = u.id
-         LEFT JOIN cd_business_unit bu ON sp.business_unit_id = bu.id
          LEFT JOIN cd_branch br ON sp.branch_id = br.id
         WHERE sp.id = $1`, [id]
     ),
@@ -32,11 +30,9 @@ const fetchRows = async (req, res) => {
     let query = `
       SELECT sp.*,
              u.user_name AS user_name_ref,
-             bu.bu_name_thai AS business_unit_name,
              br.branch_name_thai AS branch_name_thai
         FROM cd_salesperson sp
         LEFT JOIN sa_user u ON sp.user_id = u.id
-        LEFT JOIN cd_business_unit bu ON sp.business_unit_id = bu.id
         LEFT JOIN cd_branch br ON sp.branch_id = br.id
        WHERE 1=1`;
     const params = [];
@@ -69,7 +65,7 @@ const fetchRow = async (req, res) => {
 const addRow = async (req, res) => {
   const {
     salesperson_code, salesperson_name_thai, salesperson_name_eng,
-    salesperson_type, user_id, tax_id, branch_id, business_unit_id,
+    salesperson_type, user_id, tax_id, branch_id,
     phone, email, address, commission_rate,
     effective_date_from, effective_date_to, is_active,
     territories,
@@ -81,16 +77,15 @@ const addRow = async (req, res) => {
     const result = await client.query(
       `INSERT INTO cd_salesperson
          (salesperson_code, salesperson_name_thai, salesperson_name_eng,
-          salesperson_type, user_id, tax_id, branch_id, business_unit_id,
+          salesperson_type, user_id, tax_id, branch_id,
           phone, email, address, commission_rate,
           effective_date_from, effective_date_to, is_active,
           created_by, updated_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$16)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15)
        RETURNING id`,
       [
         salesperson_code?.trim().toUpperCase(), salesperson_name_thai, salesperson_name_eng || null,
         salesperson_type || 'EMPLOYEE', user_id || null, tax_id || null, branch_id || null,
-        business_unit_id || null,
         phone || null, email || null, address || null, commission_rate ?? 0,
         effective_date_from || null, effective_date_to || null,
         is_active !== undefined ? is_active : true,
@@ -117,7 +112,7 @@ const updateRow = async (req, res) => {
   const { id } = req.params;
   const {
     salesperson_code, salesperson_name_thai, salesperson_name_eng,
-    salesperson_type, user_id, tax_id, branch_id, business_unit_id,
+    salesperson_type, user_id, tax_id, branch_id,
     phone, email, address, commission_rate,
     effective_date_from, effective_date_to, is_active,
     territories,
@@ -135,22 +130,20 @@ const updateRow = async (req, res) => {
          user_id               = $5,
          tax_id                = $6,
          branch_id             = $7,
-         business_unit_id      = $8,
-         phone                 = $9,
-         email                 = $10,
-         address               = $11,
-         commission_rate       = $12,
-         effective_date_from   = $13,
-         effective_date_to     = $14,
-         is_active             = $15,
-         updated_by            = $16,
+         phone                 = $8,
+         email                 = $9,
+         address               = $10,
+         commission_rate       = $11,
+         effective_date_from   = $12,
+         effective_date_to     = $13,
+         is_active             = $14,
+         updated_by            = $15,
          updated_at            = NOW()
-       WHERE id = $17
+       WHERE id = $16
        RETURNING id`,
       [
         salesperson_code?.trim().toUpperCase(), salesperson_name_thai, salesperson_name_eng || null,
         salesperson_type || 'EMPLOYEE', user_id || null, tax_id || null, branch_id || null,
-        business_unit_id || null,
         phone || null, email || null, address || null, commission_rate ?? 0,
         effective_date_from || null, effective_date_to || null,
         is_active, userName, id,

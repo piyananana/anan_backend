@@ -66,6 +66,7 @@ const getMovementReport = async (req, res) => {
                     t.customer_id,
                     t.customer_code,
                     t.customer_name_th,
+                    c.customer_name_en,
                     c.customer_group_id,
                     c.salesperson_id,
                     t.id         AS txn_id,
@@ -145,7 +146,7 @@ const getMovementReport = async (req, res) => {
                   ${extraFilters}
             ),
             customer_list AS (
-                SELECT DISTINCT customer_id, customer_code, customer_name_th,
+                SELECT DISTINCT customer_id, customer_code, customer_name_th, customer_name_en,
                        customer_group_id, salesperson_id
                 FROM all_txn
                 WHERE period = 'in' OR period = 'before'
@@ -161,6 +162,7 @@ const getMovementReport = async (req, res) => {
                 cl.customer_id,
                 cl.customer_code,
                 cl.customer_name_th,
+                cl.customer_name_en,
                 cl.customer_group_id,
                 cl.salesperson_id,
                 COALESCE(o.opening_balance, 0) AS opening_balance,
@@ -191,6 +193,7 @@ const getMovementReport = async (req, res) => {
                     customer_id:       cid,
                     customer_code:     row.customer_code,
                     customer_name_th:  row.customer_name_th,
+                    customer_name_en:  row.customer_name_en,
                     customer_group_id: row.customer_group_id,
                     salesperson_id:    row.salesperson_id,
                     opening_balance:   Number(row.opening_balance || 0),
