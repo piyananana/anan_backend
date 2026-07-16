@@ -11,6 +11,17 @@ const apGlAccountSetupController = require('../controllers/ap/apGlAccountSetupCo
 const apTransactionController    = require('../controllers/ap/apTransactionController');
 const apPaymentRunController     = require('../controllers/ap/apPaymentRunController');
 const apVendorImportController   = require('../controllers/ap/apVendorImportController');
+const apAgingReportController        = require('../controllers/ap/apAgingReportController');
+const apFxGainLossReportController   = require('../controllers/ap/apFxGainLossReportController');
+const apMovementReportController     = require('../controllers/ap/apMovementReportController');
+const apPaymentReportController      = require('../controllers/ap/apPaymentReportController');
+const apTransactionReportController  = require('../controllers/ap/apTransactionReportController');
+const apCreditLimitReportController  = require('../controllers/ap/apCreditLimitReportController');
+const apVendorBalanceImportController = require('../controllers/ap/apVendorBalanceImportController');
+const apResetController               = require('../controllers/ap/apResetController');
+const apYearEndSetupController        = require('../controllers/ap/apYearEndSetupController');
+const apPreCloseCheckController       = require('../controllers/ap/apPreCloseCheckController');
+const apFxRevaluationController       = require('../controllers/ap/apFxRevaluationController');
 
 // ── Vendor Running (auto-code) ─────────────────────────────────────────────
 router.get('/ap_vendor_running/preview_code', apVendorRunningController.previewCode);
@@ -30,6 +41,26 @@ router.get('/ap_vendor/import/template',          apVendorImportController.getTe
 router.get('/ap_vendor/import/template/download', apVendorImportController.downloadTemplate);
 router.post('/ap_vendor/import/validate',         apVendorImportController.validateFile);
 router.post('/ap_vendor/import/confirm',          apVendorImportController.confirmImport);
+
+// ── Vendor Balance Import ──────────────────────────────────────────────────
+router.get('/ap_vendor_balance/import/template',          apVendorBalanceImportController.getTemplate);
+router.get('/ap_vendor_balance/import/template/download', apVendorBalanceImportController.downloadTemplate);
+router.post('/ap_vendor_balance/import/validate',         apVendorBalanceImportController.validateFile);
+router.post('/ap_vendor_balance/import/confirm',          apVendorBalanceImportController.confirmImport);
+
+// ── AP Reset ───────────────────────────────────────────────────────────────
+router.get('/ap_reset_transactions/counts', apResetController.getCounts);
+router.delete('/ap_reset_transactions',     apResetController.resetTransactions);
+
+// ── Aging Report ──────────────────────────────────────────────────────────
+router.get('/ap_aging_report',           apAgingReportController.getAgingReport);
+
+// ── AP Report endpoints ────────────────────────────────────────────────────
+router.get('/ap_fx_gain_loss_report',    apFxGainLossReportController.getFxGainLossReport);
+router.get('/ap_movement_report',        apMovementReportController.getMovementReport);
+router.get('/ap_payment_report',         apPaymentReportController.getPaymentReport);
+router.get('/ap_transaction_report',     apTransactionReportController.getTransactionReport);
+router.get('/ap_credit_limit_report',   apCreditLimitReportController.getCreditLimitReport);
 
 // ── WHT Report ────────────────────────────────────────────────────────────
 router.get('/ap_wht_report', apWhtReportController.fetchWhtReport);
@@ -73,5 +104,22 @@ router.put('/ap_transaction/:id',                    apTransactionController.upd
 router.put('/ap_transaction/:id/void',               apTransactionController.voidTransaction);
 router.delete('/ap_transaction/:id',                 apTransactionController.deleteTransaction);
 
+
+// ── Year-End Setup ─────────────────────────────────────────────────────────────
+router.get('/ap_year_end_setup', apYearEndSetupController.fetchSetup);
+router.put('/ap_year_end_setup', apYearEndSetupController.upsertSetup);
+
+// ── Year-End Pre-Close Check ───────────────────────────────────────────────────
+router.get('/year_end/pre_close_check', apPreCloseCheckController.preCloseCheck);
+
+// ── AP FX Revaluation ─────────────────────────────────────────────────────────
+router.get('/ap_fx_revaluation/outstanding_currencies', apFxRevaluationController.fetchOutstandingCurrencies);
+router.get('/ap_fx_revaluation',                        apFxRevaluationController.fetchRows);
+router.get('/ap_fx_revaluation/:id',                    apFxRevaluationController.fetchRow);
+router.post('/ap_fx_revaluation/preview',               apFxRevaluationController.previewReval);
+router.post('/ap_fx_revaluation',                       apFxRevaluationController.createReval);
+router.post('/ap_fx_revaluation/:id/post',              apFxRevaluationController.postReval);
+router.post('/ap_fx_revaluation/:id/void',              apFxRevaluationController.voidReval);
+router.delete('/ap_fx_revaluation/:id',                 apFxRevaluationController.deleteReval);
 
 module.exports = router;
