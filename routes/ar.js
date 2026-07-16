@@ -7,6 +7,7 @@ const arCustomerRunningController = require('../controllers/ar/arCustomerRunning
 const arTransactionController = require('../controllers/ar/arTransactionController');
 const arCollectorController = require('../controllers/ar/arCollectorController');
 const arCustomerImportController = require('../controllers/ar/arCustomerImportController');
+const arCustomerBalanceImportController = require('../controllers/ar/arCustomerBalanceImportController');
 const arGlAccountSetupController = require('../controllers/ar/arGlAccountSetupController');
 const arAgingReportController        = require('../controllers/ar/arAgingReportController');
 const arTransactionReportController  = require('../controllers/ar/arTransactionReportController');
@@ -50,6 +51,12 @@ router.get('/ar_customer/import/template', arCustomerImportController.getTemplat
 router.get('/ar_customer/import/template/download', arCustomerImportController.downloadTemplate);
 router.post('/ar_customer/import/validate', arCustomerImportController.validateFile);
 router.post('/ar_customer/import/confirm', arCustomerImportController.confirmImport);
+
+// Router สำหรับ Import ยอดลูกหนี้คงเหลือ
+router.get('/ar_customer_balance/import/template', arCustomerBalanceImportController.getTemplate);
+router.get('/ar_customer_balance/import/template/download', arCustomerBalanceImportController.downloadTemplate);
+router.post('/ar_customer_balance/import/validate', arCustomerBalanceImportController.validateFile);
+router.post('/ar_customer_balance/import/confirm', arCustomerBalanceImportController.confirmImport);
 
 // Router สำหรับจัดการข้อมูลลูกหนี้การค้า
 router.get('/ar_customer', arCustomerController.fetchRows);

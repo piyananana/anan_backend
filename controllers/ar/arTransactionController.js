@@ -206,6 +206,91 @@ const resolvePaymentGlAccount = async (client, payment, setup, fallbackCashAccou
     return fallbackCashAccountId || null;
 };
 
+// --- Helper: Create CM receipt records after AR Receipt (sysDocType=80) is posted ---
+const postCmReceiptsHelper = async (client, arTransactionId, glEntryId) => {
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS cm_receipt (
+            id                  SERIAL PRIMARY KEY,
+            receipt_date        DATE          NOT NULL,
+            bank_account_id     INTEGER       REFERENCES cm_bank_account(id),
+            payment_method_id   INTEGER,
+            payment_method_type VARCHAR(30)   NOT NULL DEFAULT 'CASH',
+            ar_transaction_id   INTEGER,
+            ar_doc_no           VARCHAR(50),
+            customer_id         INTEGER,
+            customer_code       VARCHAR(50),
+            customer_name_th    VARCHAR(200),
+            amount_lc           NUMERIC(18,4) NOT NULL DEFAULT 0,
+            amount_fc           NUMERIC(18,4) NOT NULL DEFAULT 0,
+            currency_code       VARCHAR(10)   NOT NULL DEFAULT 'THB',
+            exchange_rate       NUMERIC(15,6) NOT NULL DEFAULT 1,
+            check_no            VARCHAR(50),
+            check_date          DATE,
+            drawer_bank         VARCHAR(200),
+            status              VARCHAR(20)   NOT NULL DEFAULT 'Pending',
+            clearing_date       DATE,
+            clearing_note       TEXT,
+            gl_entry_id         INTEGER,
+            created_by          INTEGER,
+            created_at          TIMESTAMP DEFAULT NOW(),
+            updated_at          TIMESTAMP DEFAULT NOW()
+        )`);
+
+    // Idempotent: delete and re-create (handles re-post scenario)
+    await client.query(`DELETE FROM cm_receipt WHERE ar_transaction_id = $1`, [arTransactionId]);
+
+    // Fetch AR transaction header for customer info + doc date
+    const hRes = await client.query(`
+        SELECT t.doc_no, t.doc_date, t.currency_code, t.exchange_rate,
+               t.customer_id,
+               c.customer_code, c.customer_name_th
+        FROM ar_transaction t
+        LEFT JOIN ar_customer c ON c.id = t.customer_id
+        WHERE t.id = $1`, [arTransactionId]);
+    if (hRes.rows.length === 0) return;
+    const h = hRes.rows[0];
+
+    // Fetch payment rows that have a CM bank account linked
+    const pmRes = await client.query(`
+        SELECT payment_method_id, payment_method_type,
+               cm_bank_account_id, amount_lc, amount_fc,
+               ref_no, payment_date, drawer_bank_name
+        FROM ar_transaction_payment
+        WHERE header_id = $1 AND cm_bank_account_id IS NOT NULL`,
+        [arTransactionId]);
+
+    for (const pm of pmRes.rows) {
+        const isCheck = pm.payment_method_type === 'CHECK';
+        await client.query(`
+            INSERT INTO cm_receipt
+                (receipt_date, bank_account_id, payment_method_id, payment_method_type,
+                 ar_transaction_id, ar_doc_no,
+                 customer_id, customer_code, customer_name_th,
+                 amount_lc, amount_fc, currency_code, exchange_rate,
+                 check_no, check_date, drawer_bank, gl_entry_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+            [
+                h.doc_date,
+                pm.cm_bank_account_id,
+                pm.payment_method_id,
+                pm.payment_method_type || 'CASH',
+                arTransactionId,
+                h.doc_no,
+                h.customer_id  || null,
+                h.customer_code || null,
+                h.customer_name_th || null,
+                pm.amount_lc   || 0,
+                pm.amount_fc   || 0,
+                h.currency_code || 'THB',
+                h.exchange_rate || 1,
+                isCheck ? (pm.ref_no || null) : null,
+                isCheck ? (pm.payment_date || h.doc_date) : null,
+                pm.drawer_bank_name || null,
+                glEntryId,
+            ]);
+    }
+};
+
 // --- Helper: Post GL Entry for AR transaction ---
 const postGlEntry = async (client, headerId, header, details, docNo) => {
     // Find open period
@@ -987,6 +1072,8 @@ const createTransaction = async (req, res) => {
                 await insertVtRecords(client, newHeaderId, headerWithDocNo, details || [], sysDocType1);
                 await insertDeferredVtRecordsForReceipt(client, newHeaderId, headerWithDocNo, applies || []);
                 await client.query(`UPDATE ar_transaction SET gl_entry_id=$1 WHERE id=$2`, [glEntryId, newHeaderId]);
+                // Post CM receipt records for Receipt documents
+                if (sysDocType1 === '80') await postCmReceiptsHelper(client, newHeaderId, glEntryId);
                 // DN-35, CN-55, RDP-65 ไม่มียอดค้างชำระตัวเอง
                 if (['35', '55', '65'].includes(sysDocType1)) {
                     await client.query(`UPDATE ar_transaction SET balance_amount_lc=0 WHERE id=$1`, [newHeaderId]);
@@ -1188,6 +1275,8 @@ const updateTransaction = async (req, res) => {
                 await insertVtRecords(client, id, headerWithDocNo, details || [], sysDocType2);
                 await insertDeferredVtRecordsForReceipt(client, id, headerWithDocNo, applies || []);
                 await client.query(`UPDATE ar_transaction SET gl_entry_id=$1 WHERE id=$2`, [glEntryId, id]);
+                // Post CM receipt records for Receipt documents
+                if (sysDocType2 === '80') await postCmReceiptsHelper(client, id, glEntryId);
                 if (['35', '55', '65'].includes(sysDocType2)) {
                     await client.query(`UPDATE ar_transaction SET balance_amount_lc=0 WHERE id=$1`, [id]);
                 }

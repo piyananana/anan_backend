@@ -182,7 +182,21 @@ const readSheet = (workbook, sheetDef, { required = false } = {}) => {
   }
   const colIdx = {};
   headers.forEach((h, i) => { colIdx[h] = i; });
-  return { present: true, colIdx, rows: aoa.slice(1) };
+  // กรอง description/label rows (ขึ้นต้นด้วย '(') และ blank rows ออก
+  // พร้อมเก็บ Excel row number จริงเพื่อแสดงใน error message
+  const keyIdx = colIdx[sheetDef.columns[0].key] ?? 0;
+  const rowsWithMeta = aoa.slice(1)
+    .map((row, i) => ({ row, num: i + 2 }))
+    .filter(({ row }) => {
+      const val = String(row[keyIdx] ?? '').trim();
+      return val !== '' && !val.startsWith('(');
+    });
+  return {
+    present: true,
+    colIdx,
+    rows: rowsWithMeta.map(r => r.row),
+    rowNums: rowsWithMeta.map(r => r.num),
+  };
 };
 
 const parseBool = (val) => YES_VALUES.includes(String(val ?? '').trim().toLowerCase());
@@ -269,7 +283,7 @@ const validateFile = [
       // ── Sheet 1: ข้อมูลทั่วไป ─────────────────────────────────────────────
       for (let i = 0; i < general.rows.length; i++) {
         const row = general.rows[i];
-        const rowNum = i + 2; // +1 header, +1 1-indexed
+        const rowNum = general.rowNums[i];
         const get = (key) => String(row[general.colIdx[key]] ?? '').trim();
 
         const oldCode = get('old_customer_code');
@@ -421,7 +435,7 @@ const validateFile = [
       // ── Sheet 2: เขตการขายและพนักงานขาย ───────────────────────────────────
       for (let i = 0; i < sales.rows.length; i++) {
         const row = sales.rows[i];
-        const rowNum = i + 2;
+        const rowNum = sales.rowNums[i];
         const found = findCustomer(salesDef, row, sales.colIdx, rowNum);
         if (!found) continue;
         const { customer } = found;
@@ -456,7 +470,7 @@ const validateFile = [
       // ── Sheet 3: เงื่อนไขการวางบิล ─────────────────────────────────────────
       for (let i = 0; i < billingConds.rows.length; i++) {
         const row = billingConds.rows[i];
-        const rowNum = i + 2;
+        const rowNum = billingConds.rowNums[i];
         const found = findCustomer(billingCondDef, row, billingConds.colIdx, rowNum);
         if (!found) continue;
         const { customer } = found;
@@ -495,7 +509,7 @@ const validateFile = [
       // ── Sheet 4: เงื่อนไขการรับชำระเงิน ────────────────────────────────────
       for (let i = 0; i < paymentConds.rows.length; i++) {
         const row = paymentConds.rows[i];
-        const rowNum = i + 2;
+        const rowNum = paymentConds.rowNums[i];
         const found = findCustomer(paymentCondDef, row, paymentConds.colIdx, rowNum);
         if (!found) continue;
         const { customer } = found;
@@ -553,7 +567,7 @@ const validateFile = [
       // ── Sheet 5: ที่อยู่ ───────────────────────────────────────────────────
       for (let i = 0; i < addresses.rows.length; i++) {
         const row = addresses.rows[i];
-        const rowNum = i + 2;
+        const rowNum = addresses.rowNums[i];
         const found = findCustomer(addressDef, row, addresses.colIdx, rowNum);
         if (!found) continue;
         const { customer } = found;
@@ -583,7 +597,7 @@ const validateFile = [
       // ── Sheet 6: ผู้ติดต่อ ─────────────────────────────────────────────────
       for (let i = 0; i < contacts.rows.length; i++) {
         const row = contacts.rows[i];
-        const rowNum = i + 2;
+        const rowNum = contacts.rowNums[i];
         const found = findCustomer(contactDef, row, contacts.colIdx, rowNum);
         if (!found) continue;
         const { customer } = found;
@@ -607,7 +621,7 @@ const validateFile = [
       // ── Sheet 7: บัญชีธนาคาร ───────────────────────────────────────────────
       for (let i = 0; i < bankAccounts.rows.length; i++) {
         const row = bankAccounts.rows[i];
-        const rowNum = i + 2;
+        const rowNum = bankAccounts.rowNums[i];
         const found = findCustomer(bankDef, row, bankAccounts.colIdx, rowNum);
         if (!found) continue;
         const { customer } = found;
@@ -632,7 +646,7 @@ const validateFile = [
       // ── Sheet 8: รหัสบัญชีลูกหนี้ ──────────────────────────────────────────
       for (let i = 0; i < arAccount.rows.length; i++) {
         const row = arAccount.rows[i];
-        const rowNum = i + 2;
+        const rowNum = arAccount.rowNums[i];
         const found = findCustomer(arAccountDef, row, arAccount.colIdx, rowNum);
         if (!found) continue;
         const { customer } = found;
