@@ -18,6 +18,8 @@ const saUserDocumentController = require('../controllers/sa/saUserDocumentContro
 const saUserMenuController = require('../controllers/sa/saUserMenuController');
 const saModuleApproverController = require('../controllers/sa/saModuleApproverController');
 const saSmtpConfigController     = require('../controllers/sa/saSmtpConfigController');
+const saDashboardController      = require('../controllers/sa/saDashboardController');
+const saUserAuditLogController   = require('../controllers/sa/saUserAuditLogController');
 // const saOrganizationController = require('../controllers/sa/saOrganizationController');
 
 const xlsx = require('xlsx'); // Import xlsx
@@ -173,6 +175,16 @@ router.delete('/sa_module_approver/:id', saModuleApproverController.deleteRow);
 // For saSmtpConfigController
 router.get('/sa_smtp_config',  saSmtpConfigController.getConfig);
 router.put('/sa_smtp_config',  saSmtpConfigController.upsertConfig);
+
+// For saDashboardController
+router.get('/dashboard/stats',   saDashboardController.getStats);
+router.get('/dashboard/db_size', saDashboardController.getDbSize);
+
+// For saUserAuditLogController
+router.get('/user_audit_log',              saAuthController.injectUserRole, saUserAuditLogController.getList);
+router.get('/user_audit_log/users',        saAuthController.injectUserRole, saUserAuditLogController.getUsers);
+router.get('/user_audit_log/counts',       saAuthController.requireDeveloper, saUserAuditLogController.getCounts);
+router.delete('/user_audit_log/reset',     saAuthController.requireDeveloper, saUserAuditLogController.deleteLog);
 
 // router.get('/sa_organization', saOrganizationController.getAllOrganization); // Get all organizational units
 // router.get('/sa_organization/:id', saOrganizationController.getOrganizationById); // Get organizational unit by ID

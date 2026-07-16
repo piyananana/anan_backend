@@ -4,6 +4,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const PolicyController = require('../sa/saPasswordPolicyController');
 const PasswordPolicyService = require('../../services/saPasswordPolicyService');
+const auditLog = require('./saUserAuditLogController');
 
 const verifyToken = (req, res, next) => {
     const token = req.headers.authorization?.split(' ')[1];
@@ -188,7 +189,7 @@ async function ensureFirstUserExists(req, res) {
 }
 
 const login = async (req, res) => {
-    const { userName, password, databaseName } = req.body;
+    const { userName, password, databaseName, hostname: clientHostname } = req.body;
     console.log(`Login attempt for user: ${userName} in database: ${databaseName}`);
 
     if (!userName || !password || !databaseName) {
@@ -233,8 +234,9 @@ const login = async (req, res) => {
             });
         }
 
-        // force mode หรือไม่มี session เก่า: ลบ session เก่า (ถ้ามี) แล้ว login
+        // force mode หรือไม่มี session เก่า: mark audit เก่าเป็น forced แล้วลบ session
         if (existingSession) {
+            await auditLog.markForced(req.dbPool, user.id);
             await _deleteSession(req.dbPool, user.id);
         }
 
@@ -247,6 +249,20 @@ const login = async (req, res) => {
 
         // บันทึก session ใหม่
         await _upsertSession(req.dbPool, user.id, token);
+
+        // บันทึก audit log
+        const _loginIp = (String(req.headers['x-forwarded-for'] || '')).split(',')[0].trim() || req.ip || null;
+        await auditLog.logLogin(req.dbPool, {
+            userId:       user.id,
+            userType:     user.user_type,
+            username:     user.user_name,
+            fullName:     [user.first_name, user.last_name].filter(Boolean).join(' '),
+            dbName:       databaseName,
+            ipAddress:    _loginIp,
+            hostname:     clientHostname || null,
+            userAgent:    req.headers['user-agent'] || null,
+            sessionToken: token,
+        });
 
         // ตรวจสอบ Password Policy สำหรับการแจ้งเตือนและการบังคับเปลี่ยน
         const policy = await PolicyController.getPolicy(req, res);
@@ -376,6 +392,7 @@ const confirmLogin = async (req, res) => {
 
         // ลบ session เก่า แล้วสร้างใหม่
         await _ensureSessionTable(req.dbPool);
+        await auditLog.markForced(req.dbPool, user.id);
         await _deleteSession(req.dbPool, user.id);
 
         const isDeveloper = user.user_type === 'developer';
@@ -386,6 +403,20 @@ const confirmLogin = async (req, res) => {
             { expiresIn: 86400 }
         );
         await _upsertSession(req.dbPool, user.id, token);
+
+        // บันทึก audit log login ใหม่
+        const _confirmIp = (String(req.headers['x-forwarded-for'] || '')).split(',')[0].trim() || req.ip || null;
+        await auditLog.logLogin(req.dbPool, {
+            userId:       user.id,
+            userType:     user.user_type,
+            username:     user.user_name,
+            fullName:     [user.first_name, user.last_name].filter(Boolean).join(' '),
+            dbName:       decoded.dbName ?? null,
+            ipAddress:    _confirmIp,
+            hostname:     req.body.hostname || null,
+            userAgent:    req.headers['user-agent'] || null,
+            sessionToken: token,
+        });
 
         const policy = await PolicyController.getPolicy(req, res);
         return res.status(200).json({
@@ -442,6 +473,7 @@ const logout = async (req, res) => {
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
         await _ensureSessionTable(req.dbPool);
+        await auditLog.logLogout(req.dbPool, { sessionToken: token, logoutType: 'normal' });
         // ลบเฉพาะเมื่อ token ตรงกับที่เก็บไว้ — ป้องกันการลบ session ใหม่กว่า
         await req.dbPool.query(
             'DELETE FROM sa_user_session WHERE user_id = $1 AND session_token = $2',

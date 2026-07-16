@@ -7,8 +7,9 @@ const xlsx = require('xlsx'); // Import xlsx
 // ไม่ต้องใช้ verifyToken เพราะเป็น public view
 const getAllMenu = async (req, res) => {
     try {
-        // Ensure column exists
+        // Ensure columns exist
         await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS is_system BOOLEAN DEFAULT FALSE');
+        await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS menu_name_en TEXT DEFAULT ''");
 
         const isDeveloper = req.isDeveloper ?? false;
         const query = isDeveloper
@@ -149,8 +150,9 @@ const getMenuContentById = async (req, res) => {
 
 // API สำหรับเพิ่มเมนูใหม่
 const createMenu = async (req, res) => {
-    const { parent_id, menu_name, menu_type, target_path, sort_order, is_system, content_type, content_data } = req.body;
+    const { parent_id, menu_name, menu_name_en, menu_type, target_path, sort_order, is_system, content_type, content_data } = req.body;
     try {
+        await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS menu_name_en TEXT DEFAULT ''");
         let actual_sort_order = sort_order;
         if (actual_sort_order === undefined || actual_sort_order === null) {
             const maxOrderResult = await req.dbPool.query(
@@ -160,9 +162,9 @@ const createMenu = async (req, res) => {
         }
 
         const menuResult = await req.dbPool.query(
-            `INSERT INTO sa_menu (parent_id, menu_name, menu_type, target_path, sort_order, is_active, is_system)
-             VALUES ($1, $2, $3, $4, $5, TRUE, $6) RETURNING *`,
-            [parent_id, menu_name, menu_type, target_path, actual_sort_order, is_system ?? false]
+            `INSERT INTO sa_menu (parent_id, menu_name, menu_name_en, menu_type, target_path, sort_order, is_active, is_system)
+             VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7) RETURNING *`,
+            [parent_id, menu_name, menu_name_en ?? '', menu_type, target_path, actual_sort_order, is_system ?? false]
         );
         const newMenu = menuResult.rows[0];
 
@@ -185,19 +187,21 @@ const createMenu = async (req, res) => {
 // API สำหรับแก้ไขเมนู
 const updateMenu = async (req, res) => {
     const { id } = req.params;
-    const { menu_name, menu_type, target_path, sort_order, is_active, is_system, content_type, content_data } = req.body;
+    const { menu_name, menu_name_en, menu_type, target_path, sort_order, is_active, is_system, content_type, content_data } = req.body;
     try {
+        await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS menu_name_en TEXT DEFAULT ''");
         const menuResult = await req.dbPool.query(
             `UPDATE sa_menu SET
                 menu_name = $1,
-                menu_type = $2,
-                target_path = $3,
-                sort_order = $4,
-                is_active = $5,
-                is_system = $6,
+                menu_name_en = $2,
+                menu_type = $3,
+                target_path = $4,
+                sort_order = $5,
+                is_active = $6,
+                is_system = $7,
                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = $7 RETURNING *`,
-            [menu_name, menu_type, target_path, sort_order, is_active, is_system ?? false, id]
+             WHERE id = $8 RETURNING *`,
+            [menu_name, menu_name_en ?? '', menu_type, target_path, sort_order, is_active, is_system ?? false, id]
         );
 
         if (menuResult.rows.length === 0) {
