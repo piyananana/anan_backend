@@ -203,7 +203,7 @@ const getBcDocTypes = async (req, res) => {
         let result;
         if (userId) {
             result = await client.query(`
-                SELECT m.id, m.doc_code, m.doc_name_thai
+                SELECT m.id, m.doc_code, m.doc_name_thai, m.doc_name_eng
                 FROM sa_module_document m
                 JOIN sa_user_document u ON u.doc_id = m.id
                 WHERE u.user_id    = $1
@@ -215,7 +215,7 @@ const getBcDocTypes = async (req, res) => {
             `, [parseInt(userId)]);
         } else {
             result = await client.query(`
-                SELECT id, doc_code, doc_name_thai
+                SELECT id, doc_code, doc_name_thai, doc_name_eng
                 FROM sa_module_document
                 WHERE sys_module  = 11
                   AND sys_doc_type = '70'
