@@ -78,21 +78,86 @@ const fetchRow = async (req, res) => {
     }
 };
 
+// --- Helper: ensure cm_bank_account_id column on ap_payment_run ---
+const ensureApPaymentRunCmColumn = async (dbPool) => {
+    await dbPool.query(`ALTER TABLE ap_payment_run ADD COLUMN IF NOT EXISTS cm_bank_account_id INTEGER`);
+};
+
+// --- Helper: Create CM payment records after AP payment run is posted ---
+const postCmPaymentsHelper = async (client, run, lines, glEntryId) => {
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS cm_payment (
+            id                  SERIAL PRIMARY KEY,
+            payment_date        DATE          NOT NULL,
+            bank_account_id     INTEGER       REFERENCES cm_bank_account(id),
+            payment_method_id   INTEGER,
+            payment_method_type VARCHAR(30)   NOT NULL DEFAULT 'TRANSFER',
+            ap_payment_run_id   INTEGER,
+            ap_doc_no           VARCHAR(50),
+            payee_type          VARCHAR(10)   DEFAULT 'VENDOR',
+            payee_id            INTEGER,
+            payee_code          VARCHAR(50),
+            payee_name_th       VARCHAR(200),
+            amount_lc           NUMERIC(18,4) NOT NULL DEFAULT 0,
+            amount_fc           NUMERIC(18,4) NOT NULL DEFAULT 0,
+            currency_code       VARCHAR(10)   NOT NULL DEFAULT 'THB',
+            exchange_rate       NUMERIC(15,6) NOT NULL DEFAULT 1,
+            check_no            VARCHAR(50),
+            check_date          DATE,
+            checkbook_id        INTEGER       REFERENCES cm_checkbook(id),
+            status              VARCHAR(20)   NOT NULL DEFAULT 'Pending',
+            clearing_date       DATE,
+            clearing_note       TEXT,
+            gl_entry_id         INTEGER,
+            remark              TEXT,
+            created_by          INTEGER,
+            created_at          TIMESTAMP DEFAULT NOW(),
+            updated_at          TIMESTAMP DEFAULT NOW()
+        )`);
+
+    // Idempotent: delete and re-create
+    await client.query(`DELETE FROM cm_payment WHERE ap_payment_run_id = $1`, [run.id]);
+
+    for (const line of lines) {
+        const payAmt = parseFloat(line.payment_amount_lc || 0);
+        if (payAmt === 0) continue;
+        await client.query(`
+            INSERT INTO cm_payment
+                (payment_date, bank_account_id, payment_method_type,
+                 ap_payment_run_id, ap_doc_no,
+                 payee_type, payee_id, payee_code, payee_name_th,
+                 amount_lc, currency_code, exchange_rate, gl_entry_id)
+            VALUES ($1,$2,'TRANSFER',$3,$4,'VENDOR',$5,$6,$7,$8,'THB',1,$9)`,
+            [
+                run.run_date,
+                run.cm_bank_account_id || null,
+                run.id,
+                run.run_number,
+                line.vendor_id   || null,
+                line.vendor_code || null,
+                line.vendor_name_th || null,
+                payAmt,
+                glEntryId,
+            ]);
+    }
+};
+
 // --- POST create (Draft) ---
 const createRun = async (req, res) => {
-    const { run_date, description, bank_file_format_id, lines = [] } = req.body;
+    const { run_date, description, bank_file_format_id, cm_bank_account_id, lines = [] } = req.body;
     const userName = req.headers['username'] || null;
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
+        await client.query(`ALTER TABLE ap_payment_run ADD COLUMN IF NOT EXISTS cm_bank_account_id INTEGER`);
         const runNumber = await generateRunNumber(client, run_date);
         const total = lines.reduce((s, l) => s + parseFloat(l.payment_amount_lc || 0), 0);
         const hRes = await client.query(`
             INSERT INTO ap_payment_run
-                (run_number, run_date, description, bank_file_format_id, total_amount_lc, status, created_by, updated_by)
-            VALUES ($1,$2,$3,$4,$5,'Draft',$6,$6)
-            RETURNING id, run_number, run_date, description, bank_file_format_id, total_amount_lc, status`,
-            [runNumber, run_date, description || null, bank_file_format_id || null, total, userName]);
+                (run_number, run_date, description, bank_file_format_id, cm_bank_account_id, total_amount_lc, status, created_by, updated_by)
+            VALUES ($1,$2,$3,$4,$5,$6,'Draft',$7,$7)
+            RETURNING id, run_number, run_date, description, bank_file_format_id, cm_bank_account_id, total_amount_lc, status`,
+            [runNumber, run_date, description || null, bank_file_format_id || null, cm_bank_account_id || null, total, userName]);
         const runId = hRes.rows[0].id;
 
         for (let i = 0; i < lines.length; i++) {
@@ -130,11 +195,12 @@ const createRun = async (req, res) => {
 // --- PUT update (Draft only) ---
 const updateRun = async (req, res) => {
     const { id } = req.params;
-    const { run_date, description, bank_file_format_id, lines = [] } = req.body;
+    const { run_date, description, bank_file_format_id, cm_bank_account_id, lines = [] } = req.body;
     const userName = req.headers['username'] || null;
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
+        await client.query(`ALTER TABLE ap_payment_run ADD COLUMN IF NOT EXISTS cm_bank_account_id INTEGER`);
         const existing = await client.query(`SELECT status FROM ap_payment_run WHERE id=$1`, [id]);
         if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
         if (existing.rows[0].status !== 'Draft') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'แก้ไขได้เฉพาะเอกสาร Draft เท่านั้น' }); }
@@ -142,10 +208,10 @@ const updateRun = async (req, res) => {
         const total = lines.reduce((s, l) => s + parseFloat(l.payment_amount_lc || 0), 0);
         await client.query(`
             UPDATE ap_payment_run
-               SET run_date=$1, description=$2, bank_file_format_id=$3,
-                   total_amount_lc=$4, updated_at=NOW(), updated_by=$5
-             WHERE id=$6`,
-            [run_date, description || null, bank_file_format_id || null, total, userName, id]);
+               SET run_date=$1, description=$2, bank_file_format_id=$3, cm_bank_account_id=$4,
+                   total_amount_lc=$5, updated_at=NOW(), updated_by=$6
+             WHERE id=$7`,
+            [run_date, description || null, bank_file_format_id || null, cm_bank_account_id || null, total, userName, id]);
 
         await client.query(`DELETE FROM ap_payment_run_detail WHERE run_id=$1`, [id]);
         for (let i = 0; i < lines.length; i++) {
@@ -423,11 +489,12 @@ const postRun = async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // Ensure gl columns exist (idempotent migration)
+        // Ensure columns exist (idempotent migration)
         await client.query(`
             ALTER TABLE ap_payment_run
-            ADD COLUMN IF NOT EXISTS gl_entry_id INT,
-            ADD COLUMN IF NOT EXISTS gl_doc_no   VARCHAR(50)`);
+            ADD COLUMN IF NOT EXISTS gl_entry_id       INT,
+            ADD COLUMN IF NOT EXISTS gl_doc_no         VARCHAR(50),
+            ADD COLUMN IF NOT EXISTS cm_bank_account_id INTEGER`);
 
         // 1. Verify run is Approved
         const runRes = await client.query(
@@ -577,6 +644,9 @@ const postRun = async (req, res) => {
                 updated_at = NOW(), updated_by = $3
             WHERE id = $4`,
             [glEntryId, glDocNo, userName, id]);
+
+        // 13. Post CM payment records (always, bank_account_id nullable if not set)
+        await postCmPaymentsHelper(client, run, lines, glEntryId);
 
         await client.query('COMMIT');
         res.status(200).json({ message: 'บันทึก GL สำเร็จ', gl_entry_id: glEntryId, gl_doc_no: glDocNo });

@@ -1,5 +1,40 @@
 // controllers/ap/apVendorGroupController.js
 
+const formatGroupCode = (g) => {
+    let code = g.running_prefix || '';
+    if (g.running_suffix_date) {
+        const now = new Date();
+        const year  = now.getFullYear().toString();
+        const month = (now.getMonth() + 1).toString().padStart(2, '0');
+        const day   = now.getDate().toString().padStart(2, '0');
+        switch (g.running_suffix_date) {
+            case 'YY':     code += year.substring(2); break;
+            case 'YYYY':   code += year; break;
+            case 'YYMM':   code += year.substring(2) + month; break;
+            case 'YYYYMM': code += year + month; break;
+            case 'YYMMDD': code += year.substring(2) + month + day; break;
+        }
+    }
+    if (g.running_separator) code += g.running_separator;
+    code += g.running_next_number.toString().padStart(g.running_length, '0');
+    return code;
+};
+
+// สำหรับใช้ภายใน apVendorImportController (atomic increment ภายใน transaction)
+const generateNextCodeForGroup = async (client, groupId) => {
+    const result = await client.query(
+        `SELECT * FROM ap_vendor_group WHERE id = $1 FOR UPDATE`, [groupId]
+    );
+    if (result.rows.length === 0 || !result.rows[0].is_auto_number) return null;
+    const g = result.rows[0];
+    const code = formatGroupCode(g);
+    await client.query(
+        `UPDATE ap_vendor_group SET running_next_number = running_next_number + 1 WHERE id = $1`,
+        [groupId]
+    );
+    return code;
+};
+
 const GROUP_SELECT = `
     SELECT g.*,
            a.account_code      AS ap_account_code,
@@ -165,4 +200,4 @@ const deleteRow = async (req, res) => {
     }
 };
 
-module.exports = { fetchRows, fetchActiveRows, fetchRow, addRow, updateRow, deleteRow };
+module.exports = { fetchRows, fetchActiveRows, fetchRow, addRow, updateRow, deleteRow, generateNextCodeForGroup };

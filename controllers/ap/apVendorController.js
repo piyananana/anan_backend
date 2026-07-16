@@ -2,8 +2,9 @@
 const { generateNextCode } = require('./apVendorRunningController');
 
 const fetchRowById = async (pool, id) => {
-  // เพิ่ม vendor_type column แบบ idempotent
-  await pool.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS vendor_type VARCHAR(20)`).catch(() => {});
+  // เพิ่ม column แบบ idempotent
+  await pool.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS vendor_type  VARCHAR(20)`).catch(() => {});
+  await pool.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS credit_limit NUMERIC(18,4) NOT NULL DEFAULT 0`).catch(() => {});
   const [mainResult, addresses, contacts, banks] = await Promise.all([
     pool.query(`
       SELECT
@@ -24,8 +25,10 @@ const fetchRowById = async (pool, id) => {
     pool.query(`SELECT * FROM ap_vendor_bank_account WHERE vendor_id=$1 ORDER BY id`, [id]),
   ]);
   if (mainResult.rows.length === 0) return null;
+  const row = mainResult.rows[0];
   return {
-    ...mainResult.rows[0],
+    ...row,
+    credit_limit:  Number(row.credit_limit || 0),
     addresses:     addresses.rows,
     contacts:      contacts.rows,
     bank_accounts: banks.rows,
@@ -36,10 +39,13 @@ const fetchRowById = async (pool, id) => {
 const fetchRows = async (req, res) => {
   const { search } = req.query;
   try {
+    await req.dbPool.query(
+      `ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS credit_limit NUMERIC(18,4) NOT NULL DEFAULT 0`
+    ).catch(() => {});
     let query = `
       SELECT
         v.id, v.vendor_code, v.old_vendor_code, v.vendor_name_th, v.vendor_name_en,
-        v.tax_id, v.credit_term_months, v.credit_term_days,
+        v.tax_id, v.credit_term_months, v.credit_term_days, v.credit_limit,
         v.currency_code, v.is_active, v.vendor_type,
         v.vendor_group_id,   vg.group_code AS vendor_group_code, vg.group_name_thai AS vendor_group_name,
         v.business_type_id,  cbt.business_type_code, cbt.business_type_name_thai,
@@ -59,7 +65,10 @@ const fetchRows = async (req, res) => {
     }
     query += ` ORDER BY v.vendor_code ASC`;
     const result = await req.dbPool.query(query, params);
-    res.status(200).json(result.rows);
+    res.status(200).json(result.rows.map(r => ({
+      ...r,
+      credit_limit: Number(r.credit_limit || 0),
+    })));
   } catch (error) {
     console.error('Error fetching ap vendors:', error);
     res.status(500).json({ message: 'Internal server error' });
@@ -137,7 +146,7 @@ const addRow = async (req, res) => {
     vendor_group_id,
     business_type_id,
     vendor_type,
-    credit_term_months, credit_term_days,
+    credit_term_months, credit_term_days, credit_limit,
     currency_code, is_active, remark,
     ap_account_id,
     addresses, contacts, bank_accounts,
@@ -146,6 +155,8 @@ const addRow = async (req, res) => {
   const client = await req.dbPool.connect();
   try {
     await client.query('BEGIN');
+    // idempotent migration
+    await client.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS credit_limit NUMERIC(18,4) NOT NULL DEFAULT 0`).catch(() => {});
     let finalCode = vendor_code && vendor_code.trim() !== ''
       ? vendor_code.trim().toUpperCase()
       : null;
@@ -162,11 +173,11 @@ const addRow = async (req, res) => {
           vendor_group_id,
           business_type_id,
           vendor_type,
-          credit_term_months, credit_term_days,
+          credit_term_months, credit_term_days, credit_limit,
           currency_code, is_active, remark,
           ap_account_id,
           created_by, updated_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$16)
        RETURNING id`,
       [
         finalCode, old_vendor_code || null,
@@ -175,7 +186,7 @@ const addRow = async (req, res) => {
         vendor_group_id || null,
         business_type_id || null,
         vendor_type || null,
-        credit_term_months ?? 0, credit_term_days ?? 30,
+        credit_term_months ?? 0, credit_term_days ?? 30, credit_limit ?? 0,
         currency_code || 'THB',
         is_active !== undefined ? is_active : true,
         remark || null,
@@ -206,7 +217,7 @@ const updateRow = async (req, res) => {
     vendor_group_id,
     business_type_id,
     vendor_type,
-    credit_term_months, credit_term_days,
+    credit_term_months, credit_term_days, credit_limit,
     currency_code, is_active, remark,
     ap_account_id,
     addresses, contacts, bank_accounts,
@@ -224,11 +235,12 @@ const updateRow = async (req, res) => {
          business_type_id    = $7,
          vendor_type         = $8,
          credit_term_months  = $9,  credit_term_days    = $10,
-         currency_code       = $11, is_active           = $12,
-         remark              = $13,
-         ap_account_id       = $14,
-         updated_by          = $15, updated_at          = NOW()
-       WHERE id = $16
+         credit_limit        = $11,
+         currency_code       = $12, is_active           = $13,
+         remark              = $14,
+         ap_account_id       = $15,
+         updated_by          = $16, updated_at          = NOW()
+       WHERE id = $17
        RETURNING id`,
       [
         vendor_code.toUpperCase(), old_vendor_code || null,
@@ -238,6 +250,7 @@ const updateRow = async (req, res) => {
         business_type_id || null,
         vendor_type || null,
         credit_term_months ?? 0, credit_term_days ?? 30,
+        credit_limit ?? 0,
         currency_code || 'THB', is_active,
         remark || null,
         ap_account_id ?? null,

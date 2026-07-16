@@ -485,17 +485,17 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
         // FX Gain/Loss
         const fxNet = totalInvoiceApplied - totalInvoiceAtInvRate;
         if (Math.abs(fxNet) >= 0.005) {
-            if (fxNet > 0 && fxLossAccountId) {
+            if (fxNet > 0 && fxGainAccountId) {
                 // payment rate < invoice rate → gain for us (we pay less in LC)
                 glDetails.push({
-                    account_id: fxLossAccountId,
+                    account_id: fxGainAccountId,
                     description: `กำไรจากอัตราแลกเปลี่ยน ${docNo}`,
                     debit_lc: 0, credit_lc: fxNet,
                     debit_fc: 0, credit_fc: 0,
                 });
-            } else if (fxNet < 0 && fxGainAccountId) {
+            } else if (fxNet < 0 && fxLossAccountId) {
                 glDetails.push({
-                    account_id: fxGainAccountId,
+                    account_id: fxLossAccountId,
                     description: `ขาดทุนจากอัตราแลกเปลี่ยน ${docNo}`,
                     debit_lc: Math.abs(fxNet), credit_lc: 0,
                     debit_fc: 0, credit_fc: 0,

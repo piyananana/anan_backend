@@ -2,6 +2,7 @@
 const XLSX = require('xlsx');
 const multer = require('multer');
 const { generateNextCode } = require('./apVendorRunningController');
+const { generateNextCodeForGroup } = require('./apVendorGroupController');
 const { insertRelated } = require('./apVendorController');
 
 const upload = multer({ storage: multer.memoryStorage() });
@@ -132,7 +133,21 @@ const readSheet = (workbook, sheetDef, { required = false } = {}) => {
   }
   const colIdx = {};
   headers.forEach((h, i) => { colIdx[h] = i; });
-  return { present: true, colIdx, rows: aoa.slice(1) };
+  // กรอง description/label rows (ขึ้นต้นด้วย '(') และ blank rows ออก
+  // พร้อมเก็บ Excel row number จริงเพื่อแสดงใน error message
+  const keyIdx = colIdx[sheetDef.columns[0].key] ?? 0;
+  const rowsWithMeta = aoa.slice(1)
+    .map((row, i) => ({ row, num: i + 2 }))
+    .filter(({ row }) => {
+      const val = String(row[keyIdx] ?? '').trim();
+      return val !== '' && !val.startsWith('(');
+    });
+  return {
+    present: true,
+    colIdx,
+    rows: rowsWithMeta.map(r => r.row),
+    rowNums: rowsWithMeta.map(r => r.num),
+  };
 };
 
 const parseBool = (val) => YES_VALUES.includes(String(val ?? '').trim().toLowerCase());
@@ -174,7 +189,7 @@ const validateFile = [
 
       // Pre-fetch lookup tables
       const [groupsR, businessTypesR, accountsR, currenciesR, runningR] = await Promise.all([
-        req.dbPool.query(`SELECT id, group_code FROM ap_vendor_group WHERE is_active = true`),
+        req.dbPool.query(`SELECT id, group_code, is_auto_number FROM ap_vendor_group WHERE is_active = true`),
         req.dbPool.query(`SELECT id, business_type_code FROM cd_business_type WHERE is_active = true`),
         req.dbPool.query(`SELECT id, account_code FROM gl_account WHERE is_active = true AND is_control_account = true`),
         req.dbPool.query(`SELECT currency_code FROM cd_currency WHERE is_active = true`),
@@ -193,7 +208,7 @@ const validateFile = [
       // ── Sheet 1: ข้อมูลพื้นฐาน ────────────────────────────────────────────
       for (let i = 0; i < general.rows.length; i++) {
         const row    = general.rows[i];
-        const rowNum = i + 2;
+        const rowNum = general.rowNums[i];
         const get    = (key) => String(row[general.colIdx[key]] ?? '').trim();
 
         const oldCode     = get('old_vendor_code');
@@ -225,7 +240,10 @@ const validateFile = [
         }
 
         if (!vendorCode) {
-          if (!globalAutoNumber) rowErrors.push({ column: 'vendor_code', message: 'จำเป็นต้องระบุรหัสเจ้าหนี้ (ระบบไม่ได้เปิดรหัสอัตโนมัติ)' });
+          const groupAuto = resolvedGroup?.is_auto_number ?? false;
+          if (!groupAuto && !globalAutoNumber) {
+            rowErrors.push({ column: 'vendor_code', message: 'จำเป็นต้องระบุรหัสเจ้าหนี้ (กลุ่มและระบบไม่ได้เปิดรหัสอัตโนมัติ)' });
+          }
         } else if (vendorCode.length > 20) {
           rowErrors.push({ column: 'vendor_code', message: 'รหัสเจ้าหนี้ต้องไม่เกิน 20 ตัวอักษร' });
         }
@@ -307,7 +325,7 @@ const validateFile = [
       // ── Sheet 2: ที่อยู่ ──────────────────────────────────────────────────
       for (let i = 0; i < addresses.rows.length; i++) {
         const row    = addresses.rows[i];
-        const rowNum = i + 2;
+        const rowNum = addresses.rowNums[i];
         const found  = findVendor(addressDef, row, addresses.colIdx, rowNum);
         if (!found) continue;
         const { vendor } = found;
@@ -337,7 +355,7 @@ const validateFile = [
       // ── Sheet 3: ผู้ติดต่อ ────────────────────────────────────────────────
       for (let i = 0; i < contacts.rows.length; i++) {
         const row    = contacts.rows[i];
-        const rowNum = i + 2;
+        const rowNum = contacts.rowNums[i];
         const found  = findVendor(contactDef, row, contacts.colIdx, rowNum);
         if (!found) continue;
         const { vendor } = found;
@@ -361,7 +379,7 @@ const validateFile = [
       // ── Sheet 4: บัญชีธนาคาร ─────────────────────────────────────────────
       for (let i = 0; i < bankAccounts.rows.length; i++) {
         const row    = bankAccounts.rows[i];
-        const rowNum = i + 2;
+        const rowNum = bankAccounts.rowNums[i];
         const found  = findVendor(bankDef, row, bankAccounts.colIdx, rowNum);
         if (!found) continue;
         const { vendor } = found;
@@ -386,7 +404,7 @@ const validateFile = [
       // ── Sheet 5: บัญชีเจ้าหนี้ (GL) ──────────────────────────────────────
       for (let i = 0; i < apAccount.rows.length; i++) {
         const row    = apAccount.rows[i];
-        const rowNum = i + 2;
+        const rowNum = apAccount.rowNums[i];
         const found  = findVendor(apAccountDef, row, apAccount.colIdx, rowNum);
         if (!found) continue;
         const { vendor } = found;
@@ -449,9 +467,15 @@ const confirmImport = async (req, res) => {
       const savepointName = `sp_row_${idx}`;
       await client.query(`SAVEPOINT ${savepointName}`);
       try {
+        // resolve รหัสเจ้าหนี้: ถ้าว่าง → ลองกลุ่ม → ลอง global (เหมือน AR)
         let finalCode = r.vendor_code || null;
         if (!finalCode) {
-          finalCode = await generateNextCode(client);
+          if (r.vendor_group_id) {
+            finalCode = await generateNextCodeForGroup(client, r.vendor_group_id);
+          }
+          if (!finalCode) {
+            finalCode = await generateNextCode(client);
+          }
           if (!finalCode) {
             importErrors.push({ vendor_code: r.vendor_name_th, message: 'ไม่มีรหัสอัตโนมัติ — กรุณาระบุรหัสเจ้าหนี้' });
             await client.query(`RELEASE SAVEPOINT ${savepointName}`);

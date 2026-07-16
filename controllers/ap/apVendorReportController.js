@@ -15,6 +15,11 @@ const fetchReport = async (req, res) => {
   const { group_ids, code_from, code_to, status } = req.query;
 
   try {
+    // idempotent migration
+    await req.dbPool.query(
+      `ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS credit_limit NUMERIC(18,4) NOT NULL DEFAULT 0`
+    ).catch(() => {});
+
     const params = [];
     let p = 1;
     const conds = [];
@@ -60,6 +65,7 @@ const fetchReport = async (req, res) => {
         v.tax_id,
         v.credit_term_months,
         v.credit_term_days,
+        v.credit_limit,
         v.currency_code,
         v.is_active,
         v.vendor_type,
@@ -141,7 +147,10 @@ const fetchReport = async (req, res) => {
     `;
 
     const result = await req.dbPool.query(sql, params);
-    res.status(200).json(result.rows);
+    res.status(200).json(result.rows.map(r => ({
+      ...r,
+      credit_limit: Number(r.credit_limit || 0),
+    })));
   } catch (error) {
     console.error('Error fetching ap vendor report:', error);
     res.status(500).json({ message: 'Internal server error' });
