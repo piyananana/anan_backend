@@ -26,12 +26,12 @@ const BASE_SELECT = `
     ba.account_code  AS bank_account_code,
     ba.account_name_th AS bank_account_name_th,
     ba.account_number  AS bank_account_number,
-    b.bank_name_th   AS bank_name_th,
+    b.bank_name_thai  AS bank_name_th,
     b.short_name     AS bank_short_name
   FROM cm_payment_method pm
   LEFT JOIN gl_account       ga ON ga.id = pm.gl_account_id
   LEFT JOIN cm_bank_account  ba ON ba.id = pm.cm_bank_account_id
-  LEFT JOIN cm_bank          b  ON b.id  = ba.bank_id
+  LEFT JOIN cd_bank          b  ON b.id  = ba.bank_id
 `;
 
 const fetchRows = async (req, res) => {
