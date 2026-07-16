@@ -22,7 +22,7 @@ const getGeneralLedgerTransactions = async (req, res) => {
 
         let sql = `
             SELECT
-                d.account_id, a.account_code, a.account_name_thai, a.normal_balance,
+                d.account_id, a.account_code, a.account_name_thai, a.account_name_eng, a.normal_balance,
                 d.branch_id, d.dim1_id, d.dim2_id, d.dim3_id, d.dim4_id, d.dim5_id,
                 h.doc_date, doc.doc_code, h.doc_no, d.line_no,
                 ref_doc.doc_code AS ref_doc_code, h.ref_doc_no, h.ref_doc_date,

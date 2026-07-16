@@ -38,7 +38,7 @@ const getIncomeStatement = async (req, res) => {
 
       // 2. Fetch REVENUE and EXPENSE accounts
       const accountsRes = await client.query(`
-        SELECT id, account_code, account_name_thai, parent_id,
+        SELECT id, account_code, account_name_thai, account_name_eng, parent_id,
                is_normal_account, account_type, normal_balance
         FROM gl_account
         WHERE account_type IN ('REVENUE', 'EXPENSE')
@@ -110,6 +110,7 @@ const getIncomeStatement = async (req, res) => {
           account_id:        d.id,
           account_code:      d.account_code,
           account_name_thai: d.account_name_thai,
+          account_name_eng:  d.account_name_eng,
           parent_id:         d.parent_id,
           is_header:         !d.is_normal_account,
           account_type:      d.account_type,

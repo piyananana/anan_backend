@@ -250,16 +250,48 @@ const fetchDetailRows = async (req, res) => {
     }
 };
 
+// Helper: ensure cm_status column exists on gl_posting_period
+const ensureCmStatusColumn = async (pool) => {
+    try {
+        await pool.query(`
+            ALTER TABLE gl_posting_period
+            ADD COLUMN IF NOT EXISTS cm_status VARCHAR(10) NOT NULL DEFAULT 'OPEN'`);
+    } catch (_) { /* ignore if table doesn't exist yet */ }
+};
+
+// GET period cm_status for a given date (used by Flutter CM period check)
+const getCmStatusForDate = async (req, res) => {
+    const { date } = req.query;
+    if (!date) return res.status(400).json({ error: 'ต้องระบุ date' });
+    try {
+        await ensureCmStatusColumn(req.dbPool);
+        const result = await req.dbPool.query(`
+            SELECT p.id, p.period_name, p.period_start_date, p.period_end_date,
+                   COALESCE(p.cm_status,'OPEN') AS cm_status
+            FROM gl_posting_period p
+            JOIN gl_fiscal_year fy ON fy.id=p.fiscal_year_id
+            WHERE fy.is_active=true
+              AND p.period_start_date::date <= $1::date
+              AND p.period_end_date::date   >= $1::date
+            ORDER BY p.period_start_date DESC LIMIT 1`, [date]);
+        if (!result.rows.length) return res.json({ cm_status: null, message: 'ไม่พบงวดบัญชี' });
+        res.json(result.rows[0]);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+};
+
 // 2. PUT Update Period Status (เช่น ปิดรอบบัญชี GL)
 const updateStatusDetailRow = async (req, res) => {
     const { id } = req.params;
-    const { gl_status, ap_status, ar_status, im_status } = req.body;
+    const { gl_status, ap_status, ar_status, im_status, cm_status } = req.body;
     const userId = req.headers.userid;
     const userName = req.headers.username;
 
     try {
+        await ensureCmStatusColumn(req.dbPool);
         // ตรวจสอบรายการ Draft ก่อน CLOSED
-        const hasClose = [gl_status, ap_status, ar_status, im_status].some(s => s === 'CLOSED');
+        const hasClose = [gl_status, ap_status, ar_status, im_status, cm_status].some(s => s === 'CLOSED');
         if (hasClose) {
             const draftCheck = await req.dbPool.query(
                 `SELECT COUNT(*) FROM gl_entry_header WHERE period_id = $1 AND status = 'Draft'`,
@@ -273,20 +305,21 @@ const updateStatusDetailRow = async (req, res) => {
             }
         }
 
-        // SQL: อนุญาตให้อัปเดตสถานะ GL, AP, AR พร้อมกัน
+        // SQL: อนุญาตให้อัปเดตสถานะ GL, AP, AR, IM, CM พร้อมกัน
         const sql = `
-            UPDATE gl_posting_period SET 
+            UPDATE gl_posting_period SET
                 gl_status = COALESCE($1, gl_status),
                 ap_status = COALESCE($2, ap_status),
                 ar_status = COALESCE($3, ar_status),
                 im_status = COALESCE($4, im_status),
-                updated_by = $5,
+                cm_status = COALESCE($5, cm_status),
+                updated_by = $6,
                 updated_at = NOW()
-            WHERE id = $6
+            WHERE id = $7
             RETURNING *`;
-            
+
         const values = [
-            gl_status, ap_status, ar_status, im_status, userId, id
+            gl_status, ap_status, ar_status, im_status, cm_status, userId, id
         ];
         
         const result = await req.dbPool.query(sql, values);
@@ -315,13 +348,15 @@ const addDetailRow = async (req, res) => {
     try {
         const sql = `
             INSERT INTO gl_posting_period (
-                fiscal_year_id, period_number, period_name, period_start_date, period_end_date, 
-                gl_status, ap_status, ar_status, im_status, updated_by
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`;
-            
+                fiscal_year_id, period_number, period_name, period_start_date, period_end_date,
+                gl_status, ap_status, ar_status, im_status, cm_status, updated_by
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`;
+
         const values = [
-            fiscal_year_id, period_number, period_name, period_start_date, 
-            period_end_date, gl_status || 'LOCKED', ap_status || 'LOCKED', ar_status || 'LOCKED', im_status || 'LOCKED', userId
+            fiscal_year_id, period_number, period_name, period_start_date,
+            period_end_date, gl_status || 'LOCKED', ap_status || 'LOCKED',
+            ar_status || 'LOCKED', im_status || 'LOCKED',
+            (req.body.cm_status) || 'LOCKED', userId
         ];
         
         const result = await req.dbPool.query(sql, values);
@@ -480,6 +515,7 @@ module.exports = {
     deleteDetailRow,
     fetchOpenGlPeriods,
     verifyCloseApprover,
+    getCmStatusForDate,
 };
 //     fetchRows,
 //     addRow,

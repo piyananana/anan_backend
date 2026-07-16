@@ -68,6 +68,22 @@ const fetchRows = async (req, res) => {
     }
 };
 
+// GET all rows including inactive (for admin tree view)
+const fetchAllRows = async (req, res) => {
+    try {
+        const result = await req.dbPool.query(`
+            SELECT a.*, ${DIM_RULES_SQL}
+            FROM gl_account a
+            LEFT JOIN gl_account_dim_rule dr ON dr.account_id = a.id
+            GROUP BY a.id
+            ORDER BY a.parent_id ASC, a.account_code ASC`);
+        res.json(result.rows);
+    } catch (err) {
+        console.error('Error fetching all accounts:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+};
+
 const fetchRowsControlAccount = async (req, res) => {
     try {
         const result = await req.dbPool.query(`
@@ -379,6 +395,7 @@ module.exports = {
     lock,
     unlock,
     fetchRows,
+    fetchAllRows,
     fetchRowsControlAccount,
     addRow,
     updateRow,

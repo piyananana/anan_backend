@@ -40,8 +40,8 @@ const getTrialBalance = async (req, res) => {
 
       // 2. ดึงผังบัญชีทั้งหมด (เพิ่ม parent_id)
       const accountsRes = await client.query(`
-        SELECT id, account_code, account_name_thai, parent_id, is_normal_account 
-        FROM gl_account 
+        SELECT id, account_code, account_name_thai, account_name_eng, parent_id, is_normal_account
+        FROM gl_account
         ORDER BY account_code ASC
       `);
       const allAccounts = accountsRes.rows;
@@ -119,6 +119,7 @@ const getTrialBalance = async (req, res) => {
           t.account_id,
           a.account_code,
           a.account_name_thai,
+          a.account_name_eng,
           a.parent_id,         -- [สำคัญ] สำหรับคำนวณ Level ที่ Frontend
           a.is_normal_account
           ${dimFieldsT}
@@ -233,6 +234,7 @@ const getTrialBalance = async (req, res) => {
           account_id: d.id,
           account_code: d.account_code,
           account_name_thai: d.account_name_thai,
+          account_name_eng: d.account_name_eng,
           parent_id: d.parent_id, // ส่งกลับไปให้ Frontend
           is_header: !d.is_normal_account,
           // Values

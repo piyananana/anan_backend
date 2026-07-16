@@ -2,6 +2,8 @@
 const express = require('express');
 const router = express.Router();
 const glAccountController = require('../controllers/gl/glAccountController');
+const glAccountImportController = require('../controllers/gl/glAccountImportController');
+const glOpeningBalanceImportController = require('../controllers/gl/glOpeningBalanceImportController');
 const glEntryController = require('../controllers/gl/glEntryController');
 const glFinancialReportEngineController = require('../controllers/gl/glFinancialReportEngineController');
 const glGeneralLedgerReportController = require('../controllers/gl/glGeneralLedgerReportController');
@@ -24,6 +26,7 @@ const fileUpload = multer({ dest: 'public/gl/' });
 
 // Router สำหรับจัดการข้อมูลบัญชีแยกประเภท
 router.get('/gl_account', glAccountController.fetchRows);
+router.get('/gl_account/all', glAccountController.fetchAllRows);
 router.get('/gl_account/control_account', glAccountController.fetchRowsControlAccount);
 router.post('/gl_account', glAccountController.addRow);
 router.put('/gl_account/:id', glAccountController.updateRow);
@@ -31,6 +34,18 @@ router.delete('/gl_account/:id', glAccountController.deleteRow);
 router.delete('/gl_account', glAccountController.deleteRows);
 router.post('/gl_account/import', fileUpload.single('excelFile'), glAccountController.importDataExcel);
 router.get('/gl_account/export', glAccountController.exportDataExcel);
+
+// Import ผังบัญชีจาก spreadsheet (template/validate/confirm)
+router.get('/gl_account/import/template', glAccountImportController.getTemplate);
+router.get('/gl_account/import/template/download', glAccountImportController.downloadTemplate);
+router.post('/gl_account/import/validate', glAccountImportController.validateFile);
+router.post('/gl_account/import/confirm', glAccountImportController.confirmImport);
+
+// Import ยอดบัญชียกมา (Opening Balance) จาก spreadsheet 2 sheets: header / detail
+router.get('/gl_opening_balance/import/template', glOpeningBalanceImportController.getTemplate);
+router.get('/gl_opening_balance/import/template/download', glOpeningBalanceImportController.downloadTemplate);
+router.post('/gl_opening_balance/import/validate', glOpeningBalanceImportController.validateFile);
+router.post('/gl_opening_balance/import/confirm', glOpeningBalanceImportController.confirmImport);
 
 // // Router สำหรับจัดการข้อมูลรายการบัญชี
 // router.get('/gl_entry', glEntryController.fetchRows);
@@ -68,6 +83,8 @@ router.put('/gl_posting_period/:id', glPeriodController.updateDetailRow);
 router.put('/gl_posting_period/:id/status', glPeriodController.updateStatusDetailRow);
 router.delete('/gl_posting_period/:id', glPeriodController.deleteDetailRow);
 router.get('/gl_posting_period/open', glPeriodController.fetchOpenGlPeriods);
+router.get('/gl_posting_period/cm_check', glPeriodController.getCmStatusForDate);
+router.post('/gl_posting_period/verify_close_approver', glPeriodController.verifyCloseApprover);
 // Router สำหรับจัดการข้อมูลรายงาน Trial Balance
 router.get('/gl_trial_balance', glTrialBalanceReportController.getTrialBalance);
 // Router สำหรับรายงานงบดุล (Balance Sheet)
