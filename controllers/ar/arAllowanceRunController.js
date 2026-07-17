@@ -12,7 +12,7 @@ const calcAllowanceDetails = async (client, runDate) => {
     const invoices = (await client.query(`
         SELECT t.id AS invoice_id, t.customer_id, t.doc_no, t.ref_doc_no, t.doc_date,
                t.due_date, t.balance_amount_lc,
-               c.customer_code, c.customer_name_th,
+               c.customer_code, c.customer_name_th, c.customer_name_en,
                $1::date - COALESCE(t.due_date, t.doc_date) AS age_days
         FROM ar_transaction t
         JOIN sa_module_document d ON d.id = t.doc_id
@@ -41,6 +41,7 @@ const calcAllowanceDetails = async (client, runDate) => {
             customer_id:       inv.customer_id,
             customer_code:     inv.customer_code,
             customer_name_th:  inv.customer_name_th,
+            customer_name_en:  inv.customer_name_en,
             doc_no:            inv.doc_no,
             ref_doc_no:        inv.ref_doc_no || '',
             doc_date:          inv.doc_date,
@@ -94,7 +95,7 @@ const fetchRow = async (req, res) => {
         if (!hdr.rows[0]) return res.status(404).json({ error: 'Not found' });
 
         const dtl = await req.dbPool.query(`
-            SELECT d.*, c.customer_code, c.customer_name_th,
+            SELECT d.*, c.customer_code, c.customer_name_th, c.customer_name_en,
                    t.ref_doc_no
             FROM ar_allowance_run_detail d
             LEFT JOIN ar_customer c ON c.id = d.customer_id

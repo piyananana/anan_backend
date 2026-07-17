@@ -9,7 +9,7 @@ const calcRevalDetails = async (client, revalDate, yearEndRates) => {
         SELECT t.id AS invoice_id, t.customer_id, t.currency_id,
                t.currency_code, t.balance_amount_lc, t.exchange_rate AS original_rate,
                t.doc_no, t.ref_doc_no,
-               c.customer_code, c.customer_name_th,
+               c.customer_code, c.customer_name_th, c.customer_name_en,
                -- ใช้ revaluation_rate ถ้ามี (realized method ปีก่อน) มิฉะนั้นใช้ original rate
                COALESCE(t.revaluation_rate, t.exchange_rate) AS current_rate,
                CASE WHEN COALESCE(t.revaluation_rate, t.exchange_rate) > 0
@@ -44,6 +44,7 @@ const calcRevalDetails = async (client, revalDate, yearEndRates) => {
             customer_id:        row.customer_id,
             customer_code:      row.customer_code,
             customer_name_th:   row.customer_name_th,
+            customer_name_en:   row.customer_name_en,
             doc_no:             row.doc_no,
             ref_doc_no:         row.ref_doc_no || '',
             currency_code:      row.currency_code,
@@ -214,7 +215,7 @@ const fetchRow = async (req, res) => {
         if (!hdr.rows[0]) return res.status(404).json({ error: 'Not found' });
 
         const dtl = await req.dbPool.query(`
-            SELECT d.*, c.customer_code, c.customer_name_th,
+            SELECT d.*, c.customer_code, c.customer_name_th, c.customer_name_en,
                    t.doc_no AS invoice_doc_no, t.doc_date AS invoice_doc_date
             FROM ar_fx_revaluation_detail d
             LEFT JOIN ar_customer c ON c.id = d.customer_id
