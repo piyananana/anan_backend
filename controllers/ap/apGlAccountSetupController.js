@@ -4,6 +4,7 @@ const SETUP_SELECT = `
     SELECT
         d.doc_code,
         d.doc_name_thai,
+        d.doc_name_eng,
         d.sys_doc_type,
         d.is_active     AS doc_is_active,
         s.id,
