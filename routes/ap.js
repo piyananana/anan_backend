@@ -22,6 +22,8 @@ const apResetController               = require('../controllers/ap/apResetContro
 const apYearEndSetupController        = require('../controllers/ap/apYearEndSetupController');
 const apPreCloseCheckController       = require('../controllers/ap/apPreCloseCheckController');
 const apFxRevaluationController       = require('../controllers/ap/apFxRevaluationController');
+const apRemittanceAdviceController    = require('../controllers/ap/apRemittanceAdviceController');
+const apBulkPaymentController         = require('../controllers/ap/apBulkPaymentController');
 
 // ── Vendor Running (auto-code) ─────────────────────────────────────────────
 router.get('/ap_vendor_running/preview_code', apVendorRunningController.previewCode);
@@ -121,5 +123,13 @@ router.post('/ap_fx_revaluation',                       apFxRevaluationControlle
 router.post('/ap_fx_revaluation/:id/post',              apFxRevaluationController.postReval);
 router.post('/ap_fx_revaluation/:id/void',              apFxRevaluationController.voidReval);
 router.delete('/ap_fx_revaluation/:id',                 apFxRevaluationController.deleteReval);
+
+// ── AP Remittance Advice — batch BEFORE /:payment_id ──────────────────────────
+router.get('/ap_remittance_advice/batch',           apRemittanceAdviceController.getBatchRemittanceData);
+router.get('/ap_remittance_advice/:payment_id',     apRemittanceAdviceController.getRemittanceData);
+
+// ── AP Bulk Payment ────────────────────────────────────────────────────────────
+router.get('/ap_bulk_payment/eligible',             apBulkPaymentController.getEligibleInvoices);
+router.post('/ap_bulk_payment/run',                 apBulkPaymentController.runBulkPayment);
 
 module.exports = router;

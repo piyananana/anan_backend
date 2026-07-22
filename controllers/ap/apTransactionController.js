@@ -645,12 +645,12 @@ const fetchRows = async (req, res) => {
     try {
         let query = `
             SELECT t.id, t.doc_no, t.doc_date, t.due_date, t.status,
-                   t.vendor_id, v.vendor_code, v.vendor_name_th,
+                   t.vendor_id, v.vendor_code, v.vendor_name_th, v.vendor_name_en,
                    t.currency_code, t.exchange_rate,
                    t.total_amount_lc, t.paid_amount_lc, t.balance_amount_lc,
                    t.ref_no, t.description,
-                   d.doc_code, d.doc_name_thai, d.sys_doc_type,
-                   b.branch_code, b.branch_name_thai
+                   d.doc_code, d.doc_name_thai, d.doc_name_eng, d.sys_doc_type,
+                   b.branch_code, b.branch_name_thai, b.branch_name_eng
             FROM ap_transaction t
             JOIN sa_module_document d ON d.id = t.doc_id
             LEFT JOIN ap_vendor   v   ON v.id = t.vendor_id

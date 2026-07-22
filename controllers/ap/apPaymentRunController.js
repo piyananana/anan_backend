@@ -428,7 +428,7 @@ const fetchOpenInvoicesForRun = async (req, res) => {
         SELECT t.id AS txn_id, t.doc_no, t.doc_date, t.due_date,
                t.total_amount_lc, t.balance_amount_lc,
                t.currency_code, t.exchange_rate,
-               v.id AS vendor_id, v.vendor_code, v.vendor_name_th,
+               v.id AS vendor_id, v.vendor_code, v.vendor_name_th, v.vendor_name_en,
                b.bank_name, b.branch_name AS bank_branch_name,
                b.account_number, b.account_name
         FROM ap_transaction t

@@ -38,16 +38,21 @@ const BASE_SELECT = `
     SELECT p.*,
            ba.account_code     AS bank_account_code,
            ba.account_name_th  AS bank_account_name,
+           ba.account_name_en  AS bank_account_name_en,
            cb.bank_name_thai    AS bank_name,
+           cb.bank_name_eng     AS bank_name_en,
            cb.short_name       AS bank_short_name,
            pm.method_code      AS payment_method_code,
            pm.method_name_th   AS payment_method_name,
-           ck.checkbook_code   AS checkbook_code
+           pm.method_name_en   AS payment_method_name_en,
+           ck.checkbook_code   AS checkbook_code,
+           v.vendor_name_en    AS payee_name_en
     FROM cm_payment p
     LEFT JOIN cm_bank_account   ba ON ba.id = p.bank_account_id
     LEFT JOIN cd_bank           cb ON cb.id = ba.bank_id
     LEFT JOIN cm_payment_method pm ON pm.id = p.payment_method_id
     LEFT JOIN cm_checkbook      ck ON ck.id = p.checkbook_id
+    LEFT JOIN ap_vendor         v  ON v.id = p.payee_id AND p.payee_type = 'VENDOR'
 `;
 
 // GET list

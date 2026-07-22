@@ -30,8 +30,6 @@ const cmDocNumberController                 = require('../controllers/cm/cmDocNu
 const cmBankStatementImportController       = require('../controllers/cm/cmBankStatementImportController');
 const cmPostDatedCheckController            = require('../controllers/cm/cmPostDatedCheckController');
 const cmBankChargeController                = require('../controllers/cm/cmBankChargeController');
-const cmRemittanceAdviceController          = require('../controllers/cm/cmRemittanceAdviceController');
-const cmBulkPaymentController               = require('../controllers/cm/cmBulkPaymentController');
 
 // cm_bank_account
 router.get('/cm_bank_account',        cmBankAccountController.fetchRows);
@@ -215,13 +213,5 @@ router.put('/cm_bank_charge/:id',                   cmBankChargeController.updat
 router.put('/cm_bank_charge/:id/post',              cmBankChargeController.postCharge);
 router.put('/cm_bank_charge/:id/void',              cmBankChargeController.voidCharge);
 router.delete('/cm_bank_charge/:id',                cmBankChargeController.deleteRow);
-
-// cm_remittance_advice — batch BEFORE /:id
-router.get('/cm_remittance_advice/batch',           cmRemittanceAdviceController.getBatchRemittanceData);
-router.get('/cm_remittance_advice/:payment_id',     cmRemittanceAdviceController.getRemittanceData);
-
-// cm_bulk_payment
-router.get('/cm_bulk_payment/eligible',             cmBulkPaymentController.getEligibleInvoices);
-router.post('/cm_bulk_payment/run',                 cmBulkPaymentController.runBulkPayment);
 
 module.exports = router;

@@ -1557,18 +1557,19 @@ const fetchRows = async (req, res) => {
     const { branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id } = req.query;
     let sql = `
         SELECT t.id, t.doc_no, t.doc_date, t.due_date, t.status,
-               t.customer_code, t.customer_name_th,
+               t.customer_code, t.customer_name_th, c.customer_name_en,
                t.total_amount_lc, t.paid_amount_lc, t.balance_amount_lc,
                t.currency_code, t.ref_no,
-               t.branch_id, b.branch_code, b.branch_name_thai,
+               t.branch_id, b.branch_code, b.branch_name_thai, b.branch_name_eng,
                t.dim1_id, t.dim2_id, t.dim3_id, t.dim4_id, t.dim5_id,
                v1.value_name_thai AS dim1_name, v2.value_name_thai AS dim2_name,
                v3.value_name_thai AS dim3_name, v4.value_name_thai AS dim4_name,
                v5.value_name_thai AS dim5_name,
-               d.doc_code, d.doc_name_thai, d.sys_doc_type
+               d.doc_code, d.doc_name_thai, d.doc_name_eng, d.sys_doc_type
         FROM ar_transaction t
         JOIN sa_module_document d ON t.doc_id = d.id
         LEFT JOIN cd_branch b ON b.id = t.branch_id
+        LEFT JOIN ar_customer c ON c.id = t.customer_id
         LEFT JOIN gl_dimension_value v1 ON v1.id = t.dim1_id
         LEFT JOIN gl_dimension_value v2 ON v2.id = t.dim2_id
         LEFT JOIN gl_dimension_value v3 ON v3.id = t.dim3_id
