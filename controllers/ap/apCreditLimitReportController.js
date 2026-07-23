@@ -83,6 +83,7 @@ const getCreditLimitReport = async (req, res) => {
                 v.id              AS vendor_id,
                 v.vendor_code,
                 v.vendor_name_th,
+                v.vendor_name_en,
                 COALESCE(v.credit_limit, 0) AS credit_limit,
                 ${outstandingExpr}            AS outstanding
             FROM ap_vendor v
@@ -90,7 +91,7 @@ const getCreditLimitReport = async (req, res) => {
             LEFT JOIN sa_module_document d ON d.id = t.doc_id
             WHERE v.is_active = true
               ${extraFilters}
-            GROUP BY v.id, v.vendor_code, v.vendor_name_th, v.credit_limit
+            GROUP BY v.id, v.vendor_code, v.vendor_name_th, v.vendor_name_en, v.credit_limit
             ${havingClause}
             ORDER BY ${orderExpr}
         `, params);
@@ -115,6 +116,7 @@ const getCreditLimitReport = async (req, res) => {
                 vendor_id:      r.vendor_id,
                 vendor_code:    r.vendor_code,
                 vendor_name_th: r.vendor_name_th,
+                vendor_name_en: r.vendor_name_en,
                 credit_limit:   creditLimit,
                 outstanding,
                 remaining,

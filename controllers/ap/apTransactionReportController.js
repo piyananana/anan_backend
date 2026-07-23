@@ -57,6 +57,7 @@ const getTransactionReport = async (req, res) => {
                 t.vendor_id,
                 t.vendor_code,
                 t.vendor_name_th,
+                v.vendor_name_en,
                 t.id           AS txn_id,
                 t.doc_no,
                 t.doc_date,
@@ -86,6 +87,7 @@ const getTransactionReport = async (req, res) => {
                     vendor_id:      vid,
                     vendor_code:    row.vendor_code,
                     vendor_name_th: row.vendor_name_th,
+                    vendor_name_en: row.vendor_name_en,
                     pi_amount:   0,  // sys_doc_type = '10'
                     cn_amount:   0,  // '30'
                     dn_amount:   0,  // '50'

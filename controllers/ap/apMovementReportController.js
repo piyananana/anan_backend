@@ -62,6 +62,7 @@ const getMovementReport = async (req, res) => {
                     t.vendor_id,
                     t.vendor_code,
                     t.vendor_name_th,
+                    v.vendor_name_en,
                     v.vendor_group_id,
                     t.id         AS txn_id,
                     t.doc_no,
@@ -139,7 +140,7 @@ const getMovementReport = async (req, res) => {
                   ${extraFilters}
             ),
             vendor_list AS (
-                SELECT DISTINCT vendor_id, vendor_code, vendor_name_th, vendor_group_id
+                SELECT DISTINCT vendor_id, vendor_code, vendor_name_th, vendor_name_en, vendor_group_id
                 FROM all_txn
                 WHERE period = 'in' OR period = 'before'
             ),
@@ -154,6 +155,7 @@ const getMovementReport = async (req, res) => {
                 vl.vendor_id,
                 vl.vendor_code,
                 vl.vendor_name_th,
+                vl.vendor_name_en,
                 vl.vendor_group_id,
                 COALESCE(o.opening_balance, 0) AS opening_balance,
                 t.txn_id,
@@ -183,6 +185,7 @@ const getMovementReport = async (req, res) => {
                     vendor_id:       vid,
                     vendor_code:     row.vendor_code,
                     vendor_name_th:  row.vendor_name_th,
+                    vendor_name_en:  row.vendor_name_en,
                     vendor_group_id: row.vendor_group_id,
                     opening_balance: Number(row.opening_balance || 0),
                     transactions:    [],

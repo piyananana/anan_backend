@@ -22,6 +22,7 @@ const fetchWhtReport = async (req, res) => {
     // เพิ่มคอลัมน์ใหม่แบบ idempotent ก่อนใช้งาน
     await req.dbPool.query(`ALTER TABLE ap_transaction_wht ADD COLUMN IF NOT EXISTS wht_type_id INT REFERENCES cd_wht_type(id)`).catch(() => {});
     await req.dbPool.query(`ALTER TABLE ap_transaction_wht ADD COLUMN IF NOT EXISTS income_type VARCHAR(20)`).catch(() => {});
+    await req.dbPool.query(`ALTER TABLE cd_wht_type ADD COLUMN IF NOT EXISTS wht_name_en VARCHAR(200)`).catch(() => {});
 
     const sql = `
       SELECT
@@ -30,9 +31,11 @@ const fetchWhtReport = async (req, res) => {
         t.doc_date      AS payment_date,
         v.vendor_code,
         v.vendor_name_th,
+        v.vendor_name_en,
         v.tax_id,
         v.vendor_type,
         w.wht_type,
+        wt.wht_name_en   AS wht_type_en,
         w.income_type,
         w.wht_rate,
         w.base_amount_lc,
@@ -49,6 +52,7 @@ const fetchWhtReport = async (req, res) => {
       FROM ap_transaction_wht w
       JOIN ap_transaction t ON t.id = w.header_id
       JOIN ap_vendor      v ON v.id = t.vendor_id
+      LEFT JOIN cd_wht_type wt ON wt.id = w.wht_type_id
       LEFT JOIN ap_vendor_address addr
              ON addr.vendor_id = v.id
             AND addr.address_type = 'billing'

@@ -11,6 +11,9 @@ const SELECT_WITH_ACCOUNT = `
 // GET all rows
 const fetchRows = async (req, res) => {
     try {
+        await req.dbPool.query(
+            `ALTER TABLE cd_wht_type ADD COLUMN IF NOT EXISTS wht_name_en VARCHAR(200)`
+        ).catch(() => {});
         const result = await req.dbPool.query(
             SELECT_WITH_ACCOUNT + ` ORDER BY w.wht_code ASC`
         );
@@ -51,17 +54,21 @@ const fetchRow = async (req, res) => {
 
 // POST new row
 const addRow = async (req, res) => {
-    const { wht_code, wht_name, income_type, wht_rate, gl_account_id, description, is_active, effective_date, end_date } = req.body;
+    const { wht_code, wht_name, wht_name_en, income_type, wht_rate, gl_account_id, description, is_active, effective_date, end_date } = req.body;
     const userName = req.headers.username;
     try {
+        await req.dbPool.query(
+            `ALTER TABLE cd_wht_type ADD COLUMN IF NOT EXISTS wht_name_en VARCHAR(200)`
+        ).catch(() => {});
         const result = await req.dbPool.query(
             `INSERT INTO cd_wht_type
-                (wht_code, wht_name, income_type, wht_rate, gl_account_id, description, is_active, effective_date, end_date, created_by, updated_by)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10)
+                (wht_code, wht_name, wht_name_en, income_type, wht_rate, gl_account_id, description, is_active, effective_date, end_date, created_by, updated_by)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11)
              RETURNING id`,
             [
                 wht_code?.toUpperCase()?.trim(),
                 wht_name?.trim(),
+                wht_name_en?.trim() || null,
                 income_type || null,
                 wht_rate || 0,
                 gl_account_id || null,
@@ -86,27 +93,32 @@ const addRow = async (req, res) => {
 // PUT update row
 const updateRow = async (req, res) => {
     const { id } = req.params;
-    const { wht_code, wht_name, income_type, wht_rate, gl_account_id, description, is_active, effective_date, end_date } = req.body;
+    const { wht_code, wht_name, wht_name_en, income_type, wht_rate, gl_account_id, description, is_active, effective_date, end_date } = req.body;
     const userName = req.headers.username;
     try {
+        await req.dbPool.query(
+            `ALTER TABLE cd_wht_type ADD COLUMN IF NOT EXISTS wht_name_en VARCHAR(200)`
+        ).catch(() => {});
         const result = await req.dbPool.query(
             `UPDATE cd_wht_type SET
                 wht_code       = $1,
                 wht_name       = $2,
-                income_type    = $3,
-                wht_rate       = $4,
-                gl_account_id  = $5,
-                description    = $6,
-                is_active      = $7,
-                effective_date = $8,
-                end_date       = $9,
-                updated_by     = $10,
+                wht_name_en    = $3,
+                income_type    = $4,
+                wht_rate       = $5,
+                gl_account_id  = $6,
+                description    = $7,
+                is_active      = $8,
+                effective_date = $9,
+                end_date       = $10,
+                updated_by     = $11,
                 updated_at     = NOW()
-             WHERE id = $11
+             WHERE id = $12
              RETURNING id`,
             [
                 wht_code?.toUpperCase()?.trim(),
                 wht_name?.trim(),
+                wht_name_en?.trim() || null,
                 income_type || null,
                 wht_rate || 0,
                 gl_account_id || null,

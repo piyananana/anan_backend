@@ -76,6 +76,7 @@ const getPaymentReport = async (req, res) => {
                 t.vendor_id,
                 t.vendor_code,
                 t.vendor_name_th,
+                v.vendor_name_en,
                 t.id           AS txn_id,
                 t.doc_no,
                 t.doc_date,
@@ -99,7 +100,7 @@ const getPaymentReport = async (req, res) => {
               AND t.doc_date     <= $2::date
               ${extraFilters}
             GROUP BY
-                t.vendor_id, t.vendor_code, t.vendor_name_th,
+                t.vendor_id, t.vendor_code, t.vendor_name_th, v.vendor_name_en,
                 t.id, t.doc_no, t.doc_date, t.ref_doc_no, t.total_amount_lc
             ORDER BY t.vendor_code ASC, t.doc_date ASC, t.doc_no ASC
         `, params);
@@ -113,6 +114,7 @@ const getPaymentReport = async (req, res) => {
                     vendor_id:       vid,
                     vendor_code:     row.vendor_code,
                     vendor_name_th:  row.vendor_name_th,
+                    vendor_name_en:  row.vendor_name_en,
                     total_amount:    0,
                     cash_amount:     0,
                     check_amount:    0,

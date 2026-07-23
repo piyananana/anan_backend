@@ -53,7 +53,7 @@ const calcRevalDetails = async (client, revalDate, yearEndRates) => {
         SELECT t.id AS invoice_id, t.vendor_id, t.currency_id,
                t.currency_code, t.balance_amount_lc, t.exchange_rate AS original_rate,
                t.doc_no,
-               v.vendor_code, v.vendor_name_th,
+               v.vendor_code, v.vendor_name_th, v.vendor_name_en,
                COALESCE(t.revaluation_rate, t.exchange_rate) AS current_rate,
                CASE WHEN COALESCE(t.revaluation_rate, t.exchange_rate) > 0
                     THEN t.balance_amount_lc / COALESCE(t.revaluation_rate, t.exchange_rate)
@@ -88,6 +88,7 @@ const calcRevalDetails = async (client, revalDate, yearEndRates) => {
             vendor_id:          row.vendor_id,
             vendor_code:        row.vendor_code,
             vendor_name_th:     row.vendor_name_th,
+            vendor_name_en:     row.vendor_name_en,
             doc_no:             row.doc_no,
             currency_code:      row.currency_code,
             balance_amount_fc:  balanceFc,
@@ -264,7 +265,7 @@ const fetchRow = async (req, res) => {
         if (!hdr.rows[0]) return res.status(404).json({ error: 'Not found' });
 
         const dtl = await client.query(`
-            SELECT d.*, v.vendor_code, v.vendor_name_th,
+            SELECT d.*, v.vendor_code, v.vendor_name_th, v.vendor_name_en,
                    t.doc_no AS invoice_doc_no, t.doc_date AS invoice_doc_date
             FROM ap_fx_revaluation_detail d
             LEFT JOIN ap_vendor v ON v.id = d.vendor_id
