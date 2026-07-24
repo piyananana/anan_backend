@@ -536,8 +536,9 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
         }
     } else if (isAdvanceReceipt) {
         // ===== รับเงินมัดจำ (60) =====
-        // DR: เงินสด/ธนาคาร (แยกตามวิธีรับชำระ ถ้ามี ถ้าไม่มีใช้ cash_account_id)
-        // CR: เงินมัดจำรับ (advance_account_id)
+        // DR: เงินสด/ธนาคาร (แยกตามวิธีรับชำระ ถ้ามี ถ้าไม่มีใช้ cash_account_id) — ยอดเต็มรวม VAT
+        // CR: เงินมัดจำรับ (advance_account_id) — สุทธิจาก VAT
+        // CR: VAT ขาย (vat_output_account_id) — ถ้ามีการระบุ VAT ในรายการมัดจำ
         const payments60 = header._payments || [];
         if (payments60.length > 0) {
             for (const p of payments60) {
@@ -565,14 +566,30 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
                 credit_fc: 0,
             });
         }
+
+        const advanceVatLc = (details || []).reduce((s, d) => s + (Number(d.vat_amount_lc) || 0), 0);
+        const advanceVatFc = (details || []).reduce((s, d) => s + (Number(d.vat_amount_fc) || 0), 0);
+        const advanceNetLc = totalDebit - advanceVatLc;
+        const advanceNetFc = (Number(header.total_amount_fc) || 0) - advanceVatFc;
+
         if (advanceAccountId) {
             glDetails.push({
                 account_id: advanceAccountId,
                 description: `มัดจำรับ ${docNo}`,
                 debit_lc: 0,
-                credit_lc: totalDebit,
+                credit_lc: advanceNetLc,
                 debit_fc: 0,
-                credit_fc: Number(header.total_amount_fc) || 0,
+                credit_fc: advanceNetFc,
+            });
+        }
+        if (advanceVatLc > 0.005 && vatAccountId) {
+            glDetails.push({
+                account_id: vatAccountId,
+                description: `ภาษีขาย (มัดจำ) ${docNo}`,
+                debit_lc: 0,
+                credit_lc: advanceVatLc,
+                debit_fc: 0,
+                credit_fc: advanceVatFc,
             });
         }
     } else if (isAdvanceRefund) {
