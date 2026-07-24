@@ -1472,6 +1472,41 @@ const voidTransaction = async (req, res) => {
                 WHERE id = $2
             `, [id, invoiceId]);
         }
+        // Void the linked cm_receipt record, if any (AR receipt docs, sys_doc_type=80)
+        if (isReceiptVoid) {
+            await client.query(`
+                CREATE TABLE IF NOT EXISTS cm_receipt (
+                    id                  SERIAL PRIMARY KEY,
+                    receipt_date        DATE          NOT NULL,
+                    bank_account_id     INTEGER       REFERENCES cm_bank_account(id),
+                    payment_method_id   INTEGER,
+                    payment_method_type VARCHAR(30)   NOT NULL DEFAULT 'CASH',
+                    ar_transaction_id   INTEGER,
+                    ar_doc_no           VARCHAR(50),
+                    customer_id         INTEGER,
+                    customer_code       VARCHAR(50),
+                    customer_name_th    VARCHAR(200),
+                    amount_lc           NUMERIC(18,4) NOT NULL DEFAULT 0,
+                    amount_fc           NUMERIC(18,4) NOT NULL DEFAULT 0,
+                    currency_code       VARCHAR(10)   NOT NULL DEFAULT 'THB',
+                    exchange_rate       NUMERIC(15,6) NOT NULL DEFAULT 1,
+                    check_no            VARCHAR(50),
+                    check_date          DATE,
+                    drawer_bank         VARCHAR(200),
+                    status              VARCHAR(20)   NOT NULL DEFAULT 'Pending',
+                    clearing_date       DATE,
+                    clearing_note       TEXT,
+                    gl_entry_id         INTEGER,
+                    created_by          INTEGER,
+                    created_at          TIMESTAMP DEFAULT NOW(),
+                    updated_at          TIMESTAMP DEFAULT NOW()
+                )`);
+            await client.query(`
+                UPDATE cm_receipt SET status='Voided', updated_at=NOW()
+                WHERE ar_transaction_id=$1 AND status != 'Voided'
+            `, [id]);
+        }
+
         // Receipt ที่อ้าง BC ถูก Void → คืนยอดวางบิลให้ BC
         if (isReceiptVoid && checkRes.rows[0].ref_no) {
             await client.query(`

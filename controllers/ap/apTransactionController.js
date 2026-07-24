@@ -603,6 +603,93 @@ const ensurePaymentTable = async (client) => {
     `);
 };
 
+// --- Helper: Create CM payment record after a direct AP payment (sysDocType=80) is posted ---
+const postCmPaymentHelper = async (client, apTransactionId, glEntryId) => {
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS cm_payment (
+            id                  SERIAL PRIMARY KEY,
+            payment_date        DATE          NOT NULL,
+            bank_account_id     INTEGER       REFERENCES cm_bank_account(id),
+            payment_method_id   INTEGER,
+            payment_method_type VARCHAR(30)   NOT NULL DEFAULT 'TRANSFER',
+            ap_payment_run_id   INTEGER,
+            ap_doc_no           VARCHAR(50),
+            payee_type          VARCHAR(10)   DEFAULT 'VENDOR',
+            payee_id            INTEGER,
+            payee_code          VARCHAR(50),
+            payee_name_th       VARCHAR(200),
+            amount_lc           NUMERIC(18,4) NOT NULL DEFAULT 0,
+            amount_fc           NUMERIC(18,4) NOT NULL DEFAULT 0,
+            currency_code       VARCHAR(10)   NOT NULL DEFAULT 'THB',
+            exchange_rate       NUMERIC(15,6) NOT NULL DEFAULT 1,
+            check_no            VARCHAR(50),
+            check_date          DATE,
+            checkbook_id        INTEGER       REFERENCES cm_checkbook(id),
+            status              VARCHAR(20)   NOT NULL DEFAULT 'Pending',
+            clearing_date       DATE,
+            clearing_note       TEXT,
+            gl_entry_id         INTEGER,
+            remark              TEXT,
+            created_by          INTEGER,
+            created_at          TIMESTAMP DEFAULT NOW(),
+            updated_at          TIMESTAMP DEFAULT NOW()
+        )`);
+    await client.query(`ALTER TABLE cm_payment ADD COLUMN IF NOT EXISTS ap_transaction_id INTEGER`).catch(() => {});
+
+    // Idempotent: delete and re-create (handles re-post scenario)
+    await client.query(`DELETE FROM cm_payment WHERE ap_transaction_id = $1`, [apTransactionId]);
+
+    // Fetch AP transaction header for vendor info + doc date
+    const hRes = await client.query(`
+        SELECT t.doc_no, t.doc_date, t.currency_code, t.exchange_rate,
+               t.vendor_id,
+               v.vendor_code, v.vendor_name_th
+        FROM ap_transaction t
+        LEFT JOIN ap_vendor v ON v.id = t.vendor_id
+        WHERE t.id = $1`, [apTransactionId]);
+    if (hRes.rows.length === 0) return;
+    const h = hRes.rows[0];
+
+    // Fetch payment rows that have a CM bank account linked
+    const pmRes = await client.query(`
+        SELECT payment_method_id, payment_method_type,
+               cm_bank_account_id, amount_lc, amount_fc,
+               ref_no, payment_date, drawer_bank_name
+        FROM ap_transaction_payment
+        WHERE header_id = $1 AND cm_bank_account_id IS NOT NULL`,
+        [apTransactionId]);
+
+    for (const pm of pmRes.rows) {
+        const isCheck = pm.payment_method_type === 'CHECK';
+        await client.query(`
+            INSERT INTO cm_payment
+                (payment_date, bank_account_id, payment_method_id, payment_method_type,
+                 ap_transaction_id, ap_doc_no,
+                 payee_type, payee_id, payee_code, payee_name_th,
+                 amount_lc, amount_fc, currency_code, exchange_rate,
+                 check_no, check_date, gl_entry_id)
+            VALUES ($1,$2,$3,$4,$5,$6,'VENDOR',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+            [
+                h.doc_date,
+                pm.cm_bank_account_id,
+                pm.payment_method_id,
+                pm.payment_method_type || 'CASH',
+                apTransactionId,
+                h.doc_no,
+                h.vendor_id  || null,
+                h.vendor_code || null,
+                h.vendor_name_th || null,
+                pm.amount_lc   || 0,
+                pm.amount_fc   || 0,
+                h.currency_code || 'THB',
+                h.exchange_rate || 1,
+                isCheck ? (pm.ref_no || null) : null,
+                isCheck ? (pm.payment_date || h.doc_date) : null,
+                glEntryId,
+            ]);
+    }
+};
+
 // --- Fetch helper ---
 const fetchRowById = async (pool, id) => {
     const [hRes, dRes, aRes, pRes, whtRes] = await Promise.all([
@@ -983,6 +1070,7 @@ const createTransaction = async (req, res) => {
                 if (['65'].includes(sysDocType1)) {
                     await client.query(`UPDATE ap_transaction SET balance_amount_lc=0 WHERE id=$1`, [newHeaderId]);
                 }
+                if (sysDocType1 === '80') await postCmPaymentHelper(client, newHeaderId, glEntryId);
             }
         }
 
@@ -1166,6 +1254,44 @@ const voidTransaction = async (req, res) => {
             await client.query(
                 `UPDATE gl_entry_header SET status='Void', updated_at=NOW() WHERE id=$1`, [tx.gl_entry_id]
             );
+        }
+
+        // Void the linked cm_payment record, if any (direct AP payment docs, sys_doc_type=80)
+        if (tx.sys_doc_type === '80') {
+            await client.query(`
+                CREATE TABLE IF NOT EXISTS cm_payment (
+                    id                  SERIAL PRIMARY KEY,
+                    payment_date        DATE          NOT NULL,
+                    bank_account_id     INTEGER       REFERENCES cm_bank_account(id),
+                    payment_method_id   INTEGER,
+                    payment_method_type VARCHAR(30)   NOT NULL DEFAULT 'TRANSFER',
+                    ap_payment_run_id   INTEGER,
+                    ap_doc_no           VARCHAR(50),
+                    payee_type          VARCHAR(10)   DEFAULT 'VENDOR',
+                    payee_id            INTEGER,
+                    payee_code          VARCHAR(50),
+                    payee_name_th       VARCHAR(200),
+                    amount_lc           NUMERIC(18,4) NOT NULL DEFAULT 0,
+                    amount_fc           NUMERIC(18,4) NOT NULL DEFAULT 0,
+                    currency_code       VARCHAR(10)   NOT NULL DEFAULT 'THB',
+                    exchange_rate       NUMERIC(15,6) NOT NULL DEFAULT 1,
+                    check_no            VARCHAR(50),
+                    check_date          DATE,
+                    checkbook_id        INTEGER       REFERENCES cm_checkbook(id),
+                    status              VARCHAR(20)   NOT NULL DEFAULT 'Pending',
+                    clearing_date       DATE,
+                    clearing_note       TEXT,
+                    gl_entry_id         INTEGER,
+                    remark              TEXT,
+                    created_by          INTEGER,
+                    created_at          TIMESTAMP DEFAULT NOW(),
+                    updated_at          TIMESTAMP DEFAULT NOW()
+                )`);
+            await client.query(`ALTER TABLE cm_payment ADD COLUMN IF NOT EXISTS ap_transaction_id INTEGER`).catch(() => {});
+            await client.query(`
+                UPDATE cm_payment SET status='Voided', updated_at=NOW()
+                WHERE ap_transaction_id=$1 AND status != 'Voided'
+            `, [id]);
         }
 
         await client.query(
