@@ -594,15 +594,49 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
         }
     } else if (isAdvanceRefund) {
         // ===== คืนเงินมัดจำ (65) =====
-        // DR: เงินมัดจำรับ (advance_account_id)
-        // CR: เงินสด/ธนาคาร (cash_account_id)
+        // DR: เงินมัดจำรับ (advance_account_id) — สุทธิจาก VAT
+        // DR: กลับรายการ VAT ขาย (vat_output_account_id) — ตามสัดส่วนของมัดจำเดิมที่มี VAT
+        // CR: เงินสด/ธนาคาร (cash_account_id) — ยอดเต็มที่จ่ายคืนจริง
+
+        // คำนวณ VAT ที่ต้อง reverse ตามสัดส่วนของแต่ละใบมัดจำเดิมที่ถูกคืน
+        let refundVatLc = 0;
+        let refundVatFc = 0;
+        const refundApplies = (header._applies || []).filter(a => (a.apply_type || '') === 'advance_refund');
+        for (const a of refundApplies) {
+            const advId     = a.applied_to_id;
+            const appliedFc = Number(a.applied_amount_fc) || 0;
+            if (!advId || appliedFc === 0) continue;
+            const advRes = await client.query(
+                `SELECT total_amount_fc, vat_amount_fc, vat_amount_lc FROM ar_transaction WHERE id = $1`, [advId]
+            );
+            if (advRes.rows.length === 0) continue;
+            const advTotalFc = Number(advRes.rows[0].total_amount_fc) || 0;
+            if (advTotalFc === 0) continue;
+            const ratio = appliedFc / advTotalFc;
+            refundVatFc += Number(advRes.rows[0].vat_amount_fc) * ratio;
+            refundVatLc += Number(advRes.rows[0].vat_amount_lc) * ratio;
+        }
+
+        const advanceNetLc = totalDebit - refundVatLc;
+        const advanceNetFc = (Number(header.total_amount_fc) || 0) - refundVatFc;
+
         if (advanceAccountId) {
             glDetails.push({
                 account_id: advanceAccountId,
                 description: `คืนมัดจำ ${docNo}`,
-                debit_lc: totalDebit,
+                debit_lc: advanceNetLc,
                 credit_lc: 0,
-                debit_fc: Number(header.total_amount_fc) || 0,
+                debit_fc: advanceNetFc,
+                credit_fc: 0,
+            });
+        }
+        if (refundVatLc > 0.005 && vatAccountId) {
+            glDetails.push({
+                account_id: vatAccountId,
+                description: `กลับรายการภาษีขาย (คืนมัดจำ) ${docNo}`,
+                debit_lc: refundVatLc,
+                credit_lc: 0,
+                debit_fc: refundVatFc,
                 credit_fc: 0,
             });
         }
@@ -1749,6 +1783,10 @@ const fetchOpenInvoices = async (req, res) => {
                    t.currency_code, t.exchange_rate,
                    t.total_amount_fc, t.total_amount_lc,
                    t.paid_amount_lc, t.balance_amount_lc,
+                   COALESCE((SELECT SUM(dd.vat_amount_lc) FROM ar_transaction_detail dd
+                             WHERE dd.header_id = t.id AND dd.is_deferred_vat = TRUE AND dd.vat_type != 'NOVAT'), 0) AS deferred_vat_amount_lc,
+                   COALESCE((SELECT SUM(dd.vat_amount_fc) FROM ar_transaction_detail dd
+                             WHERE dd.header_id = t.id AND dd.is_deferred_vat = TRUE AND dd.vat_type != 'NOVAT'), 0) AS deferred_vat_amount_fc,
                    d.doc_name_thai, d.sys_doc_type
             FROM ar_transaction t
             JOIN sa_module_document d ON t.doc_id = d.id
@@ -1795,6 +1833,7 @@ const fetchOpenAdvancesForRefund = async (req, res) => {
         const result = await req.dbPool.query(`
             SELECT t.id, t.doc_no, t.doc_date, t.due_date,
                    t.total_amount_lc, t.paid_amount_lc, t.balance_amount_lc,
+                   t.total_amount_fc, t.vat_amount_fc, t.vat_amount_lc,
                    d.doc_name_thai, d.sys_doc_type
             FROM ar_transaction t
             JOIN sa_module_document d ON t.doc_id = d.id
