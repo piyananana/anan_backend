@@ -322,14 +322,29 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
 
     } else if (isAdvancePayment) {
         // ===== จ่ายเงินมัดจำ (60) =====
-        // DR: Advance AP / CR: Cash/Bank
+        // DR: Advance AP (สุทธิจาก VAT) / DR: VAT ซื้อ (ถ้ามี) / CR: Cash/Bank (เต็มจำนวน)
+        const advanceVatLc = (details || []).reduce((s, d) => s + (Number(d.vat_amount_lc) || 0), 0);
+        const advanceVatFc = (details || []).reduce((s, d) => s + (Number(d.vat_amount_fc) || 0), 0);
+        const advanceNetLc = totalAmount - advanceVatLc;
+        const advanceNetFc = (Number(header.total_amount_fc) || 0) - advanceVatFc;
+
         if (advanceAccountId) {
             glDetails.push({
                 account_id: advanceAccountId,
                 description: `มัดจำจ่าย ${docNo}`,
-                debit_lc: totalAmount,
+                debit_lc: advanceNetLc,
                 credit_lc: 0,
-                debit_fc: Number(header.total_amount_fc) || 0,
+                debit_fc: advanceNetFc,
+                credit_fc: 0,
+            });
+        }
+        if (advanceVatLc > 0.005 && vatAccountId) {
+            glDetails.push({
+                account_id: vatAccountId,
+                description: `ภาษีซื้อ (มัดจำ) ${docNo}`,
+                debit_lc: advanceVatLc,
+                credit_lc: 0,
+                debit_fc: advanceVatFc,
                 credit_fc: 0,
             });
         }
@@ -363,7 +378,8 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
 
     } else if (isAdvanceRefund) {
         // ===== ได้รับเงินมัดจำคืน (65) =====
-        // DR: Cash/Bank / CR: Advance AP
+        // DR: Cash/Bank (เต็มจำนวนที่ได้รับคืนจริง)
+        // CR: Advance AP (สุทธิจาก VAT) / CR: กลับรายการ VAT ซื้อ (ตามสัดส่วนของมัดจำเดิมที่มี VAT)
         if (cashAccountId) {
             glDetails.push({
                 account_id: cashAccountId,
@@ -374,14 +390,47 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
                 credit_fc: 0,
             });
         }
+
+        // คำนวณ VAT ที่ต้อง reverse ตามสัดส่วนของแต่ละใบมัดจำเดิมที่ถูกคืน
+        let refundVatLc = 0;
+        let refundVatFc = 0;
+        const refundApplies = (header._applies || []).filter(a => (a.apply_type || '') === 'advance_refund');
+        for (const a of refundApplies) {
+            const advId     = a.applied_to_id;
+            const appliedFc = Number(a.applied_amount_fc) || 0;
+            if (!advId || appliedFc === 0) continue;
+            const advRes = await client.query(
+                `SELECT total_amount_fc, vat_amount_fc, vat_amount_lc FROM ap_transaction WHERE id = $1`, [advId]
+            );
+            if (advRes.rows.length === 0) continue;
+            const advTotalFc = Number(advRes.rows[0].total_amount_fc) || 0;
+            if (advTotalFc === 0) continue;
+            const ratio = appliedFc / advTotalFc;
+            refundVatFc += Number(advRes.rows[0].vat_amount_fc) * ratio;
+            refundVatLc += Number(advRes.rows[0].vat_amount_lc) * ratio;
+        }
+
+        const advanceNetLc = totalAmount - refundVatLc;
+        const advanceNetFc = (Number(header.total_amount_fc) || 0) - refundVatFc;
+
         if (advanceAccountId) {
             glDetails.push({
                 account_id: advanceAccountId,
                 description: `ตัดมัดจำจ่าย ${docNo}`,
                 debit_lc: 0,
-                credit_lc: totalAmount,
+                credit_lc: advanceNetLc,
                 debit_fc: 0,
-                credit_fc: Number(header.total_amount_fc) || 0,
+                credit_fc: advanceNetFc,
+            });
+        }
+        if (refundVatLc > 0.005 && vatAccountId) {
+            glDetails.push({
+                account_id: vatAccountId,
+                description: `กลับรายการภาษีซื้อ (คืนมัดจำ) ${docNo}`,
+                debit_lc: 0,
+                credit_lc: refundVatLc,
+                debit_fc: 0,
+                credit_fc: refundVatFc,
             });
         }
 
@@ -811,6 +860,7 @@ const fetchOpenAdvances = async (req, res) => {
         const result = await req.dbPool.query(`
             SELECT t.id, t.doc_no, t.doc_date,
                    t.total_amount_lc, t.balance_amount_lc,
+                   t.total_amount_fc, t.vat_amount_fc, t.vat_amount_lc,
                    t.currency_code, t.exchange_rate,
                    d.doc_code, d.sys_doc_type
             FROM ap_transaction t
