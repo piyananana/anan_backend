@@ -1,5 +1,16 @@
 // controllers/sa/saModuleApproverController.js
 
+// Migration: sa_module_approver เคยถูกบันทึก module_code เป็นตัวย่อ ('AP','AR')
+// แต่ระบบจริง (เช่น apPaymentRunController) query ด้วยรหัสตัวเลขตาม sys_module ('21'=AP, '11'=AR, '01'=GL)
+// จึงทำให้ผู้อนุมัติที่ตั้งค่าไว้ไม่เคยถูกใช้งานจริง — normalize ให้ตรงกันแบบ idempotent
+const normalizeModuleCodes = async (pool) => {
+    try {
+        await pool.query(`UPDATE sa_module_approver SET module_code='21' WHERE module_code='AP'`);
+        await pool.query(`UPDATE sa_module_approver SET module_code='11' WHERE module_code='AR'`);
+        await pool.query(`UPDATE sa_module_approver SET module_code='01' WHERE module_code='GL'`);
+    } catch (_) { /* ignore if table doesn't exist yet */ }
+};
+
 const APPROVER_SELECT = `
     SELECT a.*,
            u.user_name  AS approver_username,
@@ -14,6 +25,7 @@ const APPROVER_SELECT = `
 const fetchRows = async (req, res) => {
     const { module_code, doc_category } = req.query;
     try {
+        await normalizeModuleCodes(req.dbPool);
         let sql = APPROVER_SELECT + ' WHERE 1=1';
         const params = [];
         if (module_code)   { params.push(module_code);   sql += ` AND a.module_code = $${params.length}`; }
@@ -113,6 +125,7 @@ const deleteRow = async (req, res) => {
 const fetchByModuleCategory = async (req, res) => {
     const { module_code, doc_category } = req.params;
     try {
+        await normalizeModuleCodes(req.dbPool);
         const result = await req.dbPool.query(
             APPROVER_SELECT +
             ' WHERE a.module_code=$1 AND a.doc_category=$2 AND a.is_active=true ORDER BY a.approval_level',

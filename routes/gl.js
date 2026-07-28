@@ -85,6 +85,11 @@ router.delete('/gl_posting_period/:id', glPeriodController.deleteDetailRow);
 router.get('/gl_posting_period/open', glPeriodController.fetchOpenGlPeriods);
 router.get('/gl_posting_period/cm_check', glPeriodController.getCmStatusForDate);
 router.post('/gl_posting_period/verify_close_approver', glPeriodController.verifyCloseApprover);
+// ขั้นตอนขออนุมัติปิดงวดบัญชี GL (irreversible จึงต้องผ่านผู้อนุมัติ)
+router.post('/gl_posting_period/:id/request_close', glPeriodController.requestClose);
+router.post('/gl_period_close_request/:id/approve', glPeriodController.approveCloseRequest);
+router.post('/gl_period_close_request/:id/reject', glPeriodController.rejectCloseRequest);
+router.post('/gl_period_close_request/:id/cancel', glPeriodController.cancelCloseRequest);
 // Router สำหรับจัดการข้อมูลรายงาน Trial Balance
 router.get('/gl_trial_balance', glTrialBalanceReportController.getTrialBalance);
 // Router สำหรับรายงานงบดุล (Balance Sheet)
