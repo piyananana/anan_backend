@@ -249,25 +249,52 @@ const updateRun = async (req, res) => {
 // --- PUT submit (Draft → Submitted) ---
 const submitRun = async (req, res) => {
     const { id } = req.params;
+    const { menu_id, force } = req.body || {};
     const userName = req.headers['username'] || null;
+    if (!menu_id) return res.status(400).json({ message: 'ต้องระบุ menu_id' });
     const client = await req.dbPool.connect();
     try {
+        const { ensureMenuApproverSchema, syncMenuApprovers } = require('../../utils/menuApproverSync');
+        await ensureMenuApproverSchema(client);
+        try { await client.query(`ALTER TABLE ap_payment_run ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL'`); } catch (_) {}
         await client.query('BEGIN');
+        await syncMenuApprovers(client, menu_id);
         const existing = await client.query(`SELECT status FROM ap_payment_run WHERE id=$1`, [id]);
         if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
         if (existing.rows[0].status !== 'Draft') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'ส่งอนุมัติได้เฉพาะเอกสาร Draft เท่านั้น' }); }
 
-        await client.query(`
-            UPDATE ap_payment_run SET status='Submitted', updated_at=NOW(), updated_by=$1 WHERE id=$2`,
-            [userName, id]);
+        const menuRes = await client.query(`SELECT approval_mode FROM sa_menu WHERE id=$1`, [menu_id]);
+        const approvalMode = menuRes.rows[0]?.approval_mode === 'ANY' ? 'ANY' : 'ALL';
 
-        // Create approval records from sa_module_approver
+        // Create approval records from sa_module_approver (ผูกกับ menu_id ของหน้าจอ Payment Run)
         const approvers = await client.query(`
             SELECT a.approval_level, a.approver_user_id, u.user_name
             FROM sa_module_approver a
             JOIN sa_user u ON u.id = a.approver_user_id
-            WHERE a.module_code='21' AND a.doc_category='payment_run' AND a.is_active=true
-            ORDER BY a.approval_level`, []);
+            WHERE a.menu_id=$1 AND a.is_active=true
+            ORDER BY a.approval_level`, [menu_id]);
+
+        if (approvers.rows.length === 0 && !force) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+                code: 'NO_ACTIVE_APPROVER',
+                message: 'ไม่มีผู้อนุมัติที่เปิดใช้งานอยู่สำหรับเมนูนี้ในขณะนี้ ต้องการดำเนินการต่อโดยข้ามขั้นตอนอนุมัติหรือไม่?',
+            });
+        }
+
+        if (approvers.rows.length === 0) {
+            // force=true และไม่มีผู้อนุมัติที่ active — ข้ามขั้นตอนอนุมัติ ผ่านตรงไป Approved
+            await client.query(`DELETE FROM ap_payment_run_approval WHERE run_id=$1`, [id]);
+            await client.query(`
+                UPDATE ap_payment_run SET status='Approved', approval_mode=$1, updated_at=NOW(), updated_by=$2 WHERE id=$3`,
+                [approvalMode, userName, id]);
+            await client.query('COMMIT');
+            return res.status(200).json({ message: 'ส่งอนุมัติสำเร็จ (ข้ามขั้นตอนอนุมัติ เนื่องจากไม่มีผู้อนุมัติที่ใช้งานอยู่)' });
+        }
+
+        await client.query(`
+            UPDATE ap_payment_run SET status='Submitted', approval_mode=$1, updated_at=NOW(), updated_by=$2 WHERE id=$3`,
+            [approvalMode, userName, id]);
 
         await client.query(`DELETE FROM ap_payment_run_approval WHERE run_id=$1`, [id]);
         for (const apr of approvers.rows) {
@@ -324,18 +351,19 @@ const approveRun = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
-        const run = await client.query(`SELECT status FROM ap_payment_run WHERE id=$1`, [id]);
+        const run = await client.query(`SELECT status, approval_mode FROM ap_payment_run WHERE id=$1`, [id]);
         if (run.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
         if (run.rows[0].status !== 'Submitted') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'อนุมัติได้เฉพาะเอกสาร Submitted เท่านั้น' }); }
+        const isAnyMode = run.rows[0].approval_mode === 'ANY';
 
-        // User must have pending record AND all lower-sequence approvers already approved
+        // โหมด ALL: ต้องไม่มีลำดับก่อนหน้ายัง Pending อยู่ / โหมด ANY: ใครอนุมัติก่อนก็จบเลย ไม่ต้องรอลำดับ
         const myRecord = await client.query(`
             SELECT a.id FROM ap_payment_run_approval a
             WHERE a.run_id=$1 AND a.approver_user_id=$2 AND a.status='Pending'
-              AND NOT EXISTS (
+              AND ($3::boolean OR NOT EXISTS (
                 SELECT 1 FROM ap_payment_run_approval a2
                 WHERE a2.run_id=$1 AND a2.sequence_no < a.sequence_no AND a2.status='Pending'
-              )`, [id, userId]);
+              ))`, [id, userId, isAnyMode]);
 
         if (myRecord.rows.length === 0) {
             await client.query('ROLLBACK');
@@ -346,13 +374,22 @@ const approveRun = async (req, res) => {
             UPDATE ap_payment_run_approval SET status='Approved', remarks=$1, approved_at=NOW() WHERE id=$2`,
             [remarks || null, myRecord.rows[0].id]);
 
-        // If no more pending → promote run to Approved
-        const remaining = await client.query(
-            `SELECT COUNT(*) FROM ap_payment_run_approval WHERE run_id=$1 AND status='Pending'`, [id]);
-        if (parseInt(remaining.rows[0].count) === 0) {
+        if (isAnyMode) {
+            // คนใดคนหนึ่งอนุมัติก็พอ — แถวที่เหลือของคนอื่นเปลี่ยนเป็น Skipped แล้วจบทันที
+            await client.query(
+                `UPDATE ap_payment_run_approval SET status='Skipped' WHERE run_id=$1 AND status='Pending'`, [id]);
             await client.query(
                 `UPDATE ap_payment_run SET status='Approved', updated_at=NOW(), updated_by=$1 WHERE id=$2`,
                 [userName, id]);
+        } else {
+            // โหมด ALL: ต้องอนุมัติครบทุกคนตามลำดับ
+            const remaining = await client.query(
+                `SELECT COUNT(*) FROM ap_payment_run_approval WHERE run_id=$1 AND status='Pending'`, [id]);
+            if (parseInt(remaining.rows[0].count) === 0) {
+                await client.query(
+                    `UPDATE ap_payment_run SET status='Approved', updated_at=NOW(), updated_by=$1 WHERE id=$2`,
+                    [userName, id]);
+            }
         }
         await client.query('COMMIT');
         res.status(200).json({ message: 'อนุมัติสำเร็จ' });
