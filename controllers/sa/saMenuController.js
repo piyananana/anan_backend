@@ -10,6 +10,12 @@ const getAllMenu = async (req, res) => {
         // Ensure columns exist
         await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS is_system BOOLEAN DEFAULT FALSE');
         await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS menu_name_en TEXT DEFAULT ''");
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS requires_approval BOOLEAN DEFAULT FALSE');
+        await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL'");
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS uses_doc_type BOOLEAN DEFAULT FALSE');
+        await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS doc_type_module VARCHAR(10)");
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_description TEXT');
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_description_en TEXT');
 
         const isDeveloper = req.isDeveloper ?? false;
         const query = isDeveloper
@@ -30,6 +36,12 @@ const getMenuByUserId = async (req, res) => {
     try {
         // Ensure columns exist
         await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS is_system BOOLEAN DEFAULT FALSE');
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS requires_approval BOOLEAN DEFAULT FALSE');
+        await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL'");
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS uses_doc_type BOOLEAN DEFAULT FALSE');
+        await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS doc_type_module VARCHAR(10)");
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_description TEXT');
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_description_en TEXT');
         await req.dbPool.query(`
             ALTER TABLE sa_user_menu ADD COLUMN IF NOT EXISTS can_view    BOOLEAN DEFAULT TRUE;
             ALTER TABLE sa_user_menu ADD COLUMN IF NOT EXISTS can_create  BOOLEAN DEFAULT FALSE;
@@ -150,9 +162,15 @@ const getMenuContentById = async (req, res) => {
 
 // API สำหรับเพิ่มเมนูใหม่
 const createMenu = async (req, res) => {
-    const { parent_id, menu_name, menu_name_en, menu_type, target_path, sort_order, is_system, content_type, content_data } = req.body;
+    const { parent_id, menu_name, menu_name_en, menu_type, target_path, sort_order, is_system, content_type, content_data, requires_approval } = req.body;
     try {
         await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS menu_name_en TEXT DEFAULT ''");
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS requires_approval BOOLEAN DEFAULT FALSE');
+        await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL'");
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS uses_doc_type BOOLEAN DEFAULT FALSE');
+        await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS doc_type_module VARCHAR(10)");
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_description TEXT');
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_description_en TEXT');
         let actual_sort_order = sort_order;
         if (actual_sort_order === undefined || actual_sort_order === null) {
             const maxOrderResult = await req.dbPool.query(
@@ -161,10 +179,14 @@ const createMenu = async (req, res) => {
             actual_sort_order = (maxOrderResult.rows[0].max || 0) + 1;
         }
 
+        // หมายเหตุ: approval_mode/approval_description(_en)/uses_doc_type/doc_type_module
+        // ไม่ได้ตั้งค่าที่นี่ (หน้าจอจัดการเมนู) — ใช้ค่า default ของคอลัมน์แล้วไปตั้งค่าจริง
+        // ที่หน้าจอ sa_module_approver_screen ผ่าน endpoint /sa_menu/:id/approval_config แทน
         const menuResult = await req.dbPool.query(
-            `INSERT INTO sa_menu (parent_id, menu_name, menu_name_en, menu_type, target_path, sort_order, is_active, is_system)
-             VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7) RETURNING *`,
-            [parent_id, menu_name, menu_name_en ?? '', menu_type, target_path, actual_sort_order, is_system ?? false]
+            `INSERT INTO sa_menu (parent_id, menu_name, menu_name_en, menu_type, target_path, sort_order, is_active, is_system, requires_approval)
+             VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $8) RETURNING *`,
+            [parent_id, menu_name, menu_name_en ?? '', menu_type, target_path, actual_sort_order, is_system ?? false,
+             requires_approval ?? false]
         );
         const newMenu = menuResult.rows[0];
 
@@ -187,9 +209,17 @@ const createMenu = async (req, res) => {
 // API สำหรับแก้ไขเมนู
 const updateMenu = async (req, res) => {
     const { id } = req.params;
-    const { menu_name, menu_name_en, menu_type, target_path, sort_order, is_active, is_system, content_type, content_data } = req.body;
+    const { menu_name, menu_name_en, menu_type, target_path, sort_order, is_active, is_system, content_type, content_data, requires_approval } = req.body;
     try {
         await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS menu_name_en TEXT DEFAULT ''");
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS requires_approval BOOLEAN DEFAULT FALSE');
+        await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL'");
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS uses_doc_type BOOLEAN DEFAULT FALSE');
+        await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS doc_type_module VARCHAR(10)");
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_description TEXT');
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_description_en TEXT');
+        // หมายเหตุ: การแก้ไขนี้ (หน้าจอจัดการเมนู) ไม่แตะ approval_mode/approval_description(_en)/
+        // uses_doc_type/doc_type_module — ค่าเหล่านี้ตั้งที่หน้าจอ sa_module_approver_screen แทน
         const menuResult = await req.dbPool.query(
             `UPDATE sa_menu SET
                 menu_name = $1,
@@ -199,9 +229,11 @@ const updateMenu = async (req, res) => {
                 sort_order = $5,
                 is_active = $6,
                 is_system = $7,
+                requires_approval = $8,
                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = $8 RETURNING *`,
-            [menu_name, menu_name_en ?? '', menu_type, target_path, sort_order, is_active, is_system ?? false, id]
+             WHERE id = $9 RETURNING *`,
+            [menu_name, menu_name_en ?? '', menu_type, target_path, sort_order, is_active, is_system ?? false,
+             requires_approval ?? false, id]
         );
 
         if (menuResult.rows.length === 0) {
@@ -233,6 +265,122 @@ const updateMenu = async (req, res) => {
     } catch (err) {
         console.error('Error updating menu:', err);
         res.status(500).json({ error: 'Internal server error' });
+    }
+};
+
+// API สำหรับตั้งค่ารูปแบบการอนุมัติของเมนู (ใช้จากหน้าจอ sa_module_approver_screen เท่านั้น —
+// ระดับ admin ตั้งค่า approval_mode / คำอธิบายการอนุมัติ TH-EN / ใช้ประเภทเอกสารหรือไม่)
+const updateMenuApprovalConfig = async (req, res) => {
+    const { id } = req.params;
+    const { approval_mode, approval_description, approval_description_en, uses_doc_type } = req.body;
+    try {
+        await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL'");
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS uses_doc_type BOOLEAN DEFAULT FALSE');
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_description TEXT');
+        await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_description_en TEXT');
+
+        const result = await req.dbPool.query(
+            `UPDATE sa_menu SET
+                approval_mode = $1,
+                approval_description = $2,
+                approval_description_en = $3,
+                uses_doc_type = $4,
+                updated_at = CURRENT_TIMESTAMP
+             WHERE id = $5 RETURNING *`,
+            [approval_mode ?? 'ALL', approval_description || null, approval_description_en || null,
+             uses_doc_type ?? false, id]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ message: 'Menu not found.' });
+        }
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error('Error updating menu approval config:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+};
+
+// ── การ์ดประเภทเอกสารที่ผูกกับเมนู (ใช้เมื่อ uses_doc_type = true) ──────────────
+// แต่ละแถวคือ "ประเภทเอกสาร" หนึ่งรายการที่ admin เลือกเพิ่มจากตาราง sa_module_document
+// เพื่อตั้งคิวผู้อนุมัติแยกต่อประเภทเอกสารได้ (ผ่าน sa_module_approver.doc_type)
+const ensureMenuDocTypeTable = async (dbPool) => {
+    await dbPool.query(`
+        CREATE TABLE IF NOT EXISTS sa_menu_doc_type (
+            id SERIAL PRIMARY KEY,
+            menu_id INTEGER NOT NULL REFERENCES sa_menu(id) ON DELETE CASCADE,
+            doc_type VARCHAR(50) NOT NULL,
+            doc_name_thai VARCHAR(255),
+            doc_name_eng VARCHAR(255),
+            sys_module VARCHAR(10),
+            sort_order INTEGER DEFAULT 0,
+            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(menu_id, doc_type)
+        )
+    `);
+};
+
+const getMenuDocTypes = async (req, res) => {
+    const { menuId } = req.params;
+    try {
+        await ensureMenuDocTypeTable(req.dbPool);
+        const result = await req.dbPool.query(
+            'SELECT * FROM sa_menu_doc_type WHERE menu_id = $1 ORDER BY sort_order ASC, id ASC',
+            [menuId]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        console.error('Error fetching menu doc types:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+};
+
+const addMenuDocType = async (req, res) => {
+    const { menuId } = req.params;
+    const { doc_type, doc_name_thai, doc_name_eng, sys_module } = req.body;
+    if (!doc_type) {
+        return res.status(400).json({ message: 'doc_type is required.' });
+    }
+    try {
+        await ensureMenuDocTypeTable(req.dbPool);
+        const maxOrder = await req.dbPool.query(
+            'SELECT MAX(sort_order) FROM sa_menu_doc_type WHERE menu_id = $1', [menuId]
+        );
+        const nextOrder = (maxOrder.rows[0].max || 0) + 1;
+        const result = await req.dbPool.query(
+            `INSERT INTO sa_menu_doc_type (menu_id, doc_type, doc_name_thai, doc_name_eng, sys_module, sort_order)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (menu_id, doc_type) DO UPDATE SET doc_name_thai = EXCLUDED.doc_name_thai, doc_name_eng = EXCLUDED.doc_name_eng
+             RETURNING *`,
+            [menuId, doc_type, doc_name_thai || null, doc_name_eng || null, sys_module || null, nextOrder]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (err) {
+        console.error('Error adding menu doc type:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+};
+
+const deleteMenuDocType = async (req, res) => {
+    const { menuId, docType } = req.params;
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        await ensureMenuDocTypeTable(req.dbPool);
+        await client.query(
+            'DELETE FROM sa_menu_doc_type WHERE menu_id = $1 AND doc_type = $2', [menuId, docType]
+        );
+        // ลบคิวผู้อนุมัติที่ผูกกับประเภทเอกสารนี้ไปด้วย (ถ้ามี)
+        await client.query(
+            'DELETE FROM sa_module_approver WHERE menu_id = $1 AND doc_type = $2', [menuId, docType]
+        );
+        await client.query('COMMIT');
+        res.status(204).send();
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Error deleting menu doc type:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    } finally {
+        client.release();
     }
 };
 
@@ -441,6 +589,10 @@ module.exports = {
     getMenuContentById,
     createMenu,
     updateMenu,
+    updateMenuApprovalConfig,
+    getMenuDocTypes,
+    addMenuDocType,
+    deleteMenuDocType,
     deleteMenu,
     deleteAllMenu,
     importMenu,

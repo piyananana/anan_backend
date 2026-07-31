@@ -122,6 +122,11 @@ router.post('/sa_menu/import', saAuthController.requireDeveloper, fileUpload.sin
 router.put('/sa_menu/:id', saAuthController.requireDeveloper, saMenuController.updateMenu);
 router.delete('/sa_menu/:id', saAuthController.requireDeveloper, saMenuController.deleteMenu);
 router.delete('/sa_menu/all', saAuthController.requireDeveloper, saMenuController.deleteAllMenu);
+// ตั้งค่ารูปแบบ/คำอธิบายการอนุมัติ + การ์ดประเภทเอกสาร — ใช้จากหน้าจอ sa_module_approver_screen (ระดับ admin/user ไม่ใช่ developer)
+router.put('/sa_menu/:id/approval_config', saMenuController.updateMenuApprovalConfig);
+router.get('/sa_menu/:menuId/doc_types', saMenuController.getMenuDocTypes);
+router.post('/sa_menu/:menuId/doc_types', saMenuController.addMenuDocType);
+router.delete('/sa_menu/:menuId/doc_types/:docType', saMenuController.deleteMenuDocType);
 
 // For saModuleDocumentController
 router.get('/sa_module_document', saModuleDocumentController.fetchRows);
@@ -165,12 +170,8 @@ router.put('/sa_user_menu/:userId', saUserMenuController.updateUserMenu);
 router.delete('/sa_user_menu/:userId', saUserMenuController.deleteUserMenu);
 
 // For saModuleApproverController
-router.get('/sa_module_approver/by_module/:module_code/:doc_category', saModuleApproverController.fetchByModuleCategory);
-router.get('/sa_module_approver',      saModuleApproverController.fetchRows);
-router.get('/sa_module_approver/:id',  saModuleApproverController.fetchRow);
-router.post('/sa_module_approver',     saModuleApproverController.addRow);
-router.put('/sa_module_approver/:id',  saModuleApproverController.updateRow);
-router.delete('/sa_module_approver/:id', saModuleApproverController.deleteRow);
+router.get('/sa_module_approver/by_menu/:menuId', saModuleApproverController.fetchByMenu);
+router.put('/sa_module_approver/reorder',         saModuleApproverController.reorder);
 
 // For saSmtpConfigController
 router.get('/sa_smtp_config',  saSmtpConfigController.getConfig);

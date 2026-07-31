@@ -1,141 +1,87 @@
 // controllers/sa/saModuleApproverController.js
+//
+// sa_module_approver ผูกกับ "เมนู" (menu_id) โดยตรง — คิวผู้อนุมัติ sync มาจากสิทธิ์ "อนุมัติ"
+// (can_approve) ที่ให้ไว้ใน sa_user_menu อัตโนมัติ (ใช้โดย sa_module_approver_screen.dart
+// และเป็นแหล่งข้อมูลผู้อนุมัติของ AP Payment Run / GL Period Close)
+// ดูรายละเอียดการ sync ที่ utils/menuApproverSync.js
+//
+// หมายเหตุ: เดิมมีรูปแบบ module_code+doc_category (ผูกกับ sa_module_document แยกอิสระ, ใช้โดย
+// sa_module_document_detail_widget.dart) แต่ไม่เคยมีการตรวจสิทธิ์จริงใช้งานคิวนั้น — ลบทิ้งแล้ว
 
-// Migration: sa_module_approver เคยถูกบันทึก module_code เป็นตัวย่อ ('AP','AR')
-// แต่ระบบจริง (เช่น apPaymentRunController) query ด้วยรหัสตัวเลขตาม sys_module ('21'=AP, '11'=AR, '01'=GL)
-// จึงทำให้ผู้อนุมัติที่ตั้งค่าไว้ไม่เคยถูกใช้งานจริง — normalize ให้ตรงกันแบบ idempotent
-const normalizeModuleCodes = async (pool) => {
+const { ensureMenuApproverSchema, syncMenuApprovers } = require('../../utils/menuApproverSync');
+
+// ── menu_id — ใช้โดย sa_module_approver_screen.dart ─────────────────────────────
+
+// GET /sa_module_approver/by_menu/:menuId?doc_type=xx
+// ซิงค์คิวผู้อนุมัติให้ตรงกับสิทธิ์ปัจจุบันก่อน แล้วคืนลำดับที่ตั้งไว้
+// doc_type ไม่ระบุ = คิวระดับเมนู (ค่าเริ่มต้น); ระบุ = คิวเฉพาะประเภทเอกสารนั้น (สำหรับเมนูที่ uses_doc_type)
+const fetchByMenu = async (req, res) => {
+    const { menuId } = req.params;
+    const docType = req.query.doc_type || null;
+    const client = await req.dbPool.connect();
     try {
-        await pool.query(`UPDATE sa_module_approver SET module_code='21' WHERE module_code='AP'`);
-        await pool.query(`UPDATE sa_module_approver SET module_code='11' WHERE module_code='AR'`);
-        await pool.query(`UPDATE sa_module_approver SET module_code='01' WHERE module_code='GL'`);
-    } catch (_) { /* ignore if table doesn't exist yet */ }
-};
+        await ensureMenuApproverSchema(client);
+        await client.query('BEGIN');
+        await syncMenuApprovers(client, menuId, docType);
+        await client.query('COMMIT');
 
-const APPROVER_SELECT = `
-    SELECT a.*,
-           u.user_name  AS approver_username,
-           u.first_name AS approver_first_name,
-           u.last_name  AS approver_last_name,
-           u.email      AS approver_email
-    FROM sa_module_approver a
-    LEFT JOIN sa_user u ON u.id = a.approver_user_id
-`;
-
-// GET /sa_module_approver?module_code=AP&doc_category=payment_run
-const fetchRows = async (req, res) => {
-    const { module_code, doc_category } = req.query;
-    try {
-        await normalizeModuleCodes(req.dbPool);
-        let sql = APPROVER_SELECT + ' WHERE 1=1';
-        const params = [];
-        if (module_code)   { params.push(module_code);   sql += ` AND a.module_code = $${params.length}`; }
-        if (doc_category)  { params.push(doc_category);  sql += ` AND a.doc_category = $${params.length}`; }
-        sql += ' ORDER BY a.module_code, a.doc_category, a.approval_level';
-        const result = await req.dbPool.query(sql, params);
+        const result = await client.query(`
+            SELECT a.id, a.approval_level, a.approver_user_id, a.is_active, a.doc_type,
+                   u.user_name  AS approver_username,
+                   u.first_name AS approver_first_name,
+                   u.last_name  AS approver_last_name,
+                   u.email      AS approver_email
+            FROM sa_module_approver a
+            JOIN sa_user u ON u.id = a.approver_user_id
+            WHERE a.menu_id = $1 AND a.doc_type IS NOT DISTINCT FROM $2
+            ORDER BY a.approval_level`, [menuId, docType]);
         res.status(200).json(result.rows);
     } catch (error) {
-        console.error('Error fetching sa_module_approver:', error);
+        await client.query('ROLLBACK');
+        console.error('Error fetching approvers by menu:', error);
         res.status(500).json({ message: 'Internal server error' });
+    } finally {
+        client.release();
     }
 };
 
-// GET /sa_module_approver/:id
-const fetchRow = async (req, res) => {
-    const { id } = req.params;
-    try {
-        const result = await req.dbPool.query(APPROVER_SELECT + ' WHERE a.id = $1', [id]);
-        if (result.rows.length === 0) return res.status(404).json({ message: 'ไม่พบข้อมูล' });
-        res.status(200).json(result.rows[0]);
-    } catch (error) {
-        console.error('Error fetching sa_module_approver row:', error);
-        res.status(500).json({ message: 'Internal server error' });
+// PUT /sa_module_approver/reorder  { menu_id, doc_type, items: [{approver_user_id, is_active}, ...] }
+// ลำดับใน items[] คือลำดับการอนุมัติใหม่ (index 0 = ลำดับที่ 1); is_active ใช้ "งดอนุมัติ" คนนั้นชั่วคราว
+// doc_type ไม่ระบุ = แก้ไขคิวระดับเมนู
+const reorder = async (req, res) => {
+    const { menu_id, items } = req.body;
+    const docType = req.body.doc_type || null;
+    if (!menu_id || !Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({ message: 'ต้องระบุ menu_id และรายชื่อผู้อนุมัติ' });
     }
-};
-
-// POST /sa_module_approver
-const addRow = async (req, res) => {
-    const { module_code, doc_category, approval_level, approver_user_id, signature_image, is_active } = req.body;
-    const userName = req.headers.username;
+    const client = await req.dbPool.connect();
     try {
-        const result = await req.dbPool.query(
-            `INSERT INTO sa_module_approver
-               (module_code, doc_category, approval_level, approver_user_id, signature_image, is_active, created_by, updated_by)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$7)
-             RETURNING id`,
-            [module_code, doc_category, approval_level ?? 1, approver_user_id,
-             signature_image || null, is_active ?? true, userName]
-        );
-        const newId = result.rows[0].id;
-        const newRow = await req.dbPool.query(APPROVER_SELECT + ' WHERE a.id = $1', [newId]);
-        res.status(201).json(newRow.rows[0]);
-    } catch (error) {
-        if (error.code === '23505') {
-            return res.status(409).json({ message: 'ลำดับผู้อนุมัตินี้มีอยู่แล้วในโมดูลและประเภทงานนี้' });
+        await client.query('BEGIN');
+        // เซ็ตเป็นค่าลบชั่วคราวก่อน เพื่อเลี่ยงชนกับ unique constraint (menu_id, doc_type, approval_level)
+        // ระหว่างสลับลำดับ (เช่น สลับตำแหน่ง 1 กับ 2)
+        for (let i = 0; i < items.length; i++) {
+            await client.query(
+                `UPDATE sa_module_approver SET approval_level = $1
+                 WHERE menu_id=$2 AND doc_type IS NOT DISTINCT FROM $3 AND approver_user_id=$4`,
+                [-(i + 1), menu_id, docType, items[i].approver_user_id]);
         }
-        console.error('Error adding sa_module_approver:', error);
-        res.status(500).json({ message: 'Internal server error' });
-    }
-};
-
-// PUT /sa_module_approver/:id
-const updateRow = async (req, res) => {
-    const { id } = req.params;
-    const { module_code, doc_category, approval_level, approver_user_id, signature_image, is_active } = req.body;
-    const userName = req.headers.username;
-    try {
-        const result = await req.dbPool.query(
-            `UPDATE sa_module_approver SET
-               module_code      = $1, doc_category     = $2,
-               approval_level   = $3, approver_user_id = $4,
-               signature_image  = $5, is_active        = $6,
-               updated_by = $7, updated_at = NOW()
-             WHERE id = $8
-             RETURNING id`,
-            [module_code, doc_category, approval_level, approver_user_id,
-             signature_image || null, is_active ?? true, userName, id]
-        );
-        if (result.rows.length === 0) return res.status(404).json({ message: 'ไม่พบข้อมูล' });
-        const updated = await req.dbPool.query(APPROVER_SELECT + ' WHERE a.id = $1', [id]);
-        res.status(200).json(updated.rows[0]);
-    } catch (error) {
-        if (error.code === '23505') {
-            return res.status(409).json({ message: 'ลำดับผู้อนุมัตินี้มีอยู่แล้วในโมดูลและประเภทงานนี้' });
+        for (let i = 0; i < items.length; i++) {
+            await client.query(
+                `UPDATE sa_module_approver SET approval_level = $1, is_active = $2
+                 WHERE menu_id=$3 AND doc_type IS NOT DISTINCT FROM $4 AND approver_user_id=$5`,
+                [i + 1, items[i].is_active ?? true, menu_id, docType, items[i].approver_user_id]);
         }
-        console.error('Error updating sa_module_approver:', error);
-        res.status(500).json({ message: 'Internal server error' });
-    }
-};
-
-// DELETE /sa_module_approver/:id
-const deleteRow = async (req, res) => {
-    const { id } = req.params;
-    try {
-        const result = await req.dbPool.query(
-            'DELETE FROM sa_module_approver WHERE id = $1 RETURNING id', [id]
-        );
-        if (result.rows.length === 0) return res.status(404).json({ message: 'ไม่พบข้อมูล' });
-        res.status(204).send();
+        await client.query('COMMIT');
+        res.status(200).json({ message: 'บันทึกลำดับผู้อนุมัติสำเร็จ' });
     } catch (error) {
-        console.error('Error deleting sa_module_approver:', error);
+        await client.query('ROLLBACK');
+        console.error('Error reordering approvers:', error);
         res.status(500).json({ message: 'Internal server error' });
+    } finally {
+        client.release();
     }
 };
 
-// GET /sa_module_approver/by_module/:module_code/:doc_category — สำหรับใช้ตอน approval process
-const fetchByModuleCategory = async (req, res) => {
-    const { module_code, doc_category } = req.params;
-    try {
-        await normalizeModuleCodes(req.dbPool);
-        const result = await req.dbPool.query(
-            APPROVER_SELECT +
-            ' WHERE a.module_code=$1 AND a.doc_category=$2 AND a.is_active=true ORDER BY a.approval_level',
-            [module_code, doc_category]
-        );
-        res.status(200).json(result.rows);
-    } catch (error) {
-        console.error('Error fetching approvers by module/category:', error);
-        res.status(500).json({ message: 'Internal server error' });
-    }
+module.exports = {
+    fetchByMenu, reorder,
 };
-
-module.exports = { fetchRows, fetchRow, addRow, updateRow, deleteRow, fetchByModuleCategory };
