@@ -568,7 +568,7 @@ const verifyCloseApprover = async (req, res) => {
 // รองรับผู้อนุมัติหลายคนแบบมีลำดับ เหมือน AP Payment Run
 const requestClose = async (req, res) => {
     const { id } = req.params;
-    const { menu_id, force } = req.body || {};
+    const { menu_id } = req.body || {};
     const userId = req.headers.userid;
     const userName = req.headers.username;
     if (!userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
@@ -617,21 +617,14 @@ const requestClose = async (req, res) => {
             WHERE a.menu_id=$1 AND a.is_active=true
             ORDER BY a.approval_level`, [menu_id]);
 
-        if (approvers.rows.length === 0 && !force) {
-            await client.query('ROLLBACK');
-            return res.status(409).json({
-                code: 'NO_ACTIVE_APPROVER',
-                message: 'ไม่มีผู้อนุมัติที่เปิดใช้งานอยู่สำหรับเมนูนี้ในขณะนี้ ต้องการดำเนินการต่อโดยข้ามขั้นตอนอนุมัติหรือไม่?',
-            });
-        }
-
         if (approvers.rows.length === 0) {
-            // force=true และไม่มีผู้อนุมัติที่ active — ข้ามขั้นตอนอนุมัติ ปิดงวดตรงทันที
+            // ไม่มีผู้มีสิทธิ์อนุมัติเลย หรือถูกงดอนุมัติหมดทุกคน — admin ไม่ต้องการอนุมัติสำหรับเมนูนี้
+            // ข้ามขั้นตอนอนุมัติไปเลยโดยไม่ต้องแจ้งเตือน ปิดงวดตรงทันที
             await client.query(
                 `UPDATE gl_posting_period SET gl_status='CLOSED', updated_by=$1, updated_at=NOW() WHERE id=$2`,
                 [userId, id]);
             await client.query('COMMIT');
-            return res.status(200).json({ message: 'ปิดงวดบัญชีสำเร็จ (ข้ามขั้นตอนอนุมัติ เนื่องจากไม่มีผู้อนุมัติที่ใช้งานอยู่)' });
+            return res.status(200).json({ message: 'ปิดงวดบัญชีสำเร็จ' });
         }
 
         const insertRes = await client.query(`
