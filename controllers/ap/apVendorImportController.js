@@ -79,8 +79,9 @@ const TEMPLATE_SHEETS = [
     key: 'ap_account',
     name: 'บัญชีเจ้าหนี้ (GL)',
     columns: [
-      { key: 'old_vendor_code',  label: 'รหัสเก่าเจ้าหนี้ — เชื่อมกับ sheet ข้อมูลพื้นฐาน', required: true,  example: 'VA0001' },
-      { key: 'ap_account_code', label: 'รหัสบัญชีเจ้าหนี้ (บัญชีคุมยอด)',                     required: false, example: '2100' },
+      { key: 'old_vendor_code',      label: 'รหัสเก่าเจ้าหนี้ — เชื่อมกับ sheet ข้อมูลพื้นฐาน', required: true,  example: 'VA0001' },
+      { key: 'ap_account_code',     label: 'รหัสบัญชีเจ้าหนี้ (บัญชีคุมยอด)',                     required: false, example: '2100' },
+      { key: 'payment_method_code', label: 'รหัสประเภทการชำระหลัก',                              required: false, example: 'TRANSFER' },
     ],
   },
 ];
@@ -188,18 +189,20 @@ const validateFile = [
       const apAccount    = readSheet(workbook, apAccountDef);
 
       // Pre-fetch lookup tables
-      const [groupsR, businessTypesR, accountsR, currenciesR, runningR] = await Promise.all([
+      const [groupsR, businessTypesR, accountsR, currenciesR, runningR, paymentMethodsR] = await Promise.all([
         req.dbPool.query(`SELECT id, group_code, is_auto_number FROM ap_vendor_group WHERE is_active = true`),
         req.dbPool.query(`SELECT id, business_type_code FROM cd_business_type WHERE is_active = true`),
         req.dbPool.query(`SELECT id, account_code FROM gl_account WHERE is_active = true AND is_control_account = true`),
         req.dbPool.query(`SELECT currency_code FROM cd_currency WHERE is_active = true`),
         req.dbPool.query(`SELECT is_auto_numbering FROM ap_vendor_running LIMIT 1`),
+        req.dbPool.query(`SELECT id, method_code FROM cm_payment_method WHERE is_active = true`),
       ]);
       const groupMap         = buildCodeMap(groupsR.rows, 'group_code');
       const businessTypeMap  = buildCodeMap(businessTypesR.rows, 'business_type_code');
       const accountMap       = buildCodeMap(accountsR.rows, 'account_code');
       const currencySet      = new Set(currenciesR.rows.map(r => String(r.currency_code).toUpperCase()));
       const globalAutoNumber = runningR.rows.length > 0 && runningR.rows[0].is_auto_numbering;
+      const paymentMethodMap = buildCodeMap(paymentMethodsR.rows, 'method_code');
 
       const errors  = [];
       const vendors = new Map();
@@ -297,6 +300,8 @@ const validateFile = [
           remark:               get('remark') || null,
           ap_account_code:      null,
           ap_account_id:        null,
+          payment_method_code:  null,
+          payment_method_id:    null,
           addresses:            [],
           contacts:             [],
           bank_accounts:        [],
@@ -416,6 +421,13 @@ const validateFile = [
           if (!acc) vendor.__rowErrors.push({ column: `${apAccountDef.name}: ap_account_code`, message: `ไม่พบรหัสบัญชีเจ้าหนี้ "${apAccountCode}" (ต้องเป็นบัญชีคุมยอดที่ใช้งานอยู่)` });
           else { vendor.ap_account_code = apAccountCode; vendor.ap_account_id = acc.id; }
         }
+
+        const paymentMethodCode = get('payment_method_code').toUpperCase();
+        if (paymentMethodCode) {
+          const pm = paymentMethodMap[paymentMethodCode];
+          if (!pm) vendor.__rowErrors.push({ column: `${apAccountDef.name}: payment_method_code`, message: `ไม่พบรหัสประเภทการชำระ "${paymentMethodCode}"` });
+          else { vendor.payment_method_code = paymentMethodCode; vendor.payment_method_id = pm.id; }
+        }
       }
 
       // ── สรุปผล ────────────────────────────────────────────────────────────
@@ -462,6 +474,7 @@ const confirmImport = async (req, res) => {
   const importErrors = [];
   try {
     await client.query('BEGIN');
+    await client.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS payment_method_id INTEGER`).catch(() => {});
     for (let idx = 0; idx < rows.length; idx++) {
       const r = rows[idx];
       const savepointName = `sp_row_${idx}`;
@@ -489,9 +502,9 @@ const confirmImport = async (req, res) => {
               vendor_group_id, business_type_id,
               credit_term_months, credit_term_days,
               currency_code, is_active, remark,
-              ap_account_id,
+              ap_account_id, payment_method_id,
               created_by, updated_by)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15)
            ON CONFLICT (vendor_code) DO NOTHING
            RETURNING id`,
           [
@@ -505,6 +518,7 @@ const confirmImport = async (req, res) => {
             r.is_active !== undefined ? r.is_active : true,
             trunc(r.remark, 500),
             r.ap_account_id || null,
+            r.payment_method_id || null,
             userName,
           ]
         );

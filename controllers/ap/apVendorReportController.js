@@ -19,6 +19,9 @@ const fetchReport = async (req, res) => {
     await req.dbPool.query(
       `ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS credit_limit NUMERIC(18,4) NOT NULL DEFAULT 0`
     ).catch(() => {});
+    await req.dbPool.query(
+      `ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS payment_method_id INTEGER`
+    ).catch(() => {});
 
     const params = [];
     let p = 1;
@@ -79,6 +82,10 @@ const fetchReport = async (req, res) => {
         v.ap_account_id,
         ga.account_code      AS ap_account_code,
         ga.account_name_thai AS ap_account_name_thai,
+        v.payment_method_id,
+        pm.method_code       AS payment_method_code,
+        pm.method_name_th    AS payment_method_name_thai,
+        pm.method_name_en    AS payment_method_name_eng,
 
         /* ── ที่อยู่ ─────────────────────────────────────────────── */
         COALESCE(
@@ -134,6 +141,7 @@ const fetchReport = async (req, res) => {
       LEFT JOIN ap_vendor_group    vg  ON v.vendor_group_id  = vg.id
       LEFT JOIN cd_business_type   cbt ON v.business_type_id = cbt.id
       LEFT JOIN gl_account         ga  ON v.ap_account_id    = ga.id
+      LEFT JOIN cm_payment_method  pm  ON v.payment_method_id = pm.id
       LEFT JOIN ap_vendor_address  addr ON addr.vendor_id    = v.id
       LEFT JOIN ap_vendor_contact  ct   ON ct.vendor_id      = v.id
       LEFT JOIN ap_vendor_bank_account ba ON ba.vendor_id    = v.id
@@ -142,7 +150,8 @@ const fetchReport = async (req, res) => {
         v.id,
         vg.group_code, vg.group_name_thai,
         cbt.business_type_code, cbt.business_type_name_thai,
-        ga.account_code, ga.account_name_thai
+        ga.account_code, ga.account_name_thai,
+        pm.method_code, pm.method_name_th, pm.method_name_en
       ORDER BY v.vendor_code ASC
     `;
 
