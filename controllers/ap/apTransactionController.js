@@ -927,6 +927,60 @@ const fetchRaInvoices = async (req, res) => {
     }
 };
 
+// --- Fetch Remittance Advice (RA) document by doc_no ---
+// ใช้ใน Payment เพื่อ auto-fill apply rows จากใบแจ้งชำระ (RA) — คล้ายกับ AR ที่ Receipt ดึงจากใบวางบิล
+// คืน 409 พร้อม payment_doc_no ถ้า RA ถูกจ่ายไปแล้ว
+const fetchRemittanceAdviceByDocNo = async (req, res) => {
+    const { doc_no, view } = req.query;
+    const isView = view === 'true'; // view=true: ข้ามการตรวจสอบสถานะจ่ายแล้ว (ใช้สำหรับเรียกดูเอกสาร)
+    if (!doc_no) return res.status(400).json({ error: 'doc_no required' });
+    try {
+        const hRes = await req.dbPool.query(`
+            SELECT t.*, d.doc_code, d.doc_name_thai, d.sys_doc_type, d.is_auto_numbering
+            FROM ap_transaction t
+            JOIN sa_module_document d ON t.doc_id = d.id
+            WHERE t.doc_no = $1 AND d.sys_doc_type = '70' AND t.status = 'Posted'
+            LIMIT 1
+        `, [doc_no]);
+        if (hRes.rows.length === 0) return res.status(404).json(null);
+
+        // ตรวจสอบว่า RA ถูกนำไปจ่ายชำระแล้วหรือยัง (ข้ามเมื่อ view=true)
+        if (!isView) {
+            const payRes = await req.dbPool.query(`
+                SELECT t.doc_no AS payment_doc_no
+                FROM ap_transaction t
+                JOIN sa_module_document d ON d.id = t.doc_id
+                WHERE t.ref_no = $1
+                  AND d.sys_doc_type = '80'
+                  AND t.status = 'Posted'
+                ORDER BY t.doc_date DESC, t.id DESC
+                LIMIT 1
+            `, [doc_no]);
+            if (payRes.rows.length > 0) {
+                return res.status(409).json({
+                    error: 'RA_ALREADY_PAID',
+                    payment_doc_no: payRes.rows[0].payment_doc_no,
+                });
+            }
+        }
+
+        const raId = hRes.rows[0].id;
+        const appliesRes = await req.dbPool.query(`
+            SELECT a.*, inv.doc_no AS applied_to_doc_no, inv.doc_date AS applied_to_doc_date,
+                   inv.total_amount_lc AS applied_to_total,
+                   inv.total_amount_fc AS applied_to_total_fc,
+                   inv.exchange_rate   AS applied_to_exchange_rate,
+                   inv.due_date        AS applied_to_due_date
+            FROM ap_transaction_apply a
+            JOIN ap_transaction inv ON a.applied_to_id = inv.id
+            WHERE a.transaction_id = $1 ORDER BY a.id
+        `, [raId]);
+        res.json({ ...hRes.rows[0], details: [], applies: appliesRes.rows, payments: [] });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+};
+
 // --- 1. Create Transaction (Draft/Post) ---
 const createTransaction = async (req, res) => {
     const { header, details, applies, payments, whts, action } = req.body;
@@ -1384,5 +1438,6 @@ module.exports = {
     fetchRows, fetchRow,
     fetchOpenInvoices, fetchOpenAdvances,
     fetchOpenRemittanceAdvices, fetchRaInvoices,
+    fetchRemittanceAdviceByDocNo,
     createTransaction, updateTransaction, voidTransaction, deleteTransaction,
 };
