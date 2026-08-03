@@ -1,7 +1,11 @@
 // controllers/ap/apPaymentRunController.js
 
-// --- Auto-generate run_number PR-YYYYMMDD-NNN ---
-const generateRunNumber = async (client, date) => {
+const { generateNextRunNumber } = require('./apPaymentRunRunningController');
+const apTransactionController = require('./apTransactionController');
+
+// --- Fallback auto-generate run_number PR-YYYYMMDD-NNN, used only when the
+// admin has not enabled/configured auto-numbering in ap_payment_run_running ---
+const generateRunNumberFallback = async (client, date) => {
     const d = new Date(date);
     const yyyy = d.getFullYear();
     const mm   = (d.getMonth() + 1).toString().padStart(2, '0');
@@ -20,17 +24,29 @@ const generateRunNumber = async (client, date) => {
     return prefix + seq.toString().padStart(3, '0');
 };
 
+// ตั้งค่าที่ ap_payment_run_running_screen (ตั้งค่าเลขที่ใบอนุมัติจ่ายอัตโนมัติ) ก่อน
+// ถ้ายังไม่ได้ตั้งค่า/ปิดใช้งานอยู่ ให้ใช้รูปแบบเดิม PR-YYYYMMDD-NNN แทน
+const generateRunNumber = async (client, date) => {
+    const configured = await generateNextRunNumber(client);
+    if (configured) return configured;
+    return generateRunNumberFallback(client, date);
+};
+
 // --- GET list ---
 const fetchRows = async (req, res) => {
     const { status, date_from, date_to } = req.query;
+    await ensureApPaymentRunColumns(req.dbPool);
     let query = `
         SELECT r.id, r.run_number, r.run_date, r.description,
+               r.payment_date, r.payment_method_id, r.due_date_filter,
+               pm.method_code AS payment_method_code, pm.method_name_th AS payment_method_name,
                r.total_amount_lc, r.status,
                f.format_code AS bank_file_format_code,
                f.format_name AS bank_file_format_name,
                r.created_at, r.created_by
         FROM ap_payment_run r
         LEFT JOIN cm_bank_file_format f ON f.id = r.bank_file_format_id
+        LEFT JOIN cm_payment_method pm ON pm.id = r.payment_method_id
         WHERE 1=1`;
     const params = [];
     let pi = 1;
@@ -51,14 +67,18 @@ const fetchRows = async (req, res) => {
 const fetchRow = async (req, res) => {
     const { id } = req.params;
     try {
+        await ensureApPaymentRunColumns(req.dbPool);
         const hRes = await req.dbPool.query(`
             SELECT r.id, r.run_number, r.run_date, r.description,
+                   r.payment_date, r.payment_method_id, r.due_date_filter,
+                   pm.method_code AS payment_method_code, pm.method_name_th AS payment_method_name,
                    r.bank_file_format_id, r.total_amount_lc, r.status,
                    f.format_code AS bank_file_format_code,
                    f.format_name AS bank_file_format_name,
                    r.created_by, r.updated_by
             FROM ap_payment_run r
             LEFT JOIN cm_bank_file_format f ON f.id = r.bank_file_format_id
+            LEFT JOIN cm_payment_method pm ON pm.id = r.payment_method_id
             WHERE r.id = $1`, [id]);
         if (hRes.rows.length === 0) return res.status(404).json({ message: 'Not found' });
         const header = hRes.rows[0];
@@ -78,86 +98,39 @@ const fetchRow = async (req, res) => {
     }
 };
 
-// --- Helper: ensure cm_bank_account_id column on ap_payment_run ---
-const ensureApPaymentRunCmColumn = async (dbPool) => {
+// --- Helper: ensure new columns on ap_payment_run exist (idempotent) ---
+const ensureApPaymentRunColumns = async (dbPool) => {
     await dbPool.query(`ALTER TABLE ap_payment_run ADD COLUMN IF NOT EXISTS cm_bank_account_id INTEGER`);
-};
-
-// --- Helper: Create CM payment records after AP payment run is posted ---
-const postCmPaymentsHelper = async (client, run, lines, glEntryId) => {
-    await client.query(`
-        CREATE TABLE IF NOT EXISTS cm_payment (
-            id                  SERIAL PRIMARY KEY,
-            payment_date        DATE          NOT NULL,
-            bank_account_id     INTEGER       REFERENCES cm_bank_account(id),
-            payment_method_id   INTEGER,
-            payment_method_type VARCHAR(30)   NOT NULL DEFAULT 'TRANSFER',
-            ap_payment_run_id   INTEGER,
-            ap_doc_no           VARCHAR(50),
-            payee_type          VARCHAR(10)   DEFAULT 'VENDOR',
-            payee_id            INTEGER,
-            payee_code          VARCHAR(50),
-            payee_name_th       VARCHAR(200),
-            amount_lc           NUMERIC(18,4) NOT NULL DEFAULT 0,
-            amount_fc           NUMERIC(18,4) NOT NULL DEFAULT 0,
-            currency_code       VARCHAR(10)   NOT NULL DEFAULT 'THB',
-            exchange_rate       NUMERIC(15,6) NOT NULL DEFAULT 1,
-            check_no            VARCHAR(50),
-            check_date          DATE,
-            checkbook_id        INTEGER       REFERENCES cm_checkbook(id),
-            status              VARCHAR(20)   NOT NULL DEFAULT 'Pending',
-            clearing_date       DATE,
-            clearing_note       TEXT,
-            gl_entry_id         INTEGER,
-            remark              TEXT,
-            created_by          INTEGER,
-            created_at          TIMESTAMP DEFAULT NOW(),
-            updated_at          TIMESTAMP DEFAULT NOW()
-        )`);
-
-    // Idempotent: delete and re-create
-    await client.query(`DELETE FROM cm_payment WHERE ap_payment_run_id = $1`, [run.id]);
-
-    for (const line of lines) {
-        const payAmt = parseFloat(line.payment_amount_lc || 0);
-        if (payAmt === 0) continue;
-        await client.query(`
-            INSERT INTO cm_payment
-                (payment_date, bank_account_id, payment_method_type,
-                 ap_payment_run_id, ap_doc_no,
-                 payee_type, payee_id, payee_code, payee_name_th,
-                 amount_lc, currency_code, exchange_rate, gl_entry_id)
-            VALUES ($1,$2,'TRANSFER',$3,$4,'VENDOR',$5,$6,$7,$8,'THB',1,$9)`,
-            [
-                run.run_date,
-                run.cm_bank_account_id || null,
-                run.id,
-                run.run_number,
-                line.vendor_id   || null,
-                line.vendor_code || null,
-                line.vendor_name_th || null,
-                payAmt,
-                glEntryId,
-            ]);
-    }
+    await dbPool.query(`ALTER TABLE ap_payment_run ADD COLUMN IF NOT EXISTS payment_date DATE`);
+    await dbPool.query(`ALTER TABLE ap_payment_run ADD COLUMN IF NOT EXISTS payment_method_id INTEGER`);
+    await dbPool.query(`ALTER TABLE ap_payment_run ADD COLUMN IF NOT EXISTS due_date_filter DATE`);
 };
 
 // --- POST create (Draft) ---
 const createRun = async (req, res) => {
-    const { run_date, description, bank_file_format_id, cm_bank_account_id, lines = [] } = req.body;
+    const {
+        run_date, description, bank_file_format_id, cm_bank_account_id,
+        payment_date, payment_method_id, due_date_filter,
+        lines = [],
+    } = req.body;
     const userName = req.headers['username'] || null;
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
-        await client.query(`ALTER TABLE ap_payment_run ADD COLUMN IF NOT EXISTS cm_bank_account_id INTEGER`);
+        await ensureApPaymentRunColumns(req.dbPool);
         const runNumber = await generateRunNumber(client, run_date);
         const total = lines.reduce((s, l) => s + parseFloat(l.payment_amount_lc || 0), 0);
         const hRes = await client.query(`
             INSERT INTO ap_payment_run
-                (run_number, run_date, description, bank_file_format_id, cm_bank_account_id, total_amount_lc, status, created_by, updated_by)
-            VALUES ($1,$2,$3,$4,$5,$6,'Draft',$7,$7)
-            RETURNING id, run_number, run_date, description, bank_file_format_id, cm_bank_account_id, total_amount_lc, status`,
-            [runNumber, run_date, description || null, bank_file_format_id || null, cm_bank_account_id || null, total, userName]);
+                (run_number, run_date, description, bank_file_format_id, cm_bank_account_id,
+                 payment_date, payment_method_id, due_date_filter,
+                 total_amount_lc, status, created_by, updated_by)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'Draft',$10,$10)
+            RETURNING id, run_number, run_date, description, bank_file_format_id, cm_bank_account_id,
+                      payment_date, payment_method_id, due_date_filter, total_amount_lc, status`,
+            [runNumber, run_date, description || null, bank_file_format_id || null, cm_bank_account_id || null,
+             payment_date || null, payment_method_id || null, due_date_filter || null,
+             total, userName]);
         const runId = hRes.rows[0].id;
 
         for (let i = 0; i < lines.length; i++) {
@@ -195,12 +168,16 @@ const createRun = async (req, res) => {
 // --- PUT update (Draft only) ---
 const updateRun = async (req, res) => {
     const { id } = req.params;
-    const { run_date, description, bank_file_format_id, cm_bank_account_id, lines = [] } = req.body;
+    const {
+        run_date, description, bank_file_format_id, cm_bank_account_id,
+        payment_date, payment_method_id, due_date_filter,
+        lines = [],
+    } = req.body;
     const userName = req.headers['username'] || null;
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
-        await client.query(`ALTER TABLE ap_payment_run ADD COLUMN IF NOT EXISTS cm_bank_account_id INTEGER`);
+        await ensureApPaymentRunColumns(req.dbPool);
         const existing = await client.query(`SELECT status FROM ap_payment_run WHERE id=$1`, [id]);
         if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
         if (existing.rows[0].status !== 'Draft') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'แก้ไขได้เฉพาะเอกสาร Draft เท่านั้น' }); }
@@ -209,9 +186,12 @@ const updateRun = async (req, res) => {
         await client.query(`
             UPDATE ap_payment_run
                SET run_date=$1, description=$2, bank_file_format_id=$3, cm_bank_account_id=$4,
-                   total_amount_lc=$5, updated_at=NOW(), updated_by=$6
-             WHERE id=$7`,
-            [run_date, description || null, bank_file_format_id || null, cm_bank_account_id || null, total, userName, id]);
+                   payment_date=$5, payment_method_id=$6, due_date_filter=$7,
+                   total_amount_lc=$8, updated_at=NOW(), updated_by=$9
+             WHERE id=$10`,
+            [run_date, description || null, bank_file_format_id || null, cm_bank_account_id || null,
+             payment_date || null, payment_method_id || null, due_date_filter || null,
+             total, userName, id]);
 
         await client.query(`DELETE FROM ap_payment_run_detail WHERE run_id=$1`, [id]);
         for (let i = 0; i < lines.length; i++) {
@@ -249,7 +229,7 @@ const updateRun = async (req, res) => {
 // --- PUT submit (Draft → Submitted) ---
 const submitRun = async (req, res) => {
     const { id } = req.params;
-    const { menu_id, force } = req.body || {};
+    const { menu_id } = req.body || {};
     const userName = req.headers['username'] || null;
     if (!menu_id) return res.status(400).json({ message: 'ต้องระบุ menu_id' });
     const client = await req.dbPool.connect();
@@ -274,22 +254,15 @@ const submitRun = async (req, res) => {
             WHERE a.menu_id=$1 AND a.is_active=true
             ORDER BY a.approval_level`, [menu_id]);
 
-        if (approvers.rows.length === 0 && !force) {
-            await client.query('ROLLBACK');
-            return res.status(409).json({
-                code: 'NO_ACTIVE_APPROVER',
-                message: 'ไม่มีผู้อนุมัติที่เปิดใช้งานอยู่สำหรับเมนูนี้ในขณะนี้ ต้องการดำเนินการต่อโดยข้ามขั้นตอนอนุมัติหรือไม่?',
-            });
-        }
-
         if (approvers.rows.length === 0) {
-            // force=true และไม่มีผู้อนุมัติที่ active — ข้ามขั้นตอนอนุมัติ ผ่านตรงไป Approved
+            // ไม่มีผู้มีสิทธิ์อนุมัติเลย หรือถูกงดอนุมัติหมดทุกคน — admin ไม่ต้องการอนุมัติสำหรับเมนูนี้
+            // ข้ามขั้นตอนอนุมัติไปเลยโดยไม่ต้องแจ้งเตือน แล้วผ่านตรงไป Approved
             await client.query(`DELETE FROM ap_payment_run_approval WHERE run_id=$1`, [id]);
             await client.query(`
                 UPDATE ap_payment_run SET status='Approved', approval_mode=$1, updated_at=NOW(), updated_by=$2 WHERE id=$3`,
                 [approvalMode, userName, id]);
             await client.query('COMMIT');
-            return res.status(200).json({ message: 'ส่งอนุมัติสำเร็จ (ข้ามขั้นตอนอนุมัติ เนื่องจากไม่มีผู้อนุมัติที่ใช้งานอยู่)' });
+            return res.status(200).json({ message: 'ส่งอนุมัติสำเร็จ' });
         }
 
         await client.query(`
@@ -460,7 +433,8 @@ const fetchMyPending = async (req, res) => {
 
 // --- GET open invoices for payment run picker ---
 const fetchOpenInvoicesForRun = async (req, res) => {
-    const { vendor_code, date_from, date_to } = req.query;
+    const { vendor_code, date_from, date_to, payment_method_id, due_date_max } = req.query;
+    await req.dbPool.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS payment_method_id INTEGER`).catch(() => {});
     let query = `
         SELECT t.id AS txn_id, t.doc_no, t.doc_date, t.due_date,
                t.total_amount_lc, t.balance_amount_lc,
@@ -480,6 +454,10 @@ const fetchOpenInvoicesForRun = async (req, res) => {
     if (vendor_code) { params.push(`%${vendor_code.toUpperCase()}%`); query += ` AND UPPER(v.vendor_code) LIKE $${pi++}`; }
     if (date_from)   { params.push(date_from); query += ` AND t.doc_date >= $${pi++}`; }
     if (date_to)     { params.push(date_to);   query += ` AND t.doc_date <= $${pi++}`; }
+    // ใช้กรองเจ้าหนี้ — เฉพาะเจ้าหนี้ที่ตั้ง "ประเภทการชำระหลัก" ตรงกับที่เลือกในใบอนุมัติจ่าย
+    if (payment_method_id) { params.push(payment_method_id); query += ` AND v.payment_method_id = $${pi++}`; }
+    // ใช้กรองใบแจ้งหนี้ที่ครบกำหนดชำระแล้ว ไม่เกินวันที่ระบุ
+    if (due_date_max)      { params.push(due_date_max);      query += ` AND t.due_date <= $${pi++}`; }
     query += ` ORDER BY v.vendor_code, t.doc_date, t.id`;
     try {
         const result = await req.dbPool.query(query, params);
@@ -490,209 +468,149 @@ const fetchOpenInvoicesForRun = async (req, res) => {
     }
 };
 
-// --- Helper: Generate GL document number (mirrors apTransactionController logic) ---
-const generateGlDocNo = async (client, glDocId, date) => {
-    const docRes = await client.query(
-        `SELECT * FROM sa_module_document WHERE id = $1 FOR UPDATE`, [glDocId]);
-    const doc = docRes.rows[0];
-    if (!doc || !doc.is_auto_numbering) return null;
-
-    const d = new Date(date);
-    const year  = d.getFullYear().toString();
-    const month = (d.getMonth() + 1).toString().padStart(2, '0');
-    const day   = d.getDate().toString().padStart(2, '0');
-
-    let docNo = doc.format_prefix || '';
-    const sfx = doc.format_suffix_date || '';
-    if      (sfx === 'YY')       docNo += year.substring(2);
-    else if (sfx === 'YYYY')     docNo += year;
-    else if (sfx === 'YYMM')     docNo += year.substring(2) + month;
-    else if (sfx === 'YYYYMM')   docNo += year + month;
-    else if (sfx === 'YYYYMMDD') docNo += year + month + day;
-    if (doc.format_separator) docNo += doc.format_separator;
-    docNo += doc.next_running_number.toString().padStart(doc.running_length || 4, '0');
-
-    await client.query(
-        `UPDATE sa_module_document SET next_running_number = next_running_number + 1 WHERE id = $1`,
-        [glDocId]);
-    return docNo;
+// --- Helper: ensure the run→ap_transaction traceability table exists ---
+const ensureRunPaymentTable = async (pool) => {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS ap_payment_run_payment (
+            id                SERIAL PRIMARY KEY,
+            run_id            INTEGER NOT NULL REFERENCES ap_payment_run(id) ON DELETE CASCADE,
+            vendor_id         INTEGER NOT NULL,
+            ap_transaction_id INTEGER NOT NULL REFERENCES ap_transaction(id),
+            created_at        TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE(run_id, vendor_id)
+        )
+    `);
 };
 
-// --- PUT post GL (Approved → Completed) ---
-const postRun = async (req, res) => {
+// --- PUT finalize (Approved → Completed): ส่งชำระ ---
+// สร้างธุรกรรมจ่ายชำระ (ap_transaction, doc type ที่เลือก) จริง 1 ใบต่อ 1 เจ้าหนี้ที่มีอยู่ในใบอนุมัติจ่าย
+// โดยเรียกใช้ apTransactionController.createTransaction ตัวเดียวกับที่หน้าจอ AP Transaction ใช้
+// (ไม่สร้าง GL posting แยกเองอีกต่อไป — เลิกใช้กลไก postRun/postGl เดิมทั้งหมด)
+// body: { doc_id, post: true|false } — post=true จะ Post GL ทันที, false จะสร้างเป็น Draft
+// รองรับการเรียกซ้ำ (idempotent): เจ้าหนี้ที่สร้างธุรกรรมสำเร็จไปแล้วในครั้งก่อนจะถูกข้าม
+const finalizeRun = async (req, res) => {
     const { id } = req.params;
+    const { doc_id, post } = req.body || {};
     const userName = req.headers['username'] || null;
-    const client = await req.dbPool.connect();
+    if (!doc_id) return res.status(400).json({ message: 'ต้องระบุประเภทเอกสาร' });
     try {
-        await client.query('BEGIN');
+        await ensureRunPaymentTable(req.dbPool);
 
-        // Ensure columns exist (idempotent migration)
-        await client.query(`
-            ALTER TABLE ap_payment_run
-            ADD COLUMN IF NOT EXISTS gl_entry_id       INT,
-            ADD COLUMN IF NOT EXISTS gl_doc_no         VARCHAR(50),
-            ADD COLUMN IF NOT EXISTS cm_bank_account_id INTEGER`);
-
-        // 1. Verify run is Approved
-        const runRes = await client.query(
-            `SELECT * FROM ap_payment_run WHERE id = $1`, [id]);
-        if (runRes.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ message: 'Not found' });
-        }
+        const runRes = await req.dbPool.query(`SELECT * FROM ap_payment_run WHERE id=$1`, [id]);
+        if (runRes.rows.length === 0) return res.status(404).json({ message: 'Not found' });
         const run = runRes.rows[0];
         if (run.status !== 'Approved') {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: 'บันทึก GL ได้เฉพาะเอกสาร Approved เท่านั้น' });
+            return res.status(400).json({ message: 'ส่งชำระได้เฉพาะเอกสารที่อนุมัติแล้วเท่านั้น' });
         }
 
-        // 2. Get lines
-        const linesRes = await client.query(
-            `SELECT * FROM ap_payment_run_detail WHERE run_id = $1 ORDER BY sort_order, id`, [id]);
+        const docRes = await req.dbPool.query(`SELECT * FROM sa_module_document WHERE id=$1`, [doc_id]);
+        if (docRes.rows.length === 0) return res.status(400).json({ message: 'ไม่พบประเภทเอกสารที่เลือก' });
+
+        const linesRes = await req.dbPool.query(
+            `SELECT * FROM ap_payment_run_detail WHERE run_id=$1 ORDER BY sort_order, id`, [id]);
         const lines = linesRes.rows;
-        if (lines.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: 'ไม่มีรายการชำระเงิน' });
+        if (lines.length === 0) return res.status(400).json({ message: 'ไม่มีรายการที่จะจ่ายชำระ' });
+
+        const alreadyDoneRes = await req.dbPool.query(
+            `SELECT vendor_id FROM ap_payment_run_payment WHERE run_id=$1`, [id]);
+        const alreadyDoneVendorIds = new Set(alreadyDoneRes.rows.map(r => r.vendor_id));
+
+        const byVendor = new Map();
+        for (const l of lines) {
+            if (!byVendor.has(l.vendor_id)) byVendor.set(l.vendor_id, []);
+            byVendor.get(l.vendor_id).push(l);
         }
 
-        // 3. Find GL setup for payment doc type (sys_doc_type='80')
-        const setupRes = await client.query(`
-            SELECT s.*, d.id AS sys_doc_id
-            FROM sa_module_document d
-            LEFT JOIN ap_gl_account_setup s ON s.doc_code = d.doc_code
-            WHERE d.sys_module = '21' AND d.sys_doc_type = '80' AND d.is_doc_type = true
-            LIMIT 1`);
-        if (setupRes.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: 'ไม่พบประเภทเอกสาร Payment (sys_doc_type=80) ในระบบ AP กรุณาตั้งค่า sa_module_document' });
-        }
-        const setup = setupRes.rows[0];
-        if (!setup.gl_doc_id) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: 'ยังไม่ได้ตั้งค่า GL Document Type ใน AP GL Account Setup สำหรับประเภทเอกสาร Payment' });
-        }
+        const created = [];
+        const errors = [];
+        for (const [vendorId, vLines] of byVendor) {
+            if (alreadyDoneVendorIds.has(vendorId)) continue; // สร้างธุรกรรมให้เจ้าหนี้รายนี้ไปแล้วในครั้งก่อน
+            try {
+                const vRes = await req.dbPool.query(`SELECT * FROM ap_vendor WHERE id=$1`, [vendorId]);
+                const vendor = vRes.rows[0];
+                if (!vendor) { errors.push({ vendor_id: vendorId, message: 'ไม่พบเจ้าหนี้' }); continue; }
 
-        // 4. Find open GL period
-        const periodRes = await client.query(`
-            SELECT id FROM gl_posting_period
-            WHERE $1::date BETWEEN period_start_date AND period_end_date
-              AND gl_status = 'OPEN'
-            LIMIT 1`, [run.run_date]);
-        if (periodRes.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: `ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่ ${run.run_date}` });
-        }
-        const periodId = periodRes.rows[0].id;
+                const currencyCode = vLines[0].currency_code || 'THB';
+                const currencyRes = await req.dbPool.query(
+                    `SELECT id FROM cd_currency WHERE currency_code=$1 LIMIT 1`, [currencyCode]);
+                const totalLc = vLines.reduce((s, l) => s + parseFloat(l.payment_amount_lc || 0), 0);
+                const docDate = run.payment_date || run.run_date;
 
-        // 5. Determine bank/transfer account (credit side)
-        const bankAccountId = setup.transfer_account_id || setup.cash_account_id;
-        if (!bankAccountId) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: 'ยังไม่ได้ตั้งค่าบัญชีธนาคาร/โอนเงิน ใน AP GL Account Setup' });
-        }
+                const header = {
+                    doc_id,
+                    doc_no: 'AUTO',
+                    doc_date: docDate,
+                    vendor_id: vendorId,
+                    vendor_code: vendor.vendor_code,
+                    vendor_name_th: vendor.vendor_name_th,
+                    ap_account_id: vendor.ap_account_id || null,
+                    currency_id: currencyRes.rows[0]?.id || null,
+                    currency_code: currencyCode,
+                    exchange_rate: vLines[0].exchange_rate || 1,
+                    subtotal_fc: totalLc, before_vat_fc: totalLc, total_amount_fc: totalLc,
+                    subtotal_lc: totalLc, before_vat_lc: totalLc, total_amount_lc: totalLc,
+                    ref_no: run.run_number,
+                    description: run.description || `Payment for ${run.run_number}`,
+                    created_by: userName,
+                };
+                const applies = vLines.map(l => ({
+                    applied_to_id: l.ap_transaction_id,
+                    applied_amount_lc: parseFloat(l.payment_amount_lc || 0),
+                    applied_amount_fc: parseFloat(l.payment_amount_lc || 0),
+                    apply_type: 'invoice',
+                }));
+                const payments = [{
+                    payment_method_id: run.payment_method_id || null,
+                    payment_method_type: 'TRANSFER',
+                    cm_bank_account_id: run.cm_bank_account_id || null,
+                    amount_lc: totalLc, amount_fc: totalLc,
+                    payment_date: docDate,
+                }];
 
-        // 6. Generate GL doc number
-        let glDocNo = await generateGlDocNo(client, setup.gl_doc_id, run.run_date);
-        if (!glDocNo) glDocNo = `GL-${run.run_number}`;
+                const fakeReq = {
+                    body: { header, details: [], applies, payments, whts: [], action: post ? 'Post' : 'Draft' },
+                    dbPool: req.dbPool,
+                };
+                let captured = null;
+                const fakeRes = {
+                    status(code) { this.code = code; return this; },
+                    json(body) { captured = { code: this.code, body }; },
+                };
+                await apTransactionController.createTransaction(fakeReq, fakeRes);
 
-        const totalAmount = lines.reduce((s, l) => s + parseFloat(l.payment_amount_lc || 0), 0);
-
-        // 7. Resolve created_by user id
-        const userRes = await client.query(
-            `SELECT id FROM sa_user WHERE user_name = $1 LIMIT 1`, [userName]);
-        const createdByUserId = userRes.rows[0]?.id || null;
-
-        // 8. Insert GL entry header
-        const glHeaderRes = await client.query(`
-            INSERT INTO gl_entry_header
-              (doc_id, doc_no, doc_date, posting_date, period_id,
-               ref_no, description,
-               currency_id, exchange_rate, status,
-               total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-               created_by, ref_doc_id, ref_doc_no, external_source_id)
-            VALUES ($1,$2,$3,$3,$4,$5,$6,1,1,'Posted',$7,$7,$7,$7,$8,$9,$10,$11)
-            RETURNING id`,
-            [setup.gl_doc_id, glDocNo, run.run_date, periodId,
-             run.run_number,
-             run.description || `Payment Run ${run.run_number}`,
-             totalAmount, createdByUserId,
-             setup.sys_doc_id, run.run_number, id]);
-        const glEntryId = glHeaderRes.rows[0].id;
-
-        // 9. Insert DR lines — one per payment run detail
-        let lineNo = 1;
-        for (const line of lines) {
-            const payAmt = parseFloat(line.payment_amount_lc || 0);
-            if (payAmt === 0) continue;
-
-            // Resolve AP account: prefer vendor's own account, fall back to setup default
-            let apAccountId = setup.ap_account_id ? Number(setup.ap_account_id) : null;
-            const vendorRes = await client.query(
-                `SELECT ap_account_id FROM ap_vendor WHERE id = $1`, [line.vendor_id]);
-            if (vendorRes.rows[0]?.ap_account_id)
-                apAccountId = Number(vendorRes.rows[0].ap_account_id);
-
-            if (!apAccountId) {
-                await client.query('ROLLBACK');
-                return res.status(400).json({
-                    message: `ไม่พบบัญชีเจ้าหนี้สำหรับ ${line.vendor_code} กรุณาตั้งค่าในเจ้าหนี้หรือ AP GL Account Setup`
-                });
+                if (captured && captured.code >= 200 && captured.code < 300) {
+                    created.push({ vendor_id: vendorId, ap_transaction_id: captured.body.id, doc_no: captured.body.doc_no });
+                    await req.dbPool.query(
+                        `INSERT INTO ap_payment_run_payment (run_id, vendor_id, ap_transaction_id) VALUES ($1,$2,$3)
+                         ON CONFLICT (run_id, vendor_id) DO NOTHING`,
+                        [id, vendorId, captured.body.id]);
+                } else {
+                    errors.push({ vendor_id: vendorId, message: captured?.body?.message || 'สร้างธุรกรรมไม่สำเร็จ' });
+                }
+            } catch (e) {
+                errors.push({ vendor_id: vendorId, message: e.message });
             }
-
-            await client.query(`
-                INSERT INTO gl_entry_detail
-                  (header_id, line_no, account_id, description,
-                   debit_lc, credit_lc, debit_fc, credit_fc)
-                VALUES ($1,$2,$3,$4,$5,0,$5,0)`,
-                [glEntryId, lineNo++, apAccountId,
-                 `ชำระ ${line.vendor_code} ${line.invoice_no}`, payAmt]);
         }
 
-        // 10. Insert CR line — bank/transfer total
-        await client.query(`
-            INSERT INTO gl_entry_detail
-              (header_id, line_no, account_id, description,
-               debit_lc, credit_lc, debit_fc, credit_fc)
-            VALUES ($1,$2,$3,$4,0,$5,0,$5)`,
-            [glEntryId, lineNo, bankAccountId,
-             `โอนชำระ ${run.run_number}`, totalAmount]);
-
-        // 11. Update each AP transaction's paid/balance amounts
-        for (const line of lines) {
-            const payAmt = parseFloat(line.payment_amount_lc || 0);
-            if (payAmt === 0) continue;
-            await client.query(`
-                UPDATE ap_transaction
-                SET paid_amount_lc    = COALESCE(paid_amount_lc, 0) + $1,
-                    balance_amount_lc = GREATEST(COALESCE(balance_amount_lc, 0) - $1, 0),
-                    status = CASE
-                        WHEN (COALESCE(balance_amount_lc, 0) - $1) <= 0.005 THEN 'Settled'
-                        ELSE status
-                    END,
-                    updated_at = NOW()
-                WHERE id = $2`,
-                [payAmt, line.ap_transaction_id]);
+        // ปิดใบอนุมัติจ่ายเป็น Completed เฉพาะเมื่อสร้างธุรกรรมครบทุกเจ้าหนี้แล้ว (รวมครั้งก่อนหน้าถ้ามี)
+        const doneCountRes = await req.dbPool.query(
+            `SELECT COUNT(DISTINCT vendor_id) FROM ap_payment_run_payment WHERE run_id=$1`, [id]);
+        const doneCount = parseInt(doneCountRes.rows[0].count, 10);
+        if (doneCount >= byVendor.size) {
+            await req.dbPool.query(
+                `UPDATE ap_payment_run SET status='Completed', updated_at=NOW(), updated_by=$1 WHERE id=$2`,
+                [userName, id]);
         }
 
-        // 12. Mark run Completed, store GL reference
-        await client.query(`
-            UPDATE ap_payment_run
-            SET status = 'Completed', gl_entry_id = $1, gl_doc_no = $2,
-                updated_at = NOW(), updated_by = $3
-            WHERE id = $4`,
-            [glEntryId, glDocNo, userName, id]);
-
-        // 13. Post CM payment records (always, bank_account_id nullable if not set)
-        await postCmPaymentsHelper(client, run, lines, glEntryId);
-
-        await client.query('COMMIT');
-        res.status(200).json({ message: 'บันทึก GL สำเร็จ', gl_entry_id: glEntryId, gl_doc_no: glDocNo });
+        res.status(200).json({
+            message: errors.length === 0
+                ? 'ส่งชำระสำเร็จ'
+                : `สร้างธุรกรรมสำเร็จ ${created.length} ใบ, ล้มเหลว ${errors.length} รายการ`,
+            created, errors,
+        });
     } catch (error) {
-        await client.query('ROLLBACK');
-        console.error('Error posting GL for payment run:', error);
+        console.error('Error finalizing ap_payment_run:', error);
         res.status(500).json({ message: error.message || 'Internal server error' });
-    } finally {
-        client.release();
     }
 };
 
@@ -705,7 +623,7 @@ module.exports = {
     approveRun,
     rejectRun,
     voidRun,
-    postRun,
+    finalizeRun,
     fetchMyPending,
     fetchOpenInvoicesForRun,
 };

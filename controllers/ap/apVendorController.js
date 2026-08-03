@@ -5,6 +5,7 @@ const fetchRowById = async (pool, id) => {
   // เพิ่ม column แบบ idempotent
   await pool.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS vendor_type  VARCHAR(20)`).catch(() => {});
   await pool.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS credit_limit NUMERIC(18,4) NOT NULL DEFAULT 0`).catch(() => {});
+  await pool.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS payment_method_id INTEGER`).catch(() => {});
   const [mainResult, addresses, contacts, banks] = await Promise.all([
     pool.query(`
       SELECT
@@ -14,11 +15,15 @@ const fetchRowById = async (pool, id) => {
         cbt.business_type_code,
         cbt.business_type_name_thai,
         ga.account_code    AS ap_account_code,
-        ga.account_name_thai AS ap_account_name_thai
+        ga.account_name_thai AS ap_account_name_thai,
+        pm.method_code     AS payment_method_code,
+        pm.method_name_th  AS payment_method_name_thai,
+        pm.method_name_en  AS payment_method_name_eng
       FROM ap_vendor v
       LEFT JOIN ap_vendor_group    vg  ON v.vendor_group_id  = vg.id
       LEFT JOIN cd_business_type cbt ON v.business_type_id = cbt.id
       LEFT JOIN gl_account       ga  ON v.ap_account_id    = ga.id
+      LEFT JOIN cm_payment_method pm ON v.payment_method_id = pm.id
       WHERE v.id = $1`, [id]),
     pool.query(`SELECT * FROM ap_vendor_address      WHERE vendor_id=$1 ORDER BY id`, [id]),
     pool.query(`SELECT * FROM ap_vendor_contact      WHERE vendor_id=$1 ORDER BY id`, [id]),
@@ -42,6 +47,9 @@ const fetchRows = async (req, res) => {
     await req.dbPool.query(
       `ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS credit_limit NUMERIC(18,4) NOT NULL DEFAULT 0`
     ).catch(() => {});
+    await req.dbPool.query(
+      `ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS payment_method_id INTEGER`
+    ).catch(() => {});
     let query = `
       SELECT
         v.id, v.vendor_code, v.old_vendor_code, v.vendor_name_th, v.vendor_name_en,
@@ -50,11 +58,15 @@ const fetchRows = async (req, res) => {
         v.vendor_group_id,   vg.group_code AS vendor_group_code, vg.group_name_thai AS vendor_group_name,
         v.business_type_id,  cbt.business_type_code, cbt.business_type_name_thai,
         v.ap_account_id,     ga.account_code  AS ap_account_code,
-                             ga.account_name_thai AS ap_account_name_thai
+                             ga.account_name_thai AS ap_account_name_thai,
+        v.payment_method_id, pm.method_code   AS payment_method_code,
+                             pm.method_name_th AS payment_method_name_thai,
+                             pm.method_name_en AS payment_method_name_eng
       FROM ap_vendor v
       LEFT JOIN ap_vendor_group    vg  ON v.vendor_group_id  = vg.id
       LEFT JOIN cd_business_type cbt ON v.business_type_id = cbt.id
       LEFT JOIN gl_account       ga  ON v.ap_account_id    = ga.id
+      LEFT JOIN cm_payment_method pm ON v.payment_method_id = pm.id
       WHERE 1=1`;
     const params = [];
     if (search) {
@@ -149,6 +161,7 @@ const addRow = async (req, res) => {
     credit_term_months, credit_term_days, credit_limit,
     currency_code, is_active, remark,
     ap_account_id,
+    payment_method_id,
     addresses, contacts, bank_accounts,
   } = req.body;
   const userName = req.headers.username;
@@ -157,6 +170,7 @@ const addRow = async (req, res) => {
     await client.query('BEGIN');
     // idempotent migration
     await client.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS credit_limit NUMERIC(18,4) NOT NULL DEFAULT 0`).catch(() => {});
+    await client.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS payment_method_id INTEGER`).catch(() => {});
     let finalCode = vendor_code && vendor_code.trim() !== ''
       ? vendor_code.trim().toUpperCase()
       : null;
@@ -176,8 +190,9 @@ const addRow = async (req, res) => {
           credit_term_months, credit_term_days, credit_limit,
           currency_code, is_active, remark,
           ap_account_id,
+          payment_method_id,
           created_by, updated_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$16)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17)
        RETURNING id`,
       [
         finalCode, old_vendor_code || null,
@@ -191,6 +206,7 @@ const addRow = async (req, res) => {
         is_active !== undefined ? is_active : true,
         remark || null,
         ap_account_id ?? null,
+        payment_method_id ?? null,
         userName,
       ]
     );
@@ -220,12 +236,14 @@ const updateRow = async (req, res) => {
     credit_term_months, credit_term_days, credit_limit,
     currency_code, is_active, remark,
     ap_account_id,
+    payment_method_id,
     addresses, contacts, bank_accounts,
   } = req.body;
   const userName = req.headers.username;
   const client = await req.dbPool.connect();
   try {
     await client.query('BEGIN');
+    await client.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS payment_method_id INTEGER`).catch(() => {});
     const result = await client.query(
       `UPDATE ap_vendor SET
          vendor_code         = $1,  old_vendor_code     = $2,
@@ -239,8 +257,9 @@ const updateRow = async (req, res) => {
          currency_code       = $12, is_active           = $13,
          remark              = $14,
          ap_account_id       = $15,
-         updated_by          = $16, updated_at          = NOW()
-       WHERE id = $17
+         payment_method_id   = $16,
+         updated_by          = $17, updated_at          = NOW()
+       WHERE id = $18
        RETURNING id`,
       [
         vendor_code.toUpperCase(), old_vendor_code || null,
@@ -254,6 +273,7 @@ const updateRow = async (req, res) => {
         currency_code || 'THB', is_active,
         remark || null,
         ap_account_id ?? null,
+        payment_method_id ?? null,
         userName, id,
       ]
     );

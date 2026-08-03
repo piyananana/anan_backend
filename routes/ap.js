@@ -3,6 +3,7 @@ const express = require('express');
 const router  = express.Router();
 
 const apVendorRunningController  = require('../controllers/ap/apVendorRunningController');
+const apPaymentRunRunningController = require('../controllers/ap/apPaymentRunRunningController');
 const apVendorGroupController    = require('../controllers/ap/apVendorGroupController');
 const apVendorController         = require('../controllers/ap/apVendorController');
 const apVendorReportController   = require('../controllers/ap/apVendorReportController');
@@ -29,6 +30,10 @@ const apBulkPaymentController         = require('../controllers/ap/apBulkPayment
 router.get('/ap_vendor_running/preview_code', apVendorRunningController.previewCode);
 router.get('/ap_vendor_running',              apVendorRunningController.fetchConfig);
 router.post('/ap_vendor_running',             apVendorRunningController.saveConfig);
+
+router.get('/ap_payment_run_running/preview_code', apPaymentRunRunningController.previewCode);
+router.get('/ap_payment_run_running',              apPaymentRunRunningController.fetchConfig);
+router.post('/ap_payment_run_running',             apPaymentRunRunningController.saveConfig);
 
 // ── Vendor Group ───────────────────────────────────────────────────────────
 router.get('/ap_vendor_group/active', apVendorGroupController.fetchActiveRows);
@@ -91,7 +96,7 @@ router.put('/ap_payment_run/:id/submit',       apPaymentRunController.submitRun)
 router.put('/ap_payment_run/:id/approve',      apPaymentRunController.approveRun);
 router.put('/ap_payment_run/:id/reject',       apPaymentRunController.rejectRun);
 router.put('/ap_payment_run/:id/void',         apPaymentRunController.voidRun);
-router.put('/ap_payment_run/:id/post_gl',      apPaymentRunController.postRun);
+router.put('/ap_payment_run/:id/finalize',     apPaymentRunController.finalizeRun);
 router.put('/ap_payment_run/:id',              apPaymentRunController.updateRun);
 
 // ── AP Transaction ─────────────────────────────────────────────────────────
@@ -99,6 +104,7 @@ router.get('/ap_transaction/open_invoices',          apTransactionController.fet
 router.get('/ap_transaction/open_advances',          apTransactionController.fetchOpenAdvances);
 router.get('/ap_transaction/open_remittance_advices', apTransactionController.fetchOpenRemittanceAdvices);
 router.get('/ap_transaction/ra_invoices',            apTransactionController.fetchRaInvoices);
+router.get('/ap_transaction/remittance_advice_by_doc_no', apTransactionController.fetchRemittanceAdviceByDocNo);
 router.get('/ap_transaction',                        apTransactionController.fetchRows);
 router.get('/ap_transaction/:id',                    apTransactionController.fetchRow);
 router.post('/ap_transaction',                       apTransactionController.createTransaction);
