@@ -16,7 +16,7 @@ const getChecks = async (req, res) => {
         if (status && status !== 'All') { params.push(status); wheres.push(`p.status=$${params.length}`); }
 
         const r = await client.query(`
-            SELECT p.id, p.ap_doc_no, p.payment_date, p.payee_name_th, p.payee_name_en,
+            SELECT p.id, p.ap_doc_no, p.payment_date, p.payee_name_th,
                    p.check_no, p.check_date, p.amount_lc, p.currency_code, p.status,
                    ba.account_code AS bank_account_code, ba.account_name_th AS bank_account_name,
                    cb.short_name   AS bank_short_name, cb.bank_name_thai AS bank_name

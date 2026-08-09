@@ -66,7 +66,7 @@ const getDashboard = async (req, res) => {
 
         // ── 2. Petty cash balances ───────────────────────────────────────────
         const pcAccsRes = await client.query(`
-            SELECT ba.id, ba.account_code, ba.account_name_th, ba.fund_amount
+            SELECT ba.id, ba.account_code, ba.account_name_th
             FROM cm_bank_account ba
             WHERE ba.cm_type='PETTY_CASH' AND ba.is_active=TRUE
             ORDER BY ba.account_code`);
@@ -80,7 +80,8 @@ const getDashboard = async (req, res) => {
                     WHERE petty_cash_account_id=$1 AND status='Approved'`, [acc.id]);
                 usedAmount = parseFloat(r.rows[0].amt);
             }
-            const fundAmount  = parseFloat(acc.fund_amount || 0);
+            // cm_bank_account has no fund_amount column — no petty-cash fund-limit source exists yet
+            const fundAmount  = 0;
             pettyCashBalances.push({
                 bank_account_id:   acc.id,
                 bank_account_code: acc.account_code,
@@ -137,17 +138,17 @@ const getDashboard = async (req, res) => {
         // ── 5. Recent transactions ────────────────────────────────────────────
         const txParts = [];
         if (hasReceipt)
-            txParts.push(`SELECT receipt_date AS tx_date, ar_doc_no AS doc_no, 'RECEIPT' AS tx_type,
+            txParts.push(`(SELECT receipt_date AS tx_date, ar_doc_no AS doc_no, 'RECEIPT' AS tx_type,
                 COALESCE(customer_name_th, drawer_bank, '') AS description, amount_lc FROM cm_receipt
-                WHERE status!='Voided' ORDER BY receipt_date DESC, id DESC LIMIT 10`);
+                WHERE status!='Voided' ORDER BY receipt_date DESC, id DESC LIMIT 10)`);
         if (hasPayment)
-            txParts.push(`SELECT payment_date AS tx_date, ap_doc_no AS doc_no, 'PAYMENT' AS tx_type,
+            txParts.push(`(SELECT payment_date AS tx_date, ap_doc_no AS doc_no, 'PAYMENT' AS tx_type,
                 COALESCE(payee_name_th, '') AS description, amount_lc FROM cm_payment
-                WHERE status!='Voided' ORDER BY payment_date DESC, id DESC LIMIT 10`);
+                WHERE status!='Voided' ORDER BY payment_date DESC, id DESC LIMIT 10)`);
         if (hasTransfer)
-            txParts.push(`SELECT transfer_date AS tx_date, transfer_no AS doc_no, 'TRANSFER' AS tx_type,
+            txParts.push(`(SELECT transfer_date AS tx_date, transfer_no AS doc_no, 'TRANSFER' AS tx_type,
                 COALESCE(description,'โอนเงินระหว่างบัญชี') AS description, amount_lc FROM cm_inter_bank_transfer
-                WHERE status!='Voided' ORDER BY transfer_date DESC, id DESC LIMIT 10`);
+                WHERE status!='Voided' ORDER BY transfer_date DESC, id DESC LIMIT 10)`);
 
         let recentTransactions = [];
         if (txParts.length > 0) {

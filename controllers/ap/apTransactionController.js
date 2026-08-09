@@ -69,6 +69,26 @@ const generateDocNo = async (client, docId, date, branchId = null) => {
     return docNo;
 };
 
+// --- Helper: ensure approval workflow schema exists (idempotent) ---
+// รองรับการขออนุมัติสำหรับ RA(70) และ Payment(80) กรณีไม่มีเลขที่อ้างอิง — คิวผู้อนุมัติผูกกับ
+// (menu_id, doc_type=doc_code) ผ่าน sa_module_approver เดียวกับที่ ap_payment_run ใช้
+const ensureApprovalSchema = async (pool) => {
+    await pool.query(`ALTER TABLE ap_transaction ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL'`);
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS ap_transaction_approval (
+            id                  SERIAL PRIMARY KEY,
+            transaction_id      INTEGER NOT NULL REFERENCES ap_transaction(id) ON DELETE CASCADE,
+            approver_user_id    INTEGER NOT NULL,
+            approver_user_name  VARCHAR(100),
+            sequence_no         INTEGER NOT NULL DEFAULT 1,
+            status              VARCHAR(20) NOT NULL DEFAULT 'Pending',
+            remarks             TEXT,
+            approved_at         TIMESTAMPTZ
+        )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ap_transaction_approval_txn ON ap_transaction_approval(transaction_id)`);
+};
+
 // --- Helper: Insert VAT records for AP (Input VAT) ---
 const insertVtRecords = async (client, headerId, header, details, sysDocType) => {
     const vatDetails = details.filter(d =>
@@ -741,7 +761,7 @@ const postCmPaymentHelper = async (client, apTransactionId, glEntryId) => {
 
 // --- Fetch helper ---
 const fetchRowById = async (pool, id) => {
-    const [hRes, dRes, aRes, pRes, whtRes] = await Promise.all([
+    const [hRes, dRes, aRes, pRes, whtRes, apprRes] = await Promise.all([
         pool.query(`
             SELECT t.*,
                    d.doc_code, d.doc_name_thai, d.sys_doc_type, d.is_auto_numbering,
@@ -770,9 +790,14 @@ const fetchRowById = async (pool, id) => {
             .catch(() => ({ rows: [] })),
         pool.query(`SELECT * FROM ap_transaction_wht WHERE header_id=$1 ORDER BY id`, [id])
             .catch(() => ({ rows: [] })),
+        pool.query(`SELECT * FROM ap_transaction_approval WHERE transaction_id=$1 ORDER BY sequence_no`, [id])
+            .catch(() => ({ rows: [] })),
     ]);
     if (hRes.rows.length === 0) return null;
-    return { ...hRes.rows[0], details: dRes.rows, applies: aRes.rows, payments: pRes.rows, whts: whtRes.rows };
+    return {
+        ...hRes.rows[0], details: dRes.rows, applies: aRes.rows, payments: pRes.rows, whts: whtRes.rows,
+        approvals: apprRes.rows,
+    };
 };
 
 // --- GET list ---
@@ -818,6 +843,7 @@ const fetchRows = async (req, res) => {
 const fetchRow = async (req, res) => {
     const { id } = req.params;
     try {
+        await ensureApprovalSchema(req.dbPool);
         const data = await fetchRowById(req.dbPool, id);
         if (!data) return res.status(404).json({ message: 'Not found.' });
         res.status(200).json(data);
@@ -1203,7 +1229,7 @@ const updateTransaction = async (req, res) => {
 
         const existing = await client.query(`SELECT status FROM ap_transaction WHERE id=$1`, [id]);
         if (existing.rows.length === 0) throw new Error('Not found');
-        if (existing.rows[0].status === 'Posted') throw new Error('ไม่สามารถแก้ไขเอกสารที่ Post แล้ว');
+        if (existing.rows[0].status !== 'Draft') throw new Error('แก้ไขได้เฉพาะเอกสาร Draft เท่านั้น');
 
         const periodRes = await client.query(
             `SELECT id FROM gl_posting_period
@@ -1314,6 +1340,240 @@ const updateTransaction = async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error updating ap_transaction:', error);
+        res.status(500).json({ message: error.message || 'Internal server error' });
+    } finally {
+        client.release();
+    }
+};
+
+// --- 2b. Submit for approval (Draft → Submitted, or straight to Approved if no approvers) ---
+// รองรับเฉพาะ RA(70) หรือ Payment(80) ที่ไม่มีเลขที่อ้างอิง (ไม่ได้มาจาก RA/ap_payment_run ซึ่งผ่านการอนุมัติมาแล้ว)
+// คิวผู้อนุมัติแยกตามประเภทเอกสาร (doc_type = doc_code) ภายใต้เมนู AP Transaction เดียวกัน
+const submitTransaction = async (req, res) => {
+    const { id } = req.params;
+    const { menu_id } = req.body || {};
+    const userName = req.headers['username'] || null;
+    if (!menu_id) return res.status(400).json({ message: 'ต้องระบุ menu_id' });
+    const client = await req.dbPool.connect();
+    try {
+        const { ensureMenuApproverSchema, syncMenuApprovers } = require('../../utils/menuApproverSync');
+        await ensureApprovalSchema(req.dbPool);
+        await ensureMenuApproverSchema(client);
+        await client.query('BEGIN');
+
+        const existing = await client.query(`
+            SELECT t.status, t.ref_no, d.sys_doc_type, d.doc_code
+            FROM ap_transaction t JOIN sa_module_document d ON d.id = t.doc_id
+            WHERE t.id = $1`, [id]);
+        if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
+        const tx = existing.rows[0];
+        if (tx.status !== 'Draft') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'ส่งอนุมัติได้เฉพาะเอกสาร Draft เท่านั้น' }); }
+
+        const isRa = tx.sys_doc_type === '70';
+        const isPaymentNoRef = tx.sys_doc_type === '80' && (!tx.ref_no || !tx.ref_no.trim());
+        if (!isRa && !isPaymentNoRef) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ message: 'เอกสารประเภทนี้ไม่รองรับการขออนุมัติ' });
+        }
+
+        await syncMenuApprovers(client, menu_id, tx.doc_code);
+
+        const menuRes = await client.query(`SELECT approval_mode FROM sa_menu WHERE id=$1`, [menu_id]);
+        const approvalMode = menuRes.rows[0]?.approval_mode === 'ANY' ? 'ANY' : 'ALL';
+
+        const approvers = await client.query(`
+            SELECT a.approval_level, a.approver_user_id, u.user_name
+            FROM sa_module_approver a
+            JOIN sa_user u ON u.id = a.approver_user_id
+            WHERE a.menu_id=$1 AND a.doc_type=$2 AND a.is_active=true
+            ORDER BY a.approval_level`, [menu_id, tx.doc_code]);
+
+        await client.query(`DELETE FROM ap_transaction_approval WHERE transaction_id=$1`, [id]);
+
+        if (approvers.rows.length === 0) {
+            // ไม่มีผู้มีสิทธิ์อนุมัติสำหรับประเภทเอกสารนี้ — ข้ามขั้นตอนอนุมัติไปเลยโดยไม่ต้องแจ้งเตือน
+            await client.query(`
+                UPDATE ap_transaction SET status='Approved', approval_mode=$1, updated_at=NOW(), updated_by=$2 WHERE id=$3`,
+                [approvalMode, userName, id]);
+            await client.query('COMMIT');
+            return res.status(200).json({ message: 'ส่งอนุมัติสำเร็จ (ข้ามขั้นตอนอนุมัติ)' });
+        }
+
+        await client.query(`
+            UPDATE ap_transaction SET status='Submitted', approval_mode=$1, updated_at=NOW(), updated_by=$2 WHERE id=$3`,
+            [approvalMode, userName, id]);
+        for (const apr of approvers.rows) {
+            await client.query(`
+                INSERT INTO ap_transaction_approval (transaction_id, approver_user_id, approver_user_name, sequence_no, status)
+                VALUES ($1,$2,$3,$4,'Pending')`,
+                [id, apr.approver_user_id, apr.user_name, apr.approval_level]);
+        }
+        await client.query('COMMIT');
+        res.status(200).json({ message: 'ส่งอนุมัติสำเร็จ' });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error submitting ap_transaction:', error);
+        res.status(500).json({ message: error.message || 'Internal server error' });
+    } finally {
+        client.release();
+    }
+};
+
+// --- 2c. Approve (Submitted → Approved when all/any approve, per approval_mode) ---
+const approveTransaction = async (req, res) => {
+    const { id } = req.params;
+    const { remarks } = req.body || {};
+    const userId = req.headers['userid'];
+    const userName = req.headers['username'] || null;
+    if (!userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
+    const client = await req.dbPool.connect();
+    try {
+        await ensureApprovalSchema(req.dbPool);
+        await client.query('BEGIN');
+        const tx = await client.query(`SELECT status, approval_mode FROM ap_transaction WHERE id=$1`, [id]);
+        if (tx.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
+        if (tx.rows[0].status !== 'Submitted') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'อนุมัติได้เฉพาะเอกสาร Submitted เท่านั้น' }); }
+        const isAnyMode = tx.rows[0].approval_mode === 'ANY';
+
+        const myRecord = await client.query(`
+            SELECT a.id FROM ap_transaction_approval a
+            WHERE a.transaction_id=$1 AND a.approver_user_id=$2 AND a.status='Pending'
+              AND ($3::boolean OR NOT EXISTS (
+                SELECT 1 FROM ap_transaction_approval a2
+                WHERE a2.transaction_id=$1 AND a2.sequence_no < a.sequence_no AND a2.status='Pending'
+              ))`, [id, userId, isAnyMode]);
+
+        if (myRecord.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ message: 'ไม่มีสิทธิ์อนุมัติ หรือยังรอการอนุมัติจากลำดับก่อนหน้า' });
+        }
+
+        await client.query(`
+            UPDATE ap_transaction_approval SET status='Approved', remarks=$1, approved_at=NOW() WHERE id=$2`,
+            [remarks || null, myRecord.rows[0].id]);
+
+        if (isAnyMode) {
+            await client.query(
+                `UPDATE ap_transaction_approval SET status='Skipped' WHERE transaction_id=$1 AND status='Pending'`, [id]);
+            await client.query(
+                `UPDATE ap_transaction SET status='Approved', updated_at=NOW(), updated_by=$1 WHERE id=$2`,
+                [userName, id]);
+        } else {
+            const remaining = await client.query(
+                `SELECT COUNT(*) FROM ap_transaction_approval WHERE transaction_id=$1 AND status='Pending'`, [id]);
+            if (parseInt(remaining.rows[0].count) === 0) {
+                await client.query(
+                    `UPDATE ap_transaction SET status='Approved', updated_at=NOW(), updated_by=$1 WHERE id=$2`,
+                    [userName, id]);
+            }
+        }
+        await client.query('COMMIT');
+        res.status(200).json({ message: 'อนุมัติสำเร็จ' });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error approving ap_transaction:', error);
+        res.status(500).json({ message: error.message || 'Internal server error' });
+    } finally {
+        client.release();
+    }
+};
+
+// --- 2d. Reject (Submitted → Draft, so the submitter can edit or delete it) ---
+const rejectTransaction = async (req, res) => {
+    const { id } = req.params;
+    const { remarks } = req.body || {};
+    const userId = req.headers['userid'];
+    const userName = req.headers['username'] || null;
+    if (!userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
+    const client = await req.dbPool.connect();
+    try {
+        await ensureApprovalSchema(req.dbPool);
+        await client.query('BEGIN');
+        const tx = await client.query(`SELECT status FROM ap_transaction WHERE id=$1`, [id]);
+        if (tx.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
+        if (tx.rows[0].status !== 'Submitted') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'ปฏิเสธได้เฉพาะเอกสาร Submitted เท่านั้น' }); }
+
+        const myRecord = await client.query(`
+            SELECT id FROM ap_transaction_approval
+            WHERE transaction_id=$1 AND approver_user_id=$2 AND status='Pending'`, [id, userId]);
+        if (myRecord.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ message: 'ไม่มีสิทธิ์ปฏิเสธหรืออนุมัติไปแล้ว' });
+        }
+
+        await client.query(`
+            UPDATE ap_transaction_approval SET status='Rejected', remarks=$1, approved_at=NOW() WHERE id=$2`,
+            [remarks || null, myRecord.rows[0].id]);
+        // ปฏิเสธ = ย้อนกลับไปเป็น Draft ให้ผู้ส่งแก้ไขหรือลบทิ้งเองได้เลย ไม่ค้างเป็นสถานะปฏิเสธถาวร
+        await client.query(`
+            UPDATE ap_transaction SET status='Draft', updated_at=NOW(), updated_by=$1 WHERE id=$2`,
+            [userName, id]);
+        await client.query('COMMIT');
+        res.status(200).json({ message: 'ปฏิเสธและส่งกลับไปเป็นร่างสำเร็จ' });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error rejecting ap_transaction:', error);
+        res.status(500).json({ message: error.message || 'Internal server error' });
+    } finally {
+        client.release();
+    }
+};
+
+// --- 2e. Post an existing Draft/Approved transaction (used after approval, or when re-opening a saved Draft) ---
+const postTransaction = async (req, res) => {
+    const { id } = req.params;
+    const userName = req.headers['username'] || null;
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        const existing = await client.query(`SELECT * FROM ap_transaction WHERE id=$1 FOR UPDATE`, [id]);
+        if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
+        const tx = existing.rows[0];
+        if (!['Draft', 'Approved'].includes(tx.status)) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ message: 'Post ได้เฉพาะเอกสาร Draft หรือ Approved เท่านั้น' });
+        }
+
+        const periodRes = await client.query(
+            `SELECT id FROM gl_posting_period
+             WHERE $1::date BETWEEN period_start_date AND period_end_date
+             AND gl_status = 'OPEN' LIMIT 1`, [tx.doc_date]
+        );
+        if (periodRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ message: `ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่เอกสาร ${tx.doc_date}` });
+        }
+
+        const dRes    = await client.query(`SELECT * FROM ap_transaction_detail  WHERE header_id=$1 ORDER BY line_no`, [id]);
+        const aRes    = await client.query(`SELECT * FROM ap_transaction_apply   WHERE transaction_id=$1`, [id]);
+        const pRes    = await client.query(`SELECT * FROM ap_transaction_payment WHERE header_id=$1 ORDER BY line_no`, [id]).catch(() => ({ rows: [] }));
+        const whtRes  = await client.query(`SELECT * FROM ap_transaction_wht    WHERE header_id=$1`, [id]).catch(() => ({ rows: [] }));
+
+        const sysDocTypeRes = await client.query(`SELECT sys_doc_type FROM sa_module_document WHERE id=$1`, [tx.doc_id]);
+        const sysDocType1 = sysDocTypeRes.rows[0]?.sys_doc_type || '';
+        const isRaPost = sysDocType1 === '70';
+
+        let glEntryId = null;
+        if (!isRaPost) {
+            const headerWithDocNo = { ...tx, _applies: aRes.rows, _payments: pRes.rows, _whts: whtRes.rows };
+            glEntryId = await postGlEntry(client, id, headerWithDocNo, dRes.rows, tx.doc_no);
+            await insertVtRecords(client, id, headerWithDocNo, dRes.rows, sysDocType1);
+            if (glEntryId) {
+                await client.query(`UPDATE ap_transaction SET gl_entry_id=$1 WHERE id=$2`, [glEntryId, id]);
+            }
+            if (sysDocType1 === '65') {
+                await client.query(`UPDATE ap_transaction SET balance_amount_lc=0 WHERE id=$1`, [id]);
+            }
+            if (sysDocType1 === '80') await postCmPaymentHelper(client, id, glEntryId);
+        }
+
+        await client.query(`UPDATE ap_transaction SET status='Posted', updated_at=NOW(), updated_by=$1 WHERE id=$2`, [userName, id]);
+        await client.query('COMMIT');
+        const full = await fetchRowById(req.dbPool, id);
+        res.status(200).json(full);
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error posting ap_transaction:', error);
         res.status(500).json({ message: error.message || 'Internal server error' });
     } finally {
         client.release();
@@ -1440,4 +1700,5 @@ module.exports = {
     fetchOpenRemittanceAdvices, fetchRaInvoices,
     fetchRemittanceAdviceByDocNo,
     createTransaction, updateTransaction, voidTransaction, deleteTransaction,
+    submitTransaction, approveTransaction, rejectTransaction, postTransaction,
 };

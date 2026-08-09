@@ -26,58 +26,54 @@ const getCmBalance = async (client, bankAccountId, asOfDate, flags) => {
         }
     }
 
-    const dateFilter = fromDate
-        ? `AND receipt_date > '${fromDate}' AND receipt_date <= '${asOfDate}'`
-        : `AND receipt_date <= '${asOfDate}'`;
-    const pmtFilter  = fromDate
-        ? `AND payment_date > '${fromDate}' AND payment_date <= '${asOfDate}'`
-        : `AND payment_date <= '${asOfDate}'`;
-    const tsfFilter  = fromDate
-        ? `AND transfer_date > '${fromDate}' AND transfer_date <= '${asOfDate}'`
-        : `AND transfer_date <= '${asOfDate}'`;
-    const fxFilter   = fromDate
-        ? `AND rv.revaluation_date > '${fromDate}' AND rv.revaluation_date <= '${asOfDate}'`
-        : `AND rv.revaluation_date <= '${asOfDate}'`;
-
+    // ใช้ parameterized query เสมอ — ห้าม interpolate ค่าจาก request (as_of_date) ลง SQL ตรงๆ (SQL injection)
     if (flags.hasReceipt) {
+        const dateSql = fromDate ? `AND receipt_date > $2 AND receipt_date <= $3` : `AND receipt_date <= $2`;
+        const params = fromDate ? [bankAccountId, fromDate, asOfDate] : [bankAccountId, asOfDate];
         const r = await client.query(
             `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_receipt
-             WHERE bank_account_id=$1 AND status!='Voided' ${dateFilter}`,
-            [bankAccountId]);
+             WHERE bank_account_id=$1 AND status!='Voided' ${dateSql}`,
+            params);
         balance += parseFloat(r.rows[0].amt);
     }
     if (flags.hasPayment) {
+        const dateSql = fromDate ? `AND payment_date > $2 AND payment_date <= $3` : `AND payment_date <= $2`;
+        const params = fromDate ? [bankAccountId, fromDate, asOfDate] : [bankAccountId, asOfDate];
         const r = await client.query(
             `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_payment
-             WHERE bank_account_id=$1 AND status!='Voided' ${pmtFilter}`,
-            [bankAccountId]);
+             WHERE bank_account_id=$1 AND status!='Voided' ${dateSql}`,
+            params);
         balance -= parseFloat(r.rows[0].amt);
     }
     if (flags.hasTransfer) {
+        const dateSql = fromDate ? `AND transfer_date > $2 AND transfer_date <= $3` : `AND transfer_date <= $2`;
+        const params = fromDate ? [bankAccountId, fromDate, asOfDate] : [bankAccountId, asOfDate];
         const rIn = await client.query(
             `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_inter_bank_transfer
-             WHERE to_bank_account_id=$1 AND status='Posted' ${tsfFilter}`,
-            [bankAccountId]);
+             WHERE to_bank_account_id=$1 AND status='Posted' ${dateSql}`,
+            params);
         const rOut = await client.query(
             `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_inter_bank_transfer
-             WHERE from_bank_account_id=$1 AND status='Posted' ${tsfFilter}`,
-            [bankAccountId]);
+             WHERE from_bank_account_id=$1 AND status='Posted' ${dateSql}`,
+            params);
         balance += parseFloat(rIn.rows[0].amt) - parseFloat(rOut.rows[0].amt);
     }
     if (flags.hasFxReval) {
+        const dateSql = fromDate ? `AND rv.revaluation_date > $2 AND rv.revaluation_date <= $3` : `AND rv.revaluation_date <= $2`;
+        const params = fromDate ? [bankAccountId, fromDate, asOfDate] : [bankAccountId, asOfDate];
         const r = await client.query(`
             SELECT COALESCE(SUM(rl.fx_gain_loss),0) AS adj
             FROM cm_bank_fx_revaluation_line rl
             JOIN cm_bank_fx_revaluation rv ON rv.id = rl.revaluation_id
-            WHERE rl.bank_account_id=$1 AND rv.status='Posted' ${fxFilter}`,
-            [bankAccountId]);
+            WHERE rl.bank_account_id=$1 AND rv.status='Posted' ${dateSql}`,
+            params);
         balance += parseFloat(r.rows[0].adj);
     }
     return Math.round(balance * 100) / 100;
 };
 
 const getReport = async (req, res) => {
-    const { as_of_date } = req.query;
+    const { as_of_date, account_code_from, account_code_to } = req.query;
     if (!as_of_date) return res.status(400).json({ error: 'ต้องระบุ as_of_date' });
 
     const client = await req.dbPool.connect();
@@ -92,21 +88,31 @@ const getReport = async (req, res) => {
         };
 
         // Active BANK accounts that have a GL account assigned
+        let accWhere = `WHERE ba.cm_type='BANK' AND ba.is_active=TRUE AND ba.gl_account_id IS NOT NULL`;
+        const accParams = [];
+        if (account_code_from) {
+            accParams.push(account_code_from);
+            accWhere += ` AND ba.account_code >= $${accParams.length}`;
+        }
+        if (account_code_to) {
+            accParams.push(account_code_to);
+            accWhere += ` AND ba.account_code <= $${accParams.length}`;
+        }
         const accsRes = await client.query(`
-            SELECT ba.id, ba.account_code, ba.account_name_th, ba.currency_code, ba.gl_account_id,
-                   ga.account_code AS gl_account_code, ga.account_name_thai AS gl_account_name,
+            SELECT ba.id, ba.account_code, ba.account_name_th, ba.account_name_en, ba.currency_code, ba.gl_account_id,
+                   ga.account_code AS gl_account_code, ga.account_name_thai AS gl_account_name, ga.account_name_eng AS gl_account_name_en,
                    cb.short_name   AS bank_short_name
             FROM cm_bank_account ba
             LEFT JOIN gl_account  ga ON ga.id = ba.gl_account_id
             LEFT JOIN cd_bank     cb ON cb.id = ba.bank_id
-            WHERE ba.cm_type='BANK' AND ba.is_active=TRUE AND ba.gl_account_id IS NOT NULL
-            ORDER BY ba.account_code`);
+            ${accWhere}
+            ORDER BY ba.account_code`, accParams);
 
         const rows = [];
         for (const acc of accsRes.rows) {
             const cmBalance = await getCmBalance(client, acc.id, as_of_date, flags);
 
-            // GL balance: beginning balance + gl_entry_line postings (debit_amount_lc - credit_amount_lc)
+            // GL balance: beginning balance + gl_entry_detail postings (debit_lc - credit_lc)
             let glBalance = 0;
             if (flags.hasBB) {
                 const bbRes = await client.query(
@@ -115,10 +121,10 @@ const getReport = async (req, res) => {
                 glBalance += parseFloat(bbRes.rows[0].bb);
             }
             const glRes = await client.query(`
-                SELECT COALESCE(SUM(l.debit_amount_lc - l.credit_amount_lc),0) AS gl_bal
-                FROM gl_entry_line l
+                SELECT COALESCE(SUM(l.debit_lc - l.credit_lc),0) AS gl_bal
+                FROM gl_entry_detail l
                 JOIN gl_entry_header h ON h.id = l.header_id
-                WHERE l.gl_account_id=$1 AND h.status='Posted' AND h.doc_date<=$2`,
+                WHERE l.account_id=$1 AND h.status='Posted' AND h.doc_date<=$2`,
                 [acc.gl_account_id, as_of_date]);
             glBalance += parseFloat(glRes.rows[0].gl_bal);
             glBalance = Math.round(glBalance * 100) / 100;
@@ -129,10 +135,12 @@ const getReport = async (req, res) => {
                 bank_account_id:   acc.id,
                 bank_account_code: acc.account_code,
                 bank_account_name: acc.account_name_th,
+                bank_account_name_en: acc.account_name_en,
                 bank_short_name:   acc.bank_short_name,
                 currency_code:     acc.currency_code,
                 gl_account_code:   acc.gl_account_code,
                 gl_account_name:   acc.gl_account_name,
+                gl_account_name_en: acc.gl_account_name_en,
                 cm_balance:        cmBalance,
                 gl_balance:        glBalance,
                 difference:        difference,

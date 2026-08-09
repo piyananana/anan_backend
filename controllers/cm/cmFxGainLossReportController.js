@@ -2,7 +2,7 @@
 'use strict';
 
 const getReport = async (req, res) => {
-    const { date_from, date_to, bank_account_id } = req.query;
+    const { date_from, date_to, bank_account_id, account_code_from, account_code_to } = req.query;
     if (!date_from || !date_to) {
         return res.status(400).json({ error: 'ต้องระบุ date_from และ date_to' });
     }
@@ -15,6 +15,14 @@ const getReport = async (req, res) => {
             params.push(bank_account_id);
             wheres.push(`rl.bank_account_id=$${params.length}`);
         }
+        if (account_code_from) {
+            params.push(account_code_from);
+            wheres.push(`ba.account_code>=$${params.length}`);
+        }
+        if (account_code_to) {
+            params.push(account_code_to);
+            wheres.push(`ba.account_code<=$${params.length}`);
+        }
 
         const r = await client.query(`
             SELECT
@@ -26,6 +34,7 @@ const getReport = async (req, res) => {
                 rl.bank_account_id,
                 ba.account_code    AS bank_account_code,
                 ba.account_name_th AS bank_account_name,
+                ba.account_name_en AS bank_account_name_en,
                 ba.currency_code,
                 cb.short_name      AS bank_short_name,
                 rl.balance_fc,

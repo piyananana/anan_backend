@@ -60,6 +60,96 @@ const generateGlDocNo = async (client, glDocId, date) => {
     return docNo;
 };
 
+// ── Core: balance (FC + LC per book) for one bank account as of a date ──────
+// Reuses the latest Posted revaluation (if any) as a checkpoint, then adds
+// movements after that checkpoint up to asOfDate — same logic used by calcLines.
+const calcAccountBalance = async (client, accountId, asOfDate, excludeRevalId = null) => {
+    let latestRevalQuery = `
+        SELECT r.revaluation_date, l.balance_fc, l.balance_lc_new
+        FROM cm_bank_fx_revaluation_line l
+        JOIN cm_bank_fx_revaluation r ON r.id = l.revaluation_id
+        WHERE l.bank_account_id = $1 AND r.status = 'Posted'
+          AND r.revaluation_date <= $2`;
+    const qParams = [accountId, asOfDate];
+    if (excludeRevalId) {
+        latestRevalQuery += ` AND r.id != $3`;
+        qParams.push(excludeRevalId);
+    }
+    latestRevalQuery += ` ORDER BY r.revaluation_date DESC, r.id DESC LIMIT 1`;
+    const lastReval = await client.query(latestRevalQuery, qParams);
+
+    let balanceFc, balanceLcBook;
+    if (lastReval.rows.length > 0) {
+        const lr = lastReval.rows[0];
+        const lastDate = lr.revaluation_date;
+        const movRes = await client.query(`
+            SELECT COALESCE(SUM(net_fc), 0) AS net_fc, COALESCE(SUM(net_lc), 0) AS net_lc
+            FROM (
+                SELECT amount_fc AS net_fc, amount_lc AS net_lc
+                FROM cm_receipt
+                WHERE bank_account_id = $1 AND status != 'Voided'
+                  AND receipt_date > $2 AND receipt_date <= $3
+                UNION ALL
+                SELECT -amount_fc, -amount_lc
+                FROM cm_payment
+                WHERE bank_account_id = $1 AND status != 'Voided'
+                  AND payment_date > $2 AND payment_date <= $3
+            ) t`,
+            [accountId, lastDate, asOfDate]);
+        const m = movRes.rows[0];
+        balanceFc     = parseFloat(lr.balance_fc)     + parseFloat(m.net_fc);
+        balanceLcBook = parseFloat(lr.balance_lc_new) + parseFloat(m.net_lc);
+    } else {
+        const totRes = await client.query(`
+            SELECT COALESCE(SUM(net_fc), 0) AS balance_fc, COALESCE(SUM(net_lc), 0) AS balance_lc
+            FROM (
+                SELECT amount_fc AS net_fc, amount_lc AS net_lc
+                FROM cm_receipt
+                WHERE bank_account_id = $1 AND status != 'Voided' AND receipt_date <= $2
+                UNION ALL
+                SELECT -amount_fc, -amount_lc
+                FROM cm_payment
+                WHERE bank_account_id = $1 AND status != 'Voided' AND payment_date <= $2
+            ) t`,
+            [accountId, asOfDate]);
+        const t = totRes.rows[0];
+        balanceFc     = parseFloat(t.balance_fc);
+        balanceLcBook = parseFloat(t.balance_lc);
+    }
+    return { balanceFc, balanceLcBook };
+};
+
+// GET distinct currencies with an outstanding FC bank balance as of a date
+// (mirrors AR's fetchOutstandingCurrencies — used to auto-populate the rate entry fields)
+const getOutstandingCurrencies = async (req, res) => {
+    const { as_of_date } = req.query;
+    if (!as_of_date) return res.status(400).json({ error: 'ต้องระบุ as_of_date' });
+    const client = await req.dbPool.connect();
+    try {
+        await ensureTables(client);
+        const accRes = await client.query(`
+            SELECT ba.id, ba.currency_code
+            FROM cm_bank_account ba
+            WHERE ba.currency_code != 'THB' AND ba.is_active = TRUE AND ba.cm_type = 'BANK'
+              AND ba.gl_account_id IS NOT NULL
+            ORDER BY ba.currency_code`);
+
+        const codesWithBalance = new Set();
+        for (const acc of accRes.rows) {
+            const { balanceFc } = await calcAccountBalance(client, acc.id, as_of_date);
+            if (Math.abs(balanceFc) >= 0.0001) codesWithBalance.add(acc.currency_code);
+        }
+
+        if (codesWithBalance.size === 0) return res.json([]);
+        const curRes = await client.query(
+            `SELECT currency_code, currency_name_th, currency_name_en FROM cd_currency
+             WHERE currency_code = ANY($1::text[]) ORDER BY currency_code`,
+            [Array.from(codesWithBalance)]);
+        res.json(curRes.rows);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+    finally { client.release(); }
+};
+
 // ── Core: calculate lines for a revaluation date + rates map ────────────────
 // ratesMap: { "USD": 35.8, "EUR": 40.2, ... }  keyed by currency_code
 const calcLines = async (client, revaluationDate, ratesMap, excludeRevalId = null) => {
@@ -69,7 +159,7 @@ const calcLines = async (client, revaluationDate, ratesMap, excludeRevalId = nul
                cb.short_name AS bank_short_name,
                ga.account_code AS gl_account_code
         FROM cm_bank_account ba
-        LEFT JOIN cm_bank     cb ON cb.id = ba.bank_id
+        LEFT JOIN cd_bank     cb ON cb.id = ba.bank_id
         LEFT JOIN gl_account  ga ON ga.id = ba.gl_account_id
         WHERE ba.currency_code != 'THB' AND ba.is_active = TRUE AND ba.cm_type = 'BANK'
         ORDER BY ba.account_code`);
@@ -80,68 +170,7 @@ const calcLines = async (client, revaluationDate, ratesMap, excludeRevalId = nul
         if (!newRate || newRate <= 0) continue;
         if (!acc.gl_account_id) continue;
 
-        // Find latest posted revaluation for this account (before or on revaluation_date, excluding current edit)
-        let latestRevalQuery = `
-            SELECT r.revaluation_date, l.balance_fc, l.balance_lc_new
-            FROM cm_bank_fx_revaluation_line l
-            JOIN cm_bank_fx_revaluation r ON r.id = l.revaluation_id
-            WHERE l.bank_account_id = $1 AND r.status = 'Posted'
-              AND r.revaluation_date <= $2`;
-        const qParams = [acc.id, revaluationDate];
-        if (excludeRevalId) {
-            latestRevalQuery += ` AND r.id != $3`;
-            qParams.push(excludeRevalId);
-        }
-        latestRevalQuery += ` ORDER BY r.revaluation_date DESC, r.id DESC LIMIT 1`;
-        const lastReval = await client.query(latestRevalQuery, qParams);
-
-        let balanceFc, balanceLcBook;
-
-        if (lastReval.rows.length > 0) {
-            const lr = lastReval.rows[0];
-            const lastDate = lr.revaluation_date;
-            // Movements AFTER last revaluation date up to revaluation_date
-            const movRes = await client.query(`
-                SELECT
-                    COALESCE(SUM(net_fc), 0) AS net_fc,
-                    COALESCE(SUM(net_lc), 0) AS net_lc
-                FROM (
-                    SELECT amount_fc AS net_fc, amount_lc AS net_lc
-                    FROM cm_receipt
-                    WHERE bank_account_id = $1 AND status != 'Voided'
-                      AND receipt_date > $2 AND receipt_date <= $3
-                    UNION ALL
-                    SELECT -amount_fc, -amount_lc
-                    FROM cm_payment
-                    WHERE bank_account_id = $1 AND status != 'Voided'
-                      AND payment_date > $2 AND payment_date <= $3
-                ) t`,
-                [acc.id, lastDate, revaluationDate]);
-            const m = movRes.rows[0];
-            balanceFc     = parseFloat(lr.balance_fc)     + parseFloat(m.net_fc);
-            balanceLcBook = parseFloat(lr.balance_lc_new) + parseFloat(m.net_lc);
-        } else {
-            // Sum all transactions up to revaluation_date
-            const totRes = await client.query(`
-                SELECT
-                    COALESCE(SUM(net_fc), 0) AS balance_fc,
-                    COALESCE(SUM(net_lc), 0) AS balance_lc
-                FROM (
-                    SELECT amount_fc AS net_fc, amount_lc AS net_lc
-                    FROM cm_receipt
-                    WHERE bank_account_id = $1 AND status != 'Voided'
-                      AND receipt_date <= $2
-                    UNION ALL
-                    SELECT -amount_fc, -amount_lc
-                    FROM cm_payment
-                    WHERE bank_account_id = $1 AND status != 'Voided'
-                      AND payment_date <= $2
-                ) t`,
-                [acc.id, revaluationDate]);
-            const t = totRes.rows[0];
-            balanceFc     = parseFloat(t.balance_fc);
-            balanceLcBook = parseFloat(t.balance_lc);
-        }
+        const { balanceFc, balanceLcBook } = await calcAccountBalance(client, acc.id, revaluationDate, excludeRevalId);
 
         if (Math.abs(balanceFc) < 0.0001) continue;
 
@@ -373,6 +402,10 @@ const postRow = async (req, res) => {
             await client.query('ROLLBACK');
             return res.status(400).json({ error: 'ต้องระบุบัญชี FX Gain และ FX Loss ก่อน Post GL' });
         }
+        if (!reval.gl_doc_id) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'ต้องระบุประเภทเอกสาร GL ก่อน Post' });
+        }
 
         // 2. Load lines
         const lRes = await client.query(
@@ -383,10 +416,10 @@ const postRow = async (req, res) => {
             return res.status(400).json({ error: 'ไม่มีรายการที่มี FX Gain/Loss คุ้มค่าจะ Post' });
         }
 
-        // 3. Find open period
+        // 3. Find open period (gl_posting_period — เหมือนทุกโมดูล ไม่ใช่ gl_period ที่ไม่มีจริง)
         const periodRes = await client.query(`
-            SELECT id FROM gl_period
-            WHERE $1 BETWEEN period_start AND period_end AND is_open = true
+            SELECT id FROM gl_posting_period
+            WHERE $1::date BETWEEN period_start_date AND period_end_date AND gl_status = 'OPEN'
             LIMIT 1`, [reval.revaluation_date]);
         if (!periodRes.rows.length) {
             await client.query('ROLLBACK');
@@ -397,75 +430,51 @@ const postRow = async (req, res) => {
         const periodId = periodRes.rows[0].id;
 
         // 4. Generate GL doc_no
-        let glDocNo = `FXRV-${id}`;
-        if (reval.gl_doc_id) {
-            const gen = await generateGlDocNo(client, reval.gl_doc_id, reval.revaluation_date);
-            if (gen) glDocNo = gen;
-        }
+        let glDocNo = await generateGlDocNo(client, reval.gl_doc_id, reval.revaluation_date);
+        if (!glDocNo) glDocNo = `FXRV-${id}`;
 
-        // 5. Resolve user id + currency
-        const userRes = await client.query(`SELECT id FROM sa_user WHERE user_name = $1 LIMIT 1`, [userName]);
-        const createdBy = userRes.rows[0]?.id || null;
+        // 5. Resolve base currency
         const currRes = await client.query(`SELECT id FROM cd_currency WHERE currency_code = 'THB' LIMIT 1`);
         const currencyId = currRes.rows[0]?.id || null;
 
-        const totalAbs = lines.reduce((s, l) => s + Math.abs(parseFloat(l.fx_gain_loss)), 0);
-        const totalAbsRounded = Math.round(totalAbs * 100) / 100;
-
-        // 6. Insert GL header
-        const glHRes = await client.query(`
-            INSERT INTO gl_entry_header
-                (doc_id, doc_no, doc_date, posting_date, period_id,
-                 ref_no, description, currency_id, exchange_rate, status,
-                 total_debit, total_credit, created_by, created_at, updated_at)
-            VALUES ($1,$2,$3,$3,$4,$5,$6,$7,1,'Posted',$8,$8,$9,NOW(),NOW())
-            RETURNING id`,
-            [reval.gl_doc_id || null, glDocNo, reval.revaluation_date,
-             periodId, null,
-             reval.description || `FX Revaluation ${reval.revaluation_date}`,
-             currencyId, totalAbsRounded, createdBy]);
-        const glEntryId = glHRes.rows[0].id;
-
-        // 7. Insert GL lines
-        let lineNo = 1;
+        // 6. Build GL detail lines (Gain: DR Bank / CR FX Gain — Loss: DR FX Loss / CR Bank)
+        const glDetails = [];
         for (const l of lines) {
             const gainLoss = parseFloat(l.fx_gain_loss);
             const absAmt   = Math.abs(gainLoss);
             const desc     = `FX Reval ${l.currency_code} - ${reval.revaluation_date}`;
-
             if (gainLoss > 0) {
-                // Gain: DR Bank, CR FX Gain
-                await client.query(`
-                    INSERT INTO gl_entry_line
-                        (header_id, line_no, gl_account_id, description,
-                         debit_amount_lc, credit_amount_lc, debit_amount_fc, credit_amount_fc,
-                         created_by, created_at, updated_at)
-                    VALUES ($1,$2,$3,$4,$5,0,$5,0,$6,NOW(),NOW())`,
-                    [glEntryId, lineNo++, l.gl_account_id, desc, absAmt, createdBy]);
-                await client.query(`
-                    INSERT INTO gl_entry_line
-                        (header_id, line_no, gl_account_id, description,
-                         debit_amount_lc, credit_amount_lc, debit_amount_fc, credit_amount_fc,
-                         created_by, created_at, updated_at)
-                    VALUES ($1,$2,$3,$4,0,$5,0,$5,$6,NOW(),NOW())`,
-                    [glEntryId, lineNo++, reval.fx_gain_account_id, desc, absAmt, createdBy]);
+                glDetails.push({ account_id: l.gl_account_id, description: desc, debit_lc: absAmt, credit_lc: 0 });
+                glDetails.push({ account_id: reval.fx_gain_account_id, description: desc, debit_lc: 0, credit_lc: absAmt });
             } else {
-                // Loss: DR FX Loss, CR Bank
-                await client.query(`
-                    INSERT INTO gl_entry_line
-                        (header_id, line_no, gl_account_id, description,
-                         debit_amount_lc, credit_amount_lc, debit_amount_fc, credit_amount_fc,
-                         created_by, created_at, updated_at)
-                    VALUES ($1,$2,$3,$4,$5,0,$5,0,$6,NOW(),NOW())`,
-                    [glEntryId, lineNo++, reval.fx_loss_account_id, desc, absAmt, createdBy]);
-                await client.query(`
-                    INSERT INTO gl_entry_line
-                        (header_id, line_no, gl_account_id, description,
-                         debit_amount_lc, credit_amount_lc, debit_amount_fc, credit_amount_fc,
-                         created_by, created_at, updated_at)
-                    VALUES ($1,$2,$3,$4,0,$5,0,$5,$6,NOW(),NOW())`,
-                    [glEntryId, lineNo++, l.gl_account_id, desc, absAmt, createdBy]);
+                glDetails.push({ account_id: reval.fx_loss_account_id, description: desc, debit_lc: absAmt, credit_lc: 0 });
+                glDetails.push({ account_id: l.gl_account_id, description: desc, debit_lc: 0, credit_lc: absAmt });
             }
+        }
+        const totalDebitLc  = Math.round(glDetails.reduce((s, d) => s + d.debit_lc, 0) * 100) / 100;
+        const totalCreditLc = Math.round(glDetails.reduce((s, d) => s + d.credit_lc, 0) * 100) / 100;
+
+        // 7. Insert GL header — gl_entry_header (real columns, ไม่ใช่ total_debit/total_credit ที่ไม่มีจริง)
+        const glHRes = await client.query(`
+            INSERT INTO gl_entry_header
+                (doc_id, doc_no, doc_date, posting_date, period_id,
+                 description, currency_id, exchange_rate, status,
+                 total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc, created_by)
+            VALUES ($1,$2,$3,$3,$4,$5,$6,1,'Posted',$7,$8,$7,$8,$9)
+            RETURNING id`,
+            [reval.gl_doc_id, glDocNo, reval.revaluation_date,
+             periodId,
+             reval.description || `FX Revaluation ${reval.revaluation_date}`,
+             currencyId, totalDebitLc, totalCreditLc, userName]);
+        const glEntryId = glHRes.rows[0].id;
+
+        // 8. Insert GL detail lines — gl_entry_detail (real table, ไม่ใช่ gl_entry_line ที่ไม่มีจริง)
+        let lineNo = 1;
+        for (const d of glDetails) {
+            await client.query(`
+                INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
+                VALUES ($1,$2,$3,$4,$5,$6,$5,$6)`,
+                [glEntryId, lineNo++, d.account_id, d.description, d.debit_lc, d.credit_lc]);
         }
 
         // 8. Update revaluation
@@ -502,14 +511,13 @@ const voidRow = async (req, res) => {
         if (reval.status === 'Posted' && reval.gl_entry_id) {
             // Load original GL lines and create reversal
             const origLines = await client.query(
-                `SELECT * FROM gl_entry_line WHERE header_id = $1`, [reval.gl_entry_id]);
+                `SELECT * FROM gl_entry_detail WHERE header_id = $1`, [reval.gl_entry_id]);
 
-            const userRes = await client.query(`SELECT id FROM sa_user WHERE user_name=$1 LIMIT 1`, [userName]);
-            const createdBy = userRes.rows[0]?.id || null;
             const today = new Date().toISOString().substring(0, 10);
 
             const periodRes = await client.query(`
-                SELECT id FROM gl_period WHERE $1 BETWEEN period_start AND period_end AND is_open=true LIMIT 1`,
+                SELECT id FROM gl_posting_period
+                WHERE $1::date BETWEEN period_start_date AND period_end_date AND gl_status = 'OPEN' LIMIT 1`,
                 [today]);
             if (!periodRes.rows.length) {
                 await client.query('ROLLBACK');
@@ -519,37 +527,33 @@ const voidRow = async (req, res) => {
 
             const currRes = await client.query(`SELECT id FROM cd_currency WHERE currency_code='THB' LIMIT 1`);
             const currencyId = currRes.rows[0]?.id || null;
-            const totalAbs = origLines.rows.reduce((s, l) => s + parseFloat(l.debit_amount_lc || 0), 0);
+            const totalAbs = origLines.rows.reduce((s, l) => s + parseFloat(l.debit_lc || 0), 0);
             const totalAbsRounded = Math.round(totalAbs * 100) / 100;
 
             const rvHRes = await client.query(`
                 INSERT INTO gl_entry_header
                     (doc_id, doc_no, doc_date, posting_date, period_id,
                      ref_no, description, currency_id, exchange_rate, status,
-                     total_debit, total_credit, created_by, created_at, updated_at)
-                VALUES ($1,$2,$3,$3,$4,$5,$6,$7,1,'Posted',$8,$8,$9,NOW(),NOW())
+                     total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc, created_by)
+                VALUES ($1,$2,$3,$3,$4,$5,$6,$7,1,'Posted',$8,$8,$8,$8,$9)
                 RETURNING id`,
                 [reval.gl_doc_id_ref || null,
                  `RVSL-${reval.gl_doc_no || id}`,
                  today, periodId,
                  reval.gl_doc_no,
                  `ยกเลิก FX Reval ${reval.revaluation_date}`,
-                 currencyId, totalAbsRounded, createdBy]);
+                 currencyId, totalAbsRounded, userName]);
             const rvEntryId = rvHRes.rows[0].id;
 
             let lineNo = 1;
             for (const l of origLines.rows) {
                 await client.query(`
-                    INSERT INTO gl_entry_line
-                        (header_id, line_no, gl_account_id, description,
-                         debit_amount_lc, credit_amount_lc, debit_amount_fc, credit_amount_fc,
-                         created_by, created_at, updated_at)
-                    VALUES ($1,$2,$3,$4,$5,$6,$5,$6,$7,NOW(),NOW())`,
-                    [rvEntryId, lineNo++, l.gl_account_id,
+                    INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
+                    VALUES ($1,$2,$3,$4,$5,$6,$5,$6)`,
+                    [rvEntryId, lineNo++, l.account_id,
                      `ยกเลิก: ${l.description}`,
-                     parseFloat(l.credit_amount_lc || 0),
-                     parseFloat(l.debit_amount_lc  || 0),
-                     createdBy]);
+                     parseFloat(l.credit_lc || 0),
+                     parseFloat(l.debit_lc  || 0)]);
             }
 
             await client.query(`
@@ -584,4 +588,4 @@ const deleteRow = async (req, res) => {
     finally { client.release(); }
 };
 
-module.exports = { fetchRows, fetchRow, previewLines, createRow, updateRow, postRow, voidRow, deleteRow, ensureTables };
+module.exports = { fetchRows, fetchRow, previewLines, createRow, updateRow, postRow, voidRow, deleteRow, ensureTables, getOutstandingCurrencies };

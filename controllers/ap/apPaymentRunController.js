@@ -43,10 +43,12 @@ const fetchRows = async (req, res) => {
                r.total_amount_lc, r.status,
                f.format_code AS bank_file_format_code,
                f.format_name AS bank_file_format_name,
+               cpc.config_name AS check_print_config_name,
                r.created_at, r.created_by
         FROM ap_payment_run r
         LEFT JOIN cm_bank_file_format f ON f.id = r.bank_file_format_id
         LEFT JOIN cm_payment_method pm ON pm.id = r.payment_method_id
+        LEFT JOIN cm_check_print_config cpc ON cpc.id = r.check_print_config_id
         WHERE 1=1`;
     const params = [];
     let pi = 1;
@@ -75,10 +77,12 @@ const fetchRow = async (req, res) => {
                    r.bank_file_format_id, r.total_amount_lc, r.status,
                    f.format_code AS bank_file_format_code,
                    f.format_name AS bank_file_format_name,
+                   r.check_print_config_id, cpc.config_name AS check_print_config_name,
                    r.created_by, r.updated_by
             FROM ap_payment_run r
             LEFT JOIN cm_bank_file_format f ON f.id = r.bank_file_format_id
             LEFT JOIN cm_payment_method pm ON pm.id = r.payment_method_id
+            LEFT JOIN cm_check_print_config cpc ON cpc.id = r.check_print_config_id
             WHERE r.id = $1`, [id]);
         if (hRes.rows.length === 0) return res.status(404).json({ message: 'Not found' });
         const header = hRes.rows[0];
@@ -104,13 +108,15 @@ const ensureApPaymentRunColumns = async (dbPool) => {
     await dbPool.query(`ALTER TABLE ap_payment_run ADD COLUMN IF NOT EXISTS payment_date DATE`);
     await dbPool.query(`ALTER TABLE ap_payment_run ADD COLUMN IF NOT EXISTS payment_method_id INTEGER`);
     await dbPool.query(`ALTER TABLE ap_payment_run ADD COLUMN IF NOT EXISTS due_date_filter DATE`);
+    // รูปแบบเช็ค — ใช้เมื่อประเภทการชำระเป็น CHECK (คู่กับ bank_file_format_id ที่ใช้เมื่อเป็น TRANSFER)
+    await dbPool.query(`ALTER TABLE ap_payment_run ADD COLUMN IF NOT EXISTS check_print_config_id INTEGER`);
 };
 
 // --- POST create (Draft) ---
 const createRun = async (req, res) => {
     const {
         run_date, description, bank_file_format_id, cm_bank_account_id,
-        payment_date, payment_method_id, due_date_filter,
+        payment_date, payment_method_id, due_date_filter, check_print_config_id,
         lines = [],
     } = req.body;
     const userName = req.headers['username'] || null;
@@ -123,13 +129,13 @@ const createRun = async (req, res) => {
         const hRes = await client.query(`
             INSERT INTO ap_payment_run
                 (run_number, run_date, description, bank_file_format_id, cm_bank_account_id,
-                 payment_date, payment_method_id, due_date_filter,
+                 payment_date, payment_method_id, due_date_filter, check_print_config_id,
                  total_amount_lc, status, created_by, updated_by)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'Draft',$10,$10)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'Draft',$11,$11)
             RETURNING id, run_number, run_date, description, bank_file_format_id, cm_bank_account_id,
-                      payment_date, payment_method_id, due_date_filter, total_amount_lc, status`,
+                      payment_date, payment_method_id, due_date_filter, check_print_config_id, total_amount_lc, status`,
             [runNumber, run_date, description || null, bank_file_format_id || null, cm_bank_account_id || null,
-             payment_date || null, payment_method_id || null, due_date_filter || null,
+             payment_date || null, payment_method_id || null, due_date_filter || null, check_print_config_id || null,
              total, userName]);
         const runId = hRes.rows[0].id;
 
@@ -170,7 +176,7 @@ const updateRun = async (req, res) => {
     const { id } = req.params;
     const {
         run_date, description, bank_file_format_id, cm_bank_account_id,
-        payment_date, payment_method_id, due_date_filter,
+        payment_date, payment_method_id, due_date_filter, check_print_config_id,
         lines = [],
     } = req.body;
     const userName = req.headers['username'] || null;
@@ -186,12 +192,12 @@ const updateRun = async (req, res) => {
         await client.query(`
             UPDATE ap_payment_run
                SET run_date=$1, description=$2, bank_file_format_id=$3, cm_bank_account_id=$4,
-                   payment_date=$5, payment_method_id=$6, due_date_filter=$7,
+                   payment_date=$5, payment_method_id=$6, due_date_filter=$7, check_print_config_id=$11,
                    total_amount_lc=$8, updated_at=NOW(), updated_by=$9
              WHERE id=$10`,
             [run_date, description || null, bank_file_format_id || null, cm_bank_account_id || null,
              payment_date || null, payment_method_id || null, due_date_filter || null,
-             total, userName, id]);
+             total, userName, id, check_print_config_id || null]);
 
         await client.query(`DELETE FROM ap_payment_run_detail WHERE run_id=$1`, [id]);
         for (let i = 0; i < lines.length; i++) {
@@ -398,11 +404,12 @@ const rejectRun = async (req, res) => {
         await client.query(`
             UPDATE ap_payment_run_approval SET status='Rejected', remarks=$1, approved_at=NOW() WHERE id=$2`,
             [remarks || null, myRecord.rows[0].id]);
+        // ปฏิเสธ = ย้อนกลับไปเป็น Draft ให้ผู้ส่งแก้ไขหรือลบทิ้งเองได้เลย ไม่ค้างเป็นสถานะปฏิเสธถาวร
         await client.query(`
-            UPDATE ap_payment_run SET status='Rejected', updated_at=NOW(), updated_by=$1 WHERE id=$2`,
+            UPDATE ap_payment_run SET status='Draft', updated_at=NOW(), updated_by=$1 WHERE id=$2`,
             [userName, id]);
         await client.query('COMMIT');
-        res.status(200).json({ message: 'ปฏิเสธการอนุมัติสำเร็จ' });
+        res.status(200).json({ message: 'ปฏิเสธและส่งกลับไปเป็นร่างสำเร็จ' });
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error rejecting ap_payment_run:', error);

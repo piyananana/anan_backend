@@ -103,7 +103,7 @@ const calcBalance = async (client, accId, asOfDate, tables) => {
 };
 
 const getStatement = async (req, res) => {
-    const { date_from, date_to } = req.query;
+    const { date_from, date_to, account_code_from, account_code_to } = req.query;
     if (!date_from || !date_to) {
         return res.status(400).json({ error: 'ต้องระบุ date_from และ date_to' });
     }
@@ -122,14 +122,24 @@ const getStatement = async (req, res) => {
             fxReval:  await tableExists(client, 'cm_bank_fx_revaluation'),
         };
 
-        // Get all active BANK accounts
+        // Get all active BANK accounts (optionally within an account_code range)
+        let accWhere = `WHERE ba.cm_type='BANK' AND ba.is_active=TRUE`;
+        const accParams = [];
+        if (account_code_from) {
+            accParams.push(account_code_from);
+            accWhere += ` AND ba.account_code >= $${accParams.length}`;
+        }
+        if (account_code_to) {
+            accParams.push(account_code_to);
+            accWhere += ` AND ba.account_code <= $${accParams.length}`;
+        }
         const accsRes = await client.query(`
-            SELECT ba.id, ba.account_code, ba.account_name_th, ba.currency_code,
+            SELECT ba.id, ba.account_code, ba.account_name_th, ba.account_name_en, ba.currency_code,
                    cb.short_name AS bank_short_name
             FROM cm_bank_account ba
             LEFT JOIN cd_bank cb ON cb.id = ba.bank_id
-            WHERE ba.cm_type='BANK' AND ba.is_active=TRUE
-            ORDER BY ba.account_code`);
+            ${accWhere}
+            ORDER BY ba.account_code`, accParams);
 
         const rows = [];
         for (const acc of accsRes.rows) {
@@ -195,6 +205,7 @@ const getStatement = async (req, res) => {
                 bank_account_id:   acc.id,
                 bank_account_code: acc.account_code,
                 bank_account_name: acc.account_name_th,
+                bank_account_name_en: acc.account_name_en,
                 bank_short_name:   acc.bank_short_name,
                 currency_code:     acc.currency_code,
                 opening:  Math.round(opening      * 100) / 100,

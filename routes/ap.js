@@ -109,6 +109,10 @@ router.get('/ap_transaction',                        apTransactionController.fet
 router.get('/ap_transaction/:id',                    apTransactionController.fetchRow);
 router.post('/ap_transaction',                       apTransactionController.createTransaction);
 router.put('/ap_transaction/:id',                    apTransactionController.updateTransaction);
+router.put('/ap_transaction/:id/submit',             apTransactionController.submitTransaction);
+router.put('/ap_transaction/:id/approve',            apTransactionController.approveTransaction);
+router.put('/ap_transaction/:id/reject',             apTransactionController.rejectTransaction);
+router.put('/ap_transaction/:id/post',               apTransactionController.postTransaction);
 router.put('/ap_transaction/:id/void',               apTransactionController.voidTransaction);
 router.delete('/ap_transaction/:id',                 apTransactionController.deleteTransaction);
 

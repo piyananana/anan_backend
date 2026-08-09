@@ -8,14 +8,10 @@ const cmCheckbookController        = require('../controllers/cm/cmCheckbookContr
 const cmCheckPrintConfigController = require('../controllers/cm/cmCheckPrintConfigController');
 const cmReceiptController                   = require('../controllers/cm/cmReceiptController');
 const cmPaymentController                   = require('../controllers/cm/cmPaymentController');
-const cmPettyCashVoucherController          = require('../controllers/cm/cmPettyCashVoucherController');
-const cmPettyCashReplenishmentController    = require('../controllers/cm/cmPettyCashReplenishmentController');
 const cmBankStatementController             = require('../controllers/cm/cmBankStatementController');
 const cmBankReconcileController             = require('../controllers/cm/cmBankReconcileController');
 const cmBankFxRevaluationController         = require('../controllers/cm/cmBankFxRevaluationController');
 const cmReportController                    = require('../controllers/cm/cmReportController');
-const cmInterBankTransferController         = require('../controllers/cm/cmInterBankTransferController');
-const cmGlAccountSetupController            = require('../controllers/cm/cmGlAccountSetupController');
 const cmPreCloseCheckController             = require('../controllers/cm/cmPreCloseCheckController');
 const cmResetController                     = require('../controllers/cm/cmResetController');
 const cmBankGlReconcileController           = require('../controllers/cm/cmBankGlReconcileController');
@@ -26,10 +22,10 @@ const cmBankOpeningBalanceController        = require('../controllers/cm/cmBankO
 const cmFxGainLossReportController          = require('../controllers/cm/cmFxGainLossReportController');
 const cmCashFlowStatementController         = require('../controllers/cm/cmCashFlowStatementController');
 const cmBankFileExportController            = require('../controllers/cm/cmBankFileExportController');
-const cmDocNumberController                 = require('../controllers/cm/cmDocNumberController');
 const cmBankStatementImportController       = require('../controllers/cm/cmBankStatementImportController');
 const cmPostDatedCheckController            = require('../controllers/cm/cmPostDatedCheckController');
-const cmBankChargeController                = require('../controllers/cm/cmBankChargeController');
+const cmTransactionController               = require('../controllers/cm/cmTransactionController');
+const cmTransactionGlSetupController        = require('../controllers/cm/cmTransactionGlSetupController');
 
 // cm_bank_account
 router.get('/cm_bank_account',        cmBankAccountController.fetchRows);
@@ -81,24 +77,22 @@ router.post('/cm_payment',             cmPaymentController.createPayment);
 router.put('/cm_payment/:id/clear',    cmPaymentController.clearPayment);
 router.put('/cm_payment/:id/void',     cmPaymentController.voidPayment);
 
-// cm_petty_cash_voucher
-router.get('/cm_petty_cash_voucher',               cmPettyCashVoucherController.fetchRows);
-router.get('/cm_petty_cash_voucher/:id',            cmPettyCashVoucherController.fetchRow);
-router.post('/cm_petty_cash_voucher',               cmPettyCashVoucherController.createRow);
-router.put('/cm_petty_cash_voucher/:id',            cmPettyCashVoucherController.updateRow);
-router.put('/cm_petty_cash_voucher/:id/approve',    cmPettyCashVoucherController.approveRow);
-router.put('/cm_petty_cash_voucher/:id/void',       cmPettyCashVoucherController.voidRow);
-router.delete('/cm_petty_cash_voucher/:id',         cmPettyCashVoucherController.deleteRow);
+// cm_transaction — หน้าจอธุรกรรม CM รวม (10 รายรับ, 15 รายรับจาก AR, 20 รายจ่าย, 25 รายจ่ายจาก AP,
+// 30 เติมเงินสดย่อย, 40 เบิกเงินสดย่อย, 50 โอนเงินระหว่างบัญชี, 70 ค่าธรรมเนียมธนาคาร, 90 ดอกเบี้ย)
+router.get('/cm_transaction/open_vouchers',   cmTransactionController.fetchOpenVouchers);
+router.get('/cm_transaction/receipt_view/:id', cmTransactionController.fetchReceiptView);
+router.get('/cm_transaction/payment_view/:id', cmTransactionController.fetchPaymentView);
+router.get('/cm_transaction',                 cmTransactionController.fetchRows);
+router.get('/cm_transaction/:id',             cmTransactionController.fetchRow);
+router.post('/cm_transaction',                cmTransactionController.createTransaction);
+router.put('/cm_transaction/:id',             cmTransactionController.updateTransaction);
+router.put('/cm_transaction/:id/void',        cmTransactionController.voidTransaction);
+router.delete('/cm_transaction/:id',          cmTransactionController.deleteTransaction);
 
-// cm_petty_cash_replenishment
-router.get('/cm_petty_cash_replenishment',               cmPettyCashReplenishmentController.fetchRows);
-router.get('/cm_petty_cash_replenishment/pending_vouchers', cmPettyCashReplenishmentController.fetchPendingVouchers);
-router.get('/cm_petty_cash_replenishment/:id',           cmPettyCashReplenishmentController.fetchRow);
-router.get('/cm_petty_cash_replenishment/:id/vouchers',  cmPettyCashReplenishmentController.fetchReplenishedVouchers);
-router.post('/cm_petty_cash_replenishment',              cmPettyCashReplenishmentController.createRow);
-router.put('/cm_petty_cash_replenishment/:id',           cmPettyCashReplenishmentController.updateRow);
-router.put('/cm_petty_cash_replenishment/:id/post',      cmPettyCashReplenishmentController.postReplenishment);
-router.put('/cm_petty_cash_replenishment/:id/void',      cmPettyCashReplenishmentController.voidRow);
+// cm_transaction_gl_setup — ตั้งค่าบัญชี GL ต่อประเภทเอกสาร (คู่กับ cm_transaction ด้านบน)
+router.get('/cm_transaction_gl_setup',           cmTransactionGlSetupController.fetchRows);
+router.get('/cm_transaction_gl_setup/:doc_code', cmTransactionGlSetupController.fetchRow);
+router.post('/cm_transaction_gl_setup/:doc_code', cmTransactionGlSetupController.upsertRow);
 
 // cm_bank_statement
 router.get('/cm_bank_statement',                          cmBankStatementController.fetchRows);
@@ -120,7 +114,8 @@ router.get('/cm_reconcile/summary',                             cmBankReconcileC
 router.put('/cm_reconcile/statement_line/:id/reconcile',        cmBankReconcileController.reconcilePair);
 router.put('/cm_reconcile/statement_line/:id/unreconcile',      cmBankReconcileController.unreconcileStatementLine);
 
-// cm_bank_fx_revaluation — preview BEFORE /:id to avoid route conflict
+// cm_bank_fx_revaluation — preview/outstanding_currencies BEFORE /:id to avoid route conflict
+router.get('/cm_bank_fx_revaluation/outstanding_currencies', cmBankFxRevaluationController.getOutstandingCurrencies);
 router.post('/cm_bank_fx_revaluation/preview',    cmBankFxRevaluationController.previewLines);
 router.get('/cm_bank_fx_revaluation',             cmBankFxRevaluationController.fetchRows);
 router.get('/cm_bank_fx_revaluation/:id',         cmBankFxRevaluationController.fetchRow);
@@ -135,18 +130,6 @@ router.get('/cm_report/cash_position',       cmReportController.getCashPosition)
 router.get('/cm_report/bank_transactions',   cmReportController.getBankTransactions);
 router.get('/cm_report/check_register',      cmReportController.getCheckRegister);
 
-// cm_inter_bank_transfer
-router.get('/cm_inter_bank_transfer',          cmInterBankTransferController.fetchRows);
-router.get('/cm_inter_bank_transfer/:id',      cmInterBankTransferController.fetchRow);
-router.post('/cm_inter_bank_transfer',         cmInterBankTransferController.createRow);
-router.put('/cm_inter_bank_transfer/:id',      cmInterBankTransferController.updateRow);
-router.put('/cm_inter_bank_transfer/:id/post', cmInterBankTransferController.postRow);
-router.put('/cm_inter_bank_transfer/:id/void', cmInterBankTransferController.voidRow);
-router.delete('/cm_inter_bank_transfer/:id',   cmInterBankTransferController.deleteRow);
-
-// cm_gl_account_setup
-router.get('/cm_gl_account_setup',    cmGlAccountSetupController.fetchRows);
-router.put('/cm_gl_account_setup',    cmGlAccountSetupController.upsertRow);
 
 // cm_pre_close_check
 router.get('/cm_pre_close_check', cmPreCloseCheckController.runChecks);
@@ -185,12 +168,6 @@ router.get('/cm_cash_flow_statement', cmCashFlowStatementController.getStatement
 router.get('/cm_bank_file_export/payments',  cmBankFileExportController.getPayments);
 router.post('/cm_bank_file_export/generate', cmBankFileExportController.generateFile);
 
-// cm_doc_number_config  — preview BEFORE /:id
-router.get('/cm_doc_number_config/preview', cmDocNumberController.previewDocNo);
-router.get('/cm_doc_number_config',         cmDocNumberController.fetchRows);
-router.post('/cm_doc_number_config',        cmDocNumberController.createRow);
-router.put('/cm_doc_number_config/:id',     cmDocNumberController.updateRow);
-router.delete('/cm_doc_number_config/:id',  cmDocNumberController.deleteRow);
 
 // cm_bank_statement_import
 router.post('/cm_bank_statement_import', cmBankStatementImportController.importStatement);
@@ -206,12 +183,5 @@ router.put('/cm_post_dated_check/:id/return',       cmPostDatedCheckController.r
 router.put('/cm_post_dated_check/:id/cancel',       cmPostDatedCheckController.cancelCheck);
 router.delete('/cm_post_dated_check/:id',           cmPostDatedCheckController.deleteRow);
 
-// cm_bank_charge
-router.get('/cm_bank_charge',                       cmBankChargeController.fetchRows);
-router.post('/cm_bank_charge',                      cmBankChargeController.createRow);
-router.put('/cm_bank_charge/:id',                   cmBankChargeController.updateRow);
-router.put('/cm_bank_charge/:id/post',              cmBankChargeController.postCharge);
-router.put('/cm_bank_charge/:id/void',              cmBankChargeController.voidCharge);
-router.delete('/cm_bank_charge/:id',                cmBankChargeController.deleteRow);
 
 module.exports = router;

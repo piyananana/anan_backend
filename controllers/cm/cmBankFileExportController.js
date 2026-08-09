@@ -15,9 +15,8 @@ const getPayments = async (req, res) => {
         if (status && status !== 'All') { params.push(status); wheres.push(`p.status=$${params.length}`); }
 
         const r = await client.query(`
-            SELECT p.id, p.ap_doc_no, p.payment_date, p.payment_method,
-                   p.payee_name_th, p.payee_name_en,
-                   p.bank_account_no AS payee_bank_account_no,
+            SELECT p.id, p.ap_doc_no, p.payment_date, p.payment_method_type AS payment_method,
+                   p.payee_name_th,
                    p.check_no, p.check_date,
                    p.amount_lc, p.currency_code, p.status,
                    ba.account_code AS bank_account_code,
@@ -55,7 +54,7 @@ const generateFile = async (req, res) => {
             SELECT p.*,
                    ba.account_code AS bank_account_code,
                    ba.account_name_th AS bank_account_name,
-                   ba.bank_account_no AS bank_own_account_no,
+                   ba.account_number AS bank_own_account_no,
                    cb.bank_code AS bank_code_ref,
                    cb.short_name AS bank_short_name
             FROM cm_payment p
@@ -84,11 +83,11 @@ const generateFile = async (req, res) => {
                 switch (field) {
                     case 'payment_date':     val = p.payment_date ? p.payment_date.toISOString().substring(0,10) : ''; break;
                     case 'payee_name_th':    val = p.payee_name_th || ''; break;
-                    case 'payee_name_en':    val = p.payee_name_en || ''; break;
                     case 'amount_lc':        val = parseFloat(p.amount_lc || 0).toFixed(2); break;
                     case 'check_no':         val = p.check_no || ''; break;
                     case 'check_date':       val = p.check_date ? p.check_date.toISOString().substring(0,10) : ''; break;
-                    case 'payee_bank_account_no': val = p.bank_account_no || p.payee_bank_account_no || ''; break;
+                    // cm_payment has no payee bank account number column — not captured anywhere upstream yet
+                    case 'payee_bank_account_no': val = ''; break;
                     case 'ap_doc_no':        val = p.ap_doc_no || ''; break;
                     case 'bank_code':        val = p.bank_code_ref || ''; break;
                     case 'bank_short_name':  val = p.bank_short_name || ''; break;
