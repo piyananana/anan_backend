@@ -2,14 +2,18 @@
 'use strict';
 
 const { ensureImItemCategoryTable } = require('./imItemCategoryController');
+const { ensureImUomTable } = require('./imUomController');
+const { ensureImWarehouseTable } = require('./imWarehouseController');
 const { generateNextCode } = require('./imItemRunningController');
 
 const ITEM_TYPES = ['STOCK', 'SERVICE', 'NON_STOCK'];
 const COSTING_METHODS = ['FIFO', 'AVG', 'STANDARD'];
 
 const ensureImItemTable = async (client) => {
-    // im_item.category_id references im_item_category, so that table must exist first
+    // im_item.category_id/base_uom_id/default_warehouse_id reference these tables, so they must exist first
     await ensureImItemCategoryTable(client);
+    await ensureImUomTable(client);
+    await ensureImWarehouseTable(client);
     await client.query(`
         CREATE TABLE IF NOT EXISTS im_item (
             id                    SERIAL PRIMARY KEY,
@@ -20,7 +24,7 @@ const ensureImItemTable = async (client) => {
             description           TEXT,
             category_id           INTEGER REFERENCES im_item_category(id),
             item_type             VARCHAR(10)  NOT NULL DEFAULT 'STOCK',
-            base_uom_id           INTEGER,      -- logical FK -> im_uom.id (table not created yet)
+            base_uom_id           INTEGER REFERENCES im_uom(id),
             costing_method        VARCHAR(10)  NOT NULL DEFAULT 'AVG',
             standard_cost         NUMERIC(18,4) NOT NULL DEFAULT 0,
             is_purchase_item      BOOLEAN      NOT NULL DEFAULT true,
@@ -29,7 +33,7 @@ const ensureImItemTable = async (client) => {
             is_lot_tracked        BOOLEAN      NOT NULL DEFAULT false,
             is_serial_tracked     BOOLEAN      NOT NULL DEFAULT false,
             shelf_life_days       INTEGER,
-            default_warehouse_id  INTEGER,      -- logical FK -> im_warehouse.id (table not created yet)
+            default_warehouse_id  INTEGER REFERENCES im_warehouse(id),
             min_stock_qty         NUMERIC(18,4) NOT NULL DEFAULT 0,
             max_stock_qty         NUMERIC(18,4) NOT NULL DEFAULT 0,
             reorder_point         NUMERIC(18,4) NOT NULL DEFAULT 0,
@@ -48,17 +52,40 @@ const ensureImItemTable = async (client) => {
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_im_item_category ON im_item(category_id)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_im_item_barcode  ON im_item(barcode)`);
+    // idempotent migration: attach FKs for tables created before im_uom/im_warehouse existed
+    await client.query(`
+        DO $$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint WHERE conname = 'im_item_base_uom_id_fkey'
+            ) THEN
+                ALTER TABLE im_item ADD CONSTRAINT im_item_base_uom_id_fkey FOREIGN KEY (base_uom_id) REFERENCES im_uom(id);
+            END IF;
+        END $$;
+    `).catch(() => {});
+    await client.query(`
+        DO $$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint WHERE conname = 'im_item_default_warehouse_id_fkey'
+            ) THEN
+                ALTER TABLE im_item ADD CONSTRAINT im_item_default_warehouse_id_fkey FOREIGN KEY (default_warehouse_id) REFERENCES im_warehouse(id);
+            END IF;
+        END $$;
+    `).catch(() => {});
 };
 
 const ITEM_SELECT = `
     SELECT i.*,
            c.category_code AS category_code, c.category_name_th AS category_name,
+           u.uom_code AS base_uom_code, u.uom_name_th AS base_uom_name_th, u.uom_name_en AS base_uom_name_en,
+           w.warehouse_code AS default_warehouse_code, w.warehouse_name_th AS default_warehouse_name_th, w.warehouse_name_en AS default_warehouse_name_en,
            inv.account_code AS inventory_account_code, inv.account_name_thai AS inventory_account_name,
            cogs.account_code AS cogs_account_code,      cogs.account_name_thai AS cogs_account_name,
            rev.account_code AS revenue_account_code,    rev.account_name_thai AS revenue_account_name,
            exp.account_code AS expense_account_code,    exp.account_name_thai AS expense_account_name
     FROM im_item i
     LEFT JOIN im_item_category c ON c.id = i.category_id
+    LEFT JOIN im_uom u ON u.id = i.base_uom_id
+    LEFT JOIN im_warehouse w ON w.id = i.default_warehouse_id
     LEFT JOIN gl_account inv  ON inv.id  = i.inventory_account_id
     LEFT JOIN gl_account cogs ON cogs.id = i.cogs_account_id
     LEFT JOIN gl_account rev  ON rev.id  = i.revenue_account_id

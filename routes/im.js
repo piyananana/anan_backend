@@ -4,6 +4,24 @@ const router = express.Router();
 const imItemCategoryController = require('../controllers/im/imItemCategoryController');
 const imItemController         = require('../controllers/im/imItemController');
 const imItemRunningController  = require('../controllers/im/imItemRunningController');
+const imUomController          = require('../controllers/im/imUomController');
+const imWarehouseController    = require('../controllers/im/imWarehouseController');
+
+// im_warehouse
+router.get('/im_warehouse',        imWarehouseController.fetchRows);
+router.get('/im_warehouse/active', imWarehouseController.fetchActiveRows);
+router.get('/im_warehouse/:id',    imWarehouseController.fetchRow);
+router.post('/im_warehouse',       imWarehouseController.addRow);
+router.put('/im_warehouse/:id',    imWarehouseController.updateRow);
+router.delete('/im_warehouse/:id', imWarehouseController.deleteRow);
+
+// im_uom
+router.get('/im_uom',        imUomController.fetchRows);
+router.get('/im_uom/active', imUomController.fetchActiveRows);
+router.get('/im_uom/:id',    imUomController.fetchRow);
+router.post('/im_uom',       imUomController.addRow);
+router.put('/im_uom/:id',    imUomController.updateRow);
+router.delete('/im_uom/:id', imUomController.deleteRow);
 
 // im_item_category
 router.get('/im_item_category',        imItemCategoryController.fetchRows);
