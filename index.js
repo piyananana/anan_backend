@@ -69,6 +69,11 @@ const cmRoutes = require('./routes/cm');
 app.use('/api/cm', cmRoutes);
 // ----------------
 
+// im = Inventory Management
+const imRoutes = require('./routes/im');
+app.use('/api/im', imRoutes);
+// ----------------
+
 // sa = System Administration
 const saRoutes = require('./routes/sa');
 const saPasswordPolicyController = require('./controllers/sa/saPasswordPolicyController');
