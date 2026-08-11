@@ -5,6 +5,8 @@ const { ensureImItemCategoryTable } = require('./imItemCategoryController');
 const { ensureImUomTable } = require('./imUomController');
 const { ensureImWarehouseTable } = require('./imWarehouseController');
 const { generateNextCode } = require('./imItemRunningController');
+const imUomConversion = require('./imUomConversionController');
+const imItemWarehouse = require('./imItemWarehouseController');
 
 const ITEM_TYPES = ['STOCK', 'SERVICE', 'NON_STOCK'];
 const COSTING_METHODS = ['FIFO', 'AVG', 'STANDARD'];
@@ -52,6 +54,10 @@ const ensureImItemTable = async (client) => {
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_im_item_category ON im_item(category_id)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_im_item_barcode  ON im_item(barcode)`);
+    await imUomConversion.ensureImUomConversionTable(client);
+    await imUomConversion.attachItemFk(client);
+    await imItemWarehouse.ensureImItemWarehouseTable(client);
+    await imItemWarehouse.attachItemFk(client);
     // idempotent migration: attach FKs for tables created before im_uom/im_warehouse existed
     await client.query(`
         DO $$ BEGIN
@@ -129,7 +135,9 @@ const fetchRow = async (req, res) => {
         await ensureImItemTable(client);
         const result = await client.query(`${ITEM_SELECT} WHERE i.id = $1`, [id]);
         if (result.rows.length === 0) return res.status(404).json({ message: 'ไม่พบสินค้า' });
-        res.status(200).json(result.rows[0]);
+        const uomConversions = await imUomConversion.fetchByItem(client, id);
+        const itemWarehouses = await imItemWarehouse.fetchByItem(client, id);
+        res.status(200).json({ ...result.rows[0], uom_conversions: uomConversions, item_warehouses: itemWarehouses });
     } catch (error) {
         console.error('Error fetching im_item row:', error);
         res.status(500).json({ message: 'Internal server error' });
@@ -141,9 +149,10 @@ const addRow = async (req, res) => {
     const b = req.body;
     const userName = req.headers.username || null;
     try {
+        await client.query('BEGIN');
         await ensureImItemTable(client);
         const enumErr = validateEnums(b.item_type, b.costing_method);
-        if (enumErr) return res.status(400).json({ message: enumErr });
+        if (enumErr) { await client.query('ROLLBACK'); return res.status(400).json({ message: enumErr }); }
 
         let finalCode = b.item_code && b.item_code.trim() !== ''
             ? b.item_code.trim().toUpperCase()
@@ -152,6 +161,7 @@ const addRow = async (req, res) => {
             finalCode = await generateNextCode(client);
         }
         if (!finalCode) {
+            await client.query('ROLLBACK');
             return res.status(400).json({ message: 'กรุณาระบุรหัสสินค้า หรือเปิดใช้งานรหัสอัตโนมัติในการตั้งค่า' });
         }
 
@@ -181,9 +191,16 @@ const addRow = async (req, res) => {
                 b.is_active ?? true, userName,
             ]
         );
-        const newRow = await client.query(`${ITEM_SELECT} WHERE i.id = $1`, [result.rows[0].id]);
-        res.status(201).json(newRow.rows[0]);
+        const newId = result.rows[0].id;
+        await imUomConversion.replaceForItem(client, newId, b.uom_conversions);
+        await imItemWarehouse.replaceForItem(client, newId, b.item_warehouses);
+        await client.query('COMMIT');
+        const newRow = await client.query(`${ITEM_SELECT} WHERE i.id = $1`, [newId]);
+        const uomConversions = await imUomConversion.fetchByItem(client, newId);
+        const itemWarehouses = await imItemWarehouse.fetchByItem(client, newId);
+        res.status(201).json({ ...newRow.rows[0], uom_conversions: uomConversions, item_warehouses: itemWarehouses });
     } catch (error) {
+        await client.query('ROLLBACK');
         if (error.code === '23505') return res.status(409).json({ message: `รหัสสินค้า '${b.item_code}' มีอยู่แล้ว` });
         console.error('Error adding im_item:', error);
         res.status(500).json({ message: 'Internal server error' });
@@ -196,9 +213,10 @@ const updateRow = async (req, res) => {
     const b = req.body;
     const userName = req.headers.username || null;
     try {
+        await client.query('BEGIN');
         await ensureImItemTable(client);
         const enumErr = validateEnums(b.item_type, b.costing_method);
-        if (enumErr) return res.status(400).json({ message: enumErr });
+        if (enumErr) { await client.query('ROLLBACK'); return res.status(400).json({ message: enumErr }); }
 
         const result = await client.query(
             `UPDATE im_item SET
@@ -245,10 +263,16 @@ const updateRow = async (req, res) => {
                 b.is_active ?? true, userName, id,
             ]
         );
-        if (result.rows.length === 0) return res.status(404).json({ message: 'ไม่พบสินค้า' });
+        if (result.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'ไม่พบสินค้า' }); }
+        await imUomConversion.replaceForItem(client, id, b.uom_conversions);
+        await imItemWarehouse.replaceForItem(client, id, b.item_warehouses);
+        await client.query('COMMIT');
         const updated = await client.query(`${ITEM_SELECT} WHERE i.id = $1`, [id]);
-        res.status(200).json(updated.rows[0]);
+        const uomConversions = await imUomConversion.fetchByItem(client, id);
+        const itemWarehouses = await imItemWarehouse.fetchByItem(client, id);
+        res.status(200).json({ ...updated.rows[0], uom_conversions: uomConversions, item_warehouses: itemWarehouses });
     } catch (error) {
+        await client.query('ROLLBACK');
         console.error('Error updating im_item:', error);
         res.status(500).json({ message: 'Internal server error' });
     } finally { client.release(); }

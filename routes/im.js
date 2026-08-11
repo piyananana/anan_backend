@@ -7,6 +7,21 @@ const imItemRunningController  = require('../controllers/im/imItemRunningControl
 const imUomController          = require('../controllers/im/imUomController');
 const imWarehouseController    = require('../controllers/im/imWarehouseController');
 const imBomController          = require('../controllers/im/imBomController');
+const imPriceListController    = require('../controllers/im/imPriceListController');
+const imGlAccountSetupController = require('../controllers/im/imGlAccountSetupController');
+
+// im_gl_account_setup (per doc-type GL fallback, for the future im_transaction module)
+router.get('/im_gl_account_setup',           imGlAccountSetupController.fetchRows);
+router.get('/im_gl_account_setup/:doc_code', imGlAccountSetupController.fetchRow);
+router.post('/im_gl_account_setup/:doc_code', imGlAccountSetupController.upsertRow);
+
+// im_price_list (im_price_list + im_price_list_detail)
+router.get('/im_price_list',                     imPriceListController.fetchRows);
+router.get('/im_price_list/:id',                 imPriceListController.fetchRow);
+router.get('/im_price_list_detail/by_item/:itemId', imPriceListController.fetchByItem);
+router.post('/im_price_list',                    imPriceListController.addRow);
+router.put('/im_price_list/:id',                 imPriceListController.updateRow);
+router.delete('/im_price_list/:id',               imPriceListController.deleteRow);
 
 // im_bom (im_bom_header + im_bom_detail)
 router.get('/im_bom',        imBomController.fetchRows);

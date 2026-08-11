@@ -1,6 +1,8 @@
 // controllers/im/imWarehouseController.js
 'use strict';
 
+const imLocation = require('./imLocationController');
+
 const ensureImWarehouseTable = async (client) => {
     await client.query(`
         CREATE TABLE IF NOT EXISTS im_warehouse (
@@ -17,6 +19,8 @@ const ensureImWarehouseTable = async (client) => {
             updated_by         VARCHAR(100)
         )
     `);
+    await imLocation.ensureImLocationTable(client);
+    await imLocation.attachWarehouseFk(client);
 };
 
 const WAREHOUSE_SELECT = `
@@ -58,7 +62,8 @@ const fetchRow = async (req, res) => {
         await ensureImWarehouseTable(client);
         const result = await client.query(`${WAREHOUSE_SELECT} WHERE w.id = $1`, [id]);
         if (result.rows.length === 0) return res.status(404).json({ message: 'ไม่พบคลังสินค้า' });
-        res.status(200).json(result.rows[0]);
+        const locations = await imLocation.fetchByWarehouse(client, id);
+        res.status(200).json({ ...result.rows[0], locations });
     } catch (error) {
         console.error('Error fetching im_warehouse row:', error);
         res.status(500).json({ message: 'Internal server error' });
@@ -67,9 +72,10 @@ const fetchRow = async (req, res) => {
 
 const addRow = async (req, res) => {
     const client = await req.dbPool.connect();
-    const { warehouse_code, warehouse_name_th, warehouse_name_en, branch_id, address, is_active } = req.body;
+    const { warehouse_code, warehouse_name_th, warehouse_name_en, branch_id, address, is_active, locations } = req.body;
     const userName = req.headers.username || null;
     try {
+        await client.query('BEGIN');
         await ensureImWarehouseTable(client);
         const result = await client.query(
             `INSERT INTO im_warehouse (warehouse_code, warehouse_name_th, warehouse_name_en, branch_id, address, is_active, created_by, updated_by)
@@ -77,9 +83,14 @@ const addRow = async (req, res) => {
              RETURNING id`,
             [(warehouse_code || '').trim().toUpperCase(), warehouse_name_th || '', warehouse_name_en || null, branch_id || null, address || null, is_active ?? true, userName]
         );
-        const newRow = await client.query(`${WAREHOUSE_SELECT} WHERE w.id = $1`, [result.rows[0].id]);
-        res.status(201).json(newRow.rows[0]);
+        const newId = result.rows[0].id;
+        await imLocation.replaceForWarehouse(client, newId, locations);
+        await client.query('COMMIT');
+        const newRow = await client.query(`${WAREHOUSE_SELECT} WHERE w.id = $1`, [newId]);
+        const newLocations = await imLocation.fetchByWarehouse(client, newId);
+        res.status(201).json({ ...newRow.rows[0], locations: newLocations });
     } catch (error) {
+        await client.query('ROLLBACK');
         if (error.code === '23505') return res.status(409).json({ message: `รหัสคลังสินค้า '${warehouse_code}' มีอยู่แล้ว` });
         console.error('Error adding im_warehouse:', error);
         res.status(500).json({ message: 'Internal server error' });
@@ -89,9 +100,10 @@ const addRow = async (req, res) => {
 const updateRow = async (req, res) => {
     const { id } = req.params;
     const client = await req.dbPool.connect();
-    const { warehouse_name_th, warehouse_name_en, branch_id, address, is_active } = req.body;
+    const { warehouse_name_th, warehouse_name_en, branch_id, address, is_active, locations } = req.body;
     const userName = req.headers.username || null;
     try {
+        await client.query('BEGIN');
         await ensureImWarehouseTable(client);
         const result = await client.query(
             `UPDATE im_warehouse SET
@@ -101,10 +113,14 @@ const updateRow = async (req, res) => {
              RETURNING id`,
             [warehouse_name_th || '', warehouse_name_en || null, branch_id || null, address || null, is_active ?? true, userName, id]
         );
-        if (result.rows.length === 0) return res.status(404).json({ message: 'ไม่พบคลังสินค้า' });
+        if (result.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'ไม่พบคลังสินค้า' }); }
+        await imLocation.replaceForWarehouse(client, id, locations);
+        await client.query('COMMIT');
         const updated = await client.query(`${WAREHOUSE_SELECT} WHERE w.id = $1`, [id]);
-        res.status(200).json(updated.rows[0]);
+        const updatedLocations = await imLocation.fetchByWarehouse(client, id);
+        res.status(200).json({ ...updated.rows[0], locations: updatedLocations });
     } catch (error) {
+        await client.query('ROLLBACK');
         console.error('Error updating im_warehouse:', error);
         res.status(500).json({ message: 'Internal server error' });
     } finally { client.release(); }
