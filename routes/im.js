@@ -6,6 +6,14 @@ const imItemController         = require('../controllers/im/imItemController');
 const imItemRunningController  = require('../controllers/im/imItemRunningController');
 const imUomController          = require('../controllers/im/imUomController');
 const imWarehouseController    = require('../controllers/im/imWarehouseController');
+const imBomController          = require('../controllers/im/imBomController');
+
+// im_bom (im_bom_header + im_bom_detail)
+router.get('/im_bom',        imBomController.fetchRows);
+router.get('/im_bom/:id',    imBomController.fetchRow);
+router.post('/im_bom',       imBomController.addRow);
+router.put('/im_bom/:id',    imBomController.updateRow);
+router.delete('/im_bom/:id', imBomController.deleteRow);
 
 // im_warehouse
 router.get('/im_warehouse',        imWarehouseController.fetchRows);
