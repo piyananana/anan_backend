@@ -9,6 +9,7 @@ const imWarehouseController    = require('../controllers/im/imWarehouseControlle
 const imBomController          = require('../controllers/im/imBomController');
 const imPriceListController    = require('../controllers/im/imPriceListController');
 const imGlAccountSetupController = require('../controllers/im/imGlAccountSetupController');
+const imItemImportController   = require('../controllers/im/imItemImportController');
 
 // im_gl_account_setup (per doc-type GL fallback, for the future im_transaction module)
 router.get('/im_gl_account_setup',           imGlAccountSetupController.fetchRows);
@@ -53,6 +54,12 @@ router.get('/im_item_category/:id',    imItemCategoryController.fetchRow);
 router.post('/im_item_category',       imItemCategoryController.addRow);
 router.put('/im_item_category/:id',    imItemCategoryController.updateRow);
 router.delete('/im_item_category/:id', imItemCategoryController.deleteRow);
+
+// im_item import
+router.get('/im_item/import/template',          imItemImportController.getTemplate);
+router.get('/im_item/import/template/download', imItemImportController.downloadTemplate);
+router.post('/im_item/import/validate',         imItemImportController.validateFile);
+router.post('/im_item/import/confirm',          imItemImportController.confirmImport);
 
 // im_item
 router.get('/im_item',        imItemController.fetchRows);
