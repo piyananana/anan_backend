@@ -20,6 +20,7 @@ const ensureImItemTable = async (client) => {
         CREATE TABLE IF NOT EXISTS im_item (
             id                    SERIAL PRIMARY KEY,
             item_code             VARCHAR(30)  NOT NULL UNIQUE,
+            old_item_code         VARCHAR(30),
             barcode               VARCHAR(50),
             item_name_th          VARCHAR(200) NOT NULL,
             item_name_en          VARCHAR(200),
@@ -52,8 +53,10 @@ const ensureImItemTable = async (client) => {
             updated_by            VARCHAR(100)
         )
     `);
+    await client.query(`ALTER TABLE im_item ADD COLUMN IF NOT EXISTS old_item_code VARCHAR(30)`).catch(() => {});
     await client.query(`CREATE INDEX IF NOT EXISTS idx_im_item_category ON im_item(category_id)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_im_item_barcode  ON im_item(barcode)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_im_item_old_code ON im_item(old_item_code)`);
     await imUomConversion.ensureImUomConversionTable(client);
     await imUomConversion.attachItemFk(client);
     await imItemWarehouse.ensureImItemWarehouseTable(client);
@@ -117,7 +120,7 @@ const fetchRows = async (req, res) => {
         if (item_type)   { where += ` AND i.item_type = $${pi++}`;   params.push(item_type); }
         if (is_active !== undefined) { where += ` AND i.is_active = $${pi++}`; params.push(is_active === 'true'); }
         if (keyword) {
-            where += ` AND (i.item_code ILIKE $${pi} OR i.item_name_th ILIKE $${pi} OR i.item_name_en ILIKE $${pi} OR i.barcode ILIKE $${pi})`;
+            where += ` AND (i.item_code ILIKE $${pi} OR i.old_item_code ILIKE $${pi} OR i.item_name_th ILIKE $${pi} OR i.item_name_en ILIKE $${pi} OR i.barcode ILIKE $${pi})`;
             params.push(`%${keyword}%`); pi++;
         }
         const result = await client.query(`${ITEM_SELECT} ${where} ORDER BY i.item_code`, params);
@@ -167,7 +170,7 @@ const addRow = async (req, res) => {
 
         const result = await client.query(
             `INSERT INTO im_item
-                (item_code, barcode, item_name_th, item_name_en, description, category_id,
+                (item_code, old_item_code, barcode, item_name_th, item_name_en, description, category_id,
                  item_type, base_uom_id, costing_method, standard_cost,
                  is_purchase_item, is_sales_item, is_manufactured, is_lot_tracked, is_serial_tracked,
                  shelf_life_days, default_warehouse_id,
@@ -175,10 +178,11 @@ const addRow = async (req, res) => {
                  inventory_account_id, cogs_account_id, revenue_account_id, expense_account_id,
                  dim1_id, dim2_id, dim3_id, dim4_id, dim5_id,
                  is_active, created_by, updated_by)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$32)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$33)
              RETURNING id`,
             [
                 finalCode,
+                b.old_item_code || null,
                 b.barcode || null,
                 b.item_name_th || '', b.item_name_en || null, b.description || null, b.category_id || null,
                 b.item_type || 'STOCK', b.base_uom_id || null, b.costing_method || 'AVG', b.standard_cost ?? 0,
@@ -220,37 +224,39 @@ const updateRow = async (req, res) => {
 
         const result = await client.query(
             `UPDATE im_item SET
-                barcode               = $1,
-                item_name_th          = $2,
-                item_name_en          = $3,
-                description           = $4,
-                category_id           = $5,
-                item_type             = $6,
-                base_uom_id           = $7,
-                costing_method        = $8,
-                standard_cost         = $9,
-                is_purchase_item      = $10,
-                is_sales_item         = $11,
-                is_manufactured       = $12,
-                is_lot_tracked        = $13,
-                is_serial_tracked     = $14,
-                shelf_life_days       = $15,
-                default_warehouse_id  = $16,
-                min_stock_qty         = $17,
-                max_stock_qty         = $18,
-                reorder_point         = $19,
-                default_vat_type      = $20,
-                inventory_account_id  = $21,
-                cogs_account_id       = $22,
-                revenue_account_id    = $23,
-                expense_account_id    = $24,
-                dim1_id = $25, dim2_id = $26, dim3_id = $27, dim4_id = $28, dim5_id = $29,
-                is_active             = $30,
-                updated_by            = $31,
+                old_item_code         = $1,
+                barcode               = $2,
+                item_name_th          = $3,
+                item_name_en          = $4,
+                description           = $5,
+                category_id           = $6,
+                item_type             = $7,
+                base_uom_id           = $8,
+                costing_method        = $9,
+                standard_cost         = $10,
+                is_purchase_item      = $11,
+                is_sales_item         = $12,
+                is_manufactured       = $13,
+                is_lot_tracked        = $14,
+                is_serial_tracked     = $15,
+                shelf_life_days       = $16,
+                default_warehouse_id  = $17,
+                min_stock_qty         = $18,
+                max_stock_qty         = $19,
+                reorder_point         = $20,
+                default_vat_type      = $21,
+                inventory_account_id  = $22,
+                cogs_account_id       = $23,
+                revenue_account_id    = $24,
+                expense_account_id    = $25,
+                dim1_id = $26, dim2_id = $27, dim3_id = $28, dim4_id = $29, dim5_id = $30,
+                is_active             = $31,
+                updated_by            = $32,
                 updated_at            = NOW()
-             WHERE id = $32
+             WHERE id = $33
              RETURNING id`,
             [
+                b.old_item_code || null,
                 b.barcode || null,
                 b.item_name_th || '', b.item_name_en || null, b.description || null, b.category_id || null,
                 b.item_type || 'STOCK', b.base_uom_id || null, b.costing_method || 'AVG', b.standard_cost ?? 0,
