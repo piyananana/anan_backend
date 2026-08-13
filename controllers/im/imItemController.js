@@ -9,7 +9,7 @@ const imUomConversion = require('./imUomConversionController');
 const imItemWarehouse = require('./imItemWarehouseController');
 
 const ITEM_TYPES = ['STOCK', 'SERVICE', 'NON_STOCK'];
-const COSTING_METHODS = ['FIFO', 'AVG', 'STANDARD'];
+const COSTING_METHODS = ['FIFO', 'AVG', 'STANDARD', 'SPECIFIC'];
 
 const ensureImItemTable = async (client) => {
     // im_item.category_id/base_uom_id/default_warehouse_id reference these tables, so they must exist first
@@ -102,6 +102,10 @@ const ITEM_SELECT = `
     LEFT JOIN gl_account exp  ON exp.id  = i.expense_account_id
 `;
 
+// costing_method='SPECIFIC' (ต้นทุนเฉพาะเจาะจงตาม serial) ต้องติดตาม serial เสมอ — บังคับให้ตรงกันเสมอ
+const resolveIsSerialTracked = (costing_method, is_serial_tracked) =>
+    costing_method === 'SPECIFIC' ? true : (is_serial_tracked ?? false);
+
 const validateEnums = (item_type, costing_method) => {
     if (item_type && !ITEM_TYPES.includes(item_type)) return `item_type ต้องเป็นหนึ่งใน ${ITEM_TYPES.join(', ')}`;
     if (costing_method && !COSTING_METHODS.includes(costing_method)) return `costing_method ต้องเป็นหนึ่งใน ${COSTING_METHODS.join(', ')}`;
@@ -192,7 +196,7 @@ const addRow = async (req, res) => {
                 b.item_name_th || '', b.item_name_en || null, b.description || null, b.category_id || null,
                 b.item_type || 'STOCK', b.base_uom_id || null, b.costing_method || 'AVG', b.standard_cost ?? 0,
                 b.is_purchase_item ?? true, b.is_sales_item ?? true, b.is_manufactured ?? false,
-                b.is_lot_tracked ?? false, b.is_serial_tracked ?? false,
+                b.is_lot_tracked ?? false, resolveIsSerialTracked(b.costing_method, b.is_serial_tracked),
                 b.shelf_life_days || null, b.default_warehouse_id || null,
                 b.min_stock_qty ?? 0, b.max_stock_qty ?? 0, b.reorder_point ?? 0, b.default_vat_type || 'VAT7',
                 b.inventory_account_id || null, b.cogs_account_id || null, b.revenue_account_id || null, b.expense_account_id || null,
@@ -289,7 +293,7 @@ const updateRow = async (req, res) => {
                 b.item_name_th || '', b.item_name_en || null, b.description || null, b.category_id || null,
                 b.item_type || 'STOCK', b.base_uom_id || null, b.costing_method || 'AVG', b.standard_cost ?? 0,
                 b.is_purchase_item ?? true, b.is_sales_item ?? true, b.is_manufactured ?? false,
-                b.is_lot_tracked ?? false, b.is_serial_tracked ?? false,
+                b.is_lot_tracked ?? false, resolveIsSerialTracked(b.costing_method, b.is_serial_tracked),
                 b.shelf_life_days || null, b.default_warehouse_id || null,
                 b.min_stock_qty ?? 0, b.max_stock_qty ?? 0, b.reorder_point ?? 0, b.default_vat_type || 'VAT7',
                 b.inventory_account_id || null, b.cogs_account_id || null, b.revenue_account_id || null, b.expense_account_id || null,

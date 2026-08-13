@@ -9,7 +9,7 @@ const imItemWarehouse = require('./imItemWarehouseController');
 const upload = multer({ storage: multer.memoryStorage() });
 
 const ITEM_TYPES = ['STOCK', 'SERVICE', 'NON_STOCK'];
-const COSTING_METHODS = ['FIFO', 'AVG', 'STANDARD'];
+const COSTING_METHODS = ['FIFO', 'AVG', 'STANDARD', 'SPECIFIC'];
 const YES_VALUES = ['y', 'yes', 'true', '1', 'ใช่'];
 
 // ---------------------------------------------------------------------------
@@ -332,7 +332,8 @@ const validateFile = [
         item.is_sales_item     = get('is_sales_item')     ? parseBool(get('is_sales_item'))     : true;
         item.is_manufactured   = parseBool(get('is_manufactured'));
         item.is_lot_tracked    = parseBool(get('is_lot_tracked'));
-        item.is_serial_tracked = parseBool(get('is_serial_tracked'));
+        // costing_method='SPECIFIC' (ต้นทุนเฉพาะเจาะจงตาม serial) ต้องติดตาม serial เสมอ
+        item.is_serial_tracked = costingMethod === 'SPECIFIC' ? true : parseBool(get('is_serial_tracked'));
 
         items.set(oldCode, item);
         order.push(oldCode);
