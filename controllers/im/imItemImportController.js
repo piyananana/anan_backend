@@ -439,10 +439,12 @@ const validateFile = [
 
         item.item_warehouses.push({
           warehouse_id:        warehouse.id,
+          warehouse_code:      warehouseCode,
           min_stock_qty:       numField('min_stock_qty', 'สต็อกขั้นต่ำ'),
           max_stock_qty:       numField('max_stock_qty', 'สต็อกสูงสุด'),
           reorder_point:       numField('reorder_point', 'จุดสั่งซื้อ'),
           default_location_id: defaultLocationId,
+          location_code:       defaultLocationId ? locationCode : null,
         });
       }
 
