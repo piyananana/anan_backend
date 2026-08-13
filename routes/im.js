@@ -10,6 +10,7 @@ const imBomController          = require('../controllers/im/imBomController');
 const imPriceListController    = require('../controllers/im/imPriceListController');
 const imGlAccountSetupController = require('../controllers/im/imGlAccountSetupController');
 const imItemImportController   = require('../controllers/im/imItemImportController');
+const imLocationController     = require('../controllers/im/imLocationController');
 
 // im_gl_account_setup (per doc-type GL fallback, for the future im_transaction module)
 router.get('/im_gl_account_setup',           imGlAccountSetupController.fetchRows);
@@ -38,6 +39,14 @@ router.get('/im_warehouse/:id',    imWarehouseController.fetchRow);
 router.post('/im_warehouse',       imWarehouseController.addRow);
 router.put('/im_warehouse/:id',    imWarehouseController.updateRow);
 router.delete('/im_warehouse/:id', imWarehouseController.deleteRow);
+
+// im_location (ผังตำแหน่งจัดเก็บ — โซน/แถว/ช่องเก็บ ต่อคลังสินค้า)
+router.get('/im_location',        imLocationController.fetchRows);
+router.get('/im_location/active', imLocationController.fetchActiveRows);
+router.get('/im_location/:id',    imLocationController.fetchRow);
+router.post('/im_location',       imLocationController.addRow);
+router.put('/im_location/:id',    imLocationController.updateRow);
+router.delete('/im_location/:id', imLocationController.deleteRow);
 
 // im_uom
 router.get('/im_uom',        imUomController.fetchRows);
