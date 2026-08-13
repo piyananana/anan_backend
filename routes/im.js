@@ -11,6 +11,7 @@ const imPriceListController    = require('../controllers/im/imPriceListControlle
 const imGlAccountSetupController = require('../controllers/im/imGlAccountSetupController');
 const imItemImportController   = require('../controllers/im/imItemImportController');
 const imLocationController     = require('../controllers/im/imLocationController');
+const imLocationImportController = require('../controllers/im/imLocationImportController');
 const imStockBalanceController = require('../controllers/im/imStockBalanceController');
 const imStockLayerController   = require('../controllers/im/imStockLayerController');
 
@@ -49,6 +50,12 @@ router.get('/im_location/:id',    imLocationController.fetchRow);
 router.post('/im_location',       imLocationController.addRow);
 router.put('/im_location/:id',    imLocationController.updateRow);
 router.delete('/im_location/:id', imLocationController.deleteRow);
+
+// im_location import
+router.get('/im_location/import/template',          imLocationImportController.getTemplate);
+router.get('/im_location/import/template/download', imLocationImportController.downloadTemplate);
+router.post('/im_location/import/validate',         imLocationImportController.validateFile);
+router.post('/im_location/import/confirm',          imLocationImportController.confirmImport);
 
 // im_stock_balance / im_stock_layer (sub-ledger — อ่านอย่างเดียว เขียนโดยการ Post ใบนับสต็อกเท่านั้น)
 router.get('/im_stock_balance', imStockBalanceController.fetchRows);
