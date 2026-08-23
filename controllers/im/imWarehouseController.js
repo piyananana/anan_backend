@@ -20,6 +20,8 @@ const ensureImWarehouseTable = async (client) => {
             updated_by         VARCHAR(100)
         )
     `);
+    // เผื่อสำหรับ TRF (โอนสินค้า) — override บัญชีสต็อกของ im_item เมื่อผังบัญชีถูกแยกตามคลังในอนาคต; ยังไม่ตั้งค่าที่ใดวันนี้
+    await client.query(`ALTER TABLE im_warehouse ADD COLUMN IF NOT EXISTS inventory_account_id INTEGER REFERENCES gl_account(id)`).catch(() => {});
 };
 
 const WAREHOUSE_SELECT = `

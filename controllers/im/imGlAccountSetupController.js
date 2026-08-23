@@ -1,24 +1,25 @@
 // controllers/im/imGlAccountSetupController.js
 'use strict';
 
-// Fixed structural mapping from IM doc_code (sa_module_document.doc_code, e.g. 'GRN') ->
-// which module/doc_code it pushes to when posted. Keyed by the same doc_code values
-// configured in sa_module_document for sys_module='31' (see sys_doc_type alongside each
-// for cross-reference against imSysDocType in lib/sa/models/sa_anan_module.dart):
-//   GRN(10) RTS(15) CNS(20) DNS(25) DLN(30) RTC(35) CNC(40) DNC(45) ISS(60) TRF(70) AJS(80)
+// Fixed structural mapping from IM sys_doc_type (the standard enum in imSysDocType,
+// lib/sa/models/sa_anan_module.dart) -> which module/doc_code it pushes to when posted.
+// Keyed by sys_doc_type, NOT doc_code — each sys_doc_type may have multiple doc_code
+// instances configured under it (e.g. 'GRN1', 'GRN2' both sys_doc_type='10'), each with
+// its own GL account setup row, but all sharing the same structural routing behavior:
+//   10=GRN 15=RTS 20=CNS 25=DNS 30=DLN 35=RTC 40=CNC 45=DNC 60=ISS 70=TRF 80=AJS
 // This is architecture, not admin-editable config — computed on read, never stored.
 const DOC_TYPE_TARGET = {
-    'GRN': { target_module: 'AP',   target_doc_code: '10' }, // รับสินค้า          -> AP Billing
-    'RTS': { target_module: 'AP',   target_doc_code: '50' }, // คืนสินค้า          -> AP CN
-    'CNS': { target_module: 'AP',   target_doc_code: '50' }, // ลดหนี้เจ้าหนี้      -> AP CN
-    'DNS': { target_module: 'AP',   target_doc_code: '30' }, // เพิ่มหนี้เจ้าหนี้    -> AP DN
-    'DLN': { target_module: 'AR',   target_doc_code: '10' }, // ส่งสินค้า (ขาย)     -> AR Billing
-    'RTC': { target_module: 'AR',   target_doc_code: '50' }, // รับคืนสินค้า        -> AR CN
-    'CNC': { target_module: 'AR',   target_doc_code: '50' }, // ลดหนี้ลูกหนี้       -> AR CN
-    'DNC': { target_module: 'AR',   target_doc_code: '30' }, // เพิ่มหนี้ลูกหนี้     -> AR DN
-    'ISS': { target_module: 'NONE', target_doc_code: null }, // เบิกสินค้า
-    'TRF': { target_module: 'NONE', target_doc_code: null }, // โอนสินค้า
-    'AJS': { target_module: 'NONE', target_doc_code: null }, // ปรับยอดสินค้า
+    '10': { target_module: 'AP',   target_doc_code: '10' }, // รับสินค้า (GRN)      -> AP Billing
+    '15': { target_module: 'AP',   target_doc_code: '50' }, // คืนสินค้า (RTS)      -> AP CN
+    '20': { target_module: 'AP',   target_doc_code: '50' }, // ลดหนี้เจ้าหนี้ (CNS)  -> AP CN
+    '25': { target_module: 'AP',   target_doc_code: '30' }, // เพิ่มหนี้เจ้าหนี้ (DNS) -> AP DN
+    '30': { target_module: 'AR',   target_doc_code: '10' }, // ส่งสินค้า (DLN)      -> AR Billing
+    '35': { target_module: 'AR',   target_doc_code: '50' }, // รับคืนสินค้า (RTC)   -> AR CN
+    '40': { target_module: 'AR',   target_doc_code: '50' }, // ลดหนี้ลูกหนี้ (CNC)  -> AR CN
+    '45': { target_module: 'AR',   target_doc_code: '30' }, // เพิ่มหนี้ลูกหนี้ (DNC) -> AR DN
+    '60': { target_module: 'NONE', target_doc_code: null }, // เบิกสินค้า (ISS)
+    '70': { target_module: 'NONE', target_doc_code: null }, // โอนสินค้า (TRF)
+    '80': { target_module: 'NONE', target_doc_code: null }, // ปรับยอดสินค้า (AJS)
 };
 
 const ensureImGlAccountSetupTable = async (client) => {
@@ -68,8 +69,8 @@ const SETUP_SELECT = `
 
 const withTarget = (row) => ({
     ...row,
-    target_module: DOC_TYPE_TARGET[row.doc_code]?.target_module ?? 'NONE',
-    target_doc_code: DOC_TYPE_TARGET[row.doc_code]?.target_doc_code ?? null,
+    target_module: DOC_TYPE_TARGET[row.sys_doc_type]?.target_module ?? 'NONE',
+    target_doc_code: DOC_TYPE_TARGET[row.sys_doc_type]?.target_doc_code ?? null,
 });
 
 // GET all IM doc_codes with setup data

@@ -35,6 +35,8 @@ const ensureImLocationTable = async (client) => {
     await client.query(`ALTER TABLE im_location ADD COLUMN IF NOT EXISTS level         SMALLINT NOT NULL DEFAULT 1`).catch(() => {});
     await client.query(`ALTER TABLE im_location ADD COLUMN IF NOT EXISTS location_type VARCHAR(10) NOT NULL DEFAULT 'BIN'`).catch(() => {});
     await client.query(`ALTER TABLE im_location ADD COLUMN IF NOT EXISTS category_id   INTEGER REFERENCES im_item_category(id)`).catch(() => {});
+    // ลำดับการเดินตรวจนับสต็อก (ใบตรวจนับ im_stock_count) — ไม่ระบุ = เรียงตาม location_code แทน
+    await client.query(`ALTER TABLE im_location ADD COLUMN IF NOT EXISTS sort_order    INTEGER`).catch(() => {});
     await client.query(`ALTER TABLE im_location ADD COLUMN IF NOT EXISTS created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()`).catch(() => {});
     await client.query(`ALTER TABLE im_location ADD COLUMN IF NOT EXISTS updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()`).catch(() => {});
     await client.query(`ALTER TABLE im_location ADD COLUMN IF NOT EXISTS created_by    VARCHAR(100)`).catch(() => {});
@@ -104,7 +106,7 @@ const addRow = async (req, res) => {
     const client = await req.dbPool.connect();
     const {
         warehouse_id, location_code, location_name, parent_id, location_type,
-        category_id, is_active,
+        category_id, is_active, sort_order,
     } = req.body;
     const userName = req.headers.username || null;
     try {
@@ -139,8 +141,8 @@ const addRow = async (req, res) => {
         const result = await client.query(
             `INSERT INTO im_location
                 (warehouse_id, location_code, location_name, parent_id, level, location_type, category_id, is_active,
-                 created_by, updated_by)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)
+                 sort_order, created_by, updated_by)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10)
              RETURNING id`,
             [
                 warehouse_id,
@@ -151,6 +153,7 @@ const addRow = async (req, res) => {
                 finalType,
                 finalType === 'BIN' ? (category_id || null) : null,
                 is_active ?? true,
+                sort_order ?? null,
                 userName,
             ]
         );
@@ -165,7 +168,7 @@ const addRow = async (req, res) => {
 const updateRow = async (req, res) => {
     const { id } = req.params;
     const client = await req.dbPool.connect();
-    const { location_code, location_name, parent_id, location_type, category_id, is_active } = req.body;
+    const { location_code, location_name, parent_id, location_type, category_id, is_active, sort_order } = req.body;
     const userName = req.headers.username || null;
     try {
         await ensureImLocationTable(client);
@@ -205,9 +208,9 @@ const updateRow = async (req, res) => {
         const result = await client.query(
             `UPDATE im_location SET
                 location_code = $1, location_name = $2, parent_id = $3, level = $4,
-                location_type = $5, category_id = $6, is_active = $7,
-                updated_by = $8, updated_at = NOW()
-             WHERE id = $9
+                location_type = $5, category_id = $6, is_active = $7, sort_order = $8,
+                updated_by = $9, updated_at = NOW()
+             WHERE id = $10
              RETURNING id`,
             [
                 (location_code || '').trim().toUpperCase(),
@@ -217,6 +220,7 @@ const updateRow = async (req, res) => {
                 finalType,
                 finalType === 'BIN' ? (category_id || null) : null,
                 is_active ?? true,
+                sort_order ?? null,
                 userName,
                 id,
             ]
