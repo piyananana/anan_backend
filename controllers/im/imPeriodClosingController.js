@@ -104,9 +104,24 @@ const computeEndingValue = async (client) => {
     return Number(res.rows[0].total) || 0;
 };
 
-// TODO(GRN): เมื่อ GRN โพสต์เข้าบัญชีซื้อ (im_accounting_setting.purchases_account_id) แล้ว ให้รวมยอดจาก
-// gl_entry_detail ของบัญชีนั้นในช่วงวันที่ของงวดนี้แทนค่า 0 คงที่ด้านล่าง — ตอนนี้ GRN ยังไม่มี (defer)
-const computePurchasesValue = async (client, periodId) => 0;
+// ยอดซื้อสินค้าระหว่างงวด = ผลรวม debit ของบัญชี purchases_account_id (im_accounting_setting) ในงวดนี้ — ไม่สนว่า
+// ใครเป็นผู้ Post (GRN '10' ผ่าน postGlEntry ของ IM เอง หรือ GRN Billing '11' ผ่าน ap_transaction ที่สร้างอัตโนมัติ
+// ก็ตกลงมาที่บัญชีนี้บัญชีเดียวกัน จึงรวมยอดได้ถูกต้องโดยไม่ต้องแยก branch ตาม doc type)
+const computePurchasesValue = async (client, periodId) => {
+    const setting = await fetchSettingRow(client);
+    if (!setting?.purchases_account_id) return 0;
+    const periodRes = await client.query(`SELECT period_start_date, period_end_date FROM gl_posting_period WHERE id = $1`, [periodId]);
+    if (periodRes.rows.length === 0) throw new Error('ไม่พบงวดบัญชี');
+    const { period_start_date, period_end_date } = periodRes.rows[0];
+    const res = await client.query(`
+        SELECT COALESCE(SUM(gd.debit_lc), 0) AS total
+        FROM gl_entry_detail gd
+        JOIN gl_entry_header gh ON gh.id = gd.header_id
+        WHERE gd.account_id = $1 AND gh.status = 'Posted'
+          AND gh.doc_date BETWEEN $2 AND $3
+    `, [setting.purchases_account_id, period_start_date, period_end_date]);
+    return Number(res.rows[0].total) || 0;
+};
 
 // ต้นงวด = ปลายงวดของงวดก่อนหน้าที่ปิดไปแล้ว (chain) — แถวแรกสุดถูก seed ตอนสลับโหมดเป็น PERIODIC (ดู
 // imAccountingSettingController.js: upsertSetting) ด้วยมูลค่าสต็อก ณ ตอนสลับ จึงมี anchor เสมอสำหรับงวดแรก

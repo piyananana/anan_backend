@@ -440,10 +440,10 @@ const fetchMyPending = async (req, res) => {
 
 // --- GET open invoices for payment run picker ---
 const fetchOpenInvoicesForRun = async (req, res) => {
-    const { vendor_code, date_from, date_to, payment_method_id, due_date_max } = req.query;
+    const { vendor_code, date_from, date_to, payment_method_id, due_date_max, ref_no } = req.query;
     await req.dbPool.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS payment_method_id INTEGER`).catch(() => {});
     let query = `
-        SELECT t.id AS txn_id, t.doc_no, t.doc_date, t.due_date,
+        SELECT t.id AS txn_id, t.doc_no, t.doc_date, t.due_date, t.ref_no,
                t.total_amount_lc, t.balance_amount_lc,
                t.currency_code, t.exchange_rate,
                v.id AS vendor_id, v.vendor_code, v.vendor_name_th, v.vendor_name_en,
@@ -459,6 +459,8 @@ const fetchOpenInvoicesForRun = async (req, res) => {
     const params = [];
     let pi = 1;
     if (vendor_code) { params.push(`%${vendor_code.toUpperCase()}%`); query += ` AND UPPER(v.vendor_code) LIKE $${pi++}`; }
+    // ค้นหาด้วยเลขที่ใบกำกับสินค้าผู้ขาย — ref_no คือฟิลด์ที่ GRN Billing ('11' ใน IM) บันทึกไว้ตอนสร้างใบตั้งหนี้อัตโนมัติ
+    if (ref_no)      { params.push(`%${ref_no.toUpperCase()}%`); query += ` AND UPPER(COALESCE(t.ref_no,'')) LIKE $${pi++}`; }
     if (date_from)   { params.push(date_from); query += ` AND t.doc_date >= $${pi++}`; }
     if (date_to)     { params.push(date_to);   query += ` AND t.doc_date <= $${pi++}`; }
     // ใช้กรองเจ้าหนี้ — เฉพาะเจ้าหนี้ที่ตั้ง "ประเภทการชำระหลัก" ตรงกับที่เลือกในใบอนุมัติจ่าย

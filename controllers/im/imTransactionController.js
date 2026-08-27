@@ -10,7 +10,7 @@ const { ensureImUomTable } = require('./imUomController');
 const { ensureImStockBalanceTable } = require('./imStockBalanceController');
 const { ensureImStockLayerTable } = require('./imStockLayerController');
 const { fetchSetupByDocCode } = require('./imGlAccountSetupController');
-const { fetchMode } = require('./imAccountingSettingController');
+const { fetchMode, fetchSettingRow } = require('./imAccountingSettingController');
 
 // --- Schema ---
 const ensureImTransactionTable = async (client) => {
@@ -79,6 +79,12 @@ const ensureImTransactionTable = async (client) => {
     await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS to_location_id             INTEGER REFERENCES im_location(id)`).catch(() => {});
     await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS to_balance_qty_before      NUMERIC(18,4)`).catch(() => {});
     await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS to_balance_avg_cost_before NUMERIC(18,4)`).catch(() => {});
+
+    // สำหรับ GRN ('10' รับสินค้า / '11' รับสินค้า+ตั้งหนี้อัตโนมัติ) — ผู้ขาย + ลิงก์ไปยัง ap_transaction ที่สร้างให้
+    await client.query(`ALTER TABLE im_transaction ADD COLUMN IF NOT EXISTS vendor_id               INTEGER REFERENCES ap_vendor(id)`).catch(() => {});
+    await client.query(`ALTER TABLE im_transaction ADD COLUMN IF NOT EXISTS vendor_code             VARCHAR(20)`).catch(() => {});
+    await client.query(`ALTER TABLE im_transaction ADD COLUMN IF NOT EXISTS vendor_name_th          VARCHAR(200)`).catch(() => {});
+    await client.query(`ALTER TABLE im_transaction ADD COLUMN IF NOT EXISTS linked_ap_transaction_id INTEGER`).catch(() => {});
 
     // audit ของการตัดต้นทุนจาก layer เดิม (FIFO/SPECIFIC เมื่อ variance ติดลบ) — ใช้ตอน Void เพื่อคืนค่า remaining_qty ให้ตรงเป๊ะ
     await client.query(`
@@ -437,12 +443,17 @@ const resolveCounterAccount = (sysDocType, setup) => {
                 throw new Error(`ยังไม่ได้ตั้งค่าบัญชีต้นทุน (cogs_account_id) ใน im_gl_account_setup สำหรับประเภทเอกสารนี้`);
             }
             return { accountId: Number(setup.cogs_account_id), label: 'เบิกใช้สินค้า' };
+        case '10': // GRN — รับสินค้า (ไม่มีเลขที่อ้างอิง): พักไว้รอ AP ตั้งหนี้เอง
+            if (!setup.grir_account_id) {
+                throw new Error(`ยังไม่ได้ตั้งค่าบัญชีพักรอใบกำกับ (grir_account_id) ใน im_gl_account_setup สำหรับประเภทเอกสารนี้`);
+            }
+            return { accountId: Number(setup.grir_account_id), label: 'รับสินค้า (รอใบกำกับ)' };
         default:
             throw new Error(`ยังไม่รองรับการ Post บัญชีสำหรับประเภทเอกสารนี้ (sys_doc_type='${sysDocType}')`);
     }
 };
 
-const postGlEntry = async (client, headerId, header, details, docNo, sysDocType) => {
+const postGlEntry = async (client, headerId, header, details, docNo, sysDocType, mode) => {
     const periodRes = await client.query(
         `SELECT id FROM gl_posting_period WHERE $1::date BETWEEN period_start_date AND period_end_date AND gl_status = 'OPEN' AND im_status != 'CLOSED' LIMIT 1`,
         [header.doc_date]
@@ -473,6 +484,38 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType)
             glDetails.push({
                 account_id: Number(accId), description: `โอนสินค้า ${docNo}`,
                 debit_lc: amt > 0 ? amt : 0, credit_lc: amt < 0 ? -amt : 0, debit_fc: 0, credit_fc: 0,
+            });
+        }
+    } else if (sysDocType === '10') {
+        // GRN — รับสินค้า (ไม่มีเลขที่อ้างอิง): Dr คลัง (Perpetual) หรือ Dr ซื้อสินค้า (Periodic) / Cr พักรอใบกำกับ (GR/IR)
+        // ทั้งสองโหมด Post ที่นี่เสมอ (ต่างจาก AJS/ISS/TRF ที่ถูกระงับใน Periodic) เพราะ GR/IR ต้องขยับทันทีที่รับของจริง
+        const { accountId: counterAccountId, label: counterLabel } = resolveCounterAccount(sysDocType, setup);
+        let purchasesAccountId = null;
+        if (mode === 'PERIODIC') {
+            const setting = await fetchSettingRow(client);
+            if (!setting?.purchases_account_id) {
+                throw new Error('ยังไม่ได้ตั้งค่าบัญชีซื้อสินค้า (purchases_account_id) ใน ตั้งค่าบัญชีสินค้าคงคลัง IM สำหรับโหมด Periodic');
+            }
+            purchasesAccountId = Number(setting.purchases_account_id);
+        }
+        let totalValue = 0;
+        for (const d of details) {
+            const invAcc = purchasesAccountId || await resolveInventoryAccount(client, d.item_id, header.warehouse_id, setup.inventory_account_id);
+            const value = Number(d.qty) * Number(d.unit_cost);
+            invDebitByAccount[invAcc] = (invDebitByAccount[invAcc] || 0) + value;
+            totalValue += value;
+        }
+        for (const [accId, amt] of Object.entries(invDebitByAccount)) {
+            if (amt === 0) continue;
+            glDetails.push({
+                account_id: Number(accId), description: `${counterLabel} ${docNo}`,
+                debit_lc: amt > 0 ? amt : 0, credit_lc: amt < 0 ? -amt : 0, debit_fc: 0, credit_fc: 0,
+            });
+        }
+        if (totalValue !== 0) {
+            glDetails.push({
+                account_id: counterAccountId, description: `${counterLabel} ${docNo}`,
+                debit_lc: totalValue < 0 ? -totalValue : 0, credit_lc: totalValue > 0 ? totalValue : 0, debit_fc: 0, credit_fc: 0,
             });
         }
     } else {
@@ -538,6 +581,139 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType)
     return glEntryId;
 };
 
+// GRN Billing (sys_doc_type='11') — สร้าง+โพสต์ ap_transaction (ใบกำกับสินค้า) อัตโนมัติแทนการ Post GL ของ IM เอง
+// ตามธรรมเนียมเดียวกับ postCmPaymentHelper/postCmReceiptsHelper ใน ap/arTransactionController.js: INSERT ตรงเข้า
+// ตารางของอีกโมดูลด้วย client เดียวกัน ไม่เรียกผ่าน createTransaction ของ AP (จัดการ BEGIN/COMMIT เอง เรียกข้าม
+// transaction ที่เปิดอยู่ไม่ได้) — v1: ไม่มี VAT/WHT, ผู้ใช้ AP แก้ไขเพิ่มเติมได้เองภายหลังถ้าจำเป็น
+const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoiceNo, mode }) => {
+    if (!header.vendor_id) throw new Error('ต้องระบุผู้ขายสำหรับเอกสารประเภทนี้');
+    if (!vendorInvoiceNo) throw new Error('ต้องระบุเลขที่ใบกำกับสินค้าผู้ขายสำหรับเอกสารประเภทนี้');
+
+    const apDocRes = await client.query(`
+        SELECT id, doc_code FROM sa_module_document
+        WHERE sys_module='21' AND sys_doc_type='10' AND is_doc_type=true AND is_active=true
+        ORDER BY sort_order LIMIT 1
+    `);
+    if (apDocRes.rows.length === 0) throw new Error('ไม่พบประเภทเอกสารใบกำกับสินค้า (Purchase Invoice) ในโมดูล AP');
+    const apDocId = apDocRes.rows[0].id;
+    const apDocCode = apDocRes.rows[0].doc_code;
+
+    const apSetupRes = await client.query(`SELECT * FROM ap_gl_account_setup WHERE doc_code = $1`, [apDocCode]);
+    const apSetup = apSetupRes.rows[0] || null;
+    if (!apSetup?.gl_doc_id) throw new Error('ยังไม่ได้ตั้งค่า GL Document Type ใน ap_gl_account_setup สำหรับใบกำกับสินค้า');
+
+    let apAccountId = apSetup.ap_account_id ? Number(apSetup.ap_account_id) : null;
+    if (!apAccountId) {
+        const vendorAcctRes = await client.query(`SELECT ap_account_id FROM ap_vendor WHERE id = $1`, [header.vendor_id]);
+        apAccountId = vendorAcctRes.rows[0]?.ap_account_id ? Number(vendorAcctRes.rows[0].ap_account_id) : null;
+    }
+    if (!apAccountId) throw new Error('ไม่พบบัญชีเจ้าหนี้สำหรับการลงบัญชี กรุณาตั้งค่าใน ap_gl_account_setup หรือผู้ขาย');
+
+    let purchasesAccountId = null;
+    if (mode === 'PERIODIC') {
+        const setting = await fetchSettingRow(client);
+        if (!setting?.purchases_account_id) {
+            throw new Error('ยังไม่ได้ตั้งค่าบัญชีซื้อสินค้า (purchases_account_id) ใน ตั้งค่าบัญชีสินค้าคงคลัง IM สำหรับโหมด Periodic');
+        }
+        purchasesAccountId = Number(setting.purchases_account_id);
+    }
+
+    const vendorRow = await client.query(`SELECT vendor_code, vendor_name_th FROM ap_vendor WHERE id = $1`, [header.vendor_id]);
+    const vendorCode = vendorRow.rows[0]?.vendor_code || null;
+    const vendorNameTh = vendorRow.rows[0]?.vendor_name_th || null;
+
+    const periodRes = await client.query(
+        `SELECT id FROM gl_posting_period WHERE $1::date BETWEEN period_start_date AND period_end_date AND gl_status='OPEN' AND ap_status != 'CLOSED' LIMIT 1`,
+        [header.doc_date]
+    );
+    if (periodRes.rows.length === 0) throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่ ${header.doc_date}`);
+    const periodId = periodRes.rows[0].id;
+
+    let apDocNo = await generateDocNo(client, apDocId, header.doc_date, header.branch_id);
+    if (!apDocNo) apDocNo = `PI-${docNo}`;
+
+    let createdByUserId = null;
+    if (header.created_by) {
+        const userRes = await client.query(`SELECT id FROM sa_user WHERE user_name = $1 LIMIT 1`, [header.created_by]);
+        if (userRes.rows.length > 0) createdByUserId = userRes.rows[0].id;
+    }
+
+    const lineRows = [];
+    let totalAmount = 0;
+    for (const d of details) {
+        const expenseAccountId = purchasesAccountId
+            || await resolveInventoryAccount(client, d.item_id, header.warehouse_id, apSetup.expense_account_id);
+        const qty = Number(d.qty);
+        const unitCost = Number(d.unit_cost);
+        const amount = qty * unitCost;
+        lineRows.push({ itemCode: d.item_code, itemName: d.item_name, quantity: qty, unitPriceFc: unitCost, amount, expenseAccountId });
+        totalAmount += amount;
+    }
+
+    const apHeaderRes = await client.query(`
+        INSERT INTO ap_transaction
+        (doc_id, doc_no, doc_date, period_id, vendor_id, vendor_code, vendor_name_th, ap_account_id, gl_doc_id,
+         currency_code, exchange_rate, subtotal_fc, before_vat_fc, total_amount_fc, subtotal_lc, before_vat_lc, total_amount_lc,
+         balance_amount_lc, ref_no, ref_doc_id, ref_doc_no, description, status, created_by, updated_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'THB',1,$10,$10,$10,$10,$10,$10,$10,$11,$12,$13,$14,'Posted',$15,$15)
+        RETURNING id
+    `, [
+        apDocId, apDocNo, header.doc_date, periodId, header.vendor_id, vendorCode, vendorNameTh, apAccountId, apSetup.gl_doc_id,
+        totalAmount, vendorInvoiceNo, header.doc_id, docNo, `ใบกำกับสินค้าจากการรับสินค้า ${docNo}`, createdByUserId,
+    ]);
+    const apTransactionId = apHeaderRes.rows[0].id;
+
+    let lineNo = 1;
+    for (const l of lineRows) {
+        await client.query(`
+            INSERT INTO ap_transaction_detail
+            (header_id, line_no, description, quantity, unit_price_fc, subtotal_fc, total_amount_fc, expense_account_id, subtotal_lc, total_amount_lc)
+            VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$6,$6)
+        `, [apTransactionId, lineNo++, l.itemName || l.itemCode, l.quantity, l.unitPriceFc, l.amount, l.expenseAccountId]);
+    }
+
+    const expDebitByAccount = {};
+    for (const l of lineRows) {
+        expDebitByAccount[l.expenseAccountId] = (expDebitByAccount[l.expenseAccountId] || 0) + l.amount;
+    }
+    const apGlDetails = [];
+    for (const [accId, amt] of Object.entries(expDebitByAccount)) {
+        if (amt === 0) continue;
+        apGlDetails.push({ account_id: Number(accId), description: `ใบกำกับสินค้า ${apDocNo}`, debit_lc: amt, credit_lc: 0 });
+    }
+    if (totalAmount !== 0) {
+        apGlDetails.push({ account_id: apAccountId, description: `ใบกำกับสินค้า ${apDocNo}`, debit_lc: 0, credit_lc: totalAmount });
+    }
+
+    if (apGlDetails.length > 0) {
+        const totalDebit = apGlDetails.reduce((s, l) => s + l.debit_lc, 0);
+        const totalCredit = apGlDetails.reduce((s, l) => s + l.credit_lc, 0);
+        const apGlHeaderRes = await client.query(`
+            INSERT INTO gl_entry_header
+            (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
+             currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
+             created_by, ref_doc_id, ref_doc_no, external_source_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'Posted',$9,$10,0,0,$11,$12,$13,$14)
+            RETURNING id
+        `, [
+            apSetup.gl_doc_id, `GL-${apDocNo}`, header.doc_date, header.doc_date, periodId,
+            vendorInvoiceNo, `ใบกำกับสินค้าจากการรับสินค้า ${docNo}`,
+            1, totalDebit, totalCredit, createdByUserId, apDocId, apDocNo, apTransactionId,
+        ]);
+        const apGlEntryId = apGlHeaderRes.rows[0].id;
+        let glLineNo = 1;
+        for (const l of apGlDetails) {
+            await client.query(`
+                INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
+                VALUES ($1,$2,$3,$4,$5,$6,0,0)
+            `, [apGlEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc]);
+        }
+        await client.query(`UPDATE ap_transaction SET gl_entry_id = $1 WHERE id = $2`, [apGlEntryId, apTransactionId]);
+    }
+
+    return apTransactionId;
+};
+
 // นับสต็อก + โพสต์ GL สำหรับทุกบรรทัดของเอกสาร — ใช้ทั้งใน createTransaction(action=Post) และ postTransaction
 const postDetailLines = async (client, headerId, header, docNo) => {
     const docTypeRes = await client.query(
@@ -593,12 +769,22 @@ const postDetailLines = async (client, headerId, header, docNo) => {
         updatedDetails.push({ ...d, qty: varianceQty, unit_cost: actualUnitCost, total_value_lc: valueLc });
     }
     // Periodic mode: ไม่ Post GL ต่อธุรกรรมเลย (ยังอัปเดต subledger เหมือนเดิมทุกประการ) — COGS ทั้งหมดคำนวณครั้งเดียว
-    // ตอนปิดงวดใน imPeriodClosingController.js แทน — ดู pattern_im_periodic_accounting_mode
+    // ตอนปิดงวดใน imPeriodClosingController.js แทน — ดู pattern_im_periodic_accounting_mode — ยกเว้น '10' (GRN ไม่มี
+    // เลขที่อ้างอิง) ที่ต้อง Post เสมอทั้งสองโหมด เพราะ GR/IR ต้องขยับทันทีที่รับของจริง (ดู postGlEntry) และ '11'
+    // (GRN Billing) ที่ไม่ Post ผ่านทางนี้เลยไม่ว่าโหมดใด เพราะ ap_transaction ที่สร้างอัตโนมัติมี entry ของตัวเองแล้ว
     const mode = await fetchMode(client);
-    const glEntryId = mode === 'PERIODIC' ? null : await postGlEntry(client, headerId, header, updatedDetails, docNo, sysDocType);
+    let glEntryId = null;
+    let linkedApTransactionId = null;
+    if (sysDocType === '11') {
+        linkedApTransactionId = await postApBillFromGrn(client, {
+            header, details: updatedDetails, docNo, vendorInvoiceNo: header.ref_no, mode,
+        });
+    } else if (sysDocType === '10' || mode !== 'PERIODIC') {
+        glEntryId = await postGlEntry(client, headerId, header, updatedDetails, docNo, sysDocType, mode);
+    }
     await client.query(`
-        UPDATE im_transaction SET status='Posted', gl_entry_id=$1, total_qty=$2, total_value_lc=$3, updated_at=NOW() WHERE id=$4
-    `, [glEntryId, totalQty, totalValue, headerId]);
+        UPDATE im_transaction SET status='Posted', gl_entry_id=$1, linked_ap_transaction_id=$2, total_qty=$3, total_value_lc=$4, updated_at=NOW() WHERE id=$5
+    `, [glEntryId, linkedApTransactionId, totalQty, totalValue, headerId]);
     return glEntryId;
 };
 
@@ -716,7 +902,7 @@ const fetchSystemQty = async (req, res) => {
 // (2) imStockCountController.closeCount เรียกตรงๆ ด้วย sysDocType='80' (มาตรฐาน AJS) โดยไม่เจาะจง doc_code —
 //     ให้ resolve เอาเองว่าจะใช้ doc_code ไหนใต้มาตรฐานนี้ (เผื่อมีหลาย doc_code ต่อ sys_doc_type)
 const insertAndPostAdjustment = async (client, {
-    docId, docCode, sysDocType, docNo, docDate, warehouseId, toWarehouseId,
+    docId, docCode, sysDocType, docNo, docDate, warehouseId, toWarehouseId, vendorId,
     refNo, refDocId, refDocNo, description,
     dim1Id, dim2Id, dim3Id, dim4Id, dim5Id, branchId, createdBy,
     lines, action,
@@ -756,6 +942,20 @@ const insertAndPostAdjustment = async (client, {
     if (resolvedSysDocType === '70' && !toWarehouseId) {
         throw new Error('กรุณาระบุคลังปลายทาง (to_warehouse_id) สำหรับเอกสารประเภทโอนสินค้า');
     }
+    if ((resolvedSysDocType === '10' || resolvedSysDocType === '11') && !vendorId) {
+        throw new Error('กรุณาระบุผู้ขาย สำหรับเอกสารประเภทรับสินค้า');
+    }
+    if (resolvedSysDocType === '11' && !refNo) {
+        throw new Error('กรุณาระบุเลขที่ใบกำกับสินค้าผู้ขาย สำหรับเอกสารประเภทรับสินค้า+ตั้งหนี้อัตโนมัติ');
+    }
+
+    let vendorCode = null, vendorNameTh = null;
+    if (vendorId) {
+        const vendorRes = await client.query(`SELECT vendor_code, vendor_name_th FROM ap_vendor WHERE id = $1`, [vendorId]);
+        if (vendorRes.rows.length === 0) throw new Error('ไม่พบผู้ขายที่ระบุ');
+        vendorCode = vendorRes.rows[0].vendor_code;
+        vendorNameTh = vendorRes.rows[0].vendor_name_th;
+    }
 
     const periodRes = await client.query(
         `SELECT id FROM gl_posting_period WHERE $1::date BETWEEN period_start_date AND period_end_date AND gl_status = 'OPEN' AND im_status != 'CLOSED' LIMIT 1`,
@@ -775,12 +975,14 @@ const insertAndPostAdjustment = async (client, {
     const hRes = await client.query(`
         INSERT INTO im_transaction
         (doc_id, doc_no, doc_code, doc_date, period_id, warehouse_id, to_warehouse_id,
+         vendor_id, vendor_code, vendor_name_th,
          ref_no, ref_doc_id, ref_doc_no, description, status,
          dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id, created_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
         RETURNING id
     `, [
         resolvedDocId, finalDocNo, resolvedDocCode, docDate, periodId, warehouseId, toWarehouseId || null,
+        vendorId || null, vendorCode, vendorNameTh,
         refNo || null, refDocId || null, refDocNo || null, description || null, 'Draft',
         dim1Id || null, dim2Id || null, dim3Id || null, dim4Id || null, dim5Id || null,
         branchId || null, createdBy || null,
@@ -803,7 +1005,8 @@ const insertAndPostAdjustment = async (client, {
 
     if ((action || 'Post') === 'Post') {
         const headerForPost = {
-            doc_code: resolvedDocCode, doc_date: docDate, warehouse_id: warehouseId, to_warehouse_id: toWarehouseId || null,
+            doc_id: resolvedDocId, doc_code: resolvedDocCode, doc_date: docDate, warehouse_id: warehouseId, to_warehouse_id: toWarehouseId || null,
+            vendor_id: vendorId || null,
             ref_no: refNo, description,
             dim1_id: dim1Id, dim2_id: dim2Id, dim3_id: dim3Id, dim4_id: dim4Id, dim5_id: dim5Id,
             branch_id: branchId, created_by: createdBy, updated_by: createdBy,
@@ -823,7 +1026,7 @@ const createTransaction = async (req, res) => {
 
         const newHeaderId = await insertAndPostAdjustment(client, {
             docId: header.doc_id, docNo: header.doc_no, docDate: header.doc_date,
-            warehouseId: header.warehouse_id, toWarehouseId: header.to_warehouse_id,
+            warehouseId: header.warehouse_id, toWarehouseId: header.to_warehouse_id, vendorId: header.vendor_id,
             refNo: header.ref_no, refDocId: header.ref_doc_id, refDocNo: header.ref_doc_no,
             description: header.description,
             dim1Id: header.dim1_id, dim2Id: header.dim2_id, dim3Id: header.dim3_id,
@@ -858,6 +1061,20 @@ const updateTransaction = async (req, res) => {
         if (existing.rows[0].sys_doc_type === '70' && !header.to_warehouse_id) {
             throw new Error('กรุณาระบุคลังปลายทาง (to_warehouse_id) สำหรับเอกสารประเภทโอนสินค้า');
         }
+        if ((existing.rows[0].sys_doc_type === '10' || existing.rows[0].sys_doc_type === '11') && !header.vendor_id) {
+            throw new Error('กรุณาระบุผู้ขาย สำหรับเอกสารประเภทรับสินค้า');
+        }
+        if (existing.rows[0].sys_doc_type === '11' && !header.ref_no) {
+            throw new Error('กรุณาระบุเลขที่ใบกำกับสินค้าผู้ขาย สำหรับเอกสารประเภทรับสินค้า+ตั้งหนี้อัตโนมัติ');
+        }
+
+        let vendorCode = null, vendorNameTh = null;
+        if (header.vendor_id) {
+            const vendorRes = await client.query(`SELECT vendor_code, vendor_name_th FROM ap_vendor WHERE id = $1`, [header.vendor_id]);
+            if (vendorRes.rows.length === 0) throw new Error('ไม่พบผู้ขายที่ระบุ');
+            vendorCode = vendorRes.rows[0].vendor_code;
+            vendorNameTh = vendorRes.rows[0].vendor_name_th;
+        }
 
         const periodRes = await client.query(
             `SELECT id FROM gl_posting_period WHERE $1::date BETWEEN period_start_date AND period_end_date AND gl_status = 'OPEN' AND im_status != 'CLOSED' LIMIT 1`,
@@ -871,12 +1088,14 @@ const updateTransaction = async (req, res) => {
         await client.query(`
             UPDATE im_transaction SET
                 doc_date=$1, period_id=$2, warehouse_id=$3, to_warehouse_id=$4,
-                ref_no=$5, ref_doc_id=$6, ref_doc_no=$7, description=$8,
-                dim1_id=$9, dim2_id=$10, dim3_id=$11, dim4_id=$12, dim5_id=$13,
-                branch_id=$14, updated_by=$15, updated_at=NOW()
-            WHERE id=$16
+                vendor_id=$5, vendor_code=$6, vendor_name_th=$7,
+                ref_no=$8, ref_doc_id=$9, ref_doc_no=$10, description=$11,
+                dim1_id=$12, dim2_id=$13, dim3_id=$14, dim4_id=$15, dim5_id=$16,
+                branch_id=$17, updated_by=$18, updated_at=NOW()
+            WHERE id=$19
         `, [
             header.doc_date, periodId, header.warehouse_id, header.to_warehouse_id || null,
+            header.vendor_id || null, vendorCode, vendorNameTh,
             header.ref_no || null, header.ref_doc_id || null, header.ref_doc_no || null, header.description || null,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
             header.branch_id || null, header.updated_by || null, id,
@@ -946,6 +1165,25 @@ const voidTransaction = async (req, res) => {
         if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
         const tx = existing.rows[0];
         if (tx.status !== 'Posted') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'Void ได้เฉพาะเอกสารที่ Posted แล้วเท่านั้น' }); }
+
+        // GRN Billing ('11') สร้าง ap_transaction ไว้ — ต้อง Void ตามด้วยเสมอ เว้นแต่มีการจ่ายชำระ/จับคู่ไปแล้ว
+        if (tx.linked_ap_transaction_id) {
+            const apRes = await client.query(`SELECT * FROM ap_transaction WHERE id = $1 FOR UPDATE`, [tx.linked_ap_transaction_id]);
+            const apTx = apRes.rows[0];
+            if (apTx && apTx.status !== 'Void') {
+                const appliedRes = await client.query(
+                    `SELECT COUNT(*) FROM ap_transaction_apply WHERE applied_to_id = $1`,
+                    [tx.linked_ap_transaction_id]
+                );
+                if (Number(appliedRes.rows[0].count) > 0 || Number(apTx.paid_amount_lc) > 0) {
+                    throw new Error('ไม่สามารถ Void ได้ เนื่องจากใบตั้งหนี้ที่สร้างจากเอกสารนี้มีการจ่ายชำระ/จับคู่ไปแล้วในโมดูล AP');
+                }
+                if (apTx.gl_entry_id) {
+                    await client.query(`UPDATE gl_entry_header SET status='Void', updated_at=NOW() WHERE id=$1`, [apTx.gl_entry_id]);
+                }
+                await client.query(`UPDATE ap_transaction SET status='Void', updated_at=NOW() WHERE id=$1`, [tx.linked_ap_transaction_id]);
+            }
+        }
 
         await reverseStockMovement(client, id);
 

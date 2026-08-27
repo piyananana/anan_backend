@@ -9,7 +9,8 @@
 //   10=GRN 15=RTS 20=CNS 25=DNS 30=DLN 35=RTC 40=CNC 45=DNC 60=ISS 70=TRF 80=AJS
 // This is architecture, not admin-editable config — computed on read, never stored.
 const DOC_TYPE_TARGET = {
-    '10': { target_module: 'AP',   target_doc_code: '10' }, // รับสินค้า (GRN)      -> AP Billing
+    '10': { target_module: 'AP',   target_doc_code: '10' }, // รับสินค้า (GRN, ไม่มีเลขที่อ้างอิง) -> AP ตั้งหนี้เองภายหลัง
+    '11': { target_module: 'AP',   target_doc_code: '10' }, // รับสินค้า+ตั้งหนี้อัตโนมัติ (GRN Billing) -> AP Billing
     '15': { target_module: 'AP',   target_doc_code: '50' }, // คืนสินค้า (RTS)      -> AP CN
     '20': { target_module: 'AP',   target_doc_code: '50' }, // ลดหนี้เจ้าหนี้ (CNS)  -> AP CN
     '25': { target_module: 'AP',   target_doc_code: '30' }, // เพิ่มหนี้เจ้าหนี้ (DNS) -> AP DN
@@ -38,6 +39,8 @@ const ensureImGlAccountSetupTable = async (client) => {
             updated_by            VARCHAR(100)
         )
     `);
+    // บัญชีพักรอใบกำกับ (GR/IR clearing) — ใช้เฉพาะ sys_doc_type='10' (GRN ไม่มีเลขที่อ้างอิง)
+    await client.query(`ALTER TABLE im_gl_account_setup ADD COLUMN IF NOT EXISTS grir_account_id INTEGER REFERENCES gl_account(id)`).catch(() => {});
 };
 
 // Driven by sa_module_document (sys_module='31') so the left panel always reflects the
@@ -54,6 +57,7 @@ const SETUP_SELECT = `
         s.cogs_account_id,      cogs.account_code AS cogs_account_code,      cogs.account_name_thai AS cogs_account_name,
         s.variance_account_id,  var.account_code  AS variance_account_code, var.account_name_thai  AS variance_account_name,
         s.wip_account_id,       wip.account_code  AS wip_account_code,      wip.account_name_thai  AS wip_account_name,
+        s.grir_account_id,      grir.account_code AS grir_account_code,     grir.account_name_thai AS grir_account_name,
         s.gl_doc_id,             gl_d.doc_code AS gl_doc_code,               gl_d.doc_name_thai AS gl_doc_name,
         s.created_at, s.updated_at, s.created_by, s.updated_by
     FROM sa_module_document d
@@ -62,6 +66,7 @@ const SETUP_SELECT = `
     LEFT JOIN gl_account cogs        ON cogs.id = s.cogs_account_id
     LEFT JOIN gl_account var         ON var.id  = s.variance_account_id
     LEFT JOIN gl_account wip         ON wip.id  = s.wip_account_id
+    LEFT JOIN gl_account grir        ON grir.id = s.grir_account_id
     LEFT JOIN sa_module_document gl_d ON gl_d.id = s.gl_doc_id
     WHERE d.sys_module = '31'
       AND d.is_doc_type = true
@@ -105,7 +110,7 @@ const fetchRow = async (req, res) => {
 // target_module/target_doc_code are derived (see withTarget), never stored.
 const upsertRow = async (req, res) => {
     const { doc_code } = req.params;
-    const { inventory_account_id, cogs_account_id, variance_account_id, wip_account_id, gl_doc_id } = req.body;
+    const { inventory_account_id, cogs_account_id, variance_account_id, wip_account_id, grir_account_id, gl_doc_id } = req.body;
     const userName = req.headers.username || null;
     const client = await req.dbPool.connect();
     try {
@@ -120,18 +125,19 @@ const upsertRow = async (req, res) => {
 
         await client.query(
             `INSERT INTO im_gl_account_setup
-                (doc_code, inventory_account_id, cogs_account_id, variance_account_id, wip_account_id, gl_doc_id, created_by, updated_by)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$7)
+                (doc_code, inventory_account_id, cogs_account_id, variance_account_id, wip_account_id, grir_account_id, gl_doc_id, created_by, updated_by)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)
              ON CONFLICT (doc_code) DO UPDATE SET
                 inventory_account_id = EXCLUDED.inventory_account_id,
                 cogs_account_id      = EXCLUDED.cogs_account_id,
                 variance_account_id  = EXCLUDED.variance_account_id,
                 wip_account_id       = EXCLUDED.wip_account_id,
+                grir_account_id      = EXCLUDED.grir_account_id,
                 gl_doc_id            = EXCLUDED.gl_doc_id,
                 updated_by           = EXCLUDED.updated_by,
                 updated_at           = NOW()`,
             [doc_code, inventory_account_id || null, cogs_account_id || null, variance_account_id || null,
-             wip_account_id || null, gl_doc_id || null, userName]
+             wip_account_id || null, grir_account_id || null, gl_doc_id || null, userName]
         );
 
         const updated = await client.query(`${SETUP_SELECT} AND d.doc_code = $1`, [doc_code]);

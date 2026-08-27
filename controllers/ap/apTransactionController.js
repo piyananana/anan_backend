@@ -859,7 +859,7 @@ const fetchOpenInvoices = async (req, res) => {
     if (!vendor_id) return res.status(400).json({ message: 'vendor_id required' });
     try {
         const result = await req.dbPool.query(`
-            SELECT t.id, t.doc_no, t.doc_date, t.due_date,
+            SELECT t.id, t.doc_no, t.doc_date, t.due_date, t.ref_no,
                    t.total_amount_lc, t.balance_amount_lc,
                    t.currency_code, t.exchange_rate,
                    d.doc_code, d.sys_doc_type
