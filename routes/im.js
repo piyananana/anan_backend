@@ -20,6 +20,7 @@ const imStockCountRunningController = require('../controllers/im/imStockCountRun
 const imOpeningBalanceImportController = require('../controllers/im/imOpeningBalanceImportController');
 const imAccountingSettingController = require('../controllers/im/imAccountingSettingController');
 const imPeriodClosingController = require('../controllers/im/imPeriodClosingController');
+const imGrBillingReportController = require('../controllers/im/imGrBillingReportController');
 
 // im_gl_account_setup (per doc-type GL fallback, for the future im_transaction module)
 router.get('/im_gl_account_setup',           imGlAccountSetupController.fetchRows);
@@ -69,11 +70,13 @@ router.get('/im_stock_layer',   imStockLayerController.fetchRows);
 
 // im_transaction (v1: doc_code='AJS' — ตั้งยอดสินค้าด้วยการนับสต็อค; ISS/TRF/GRN/DLN family เพิ่มทีหลังในหน้าจอเดียวกัน)
 router.get('/im_transaction/system_qty', imTransactionController.fetchSystemQty);
+router.get('/im_transaction/gr_billing_report', imGrBillingReportController.getGrBillingReport);
 router.get('/im_transaction',            imTransactionController.fetchRows);
 router.get('/im_transaction/:id',        imTransactionController.fetchRow);
 router.post('/im_transaction',           imTransactionController.createTransaction);
 router.put('/im_transaction/:id',        imTransactionController.updateTransaction);
 router.put('/im_transaction/:id/post',   imTransactionController.postTransaction);
+router.put('/im_transaction/:id/post_billing', imTransactionController.postBillingForGrn);
 router.put('/im_transaction/:id/void',   imTransactionController.voidTransaction);
 router.delete('/im_transaction/:id',     imTransactionController.deleteTransaction);
 

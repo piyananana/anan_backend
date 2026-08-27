@@ -86,6 +86,9 @@ const ensureImTransactionTable = async (client) => {
     await client.query(`ALTER TABLE im_transaction ADD COLUMN IF NOT EXISTS vendor_name_th          VARCHAR(200)`).catch(() => {});
     await client.query(`ALTER TABLE im_transaction ADD COLUMN IF NOT EXISTS linked_ap_transaction_id INTEGER`).catch(() => {});
 
+    // สำหรับ '12' (รับสินค้า รอตั้งหนี้) — ต้นทุนจริงตามใบกำกับ (อาจต่างจาก unit_cost ที่ใช้ตีมูลค่าสต็อกตอนรับของ)
+    await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS billed_unit_cost NUMERIC(18,4)`).catch(() => {});
+
     // audit ของการตัดต้นทุนจาก layer เดิม (FIFO/SPECIFIC เมื่อ variance ติดลบ) — ใช้ตอน Void เพื่อคืนค่า remaining_qty ให้ตรงเป๊ะ
     await client.query(`
         CREATE TABLE IF NOT EXISTS im_stock_layer_consumption (
@@ -768,6 +771,15 @@ const postDetailLines = async (client, headerId, header, docNo) => {
         totalValue += valueLc;
         updatedDetails.push({ ...d, qty: varianceQty, unit_cost: actualUnitCost, total_value_lc: valueLc });
     }
+    // '12' (รับสินค้า รอตั้งหนี้): Post IM อย่างเดียว — อัปเดต subledger ตามปกติ แต่ไม่แตะ GL/AP เลย จนกว่าจะ Post
+    // AP/GL แยกต่างหากทีหลัง (postApBillingForGrn) เมื่อได้ใบกำกับจริงจากผู้ขาย — สถานะจึงเป็น 'Received' ไม่ใช่ 'Posted'
+    if (sysDocType === '12') {
+        await client.query(`
+            UPDATE im_transaction SET status='Received', total_qty=$1, total_value_lc=$2, updated_at=NOW() WHERE id=$3
+        `, [totalQty, totalValue, headerId]);
+        return null;
+    }
+
     // Periodic mode: ไม่ Post GL ต่อธุรกรรมเลย (ยังอัปเดต subledger เหมือนเดิมทุกประการ) — COGS ทั้งหมดคำนวณครั้งเดียว
     // ตอนปิดงวดใน imPeriodClosingController.js แทน — ดู pattern_im_periodic_accounting_mode — ยกเว้น '10' (GRN ไม่มี
     // เลขที่อ้างอิง) ที่ต้อง Post เสมอทั้งสองโหมด เพราะ GR/IR ต้องขยับทันทีที่รับของจริง (ดู postGlEntry) และ '11'
@@ -942,7 +954,7 @@ const insertAndPostAdjustment = async (client, {
     if (resolvedSysDocType === '70' && !toWarehouseId) {
         throw new Error('กรุณาระบุคลังปลายทาง (to_warehouse_id) สำหรับเอกสารประเภทโอนสินค้า');
     }
-    if ((resolvedSysDocType === '10' || resolvedSysDocType === '11') && !vendorId) {
+    if (['10', '11', '12'].includes(resolvedSysDocType) && !vendorId) {
         throw new Error('กรุณาระบุผู้ขาย สำหรับเอกสารประเภทรับสินค้า');
     }
     if (resolvedSysDocType === '11' && !refNo) {
@@ -1057,11 +1069,29 @@ const updateTransaction = async (req, res) => {
             JOIN sa_module_document d ON d.id = t.doc_id WHERE t.id=$1
         `, [id]);
         if (existing.rows.length === 0) throw new Error('Not found');
+
+        // '12' (รับสินค้า รอตั้งหนี้) ที่อยู่สถานะ Received: แก้ได้แค่เลขที่ใบกำกับ + billed cost รายบรรทัด — ไม่แตะ
+        // จำนวน/สินค้า/คลัง เพราะรับของจริงไปแล้ว ไม่ใช่ flow เดียวกับการแก้ไข Draft ทั่วไป จึงแยก branch ต่างหาก
+        if (existing.rows[0].status === 'Received' && existing.rows[0].sys_doc_type === '12') {
+            await client.query(`UPDATE im_transaction SET ref_no=$1, updated_by=$2, updated_at=NOW() WHERE id=$3`,
+                [header.ref_no || null, header.updated_by || null, id]);
+            for (const d of details || []) {
+                if (!d.id) continue;
+                await client.query(
+                    `UPDATE im_transaction_detail SET billed_unit_cost=$1 WHERE id=$2 AND header_id=$3`,
+                    [d.billed_unit_cost ?? null, d.id, id]
+                );
+            }
+            await client.query('COMMIT');
+            const full = await fetchRowById(req.dbPool, id);
+            return res.status(200).json(full);
+        }
+
         if (existing.rows[0].status !== 'Draft') throw new Error('แก้ไขได้เฉพาะเอกสาร Draft เท่านั้น');
         if (existing.rows[0].sys_doc_type === '70' && !header.to_warehouse_id) {
             throw new Error('กรุณาระบุคลังปลายทาง (to_warehouse_id) สำหรับเอกสารประเภทโอนสินค้า');
         }
-        if ((existing.rows[0].sys_doc_type === '10' || existing.rows[0].sys_doc_type === '11') && !header.vendor_id) {
+        if (['10', '11', '12'].includes(existing.rows[0].sys_doc_type) && !header.vendor_id) {
             throw new Error('กรุณาระบุผู้ขาย สำหรับเอกสารประเภทรับสินค้า');
         }
         if (existing.rows[0].sys_doc_type === '11' && !header.ref_no) {
@@ -1155,6 +1185,75 @@ const postTransaction = async (req, res) => {
     } finally { client.release(); }
 };
 
+// --- 2c. Post AP/GL for a 'Received' '12' (รับสินค้า รอตั้งหนี้) — ครั้งที่สองเมื่อได้ใบกำกับจริงจากผู้ขายแล้ว
+// รับ ref_no (เลขที่ใบกำกับผู้ขาย) + billed costs รายบรรทัดมาอัปเดตในคำขอเดียวกันได้เลย (ไม่บังคับต้อง Save แยกก่อน)
+// แล้วเรียก postApBillFromGrn ตัวเดียวกับที่ '11' ใช้ ด้วยต้นทุนตามใบกำกับ (ไม่ใช่ unit_cost ที่ตีมูลค่าสต็อกไปแล้ว)
+const postBillingForGrn = async (req, res) => {
+    const { id } = req.params;
+    const { ref_no: refNoBody, lines } = req.body || {};
+    const userName = req.headers.username || null;
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        const existing = await client.query(`
+            SELECT t.*, d.doc_code AS d_doc_code, d.sys_doc_type FROM im_transaction t
+            JOIN sa_module_document d ON d.id = t.doc_id WHERE t.id=$1 FOR UPDATE`, [id]);
+        if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
+        const tx = existing.rows[0];
+        if (tx.sys_doc_type !== '12') {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ message: 'ใช้ได้เฉพาะเอกสารประเภทรับสินค้า (รอตั้งหนี้) เท่านั้น' });
+        }
+        if (tx.status !== 'Received') {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ message: 'Post AP/GL ได้เฉพาะเอกสารที่ Post IM แล้ว (สถานะ Received) เท่านั้น' });
+        }
+
+        const refNo = refNoBody || tx.ref_no;
+        if (!refNo) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ message: 'กรุณาระบุเลขที่ใบกำกับสินค้าผู้ขาย' });
+        }
+
+        // บันทึกเลขที่ใบกำกับ + billed cost รายบรรทัด (ถ้าส่งมาในคำขอนี้) ก่อน Post
+        if (refNoBody) {
+            await client.query(`UPDATE im_transaction SET ref_no=$1, updated_by=$2, updated_at=NOW() WHERE id=$3`, [refNoBody, userName, id]);
+        }
+        if (Array.isArray(lines)) {
+            for (const l of lines) {
+                if (!l.id) continue;
+                await client.query(
+                    `UPDATE im_transaction_detail SET billed_unit_cost=$1 WHERE id=$2 AND header_id=$3`,
+                    [l.billed_unit_cost ?? null, l.id, id]
+                );
+            }
+        }
+
+        const detailsRes = await client.query(`SELECT * FROM im_transaction_detail WHERE header_id=$1 ORDER BY line_no`, [id]);
+        const billedDetails = detailsRes.rows.map((d) => ({
+            ...d, unit_cost: d.billed_unit_cost ?? d.unit_cost,
+        }));
+
+        const mode = await fetchMode(client);
+        const headerForBilling = { ...tx, doc_code: tx.doc_code || tx.d_doc_code, updated_by: userName };
+        const apTransactionId = await postApBillFromGrn(client, {
+            header: headerForBilling, details: billedDetails, docNo: tx.doc_no, vendorInvoiceNo: refNo, mode,
+        });
+
+        await client.query(`
+            UPDATE im_transaction SET status='Posted', linked_ap_transaction_id=$1, updated_by=$2, updated_at=NOW() WHERE id=$3
+        `, [apTransactionId, userName, id]);
+
+        await client.query('COMMIT');
+        const full = await fetchRowById(req.dbPool, id);
+        res.status(200).json(full);
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error posting AP/GL billing for im_transaction:', error);
+        res.status(500).json({ message: error.message || 'Internal server error' });
+    } finally { client.release(); }
+};
+
 // --- 3. Void ---
 const voidTransaction = async (req, res) => {
     const { id } = req.params;
@@ -1164,7 +1263,11 @@ const voidTransaction = async (req, res) => {
         const existing = await client.query(`SELECT * FROM im_transaction WHERE id=$1 FOR UPDATE`, [id]);
         if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
         const tx = existing.rows[0];
-        if (tx.status !== 'Posted') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'Void ได้เฉพาะเอกสารที่ Posted แล้วเท่านั้น' }); }
+        // 'Received' = '12' ที่ Post IM แล้วแต่ยังไม่ Post AP/GL — Void ได้เหมือนกัน แค่ยังไม่มี GL/AP ให้ย้อนกลับ
+        if (tx.status !== 'Posted' && tx.status !== 'Received') {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ message: 'Void ได้เฉพาะเอกสารที่ Posted หรือ Received แล้วเท่านั้น' });
+        }
 
         // GRN Billing ('11') สร้าง ap_transaction ไว้ — ต้อง Void ตามด้วยเสมอ เว้นแต่มีการจ่ายชำระ/จับคู่ไปแล้ว
         if (tx.linked_ap_transaction_id) {
@@ -1223,7 +1326,7 @@ const deleteTransaction = async (req, res) => {
 module.exports = {
     ensureImTransactionTable,
     fetchRows, fetchRow, fetchSystemQty,
-    createTransaction, updateTransaction, postTransaction, voidTransaction, deleteTransaction,
+    createTransaction, updateTransaction, postTransaction, postBillingForGrn, voidTransaction, deleteTransaction,
     insertAndPostAdjustment, STOCK_BALANCE_KEY,
     upsertStockBalance, recomputeBalanceFromLayers,
     generateDocNo,
