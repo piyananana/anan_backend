@@ -14,7 +14,9 @@ const DOC_TYPE_TARGET = {
     '15': { target_module: 'AP',   target_doc_code: '50' }, // คืนสินค้า (RTS)      -> AP CN
     '20': { target_module: 'AP',   target_doc_code: '50' }, // ลดหนี้เจ้าหนี้ (CNS)  -> AP CN
     '25': { target_module: 'AP',   target_doc_code: '30' }, // เพิ่มหนี้เจ้าหนี้ (DNS) -> AP DN
-    '30': { target_module: 'AR',   target_doc_code: '10' }, // ส่งสินค้า (DLN)      -> AR Billing
+    '30': { target_module: 'AR',   target_doc_code: '10' }, // ส่งสินค้า (DLN)      -> AR Billing (ตั้งหนี้เองภายหลัง)
+    '31': { target_module: 'AR',   target_doc_code: '10' }, // ส่งสินค้า+ตั้งหนี้อัตโนมัติ (DLN Billing) -> AR Billing
+    '32': { target_module: 'AR',   target_doc_code: '10' }, // ส่งสินค้ารอตั้งหนี้ (DLN Deferred Billing) -> AR Billing
     '35': { target_module: 'AR',   target_doc_code: '50' }, // รับคืนสินค้า (RTC)   -> AR CN
     '40': { target_module: 'AR',   target_doc_code: '50' }, // ลดหนี้ลูกหนี้ (CNC)  -> AR CN
     '45': { target_module: 'AR',   target_doc_code: '30' }, // เพิ่มหนี้ลูกหนี้ (DNC) -> AR DN
