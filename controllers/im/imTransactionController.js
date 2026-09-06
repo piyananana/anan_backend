@@ -890,15 +890,15 @@ const postArBillFromDln = async (client, { header, details, docNo }) => {
 
     const arHeaderRes = await client.query(`
         INSERT INTO ar_transaction
-        (doc_id, doc_no, doc_date, period_id, customer_id, customer_code, customer_name_th, ar_account_id, gl_doc_id,
+        (doc_id, doc_no, doc_date, period_id, customer_id, customer_code, customer_name_th, ar_account_id,
          currency_code, exchange_rate, subtotal_fc, before_vat_fc, vat_amount_fc, total_amount_fc,
          subtotal_lc, before_vat_lc, vat_amount_lc, total_amount_lc, balance_amount_lc,
          ref_no, ref_doc_id, ref_doc_no, description, status, created_by, updated_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'THB',1,$10,$10,$11,$12,$10,$10,$11,$12,$12,$13,$14,$15,$16,'Posted',$17,$17)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'THB',1,$9,$9,$10,$11,$9,$9,$10,$11,$11,$12,$13,$14,$15,'Posted',$16,$16)
         RETURNING id
     `, [
         arDocId, arDocNo, header.doc_date, periodId, header.customer_id, customerRow.customer_code, customerRow.customer_name_th,
-        arAccountId, arSetup.gl_doc_id,
+        arAccountId,
         totalSubtotal, totalVat, totalAmount,
         header.ref_no || null, header.doc_id, docNo, `ใบแจ้งหนี้จากการส่งสินค้า ${docNo}`, createdByUserId,
     ]);
@@ -1145,8 +1145,8 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, mod
 };
 
 // AR CN/DN from IM (sys_doc_type '35'/'40'=รับคืนสินค้า/ลดหนี้ลูกหนี้ → AR CN, '45'=เพิ่มหนี้ลูกหนี้ → AR DN) —
-// มิเรอร์ postApCreditDebitNoteFromIm ข้างบน (ฟังก์ชันเดียว + flag isCredit) คิดภาษีขายมาตรฐาน 7% เสมอเหมือน
-// postArBillFromDln เพราะเป็นเอกสารฝั่งลูกค้า/ภาษี ไม่ใช่ฝั่งซื้อแบบ AP (v1: ยังไม่รองรับ vat_type ต่อรายการ)
+// มิเรอร์ postApCreditDebitNoteFromIm ข้างบน (ฟังก์ชันเดียว + flag isCredit) ใช้ vat_type/vat_rate ต่อบรรทัด
+// เดียวกับ postArBillFromDln (ดู insertImVtLine) ไม่ใช่ 7% ตายตัวอีกต่อไป
 // sys_doc_type จริงตรงกับ arSysDocType (sa_anan_module.dart) พอดี ไม่มีปัญหา label สลับแบบฝั่ง AP: 50=CN, 30=DN
 const postArCreditDebitNoteFromIm = async (client, { header, details, docNo, isCredit }) => {
     if (!header.customer_id) throw new Error('ต้องระบุลูกค้าสำหรับเอกสารประเภทนี้');
@@ -1223,15 +1223,15 @@ const postArCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
     const label = isCredit ? 'ใบลดหนี้ลูกค้า' : 'ใบเพิ่มหนี้ลูกค้า';
     const arHeaderRes = await client.query(`
         INSERT INTO ar_transaction
-        (doc_id, doc_no, doc_date, period_id, customer_id, customer_code, customer_name_th, ar_account_id, gl_doc_id,
+        (doc_id, doc_no, doc_date, period_id, customer_id, customer_code, customer_name_th, ar_account_id,
          currency_code, exchange_rate, subtotal_fc, before_vat_fc, vat_amount_fc, total_amount_fc,
          subtotal_lc, before_vat_lc, vat_amount_lc, total_amount_lc, balance_amount_lc,
          ref_no, ref_doc_id, ref_doc_no, description, status, created_by, updated_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'THB',1,$10,$10,$11,$12,$10,$10,$11,$12,$12,$13,$14,$15,$16,'Posted',$17,$17)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'THB',1,$9,$9,$10,$11,$9,$9,$10,$11,$11,$12,$13,$14,$15,'Posted',$16,$16)
         RETURNING id
     `, [
         arDocId, arDocNo, header.doc_date, periodId, header.customer_id, customerRow.customer_code, customerRow.customer_name_th,
-        arAccountId, arSetup.gl_doc_id,
+        arAccountId,
         totalSubtotal, totalVat, totalAmount,
         header.ref_no || null, header.doc_id, docNo, `${label} (${docNo})`, createdByUserId,
     ]);
@@ -1483,8 +1483,8 @@ const fetchRowById = async (pool, id) => {
                tw.warehouse_code AS to_warehouse_code, tw.warehouse_name_th AS to_warehouse_name_th,
                b.branch_code, b.branch_name_thai,
                reft.doc_no AS ref_im_transaction_doc_no,
-               dim1.value_name AS dim1_name, dim2.value_name AS dim2_name, dim3.value_name AS dim3_name,
-               dim4.value_name AS dim4_name, dim5.value_name AS dim5_name
+               dim1.value_name_thai AS dim1_name, dim2.value_name_thai AS dim2_name, dim3.value_name_thai AS dim3_name,
+               dim4.value_name_thai AS dim4_name, dim5.value_name_thai AS dim5_name
         FROM im_transaction t
         JOIN sa_module_document d ON d.id = t.doc_id
         LEFT JOIN im_warehouse w  ON w.id = t.warehouse_id

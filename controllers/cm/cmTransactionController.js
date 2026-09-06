@@ -372,8 +372,8 @@ const fetchRowById = async (pool, id) => {
                    tb.bank_name_th AS to_bank_name, tb.account_number AS to_account_number,
                    bb.bank_name_th AS bank_name, bb.account_number AS bank_account_number,
                    b.branch_code, b.branch_name_thai,
-                   dim1.value_name AS dim1_name, dim2.value_name AS dim2_name,
-                   dim3.value_name AS dim3_name, dim4.value_name AS dim4_name, dim5.value_name AS dim5_name
+                   dim1.value_name_thai AS dim1_name, dim2.value_name_thai AS dim2_name,
+                   dim3.value_name_thai AS dim3_name, dim4.value_name_thai AS dim4_name, dim5.value_name_thai AS dim5_name
             FROM cm_transaction t
             JOIN sa_module_document d ON d.id = t.doc_id
             LEFT JOIN cm_bank_account fb ON fb.id = t.from_bank_account_id

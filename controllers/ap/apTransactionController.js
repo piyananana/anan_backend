@@ -767,9 +767,9 @@ const fetchRowById = async (pool, id) => {
                    d.doc_code, d.doc_name_thai, d.sys_doc_type, d.is_auto_numbering,
                    v.vendor_code, v.vendor_name_th, v.tax_id AS vendor_tax_id,
                    b.branch_code, b.branch_name_thai,
-                   dim1.value_name AS dim1_name, dim2.value_name AS dim2_name,
-                   dim3.value_name AS dim3_name, dim4.value_name AS dim4_name,
-                   dim5.value_name AS dim5_name
+                   dim1.value_name_thai AS dim1_name, dim2.value_name_thai AS dim2_name,
+                   dim3.value_name_thai AS dim3_name, dim4.value_name_thai AS dim4_name,
+                   dim5.value_name_thai AS dim5_name
             FROM ap_transaction t
             JOIN sa_module_document d ON d.id = t.doc_id
             LEFT JOIN ap_vendor   v   ON v.id = t.vendor_id
