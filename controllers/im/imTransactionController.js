@@ -2058,8 +2058,8 @@ const postBillingForGrn = async (req, res) => {
             for (const l of lines) {
                 if (!l.id) continue;
                 await client.query(
-                    `UPDATE im_transaction_detail SET billed_unit_cost=$1 WHERE id=$2 AND header_id=$3`,
-                    [l.billed_unit_cost ?? null, l.id, id]
+                    `UPDATE im_transaction_detail SET billed_unit_cost=$1, vat_type=$2, vat_rate=$3 WHERE id=$4 AND header_id=$5`,
+                    [l.billed_unit_cost ?? null, l.vat_type ?? null, l.vat_rate ?? null, l.id, id]
                 );
             }
         }
@@ -2121,8 +2121,8 @@ const postBillingForDln = async (req, res) => {
             for (const l of lines) {
                 if (!l.id) continue;
                 await client.query(
-                    `UPDATE im_transaction_detail SET unit_price=$1 WHERE id=$2 AND header_id=$3`,
-                    [l.unit_price ?? null, l.id, id]
+                    `UPDATE im_transaction_detail SET unit_price=$1, vat_type=$2, vat_rate=$3 WHERE id=$4 AND header_id=$5`,
+                    [l.unit_price ?? null, l.vat_type ?? null, l.vat_rate ?? null, l.id, id]
                 );
             }
         }
