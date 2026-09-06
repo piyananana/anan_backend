@@ -22,6 +22,8 @@ const imAccountingSettingController = require('../controllers/im/imAccountingSet
 const imPeriodClosingController = require('../controllers/im/imPeriodClosingController');
 const imGrBillingReportController = require('../controllers/im/imGrBillingReportController');
 const imDlnBillingReportController = require('../controllers/im/imDlnBillingReportController');
+const imResetController        = require('../controllers/im/imResetController');
+const imTransactionReportController = require('../controllers/im/imTransactionReportController');
 
 // im_gl_account_setup (per doc-type GL fallback, for the future im_transaction module)
 router.get('/im_gl_account_setup',           imGlAccountSetupController.fetchRows);
@@ -71,10 +73,13 @@ router.get('/im_stock_layer',   imStockLayerController.fetchRows);
 
 // im_transaction (v1: doc_code='AJS' — ตั้งยอดสินค้าด้วยการนับสต็อค; ISS/TRF/GRN/DLN family เพิ่มทีหลังในหน้าจอเดียวกัน)
 router.get('/im_transaction/system_qty', imTransactionController.fetchSystemQty);
+router.get('/im_transaction/returnable_docs', imTransactionController.fetchReturnableDocs);
 router.get('/im_transaction/gr_billing_report', imGrBillingReportController.getGrBillingReport);
 router.get('/im_transaction/dln_billing_report', imDlnBillingReportController.getDlnBillingReport);
+router.get('/im_transaction_report', imTransactionReportController.getTransactionReport);
 router.get('/im_transaction',            imTransactionController.fetchRows);
 router.get('/im_transaction/:id',        imTransactionController.fetchRow);
+router.get('/im_transaction/:id/returnable_lines', imTransactionController.fetchReturnableLines);
 router.post('/im_transaction',           imTransactionController.createTransaction);
 router.put('/im_transaction/:id',        imTransactionController.updateTransaction);
 router.put('/im_transaction/:id/post',   imTransactionController.postTransaction);
@@ -155,5 +160,9 @@ router.delete('/im_item/:id', imItemController.deleteRow);
 router.get('/im_item_running/preview_code', imItemRunningController.previewCode);
 router.get('/im_item_running',              imItemRunningController.fetchConfig);
 router.post('/im_item_running',             imItemRunningController.saveConfig);
+
+// im_reset_transactions (เครื่องมือผู้พัฒนาระบบ — ล้างข้อมูลธุรกรรม/ข้อมูลหลักของ IM)
+router.get('/im_reset_transactions/counts', imResetController.getCounts);
+router.delete('/im_reset_transactions',     imResetController.resetTransactions);
 
 module.exports = router;

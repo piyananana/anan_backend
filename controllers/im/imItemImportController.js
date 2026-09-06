@@ -182,18 +182,21 @@ const validateFile = [
       const glAccounts     = readSheet(workbook, glAccountDef);
 
       // Pre-fetch lookup tables
-      const [categoriesR, uomsR, warehousesR, locationsR, accountsR, runningR] = await Promise.all([
+      const [categoriesR, uomsR, warehousesR, locationsR, accountsR, runningR, vatRatesR] = await Promise.all([
         req.dbPool.query(`SELECT id, category_code, is_auto_number FROM im_item_category WHERE is_active = true AND category_type = 'CATEGORY'`),
         req.dbPool.query(`SELECT id, uom_code FROM im_uom WHERE is_active = true`),
         req.dbPool.query(`SELECT id, warehouse_code FROM im_warehouse WHERE is_active = true`),
         req.dbPool.query(`SELECT id, warehouse_id, location_code FROM im_location WHERE is_active = true`),
         req.dbPool.query(`SELECT id, account_code FROM gl_account WHERE is_active = true`),
         req.dbPool.query(`SELECT is_auto_numbering FROM im_item_running LIMIT 1`),
+        req.dbPool.query(`SELECT DISTINCT vat_code FROM cd_vat_rate WHERE is_active = true`),
       ]);
       const categoryMap  = buildCodeMap(categoriesR.rows, 'category_code');
       const uomMap        = buildCodeMap(uomsR.rows, 'uom_code');
       const warehouseMap  = buildCodeMap(warehousesR.rows, 'warehouse_code');
       const accountMap    = buildCodeMap(accountsR.rows, 'account_code');
+      const vatCodeSet    = new Set(vatRatesR.rows.map(r => String(r.vat_code).toUpperCase()));
+      const firstActiveVatCode = vatRatesR.rows.length > 0 ? String(vatRatesR.rows[0].vat_code).toUpperCase() : null;
       const locationMap   = {};
       for (const l of locationsR.rows) {
         locationMap[`${l.warehouse_id}|${String(l.location_code).toUpperCase()}`] = l;
@@ -297,6 +300,18 @@ const validateFile = [
 
         const isActiveStr = get('is_active');
 
+        // ประเภทภาษี VAT ตั้งต้น — validate กับ cd_vat_rate จริงเหมือน category/uom/warehouse/account code อื่นๆ
+        // เว้นว่างได้ = ใช้รหัสแรกที่เปิดใช้งานจริงใน cd_vat_rate เป็นค่า default (ไม่ hardcode 'VAT7' ตายตัว เพราะ
+        // แต่ละบริษัทตั้งรหัส VAT ของตัวเองไม่เหมือนกัน — 'VAT7' อาจไม่มีอยู่จริงในระบบนี้เลยก็ได้) แต่ถ้ากรอกมาแล้ว
+        // ไม่พบใน cd_vat_rate ต้อง error ชัดเจนเหมือนฟีลด์ lookup อื่น
+        const defaultVatTypeRaw = get('default_vat_type').toUpperCase();
+        const defaultVatType = defaultVatTypeRaw || firstActiveVatCode;
+        if (defaultVatTypeRaw && !vatCodeSet.has(defaultVatTypeRaw)) {
+          rowErrors.push({ column: 'default_vat_type', message: `ไม่พบประเภทภาษี VAT "${defaultVatTypeRaw}"` });
+        } else if (!defaultVatTypeRaw && !firstActiveVatCode) {
+          rowErrors.push({ column: 'default_vat_type', message: 'ยังไม่มีประเภทภาษี VAT ที่เปิดใช้งานในระบบ กรุณาตั้งค่าที่หน้าจอ VAT ก่อน' });
+        }
+
         const item = {
           __rowNum: rowNum,
           __rowErrors: rowErrors,
@@ -319,7 +334,7 @@ const validateFile = [
           min_stock_qty:          minStockQty,
           max_stock_qty:          maxStockQty,
           reorder_point:          reorderPoint,
-          default_vat_type:       get('default_vat_type') || 'VAT7',
+          default_vat_type:       defaultVatType,
           is_active:              isActiveStr ? parseBool(isActiveStr) : true,
           inventory_account_code: null, inventory_account_id: null,
           cogs_account_code:      null, cogs_account_id:      null,

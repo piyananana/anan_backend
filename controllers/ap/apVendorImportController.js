@@ -24,8 +24,10 @@ const TEMPLATE_SHEETS = [
       { key: 'vendor_name_en',     label: 'ชื่อเจ้าหนี้ (อังกฤษ)',                                required: false, example: 'XYZ Co., Ltd.' },
       { key: 'tax_id',             label: 'เลขประจำตัวผู้เสียภาษี',                               required: false, example: '0105555012345' },
       { key: 'business_type_code', label: 'รหัสประเภทธุรกิจ',                                     required: false, example: 'TRADE' },
+      { key: 'vendor_type',        label: 'ประเภทผู้ขาย (individual/juristic)',                    required: false, example: 'juristic' },
       { key: 'credit_term_months', label: 'เครดิต (เดือน)',                                        required: false, example: '0' },
       { key: 'credit_term_days',   label: 'เครดิต (วัน)',                                          required: false, example: '30' },
+      { key: 'credit_limit',       label: 'วงเงินเครดิต',                                         required: false, example: '0' },
       { key: 'currency_code',      label: 'สกุลเงิน',                                             required: false, example: 'THB' },
       { key: 'is_active',          label: 'ใช้งาน (Y/N)',                                         required: false, example: 'Y' },
       { key: 'remark',             label: 'หมายเหตุ',                                              required: false, example: '' },
@@ -88,6 +90,7 @@ const TEMPLATE_SHEETS = [
 
 const ADDRESS_TYPES = ['billing', 'shipping'];
 const ACCOUNT_TYPES = ['current', 'savings'];
+const VENDOR_TYPES = ['individual', 'juristic'];
 const YES_VALUES = ['y', 'yes', 'true', '1', 'ใช่'];
 
 // GET /ap_vendor/import/template
@@ -258,6 +261,11 @@ const validateFile = [
           if (!resolvedBusinessType) rowErrors.push({ column: 'business_type_code', message: `ไม่พบประเภทธุรกิจ "${businessTypeCode}"` });
         }
 
+        const vendorTypeRaw = get('vendor_type').toLowerCase();
+        if (vendorTypeRaw && !VENDOR_TYPES.includes(vendorTypeRaw)) {
+          rowErrors.push({ column: 'vendor_type', message: `ประเภทผู้ขายต้องเป็นหนึ่งใน ${VENDOR_TYPES.join(', ')}` });
+        }
+
         const currencyCodeRaw = get('currency_code').toUpperCase();
         const currencyCode = currencyCodeRaw || 'THB';
         if (currencyCodeRaw && currencySet.size > 0 && !currencySet.has(currencyCodeRaw)) {
@@ -278,6 +286,13 @@ const validateFile = [
           if (isNaN(creditTermDays) || creditTermDays < 0)
             rowErrors.push({ column: 'credit_term_days', message: 'เครดิต (วัน) ต้องเป็นตัวเลขไม่ติดลบ' });
         }
+        let creditLimit = 0;
+        const creditLimitStr = get('credit_limit');
+        if (creditLimitStr) {
+          creditLimit = parseFloat(creditLimitStr);
+          if (isNaN(creditLimit) || creditLimit < 0)
+            rowErrors.push({ column: 'credit_limit', message: 'วงเงินเครดิตต้องเป็นตัวเลขไม่ติดลบ' });
+        }
 
         const isActiveStr = get('is_active');
 
@@ -293,8 +308,10 @@ const validateFile = [
           tax_id:               get('tax_id') || null,
           business_type_code:   businessTypeCode || null,
           business_type_id:     resolvedBusinessType?.id || null,
+          vendor_type:          vendorTypeRaw || null,
           credit_term_months:   creditTermMonths,
           credit_term_days:     creditTermDays,
+          credit_limit:         creditLimit,
           currency_code:        currencyCode,
           is_active:            isActiveStr ? parseBool(isActiveStr) : true,
           remark:               get('remark') || null,
@@ -476,6 +493,8 @@ const confirmImport = async (req, res) => {
     await client.query('BEGIN');
     await client.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS payment_method_id INTEGER`).catch(() => {});
     await client.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS is_code_auto_generated BOOLEAN NOT NULL DEFAULT false`).catch(() => {});
+    await client.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS vendor_type VARCHAR(20)`).catch(() => {});
+    await client.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS credit_limit NUMERIC(18,4) NOT NULL DEFAULT 0`).catch(() => {});
     for (let idx = 0; idx < rows.length; idx++) {
       const r = rows[idx];
       const savepointName = `sp_row_${idx}`;
@@ -502,12 +521,12 @@ const confirmImport = async (req, res) => {
         const result = await client.query(
           `INSERT INTO ap_vendor
              (vendor_code, old_vendor_code, vendor_name_th, vendor_name_en, tax_id,
-              vendor_group_id, business_type_id,
-              credit_term_months, credit_term_days,
+              vendor_group_id, business_type_id, vendor_type,
+              credit_term_months, credit_term_days, credit_limit,
               currency_code, is_active, remark,
               ap_account_id, payment_method_id, is_code_auto_generated,
               created_by, updated_by)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$16)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$18)
            ON CONFLICT (vendor_code) DO NOTHING
            RETURNING id`,
           [
@@ -516,7 +535,8 @@ const confirmImport = async (req, res) => {
             trunc(r.tax_id, 20),
             r.vendor_group_id   || null,
             r.business_type_id  || null,
-            r.credit_term_months ?? 0, r.credit_term_days ?? 30,
+            r.vendor_type || null,
+            r.credit_term_months ?? 0, r.credit_term_days ?? 30, r.credit_limit ?? 0,
             trunc(r.currency_code, 10) || 'THB',
             r.is_active !== undefined ? r.is_active : true,
             trunc(r.remark, 500),

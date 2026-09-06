@@ -100,6 +100,18 @@ const ensureImTransactionTable = async (client) => {
     // ledger เอง ไม่มีผลต่อการตีมูลค่าสต็อกใดๆ จึงไม่ต้องมีคอลัมน์คู่แบบ billed_unit_cost — แก้ไขได้ตรงๆ ก่อน Post)
     await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS unit_price NUMERIC(18,4)`).catch(() => {});
 
+    // สำหรับ '15'/'35' (คืนสินค้าผู้ขาย/รับคืนจากลูกค้า) — อ้างอิงเอกสารต้นฉบับ (GRN/DLN) เพื่อติดตามจำนวนคืนบางส่วน
+    // (partial return) ระดับหัวเอกสารเก็บไว้เพื่อความสะดวกในการแสดงผล/กรอง ส่วนการตรวจคงเหลือที่คืนได้จริงคำนวณจาก
+    // ระดับบรรทัดเสมอ (ref_im_transaction_detail_id) — เอกสารต้นฉบับหนึ่งใบอาจถูกคืนหลายครั้ง (คนละบรรทัด/คนละใบ)
+    await client.query(`ALTER TABLE im_transaction ADD COLUMN IF NOT EXISTS ref_im_transaction_id INTEGER REFERENCES im_transaction(id)`).catch(() => {});
+    await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS ref_im_transaction_detail_id INTEGER REFERENCES im_transaction_detail(id)`).catch(() => {});
+
+    // VAT ต่อบรรทัด — ใช้เฉพาะประเภทเอกสารที่สร้าง/อ้างอิงใบกำกับ AP/AR อัตโนมัติ ('11'/'12'/'15'/'20'/'25'/'31'/
+    // '32'/'35'/'40'/'45') อ้างอิง cd_vat_rate เดียวกับที่ AR/AP ใช้ (vat_type=vat_code, vat_rate=snapshot ณ ตอนโพสต์
+    // เหมือนที่ ar/apTransactionController.js เก็บ) — ไม่มี is_deferred_vat เหมือน AR เพราะ IM Post ครั้งเดียวจบ
+    await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS vat_type VARCHAR(10)`).catch(() => {});
+    await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS vat_rate NUMERIC(5,2)`).catch(() => {});
+
     // audit ของการตัดต้นทุนจาก layer เดิม (FIFO/SPECIFIC เมื่อ variance ติดลบ) — ใช้ตอน Void เพื่อคืนค่า remaining_qty ให้ตรงเป๊ะ
     await client.query(`
         CREATE TABLE IF NOT EXISTS im_stock_layer_consumption (
@@ -476,6 +488,9 @@ const resolveCounterAccount = (sysDocType, setup) => {
         case '30': // DLN — ส่งสินค้า (ธรรมดา/พร้อมตั้งหนี้/รอตั้งหนี้): รับรู้เป็นต้นทุนขาย ใช้บัญชีเดียวกับ ISS
         case '31':
         case '32':
+        case '35': // รับคืนสินค้า (RTC) / ลดหนี้ลูกหนี้ (CNC) / เพิ่มหนี้ลูกหนี้ (DNC) — กลับรายการต้นทุนขายเดียวกัน
+        case '40': // (บวก=คืนของ ลด COGS, ลบ=ส่งเพิ่ม เพิ่ม COGS — ทิศทางมาจากเครื่องหมายของ qty ใน postGlEntry เอง)
+        case '45':
             if (!setup.cogs_account_id) {
                 throw new Error(`ยังไม่ได้ตั้งค่าบัญชีต้นทุนขาย (cogs_account_id) ใน im_gl_account_setup สำหรับประเภทเอกสารนี้`);
             }
@@ -613,6 +628,32 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
     return glEntryId;
 };
 
+// บันทึกรายการ VAT ลง vt_transaction (ตารางกลางสำหรับรายงานภาษีมูลค่าเพิ่ม ใช้ร่วมกันทุกโมดูล) — มิเรอร์
+// insertVtRecords ของ ap/arTransactionController.js เอง แต่รวมเป็นฟังก์ชันเดียวใช้ร่วมกันทั้งฝั่ง AP
+// (INPUT_VAT) และ AR (OUTPUT_VAT) เพราะฟังก์ชัน postXxxFromIm ทั้งหมด insert ตรงเข้า ap_transaction/
+// ar_transaction เอง (ไม่ได้เรียกผ่าน createTransaction ของ AP/AR) จึงต้องบันทึก vt_transaction เองที่นี่
+// ด้วยเช่นกัน — เรียกทีละบรรทัดหลังจาก insert ap_transaction_detail/ar_transaction_detail แล้ว เพื่อให้มี
+// detailId จริงสำหรับ source_detail_id (มิเรอร์ระดับความละเอียดเดียวกับต้นฉบับ)
+const insertImVtLine = async (client, {
+    moduleCode, vatType, vatRate, docId, headerId, detailId, docNo, docDate,
+    baseLc, vatLc, entityIdField, entityId, entityName, entityTaxId, createdByUserId, vatSign,
+}) => {
+    if (!vatType || vatType === 'NOVAT' || Number(vatLc) === 0) return;
+    await client.query(`
+        INSERT INTO vt_transaction
+        (module_code, vat_type, doc_id, source_header_id, source_detail_id,
+         doc_no, doc_date, vat_rate,
+         base_amount_lc, vat_amount_lc, base_amount_fc, vat_amount_fc,
+         currency_id, exchange_rate, ${entityIdField}, entity_name, entity_tax_id, created_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$9,$10,1,1,$11,$12,$13,$14)
+    `, [
+        moduleCode, vatType, docId, headerId, detailId,
+        docNo, docDate, vatRate,
+        baseLc * vatSign, vatLc * vatSign,
+        entityId, entityName || '', entityTaxId || null, createdByUserId,
+    ]);
+};
+
 // GRN Billing (sys_doc_type='11') — สร้าง+โพสต์ ap_transaction (ใบกำกับสินค้า) อัตโนมัติแทนการ Post GL ของ IM เอง
 // ตามธรรมเนียมเดียวกับ postCmPaymentHelper/postCmReceiptsHelper ใน ap/arTransactionController.js: INSERT ตรงเข้า
 // ตารางของอีกโมดูลด้วย client เดียวกัน ไม่เรียกผ่าน createTransaction ของ AP (จัดการ BEGIN/COMMIT เอง เรียกข้าม
@@ -641,6 +682,11 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
     }
     if (!apAccountId) throw new Error('ไม่พบบัญชีเจ้าหนี้สำหรับการลงบัญชี กรุณาตั้งค่าใน ap_gl_account_setup หรือผู้ขาย');
 
+    // บัญชี VAT ซื้อ — ดูที่ im_gl_account_setup ของ doc_code เอกสาร IM นี้ก่อน (ให้ override ได้ต่อ doc_code
+    // เหมือน resolveInventoryAccount) แล้วค่อย fallback ไปที่บัญชี VAT ของใบกำกับสินค้า AP เอง
+    const imSetupVatRes = await client.query(`SELECT vat_input_account_id FROM im_gl_account_setup WHERE doc_code = $1`, [header.doc_code]);
+    const vatAccountId = Number(imSetupVatRes.rows[0]?.vat_input_account_id) || Number(apSetup.vat_input_account_id) || null;
+
     let purchasesAccountId = null;
     if (mode === 'PERIODIC') {
         const setting = await fetchSettingRow(client);
@@ -650,9 +696,10 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
         purchasesAccountId = Number(setting.purchases_account_id);
     }
 
-    const vendorRow = await client.query(`SELECT vendor_code, vendor_name_th FROM ap_vendor WHERE id = $1`, [header.vendor_id]);
+    const vendorRow = await client.query(`SELECT vendor_code, vendor_name_th, tax_id FROM ap_vendor WHERE id = $1`, [header.vendor_id]);
     const vendorCode = vendorRow.rows[0]?.vendor_code || null;
     const vendorNameTh = vendorRow.rows[0]?.vendor_name_th || null;
+    const vendorTaxId = vendorRow.rows[0]?.tax_id || null;
 
     const periodRes = await client.query(
         `SELECT id FROM gl_posting_period WHERE $1::date BETWEEN period_start_date AND period_end_date AND gl_status='OPEN' AND ap_status != 'CLOSED' LIMIT 1`,
@@ -671,37 +718,52 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
     }
 
     const lineRows = [];
-    let totalAmount = 0;
+    let totalAmount = 0, totalVat = 0;
     for (const d of details) {
         const expenseAccountId = purchasesAccountId
             || await resolveInventoryAccount(client, d.item_id, header.warehouse_id, apSetup.expense_account_id);
         const qty = Number(d.qty);
         const unitCost = Number(d.unit_cost);
         const amount = qty * unitCost;
-        lineRows.push({ itemCode: d.item_code, itemName: d.item_name, quantity: qty, unitPriceFc: unitCost, amount, expenseAccountId });
+        const vatType = d.vat_type || 'NOVAT';
+        const vatRate = vatType === 'NOVAT' ? 0 : (Number(d.vat_rate) || 0);
+        const vatAmount = amount * vatRate / 100;
+        lineRows.push({ itemCode: d.item_code, itemName: d.item_name, quantity: qty, unitPriceFc: unitCost, amount, expenseAccountId, vatType, vatRate, vatAmount });
         totalAmount += amount;
+        totalVat += vatAmount;
     }
+    const grandTotal = totalAmount + totalVat;
 
     const apHeaderRes = await client.query(`
         INSERT INTO ap_transaction
         (doc_id, doc_no, doc_date, period_id, vendor_id, vendor_code, vendor_name_th, ap_account_id, gl_doc_id,
-         currency_code, exchange_rate, subtotal_fc, before_vat_fc, total_amount_fc, subtotal_lc, before_vat_lc, total_amount_lc,
+         currency_code, exchange_rate, subtotal_fc, before_vat_fc, vat_amount_fc, total_amount_fc,
+         subtotal_lc, before_vat_lc, vat_amount_lc, total_amount_lc,
          balance_amount_lc, ref_no, ref_doc_id, ref_doc_no, description, status, created_by, updated_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'THB',1,$10,$10,$10,$10,$10,$10,$10,$11,$12,$13,$14,'Posted',$15,$15)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'THB',1,$10,$10,$11,$12,$10,$10,$11,$12,$12,$13,$14,$15,$16,'Posted',$17,$17)
         RETURNING id
     `, [
         apDocId, apDocNo, header.doc_date, periodId, header.vendor_id, vendorCode, vendorNameTh, apAccountId, apSetup.gl_doc_id,
-        totalAmount, vendorInvoiceNo, header.doc_id, docNo, `ใบกำกับสินค้าจากการรับสินค้า ${docNo}`, createdByUserId,
+        totalAmount, totalVat, grandTotal,
+        vendorInvoiceNo, header.doc_id, docNo, `ใบกำกับสินค้าจากการรับสินค้า ${docNo}`, createdByUserId,
     ]);
     const apTransactionId = apHeaderRes.rows[0].id;
 
     let lineNo = 1;
     for (const l of lineRows) {
-        await client.query(`
+        const detailRes = await client.query(`
             INSERT INTO ap_transaction_detail
-            (header_id, line_no, description, quantity, unit_price_fc, subtotal_fc, total_amount_fc, expense_account_id, subtotal_lc, total_amount_lc)
-            VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$6,$6)
-        `, [apTransactionId, lineNo++, l.itemName || l.itemCode, l.quantity, l.unitPriceFc, l.amount, l.expenseAccountId]);
+            (header_id, line_no, description, quantity, unit_price_fc, subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
+             expense_account_id, subtotal_lc, vat_amount_lc, total_amount_lc)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$6,$9,$10)
+            RETURNING id
+        `, [apTransactionId, lineNo++, l.itemName || l.itemCode, l.quantity, l.unitPriceFc, l.amount, l.vatType, l.vatRate, l.vatAmount, l.amount + l.vatAmount, l.expenseAccountId]);
+        await insertImVtLine(client, {
+            moduleCode: 'AP', vatType: l.vatType, vatRate: l.vatRate, docId: apDocId, headerId: apTransactionId,
+            detailId: detailRes.rows[0].id, docNo: apDocNo, docDate: header.doc_date,
+            baseLc: l.amount, vatLc: l.vatAmount, entityIdField: 'vendor_id', entityId: header.vendor_id,
+            entityName: vendorNameTh, entityTaxId: vendorTaxId, createdByUserId, vatSign: 1,
+        });
     }
 
     const expDebitByAccount = {};
@@ -713,8 +775,12 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
         if (amt === 0) continue;
         apGlDetails.push({ account_id: Number(accId), description: `ใบกำกับสินค้า ${apDocNo}`, debit_lc: amt, credit_lc: 0 });
     }
-    if (totalAmount !== 0) {
-        apGlDetails.push({ account_id: apAccountId, description: `ใบกำกับสินค้า ${apDocNo}`, debit_lc: 0, credit_lc: totalAmount });
+    if (totalVat !== 0) {
+        if (!vatAccountId) throw new Error('ยังไม่ได้ตั้งค่าบัญชี VAT ซื้อ (vat_input_account_id) ใน im_gl_account_setup หรือ ap_gl_account_setup');
+        apGlDetails.push({ account_id: vatAccountId, description: `VAT ซื้อ ${apDocNo}`, debit_lc: totalVat, credit_lc: 0 });
+    }
+    if (grandTotal !== 0) {
+        apGlDetails.push({ account_id: apAccountId, description: `ใบกำกับสินค้า ${apDocNo}`, debit_lc: 0, credit_lc: grandTotal });
     }
 
     if (apGlDetails.length > 0) {
@@ -749,7 +815,8 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
 // DLN Billing (sys_doc_type='31'/'32' ตอน Post AR/GL) — สร้าง+โพสต์ ar_transaction (ใบแจ้งหนี้ลูกหนี้) อัตโนมัติ
 // แยกต่างหากจากการ Post GL ของ IM เอง (Dr ต้นทุนขาย/Cr คลัง ผ่าน postGlEntry) เพราะการขายมี 2 journal entry แยกกัน
 // ตามหลักบัญชีคู่มาตรฐาน (ต่างจาก GRN ที่ Dr คลัง/Cr เจ้าหนี้ เป็น entry เดียวกัน จึงข้าม postGlEntry ไปเลยสำหรับ '11')
-// คิดภาษีขายมาตรฐาน 7% ให้ทุกบรรทัด (v1: ยังไม่รองรับ vat_type ต่อรายการ/สินค้ายกเว้นภาษี — ผู้ใช้ AR แก้ไขเพิ่มเติมได้เองภายหลัง)
+// vat_type/vat_rate มาจากที่ผู้ใช้เลือกต่อบรรทัดในหน้าจอ IM เอง (อ้างอิง cd_vat_rate เดียวกับ AR/AP) ไม่ใช่ 7%
+// ตายตัวอีกต่อไป — ดู insertImVtLine สำหรับการบันทึกลง vt_transaction (รายงานภาษี) ควบคู่กันไปด้วย
 const postArBillFromDln = async (client, { header, details, docNo }) => {
     if (!header.customer_id) throw new Error('ต้องระบุลูกค้าสำหรับเอกสารประเภทนี้');
 
@@ -765,10 +832,14 @@ const postArBillFromDln = async (client, { header, details, docNo }) => {
     const arSetupRes = await client.query(`SELECT * FROM ar_gl_account_setup WHERE doc_code = $1`, [arDocCode]);
     const arSetup = arSetupRes.rows[0] || null;
     if (!arSetup?.gl_doc_id) throw new Error('ยังไม่ได้ตั้งค่า GL Document Type ใน ar_gl_account_setup สำหรับใบแจ้งหนี้');
-    if (!arSetup.vat_output_account_id) throw new Error('ยังไม่ได้ตั้งค่าบัญชีภาษีขาย (vat_output_account_id) ใน ar_gl_account_setup');
+
+    // บัญชี VAT ขาย — ดูที่ im_gl_account_setup ของ doc_code เอกสาร IM นี้ก่อน (ให้ override ได้ต่อ doc_code
+    // เหมือน resolveInventoryAccount) แล้วค่อย fallback ไปที่บัญชี VAT ของใบแจ้งหนี้ AR เอง
+    const imSetupVatRes = await client.query(`SELECT vat_output_account_id FROM im_gl_account_setup WHERE doc_code = $1`, [header.doc_code]);
+    const vatAccountId = Number(imSetupVatRes.rows[0]?.vat_output_account_id) || Number(arSetup.vat_output_account_id) || null;
 
     const customerRes = await client.query(`
-        SELECT c.customer_code, c.customer_name_th, c.ar_account_id, g.gl_account_id AS group_ar_account_id
+        SELECT c.customer_code, c.customer_name_th, c.tax_id, c.ar_account_id, g.gl_account_id AS group_ar_account_id
         FROM ar_customer c LEFT JOIN ar_customer_group g ON g.id = c.customer_group_id
         WHERE c.id = $1
     `, [header.customer_id]);
@@ -805,10 +876,12 @@ const postArBillFromDln = async (client, { header, details, docNo }) => {
         const qty = Math.abs(Number(d.qty) || 0); // qty ของ DLN ติดลบเสมอ (สต็อกลด) — ใบแจ้งหนี้ต้องเป็นจำนวนบวก
         const unitPrice = Number(d.unit_price) || 0;
         const subtotal = qty * unitPrice;
-        const vatAmount = subtotal * 0.07;
+        const vatType = d.vat_type || 'NOVAT';
+        const vatRate = vatType === 'NOVAT' ? 0 : (Number(d.vat_rate) || 0);
+        const vatAmount = subtotal * vatRate / 100;
         lineRows.push({
             itemCode: d.item_code, itemName: d.item_name, quantity: qty, unitPriceFc: unitPrice,
-            subtotal, vatAmount, total: subtotal + vatAmount, revenueAccountId,
+            subtotal, vatType, vatRate, vatAmount, total: subtotal + vatAmount, revenueAccountId,
         });
         totalSubtotal += subtotal;
         totalVat += vatAmount;
@@ -833,12 +906,19 @@ const postArBillFromDln = async (client, { header, details, docNo }) => {
 
     let lineNo = 1;
     for (const l of lineRows) {
-        await client.query(`
+        const detailRes = await client.query(`
             INSERT INTO ar_transaction_detail
             (header_id, line_no, description, quantity, unit_price_fc, subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
              revenue_account_id, subtotal_lc, vat_amount_lc, total_amount_lc)
-            VALUES ($1,$2,$3,$4,$5,$6,'VAT7',7,$7,$8,$9,$6,$7,$8)
-        `, [arTransactionId, lineNo++, l.itemName || l.itemCode, l.quantity, l.unitPriceFc, l.subtotal, l.vatAmount, l.total, l.revenueAccountId]);
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$6,$9,$10)
+            RETURNING id
+        `, [arTransactionId, lineNo++, l.itemName || l.itemCode, l.quantity, l.unitPriceFc, l.subtotal, l.vatType, l.vatRate, l.vatAmount, l.total, l.revenueAccountId]);
+        await insertImVtLine(client, {
+            moduleCode: 'AR', vatType: l.vatType, vatRate: l.vatRate, docId: arDocId, headerId: arTransactionId,
+            detailId: detailRes.rows[0].id, docNo: arDocNo, docDate: header.doc_date,
+            baseLc: l.subtotal, vatLc: l.vatAmount, entityIdField: 'customer_id', entityId: header.customer_id,
+            entityName: customerRow.customer_name_th, entityTaxId: customerRow.tax_id, createdByUserId, vatSign: 1,
+        });
     }
 
     const revCreditByAccount = {};
@@ -851,7 +931,8 @@ const postArBillFromDln = async (client, { header, details, docNo }) => {
         arGlDetails.push({ account_id: Number(accId), description: `ใบแจ้งหนี้ ${arDocNo}`, debit_lc: 0, credit_lc: amt });
     }
     if (totalVat !== 0) {
-        arGlDetails.push({ account_id: Number(arSetup.vat_output_account_id), description: `ภาษีขาย ${arDocNo}`, debit_lc: 0, credit_lc: totalVat });
+        if (!vatAccountId) throw new Error('ยังไม่ได้ตั้งค่าบัญชีภาษีขาย (vat_output_account_id) ใน im_gl_account_setup หรือ ar_gl_account_setup');
+        arGlDetails.push({ account_id: vatAccountId, description: `ภาษีขาย ${arDocNo}`, debit_lc: 0, credit_lc: totalVat });
     }
     if (totalAmount !== 0) {
         arGlDetails.push({ account_id: arAccountId, description: `ใบแจ้งหนี้ ${arDocNo}`, debit_lc: totalAmount, credit_lc: 0 });
@@ -884,6 +965,370 @@ const postArBillFromDln = async (client, { header, details, docNo }) => {
     }
 
     return arTransactionId;
+};
+
+// AP CN/DN from IM (sys_doc_type '15'/'20'=คืนสินค้า/ลดหนี้เจ้าหนี้ → AP CN, '25'=เพิ่มหนี้เจ้าหนี้ → AP DN) —
+// รวมเป็นฟังก์ชันเดียวด้วย flag isCredit แทนที่จะแยก 2 ฟังก์ชันแบบ postApBillFromGrn/postArBillFromDln เพราะการ
+// แยกฟังก์ชันของทั้งคู่นั้นมีเหตุผลจากการข้าม module boundary (AP กับ AR) — แต่ CN/DN ที่นี่อยู่ใน module เดียวกัน
+// (AP) ต่างกันแค่ทิศทาง Dr/Cr เหมือนที่ apTransactionController.js เองก็ใช้ flag เดียว (isCreditNote) จัดการทั้งคู่
+// สำคัญ: sys_doc_type จริงของ AP CN/DN คือ 30=ใบลดหนี้(CN), 50=ใบเพิ่มหนี้(DN) ตาม ap_transaction.dart/
+// apTransactionController.js ('isCreditNote = sysDocType === '30'') — สลับกับ label ที่ผิดใน apSysDocType
+// (sa_anan_module.dart) จึง hardcode ตามโค้ดจริงตรงนี้ ไม่ผ่าน map นั้น
+// v1: ไม่มี VAT/WHT เหมือน postApBillFromGrn (เอกสารฝั่งซื้อ ผู้ใช้ AP แก้ไขเพิ่มเติมได้เองภายหลังถ้าจำเป็น)
+const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, mode, isCredit }) => {
+    if (!header.vendor_id) throw new Error('ต้องระบุผู้ขายสำหรับเอกสารประเภทนี้');
+
+    const apSysDocType = isCredit ? '30' : '50';
+    const apDocRes = await client.query(`
+        SELECT id, doc_code FROM sa_module_document
+        WHERE sys_module='21' AND sys_doc_type=$1 AND is_doc_type=true AND is_active=true
+        ORDER BY sort_order LIMIT 1
+    `, [apSysDocType]);
+    if (apDocRes.rows.length === 0) {
+        throw new Error(`ไม่พบประเภทเอกสาร${isCredit ? 'ใบลดหนี้จากผู้ขาย' : 'ใบเพิ่มหนี้จากผู้ขาย'} ในโมดูล AP`);
+    }
+    const apDocId = apDocRes.rows[0].id;
+    const apDocCode = apDocRes.rows[0].doc_code;
+
+    const apSetupRes = await client.query(`SELECT * FROM ap_gl_account_setup WHERE doc_code = $1`, [apDocCode]);
+    const apSetup = apSetupRes.rows[0] || null;
+    if (!apSetup?.gl_doc_id) throw new Error(`ยังไม่ได้ตั้งค่า GL Document Type ใน ap_gl_account_setup สำหรับ${isCredit ? 'ใบลดหนี้' : 'ใบเพิ่มหนี้'}จากผู้ขาย`);
+
+    let apAccountId = apSetup.ap_account_id ? Number(apSetup.ap_account_id) : null;
+    if (!apAccountId) {
+        const vendorAcctRes = await client.query(`SELECT ap_account_id FROM ap_vendor WHERE id = $1`, [header.vendor_id]);
+        apAccountId = vendorAcctRes.rows[0]?.ap_account_id ? Number(vendorAcctRes.rows[0].ap_account_id) : null;
+    }
+    if (!apAccountId) throw new Error('ไม่พบบัญชีเจ้าหนี้สำหรับการลงบัญชี กรุณาตั้งค่าใน ap_gl_account_setup หรือผู้ขาย');
+
+    // บัญชี VAT ซื้อ — ดูที่ im_gl_account_setup ของ doc_code เอกสาร IM นี้ก่อน แล้วค่อย fallback ไปที่
+    // บัญชี VAT ของ AP เอง (มิเรอร์ postApBillFromGrn ทุกประการ)
+    const imSetupVatRes = await client.query(`SELECT vat_input_account_id FROM im_gl_account_setup WHERE doc_code = $1`, [header.doc_code]);
+    const vatAccountId = Number(imSetupVatRes.rows[0]?.vat_input_account_id) || Number(apSetup.vat_input_account_id) || null;
+
+    let purchasesAccountId = null;
+    if (mode === 'PERIODIC') {
+        const setting = await fetchSettingRow(client);
+        if (!setting?.purchases_account_id) {
+            throw new Error('ยังไม่ได้ตั้งค่าบัญชีซื้อสินค้า (purchases_account_id) ใน ตั้งค่าบัญชีสินค้าคงคลัง IM สำหรับโหมด Periodic');
+        }
+        purchasesAccountId = Number(setting.purchases_account_id);
+    }
+
+    const vendorRow = await client.query(`SELECT vendor_code, vendor_name_th, tax_id FROM ap_vendor WHERE id = $1`, [header.vendor_id]);
+    const vendorCode = vendorRow.rows[0]?.vendor_code || null;
+    const vendorNameTh = vendorRow.rows[0]?.vendor_name_th || null;
+    const vendorTaxId = vendorRow.rows[0]?.tax_id || null;
+
+    const periodRes = await client.query(
+        `SELECT id FROM gl_posting_period WHERE $1::date BETWEEN period_start_date AND period_end_date AND gl_status='OPEN' AND ap_status != 'CLOSED' LIMIT 1`,
+        [header.doc_date]
+    );
+    if (periodRes.rows.length === 0) throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่ ${header.doc_date}`);
+    const periodId = periodRes.rows[0].id;
+
+    let apDocNo = await generateDocNo(client, apDocId, header.doc_date, header.branch_id);
+    if (!apDocNo) apDocNo = `${isCredit ? 'CN' : 'DN'}-${docNo}`;
+
+    let createdByUserId = null;
+    if (header.created_by) {
+        const userRes = await client.query(`SELECT id FROM sa_user WHERE user_name = $1 LIMIT 1`, [header.created_by]);
+        if (userRes.rows.length > 0) createdByUserId = userRes.rows[0].id;
+    }
+
+    const lineRows = [];
+    let totalAmount = 0, totalVat = 0;
+    for (const d of details) {
+        const expenseAccountId = purchasesAccountId
+            || await resolveInventoryAccount(client, d.item_id, header.warehouse_id, apSetup.expense_account_id);
+        const qty = Math.abs(Number(d.qty) || 0); // qty ติดลบสำหรับ CN (สต็อกลด) บวกสำหรับ DN — เอกสาร AP ต้องเป็นจำนวนบวกเสมอ
+        const unitCost = Number(d.unit_cost);
+        const amount = qty * unitCost;
+        const vatType = d.vat_type || 'NOVAT';
+        const vatRate = vatType === 'NOVAT' ? 0 : (Number(d.vat_rate) || 0);
+        const vatAmount = amount * vatRate / 100;
+        lineRows.push({ itemCode: d.item_code, itemName: d.item_name, quantity: qty, unitPriceFc: unitCost, amount, expenseAccountId, vatType, vatRate, vatAmount });
+        totalAmount += amount;
+        totalVat += vatAmount;
+    }
+    const grandTotal = totalAmount + totalVat;
+
+    const label = isCredit ? 'ใบลดหนี้จากผู้ขาย' : 'ใบเพิ่มหนี้จากผู้ขาย';
+    const apHeaderRes = await client.query(`
+        INSERT INTO ap_transaction
+        (doc_id, doc_no, doc_date, period_id, vendor_id, vendor_code, vendor_name_th, ap_account_id, gl_doc_id,
+         currency_code, exchange_rate, subtotal_fc, before_vat_fc, vat_amount_fc, total_amount_fc,
+         subtotal_lc, before_vat_lc, vat_amount_lc, total_amount_lc,
+         balance_amount_lc, ref_no, ref_doc_id, ref_doc_no, description, status, created_by, updated_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'THB',1,$10,$10,$11,$12,$10,$10,$11,$12,$12,$13,$14,$15,$16,'Posted',$17,$17)
+        RETURNING id
+    `, [
+        apDocId, apDocNo, header.doc_date, periodId, header.vendor_id, vendorCode, vendorNameTh, apAccountId, apSetup.gl_doc_id,
+        totalAmount, totalVat, grandTotal,
+        header.ref_no || null, header.doc_id, docNo, `${label} (${docNo})`, createdByUserId,
+    ]);
+    const apTransactionId = apHeaderRes.rows[0].id;
+
+    let lineNo = 1;
+    for (const l of lineRows) {
+        const detailRes = await client.query(`
+            INSERT INTO ap_transaction_detail
+            (header_id, line_no, description, quantity, unit_price_fc, subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
+             expense_account_id, subtotal_lc, vat_amount_lc, total_amount_lc)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$6,$9,$10)
+            RETURNING id
+        `, [apTransactionId, lineNo++, l.itemName || l.itemCode, l.quantity, l.unitPriceFc, l.amount, l.vatType, l.vatRate, l.vatAmount, l.amount + l.vatAmount, l.expenseAccountId]);
+        await insertImVtLine(client, {
+            moduleCode: 'AP', vatType: l.vatType, vatRate: l.vatRate, docId: apDocId, headerId: apTransactionId,
+            detailId: detailRes.rows[0].id, docNo: apDocNo, docDate: header.doc_date,
+            baseLc: l.amount, vatLc: l.vatAmount, entityIdField: 'vendor_id', entityId: header.vendor_id,
+            entityName: vendorNameTh, entityTaxId: vendorTaxId, createdByUserId,
+            vatSign: isCredit ? -1 : 1, // CN ลดยอดภาษีซื้อ (ตรงข้ามใบกำกับปกติ) มิเรอร์ AP's own insertVtRecords
+        });
+    }
+
+    const invByAccount = {};
+    for (const l of lineRows) {
+        invByAccount[l.expenseAccountId] = (invByAccount[l.expenseAccountId] || 0) + l.amount;
+    }
+    const apGlDetails = [];
+    for (const [accId, amt] of Object.entries(invByAccount)) {
+        if (amt === 0) continue;
+        // CN: Dr AP / Cr คลัง — DN: Dr คลัง / Cr AP (มิเรอร์ postApBillFromGrn โดยกลับทิศทางเมื่อ isCredit)
+        apGlDetails.push({
+            account_id: Number(accId), description: `${label} ${apDocNo}`,
+            debit_lc: isCredit ? 0 : amt, credit_lc: isCredit ? amt : 0,
+        });
+    }
+    if (totalVat !== 0) {
+        if (!vatAccountId) throw new Error('ยังไม่ได้ตั้งค่าบัญชี VAT ซื้อ (vat_input_account_id) ใน im_gl_account_setup หรือ ap_gl_account_setup');
+        // VAT ตามทิศทางเดียวกับรายการต้นทุน (CN กลับรายการ VAT ที่เคยขอคืนไปด้วย, DN เพิ่ม VAT ใหม่)
+        apGlDetails.push({
+            account_id: vatAccountId, description: `VAT ซื้อ ${apDocNo}`,
+            debit_lc: isCredit ? 0 : totalVat, credit_lc: isCredit ? totalVat : 0,
+        });
+    }
+    if (grandTotal !== 0) {
+        apGlDetails.push({
+            account_id: apAccountId, description: `${label} ${apDocNo}`,
+            debit_lc: isCredit ? grandTotal : 0, credit_lc: isCredit ? 0 : grandTotal,
+        });
+    }
+
+    if (apGlDetails.length > 0) {
+        const totalDebit = apGlDetails.reduce((s, l) => s + l.debit_lc, 0);
+        const totalCredit = apGlDetails.reduce((s, l) => s + l.credit_lc, 0);
+        const apGlHeaderRes = await client.query(`
+            INSERT INTO gl_entry_header
+            (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
+             currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
+             created_by, ref_doc_id, ref_doc_no, external_source_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'Posted',$9,$10,0,0,$11,$12,$13,$14)
+            RETURNING id
+        `, [
+            apSetup.gl_doc_id, `GL-${apDocNo}`, header.doc_date, header.doc_date, periodId,
+            header.ref_no || null, `${label} (${docNo})`,
+            1, totalDebit, totalCredit, createdByUserId, apDocId, apDocNo, apTransactionId,
+        ]);
+        const apGlEntryId = apGlHeaderRes.rows[0].id;
+        let glLineNo = 1;
+        for (const l of apGlDetails) {
+            await client.query(`
+                INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
+                VALUES ($1,$2,$3,$4,$5,$6,0,0)
+            `, [apGlEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc]);
+        }
+        await client.query(`UPDATE ap_transaction SET gl_entry_id = $1 WHERE id = $2`, [apGlEntryId, apTransactionId]);
+    }
+
+    return apTransactionId;
+};
+
+// AR CN/DN from IM (sys_doc_type '35'/'40'=รับคืนสินค้า/ลดหนี้ลูกหนี้ → AR CN, '45'=เพิ่มหนี้ลูกหนี้ → AR DN) —
+// มิเรอร์ postApCreditDebitNoteFromIm ข้างบน (ฟังก์ชันเดียว + flag isCredit) คิดภาษีขายมาตรฐาน 7% เสมอเหมือน
+// postArBillFromDln เพราะเป็นเอกสารฝั่งลูกค้า/ภาษี ไม่ใช่ฝั่งซื้อแบบ AP (v1: ยังไม่รองรับ vat_type ต่อรายการ)
+// sys_doc_type จริงตรงกับ arSysDocType (sa_anan_module.dart) พอดี ไม่มีปัญหา label สลับแบบฝั่ง AP: 50=CN, 30=DN
+const postArCreditDebitNoteFromIm = async (client, { header, details, docNo, isCredit }) => {
+    if (!header.customer_id) throw new Error('ต้องระบุลูกค้าสำหรับเอกสารประเภทนี้');
+
+    const arSysDocType = isCredit ? '50' : '30';
+    const arDocRes = await client.query(`
+        SELECT id, doc_code FROM sa_module_document
+        WHERE sys_module='11' AND sys_doc_type=$1 AND is_doc_type=true AND is_active=true
+        ORDER BY sort_order LIMIT 1
+    `, [arSysDocType]);
+    if (arDocRes.rows.length === 0) {
+        throw new Error(`ไม่พบประเภทเอกสาร${isCredit ? 'ใบลดหนี้ลูกค้า' : 'ใบเพิ่มหนี้ลูกค้า'} ในโมดูล AR`);
+    }
+    const arDocId = arDocRes.rows[0].id;
+    const arDocCode = arDocRes.rows[0].doc_code;
+
+    const arSetupRes = await client.query(`SELECT * FROM ar_gl_account_setup WHERE doc_code = $1`, [arDocCode]);
+    const arSetup = arSetupRes.rows[0] || null;
+    if (!arSetup?.gl_doc_id) throw new Error(`ยังไม่ได้ตั้งค่า GL Document Type ใน ar_gl_account_setup สำหรับ${isCredit ? 'ใบลดหนี้' : 'ใบเพิ่มหนี้'}ลูกค้า`);
+
+    // บัญชี VAT ขาย — ดูที่ im_gl_account_setup ของ doc_code เอกสาร IM นี้ก่อน แล้วค่อย fallback ไปที่
+    // บัญชี VAT ของ AR เอง (มิเรอร์ postArBillFromDln ทุกประการ)
+    const imSetupVatRes = await client.query(`SELECT vat_output_account_id FROM im_gl_account_setup WHERE doc_code = $1`, [header.doc_code]);
+    const vatAccountId = Number(imSetupVatRes.rows[0]?.vat_output_account_id) || Number(arSetup.vat_output_account_id) || null;
+
+    const customerRes = await client.query(`
+        SELECT c.customer_code, c.customer_name_th, c.tax_id, c.ar_account_id, g.gl_account_id AS group_ar_account_id
+        FROM ar_customer c LEFT JOIN ar_customer_group g ON g.id = c.customer_group_id
+        WHERE c.id = $1
+    `, [header.customer_id]);
+    const customerRow = customerRes.rows[0];
+    if (!customerRow) throw new Error('ไม่พบลูกค้าที่ระบุ');
+
+    let arAccountId = arSetup.ar_account_id ? Number(arSetup.ar_account_id) : null;
+    if (!arAccountId) arAccountId = customerRow.group_ar_account_id ? Number(customerRow.group_ar_account_id) : null;
+    if (!arAccountId) arAccountId = customerRow.ar_account_id ? Number(customerRow.ar_account_id) : null;
+    if (!arAccountId) throw new Error('ไม่พบบัญชีลูกหนี้สำหรับการลงบัญชี กรุณาตั้งค่าใน ar_gl_account_setup, กลุ่มลูกค้า หรือลูกค้า');
+
+    const periodRes = await client.query(
+        `SELECT id FROM gl_posting_period WHERE $1::date BETWEEN period_start_date AND period_end_date AND gl_status='OPEN' LIMIT 1`,
+        [header.doc_date]
+    );
+    if (periodRes.rows.length === 0) throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่ ${header.doc_date}`);
+    const periodId = periodRes.rows[0].id;
+
+    let arDocNo = await generateDocNo(client, arDocId, header.doc_date, header.branch_id);
+    if (!arDocNo) arDocNo = `${isCredit ? 'CN' : 'DN'}-${docNo}`;
+
+    let createdByUserId = null;
+    if (header.created_by) {
+        const userRes = await client.query(`SELECT id FROM sa_user WHERE user_name = $1 LIMIT 1`, [header.created_by]);
+        if (userRes.rows.length > 0) createdByUserId = userRes.rows[0].id;
+    }
+
+    const lineRows = [];
+    let totalSubtotal = 0, totalVat = 0;
+    for (const d of details) {
+        const revenueAccountId = await resolveRevenueAccount(client, d.item_id, arSetup.revenue_account_id);
+        const qty = Math.abs(Number(d.qty) || 0); // qty ติดลบสำหรับ DN (สต็อกลด) บวกสำหรับ CN — ใบแจ้งหนี้ต้องเป็นจำนวนบวก
+        const unitPrice = Number(d.unit_price) || 0;
+        const subtotal = qty * unitPrice;
+        const vatType = d.vat_type || 'NOVAT';
+        const vatRate = vatType === 'NOVAT' ? 0 : (Number(d.vat_rate) || 0);
+        const vatAmount = subtotal * vatRate / 100;
+        lineRows.push({
+            itemCode: d.item_code, itemName: d.item_name, quantity: qty, unitPriceFc: unitPrice,
+            subtotal, vatType, vatRate, vatAmount, total: subtotal + vatAmount, revenueAccountId,
+        });
+        totalSubtotal += subtotal;
+        totalVat += vatAmount;
+    }
+    const totalAmount = totalSubtotal + totalVat;
+
+    const label = isCredit ? 'ใบลดหนี้ลูกค้า' : 'ใบเพิ่มหนี้ลูกค้า';
+    const arHeaderRes = await client.query(`
+        INSERT INTO ar_transaction
+        (doc_id, doc_no, doc_date, period_id, customer_id, customer_code, customer_name_th, ar_account_id, gl_doc_id,
+         currency_code, exchange_rate, subtotal_fc, before_vat_fc, vat_amount_fc, total_amount_fc,
+         subtotal_lc, before_vat_lc, vat_amount_lc, total_amount_lc, balance_amount_lc,
+         ref_no, ref_doc_id, ref_doc_no, description, status, created_by, updated_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'THB',1,$10,$10,$11,$12,$10,$10,$11,$12,$12,$13,$14,$15,$16,'Posted',$17,$17)
+        RETURNING id
+    `, [
+        arDocId, arDocNo, header.doc_date, periodId, header.customer_id, customerRow.customer_code, customerRow.customer_name_th,
+        arAccountId, arSetup.gl_doc_id,
+        totalSubtotal, totalVat, totalAmount,
+        header.ref_no || null, header.doc_id, docNo, `${label} (${docNo})`, createdByUserId,
+    ]);
+    const arTransactionId = arHeaderRes.rows[0].id;
+
+    let lineNo = 1;
+    for (const l of lineRows) {
+        const detailRes = await client.query(`
+            INSERT INTO ar_transaction_detail
+            (header_id, line_no, description, quantity, unit_price_fc, subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
+             revenue_account_id, subtotal_lc, vat_amount_lc, total_amount_lc)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$6,$9,$10)
+            RETURNING id
+        `, [arTransactionId, lineNo++, l.itemName || l.itemCode, l.quantity, l.unitPriceFc, l.subtotal, l.vatType, l.vatRate, l.vatAmount, l.total, l.revenueAccountId]);
+        await insertImVtLine(client, {
+            moduleCode: 'AR', vatType: l.vatType, vatRate: l.vatRate, docId: arDocId, headerId: arTransactionId,
+            detailId: detailRes.rows[0].id, docNo: arDocNo, docDate: header.doc_date,
+            baseLc: l.subtotal, vatLc: l.vatAmount, entityIdField: 'customer_id', entityId: header.customer_id,
+            entityName: customerRow.customer_name_th, entityTaxId: customerRow.tax_id, createdByUserId,
+            vatSign: isCredit ? -1 : 1, // CN ลดยอดภาษีขาย (ตรงข้ามใบแจ้งหนี้ปกติ) มิเรอร์ AR's own insertVtRecords
+        });
+    }
+
+    const revByAccount = {};
+    for (const l of lineRows) {
+        revByAccount[l.revenueAccountId] = (revByAccount[l.revenueAccountId] || 0) + l.subtotal;
+    }
+    const arGlDetails = [];
+    for (const [accId, amt] of Object.entries(revByAccount)) {
+        if (amt === 0) continue;
+        // DN: Cr รายได้ (เหมือน postArBillFromDln) — CN: Dr รายได้ (กลับรายการ)
+        arGlDetails.push({
+            account_id: Number(accId), description: `${label} ${arDocNo}`,
+            debit_lc: isCredit ? amt : 0, credit_lc: isCredit ? 0 : amt,
+        });
+    }
+    if (totalVat !== 0) {
+        if (!vatAccountId) throw new Error('ยังไม่ได้ตั้งค่าบัญชีภาษีขาย (vat_output_account_id) ใน im_gl_account_setup หรือ ar_gl_account_setup');
+        arGlDetails.push({
+            account_id: vatAccountId, description: `ภาษีขาย ${arDocNo}`,
+            debit_lc: isCredit ? totalVat : 0, credit_lc: isCredit ? 0 : totalVat,
+        });
+    }
+    if (totalAmount !== 0) {
+        arGlDetails.push({
+            account_id: arAccountId, description: `${label} ${arDocNo}`,
+            debit_lc: isCredit ? 0 : totalAmount, credit_lc: isCredit ? totalAmount : 0,
+        });
+    }
+
+    if (arGlDetails.length > 0) {
+        const totalDebit = arGlDetails.reduce((s, l) => s + l.debit_lc, 0);
+        const totalCredit = arGlDetails.reduce((s, l) => s + l.credit_lc, 0);
+        const arGlHeaderRes = await client.query(`
+            INSERT INTO gl_entry_header
+            (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
+             currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
+             created_by, ref_doc_id, ref_doc_no, external_source_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'Posted',$9,$10,0,0,$11,$12,$13,$14)
+            RETURNING id
+        `, [
+            arSetup.gl_doc_id, `GL-${arDocNo}`, header.doc_date, header.doc_date, periodId,
+            header.ref_no || null, `${label} (${docNo})`,
+            1, totalDebit, totalCredit, createdByUserId, arDocId, arDocNo, arTransactionId,
+        ]);
+        const arGlEntryId = arGlHeaderRes.rows[0].id;
+        let glLineNo = 1;
+        for (const l of arGlDetails) {
+            await client.query(`
+                INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
+                VALUES ($1,$2,$3,$4,$5,$6,0,0)
+            `, [arGlEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc]);
+        }
+        await client.query(`UPDATE ar_transaction SET gl_entry_id = $1 WHERE id = $2`, [arGlEntryId, arTransactionId]);
+    }
+
+    return arTransactionId;
+};
+
+// ตรวจสอบว่าจำนวนที่จะคืน (ต่อบรรทัด, '15'/'35') ไม่เกินจำนวนคงเหลือที่คืนได้ของบรรทัดต้นฉบับ (GRN/DLN) — เอกสาร
+// ต้นฉบับหนึ่งบรรทัดอาจถูกคืนหลายครั้ง (คนละใบ) คงเหลือคำนวณจากผลรวมการคืนที่ Posted แล้วเท่านั้น (Draft ไม่นับ
+// เหมือนกับที่ Draft ไม่มีผลต่อ stock ที่ไหนในโมดูลนี้เลย) — เรียกจาก postDetailLines ก่อน applyStockMovement เสมอ
+const validateReturnableQty = async (client, { refImTransactionDetailId, requestedQty }) => {
+    const origRes = await client.query(
+        `SELECT qty, item_code FROM im_transaction_detail WHERE id = $1`, [refImTransactionDetailId]
+    );
+    if (origRes.rows.length === 0) throw new Error('ไม่พบรายการต้นฉบับที่อ้างอิงสำหรับการคืนสินค้า');
+    const originalQty = Math.abs(Number(origRes.rows[0].qty));
+    const returnedRes = await client.query(`
+        SELECT COALESCE(SUM(ABS(dt2.qty)), 0) AS returned
+        FROM im_transaction_detail dt2 JOIN im_transaction t2 ON t2.id = dt2.header_id
+        WHERE dt2.ref_im_transaction_detail_id = $1 AND t2.status = 'Posted'
+    `, [refImTransactionDetailId]);
+    const remaining = originalQty - Number(returnedRes.rows[0].returned);
+    if (requestedQty > remaining + 0.0001) {
+        throw new Error(`จำนวนที่คืนเกินกว่าคงเหลือที่คืนได้ของ ${origRes.rows[0].item_code} (คงเหลือคืนได้ ${remaining})`);
+    }
 };
 
 // นับสต็อก + โพสต์ GL สำหรับทุกบรรทัดของเอกสาร — ใช้ทั้งใน createTransaction(action=Post) และ postTransaction
@@ -930,6 +1375,14 @@ const postDetailLines = async (client, headerId, header, docNo) => {
             countedQty: d.counted_qty, enteredUnitCost: d.unit_cost, docDate: header.doc_date, docCode: header.doc_code,
             headerId, docNo, detailId: d.id, updatedBy,
         });
+        // '15'/'35' (คืนสินค้าผู้ขาย/รับคืนจากลูกค้า) ที่อ้างอิงบรรทัดต้นฉบับ — ตรวจคงเหลือที่คืนได้ *หลัง* ทราบ
+        // จำนวนจริงที่เคลื่อนไหว (varianceQty) เพื่อเลี่ยงคำนวณ balance-before ซ้ำ ยัง throw ก่อน COMMIT ได้ทันเวลา
+        // เพราะทั้งหมดอยู่ใน client transaction เดียวกัน (rollback ทั้งหมดถ้า error)
+        if (['15', '35'].includes(sysDocType) && d.ref_im_transaction_detail_id) {
+            await validateReturnableQty(client, {
+                refImTransactionDetailId: d.ref_im_transaction_detail_id, requestedQty: Math.abs(varianceQty),
+            });
+        }
         const valueLc = varianceQty * actualUnitCost;
         await client.query(`
             UPDATE im_transaction_detail
@@ -960,6 +1413,37 @@ const postDetailLines = async (client, headerId, header, docNo) => {
     if (sysDocType === '11') {
         linkedApTransactionId = await postApBillFromGrn(client, {
             header, details: updatedDetails, docNo, vendorInvoiceNo: header.ref_no, mode,
+        });
+    } else if (['15', '20'].includes(sysDocType)) {
+        // คืนสินค้าผู้ขาย ('15') / ลดหนี้เจ้าหนี้ ('20') — ทั้งคู่โพสต์ AP CN เดียวกัน ('15' มีการอ้างอิงเอกสารต้นฉบับ
+        // เพิ่มเติมเท่านั้น ไม่ต่างกันที่การโพสต์บัญชี — Dr AP/Cr คลัง เป็น entry เดียวจบ ไม่ผ่าน postGlEntry ของ IM
+        // เอง เลย (มิเรอร์ '11') ไม่ระงับใน Periodic เพราะเป็นภาระผูกพันจริงกับเจ้าหนี้ ไม่ใช่การตีมูลค่าสต็อก
+        linkedApTransactionId = await postApCreditDebitNoteFromIm(client, {
+            header, details: updatedDetails, docNo, mode, isCredit: true,
+        });
+    } else if (sysDocType === '25') {
+        // เพิ่มหนี้เจ้าหนี้ (DNS) — โพสต์ AP DN, Dr คลัง/Cr AP (เหมือน '11' ทุกประการในรูปร่าง ต่างกันแค่เหตุผลทางธุรกิจ)
+        linkedApTransactionId = await postApCreditDebitNoteFromIm(client, {
+            header, details: updatedDetails, docNo, mode, isCredit: false,
+        });
+    } else if (['35', '40'].includes(sysDocType)) {
+        // รับคืนสินค้าจากลูกค้า ('35') / ลดหนี้ลูกหนี้ ('40') — มิเรอร์ '31': กลับรายการต้นทุนขาย (Dr คลัง/Cr COGS ผ่าน
+        // postGlEntry ของ IM เอง ระงับใน Periodic เหมือน '30'/'31'/ISS) + โพสต์ AR CN แยกต่างหาก (Dr รายได้+ภาษี/Cr AR
+        // ต้อง Post เสมอไม่ว่าโหมดใด เพราะเป็นภาระผูกพันจริงกับลูกค้า) — 2 entry แยกกันเหมือน '31' ('15'/'20' ฝั่ง AP
+        // ไม่ต้องแยกเพราะ Dr/Cr คลัง-เจ้าหนี้เป็น entry เดียวจบได้ในตัว ไม่มีการรับรู้ต้นทุนขายแยกแบบฝั่งขาย)
+        if (mode !== 'PERIODIC') {
+            glEntryId = await postGlEntry(client, headerId, header, updatedDetails, docNo, sysDocType, mode);
+        }
+        linkedArTransactionId = await postArCreditDebitNoteFromIm(client, {
+            header, details: updatedDetails, docNo, isCredit: true,
+        });
+    } else if (sysDocType === '45') {
+        // เพิ่มหนี้ลูกหนี้ (DNC) — มิเรอร์ '31' ทุกประการในรูปร่าง (Dr COGS/Cr คลัง + Dr AR/Cr รายได้+ภาษี)
+        if (mode !== 'PERIODIC') {
+            glEntryId = await postGlEntry(client, headerId, header, updatedDetails, docNo, sysDocType, mode);
+        }
+        linkedArTransactionId = await postArCreditDebitNoteFromIm(client, {
+            header, details: updatedDetails, docNo, isCredit: false,
         });
     } else if (sysDocType === '31') {
         // DLN Billing — ต้นทุนขาย (Dr COGS/Cr คลัง) ถูกระงับใน Periodic เหมือน '30'/ISS ทุกประการ (คำนวณรวมตอนปิดงวด
@@ -998,6 +1482,7 @@ const fetchRowById = async (pool, id) => {
                w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
                tw.warehouse_code AS to_warehouse_code, tw.warehouse_name_th AS to_warehouse_name_th,
                b.branch_code, b.branch_name_thai,
+               reft.doc_no AS ref_im_transaction_doc_no,
                dim1.value_name AS dim1_name, dim2.value_name AS dim2_name, dim3.value_name AS dim3_name,
                dim4.value_name AS dim4_name, dim5.value_name AS dim5_name
         FROM im_transaction t
@@ -1005,6 +1490,7 @@ const fetchRowById = async (pool, id) => {
         LEFT JOIN im_warehouse w  ON w.id = t.warehouse_id
         LEFT JOIN im_warehouse tw ON tw.id = t.to_warehouse_id
         LEFT JOIN cd_branch b     ON b.id = t.branch_id
+        LEFT JOIN im_transaction reft ON reft.id = t.ref_im_transaction_id
         LEFT JOIN gl_dimension_value dim1 ON dim1.id = t.dim1_id
         LEFT JOIN gl_dimension_value dim2 ON dim2.id = t.dim2_id
         LEFT JOIN gl_dimension_value dim3 ON dim3.id = t.dim3_id
@@ -1098,6 +1584,70 @@ const fetchSystemQty = async (req, res) => {
     } finally { client.release(); }
 };
 
+// GET /im_transaction/returnable_docs?family=GRN|DLN&vendor_id=&customer_id=&search= — เอกสาร GRN/DLN ที่ Post
+// แล้ว ให้เลือกเป็นเอกสารต้นฉบับสำหรับ '15' (คืนสินค้าผู้ขาย) / '35' (รับคืนจากลูกค้า) — ใช้โดย document picker หน้าบ้าน
+const fetchReturnableDocs = async (req, res) => {
+    const client = await req.dbPool.connect();
+    try {
+        await ensureImTransactionTable(client);
+        const { family, vendor_id, customer_id, search } = req.query;
+        const isDln = family === 'DLN';
+        const sysTypes = isDln ? ['30', '31', '32'] : ['10', '11', '12'];
+        const statuses = isDln ? ['Posted', 'Delivered'] : ['Posted', 'Received'];
+        let query = `
+            SELECT t.id, t.doc_no, t.doc_date, t.status, t.vendor_id, t.vendor_code, t.vendor_name_th,
+                   t.customer_id, t.customer_code, t.customer_name_th, d.doc_code, d.sys_doc_type
+            FROM im_transaction t
+            JOIN sa_module_document d ON d.id = t.doc_id
+            WHERE d.sys_doc_type = ANY($1::text[]) AND t.status = ANY($2::text[])`;
+        const params = [sysTypes, statuses];
+        let pi = 3;
+        if (vendor_id)   { params.push(vendor_id);   query += ` AND t.vendor_id = $${pi++}`; }
+        if (customer_id) { params.push(customer_id); query += ` AND t.customer_id = $${pi++}`; }
+        if (search) { params.push(`%${search.toUpperCase()}%`); query += ` AND UPPER(t.doc_no) LIKE $${pi++}`; }
+        query += ` ORDER BY t.doc_date DESC, t.id DESC LIMIT 50`;
+        const result = await client.query(query, params);
+        res.status(200).json(result.rows);
+    } catch (error) {
+        console.error('Error fetching im_transaction returnable_docs:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    } finally { client.release(); }
+};
+
+// GET /im_transaction/:id/returnable_lines — บรรทัดของเอกสารต้นฉบับ (GRN/DLN) พร้อมจำนวนคงเหลือที่คืนได้ต่อบรรทัด
+// (จำนวนเดิม - ผลรวมจำนวนที่ถูกคืนไปแล้วผ่านเอกสาร '15'/'35' ที่ Posted แล้วเท่านั้น) — คำนวณสูตรเดียวกับ
+// validateReturnableQty ที่ใช้ตรวจจริงตอน Post เพื่อให้ตัวเลขที่ผู้ใช้เห็นตอนเลือกตรงกับที่ระบบจะยอมให้ Post จริง
+const fetchReturnableLines = async (req, res) => {
+    const client = await req.dbPool.connect();
+    try {
+        await ensureImTransactionTable(client);
+        const { id } = req.params;
+        const detailsRes = await client.query(`
+            SELECT dt.id, dt.line_no, dt.item_id, dt.item_code, dt.item_name, dt.location_id, dt.lot_no, dt.serial_no,
+                   dt.uom_id, dt.qty, dt.unit_cost, l.location_code, u.uom_code
+            FROM im_transaction_detail dt
+            LEFT JOIN im_location l ON l.id = dt.location_id
+            LEFT JOIN im_uom u      ON u.id  = dt.uom_id
+            WHERE dt.header_id = $1 ORDER BY dt.line_no
+        `, [id]);
+        const lines = [];
+        for (const d of detailsRes.rows) {
+            const originalQty = Math.abs(Number(d.qty) || 0);
+            const returnedRes = await client.query(`
+                SELECT COALESCE(SUM(ABS(dt2.qty)), 0) AS returned
+                FROM im_transaction_detail dt2 JOIN im_transaction t2 ON t2.id = dt2.header_id
+                WHERE dt2.ref_im_transaction_detail_id = $1 AND t2.status = 'Posted'
+            `, [d.id]);
+            const remainingQty = originalQty - Number(returnedRes.rows[0].returned);
+            lines.push({ ...d, original_qty: originalQty, remaining_qty: remainingQty });
+        }
+        res.status(200).json(lines);
+    } catch (error) {
+        console.error('Error fetching im_transaction returnable_lines:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    } finally { client.release(); }
+};
+
 // --- 1. Create Transaction (Draft/Post) ---
 // สร้าง + (ถ้า action='Post') โพสต์ im_transaction ทันที ในทรานแซกชันของ client ที่ส่งเข้ามา
 // ใช้ได้ 2 ทาง: (1) createTransaction (HTTP handler ด้านล่าง) ส่ง docId ที่ผู้ใช้เลือกมาจาก dropdown
@@ -1105,7 +1655,7 @@ const fetchSystemQty = async (req, res) => {
 //     ให้ resolve เอาเองว่าจะใช้ doc_code ไหนใต้มาตรฐานนี้ (เผื่อมีหลาย doc_code ต่อ sys_doc_type)
 const insertAndPostAdjustment = async (client, {
     docId, docCode, sysDocType, docNo, docDate, warehouseId, toWarehouseId, vendorId, customerId,
-    refNo, refDocId, refDocNo, description,
+    refNo, refDocId, refDocNo, refImTransactionId, description,
     dim1Id, dim2Id, dim3Id, dim4Id, dim5Id, branchId, createdBy,
     lines, action,
 }) => {
@@ -1144,14 +1694,38 @@ const insertAndPostAdjustment = async (client, {
     if (resolvedSysDocType === '70' && !toWarehouseId) {
         throw new Error('กรุณาระบุคลังปลายทาง (to_warehouse_id) สำหรับเอกสารประเภทโอนสินค้า');
     }
-    if (['10', '11', '12'].includes(resolvedSysDocType) && !vendorId) {
-        throw new Error('กรุณาระบุผู้ขาย สำหรับเอกสารประเภทรับสินค้า');
+    if (['10', '11', '12', '15', '20', '25'].includes(resolvedSysDocType) && !vendorId) {
+        throw new Error('กรุณาระบุผู้ขาย สำหรับเอกสารประเภทนี้');
     }
     if (resolvedSysDocType === '11' && !refNo) {
         throw new Error('กรุณาระบุเลขที่ใบกำกับสินค้าผู้ขาย สำหรับเอกสารประเภทรับสินค้า+ตั้งหนี้อัตโนมัติ');
     }
-    if (['30', '31', '32'].includes(resolvedSysDocType) && !customerId) {
-        throw new Error('กรุณาระบุลูกค้า สำหรับเอกสารประเภทส่งสินค้า');
+    if (['30', '31', '32', '35', '40', '45'].includes(resolvedSysDocType) && !customerId) {
+        throw new Error('กรุณาระบุลูกค้า สำหรับเอกสารประเภทนี้');
+    }
+    // '15'/'35' (คืนสินค้าผู้ขาย/รับคืนจากลูกค้า) — บังคับอ้างอิงเอกสารต้นฉบับ (GRN/DLN) เสมอ เพื่อติดตามจำนวนคืน
+    // บางส่วน (partial return) แตกต่างจาก '20'/'25'/'40'/'45' ที่เป็นเอกสารอิสระ (stand-alone เหมือน '11'/'31')
+    if (['15', '35'].includes(resolvedSysDocType)) {
+        if (!refImTransactionId) {
+            throw new Error('กรุณาระบุเอกสารต้นฉบับที่จะคืน สำหรับเอกสารประเภทนี้');
+        }
+        const refFamily = resolvedSysDocType === '15' ? ['10', '11', '12'] : ['30', '31', '32'];
+        const refStatuses = resolvedSysDocType === '15' ? ['Posted', 'Received'] : ['Posted', 'Delivered'];
+        const refRes = await client.query(`
+            SELECT t.vendor_id, t.customer_id, t.status, d.sys_doc_type FROM im_transaction t
+            JOIN sa_module_document d ON d.id = t.doc_id WHERE t.id = $1
+        `, [refImTransactionId]);
+        if (refRes.rows.length === 0) throw new Error('ไม่พบเอกสารต้นฉบับที่อ้างอิง');
+        const refRow = refRes.rows[0];
+        if (!refFamily.includes(refRow.sys_doc_type) || !refStatuses.includes(refRow.status)) {
+            throw new Error('เอกสารต้นฉบับที่อ้างอิงต้องเป็นเอกสารรับ/ส่งสินค้าที่ Post แล้วในกลุ่มเดียวกันเท่านั้น');
+        }
+        if (resolvedSysDocType === '15' && Number(refRow.vendor_id) !== Number(vendorId)) {
+            throw new Error('ผู้ขายของเอกสารคืนสินค้าต้องตรงกับผู้ขายของเอกสารต้นฉบับ');
+        }
+        if (resolvedSysDocType === '35' && Number(refRow.customer_id) !== Number(customerId)) {
+            throw new Error('ลูกค้าของเอกสารรับคืนสินค้าต้องตรงกับลูกค้าของเอกสารต้นฉบับ');
+        }
     }
 
     let vendorCode = null, vendorNameTh = null;
@@ -1189,14 +1763,14 @@ const insertAndPostAdjustment = async (client, {
         INSERT INTO im_transaction
         (doc_id, doc_no, doc_code, doc_date, period_id, warehouse_id, to_warehouse_id,
          vendor_id, vendor_code, vendor_name_th, customer_id, customer_code, customer_name_th,
-         ref_no, ref_doc_id, ref_doc_no, description, status,
+         ref_no, ref_doc_id, ref_doc_no, ref_im_transaction_id, description, status,
          dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id, created_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
         RETURNING id
     `, [
         resolvedDocId, finalDocNo, resolvedDocCode, docDate, periodId, warehouseId, toWarehouseId || null,
         vendorId || null, vendorCode, vendorNameTh, customerId || null, customerCode, customerNameTh,
-        refNo || null, refDocId || null, refDocNo || null, description || null, 'Draft',
+        refNo || null, refDocId || null, refDocNo || null, refImTransactionId || null, description || null, 'Draft',
         dim1Id || null, dim2Id || null, dim3Id || null, dim4Id || null, dim5Id || null,
         branchId || null, createdBy || null,
     ]);
@@ -1207,12 +1781,14 @@ const insertAndPostAdjustment = async (client, {
         await client.query(`
             INSERT INTO im_transaction_detail
             (header_id, line_no, item_id, item_code, item_name, location_id, to_location_id, lot_no, serial_no, uom_id,
-             system_qty, counted_qty, unit_cost, unit_price, description)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+             system_qty, counted_qty, unit_cost, unit_price, vat_type, vat_rate, ref_im_transaction_detail_id, description)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
         `, [
             newHeaderId, lineNo++, d.item_id, d.item_code || null, d.item_name || null,
             d.location_id || null, d.to_location_id || null, d.lot_no || null, d.serial_no || null, d.uom_id || null,
-            d.system_qty ?? 0, d.counted_qty ?? 0, d.unit_cost ?? null, d.unit_price ?? null, d.description || null,
+            d.system_qty ?? 0, d.counted_qty ?? 0, d.unit_cost ?? null, d.unit_price ?? null,
+            d.vat_type || null, d.vat_rate ?? null,
+            d.ref_im_transaction_detail_id || null, d.description || null,
         ]);
     }
 
@@ -1242,6 +1818,7 @@ const createTransaction = async (req, res) => {
             warehouseId: header.warehouse_id, toWarehouseId: header.to_warehouse_id, vendorId: header.vendor_id,
             customerId: header.customer_id,
             refNo: header.ref_no, refDocId: header.ref_doc_id, refDocNo: header.ref_doc_no,
+            refImTransactionId: header.ref_im_transaction_id,
             description: header.description,
             dim1Id: header.dim1_id, dim2Id: header.dim2_id, dim3Id: header.dim3_id,
             dim4Id: header.dim4_id, dim5Id: header.dim5_id,
@@ -1310,14 +1887,37 @@ const updateTransaction = async (req, res) => {
         if (existing.rows[0].sys_doc_type === '70' && !header.to_warehouse_id) {
             throw new Error('กรุณาระบุคลังปลายทาง (to_warehouse_id) สำหรับเอกสารประเภทโอนสินค้า');
         }
-        if (['10', '11', '12'].includes(existing.rows[0].sys_doc_type) && !header.vendor_id) {
-            throw new Error('กรุณาระบุผู้ขาย สำหรับเอกสารประเภทรับสินค้า');
+        if (['10', '11', '12', '15', '20', '25'].includes(existing.rows[0].sys_doc_type) && !header.vendor_id) {
+            throw new Error('กรุณาระบุผู้ขาย สำหรับเอกสารประเภทนี้');
         }
         if (existing.rows[0].sys_doc_type === '11' && !header.ref_no) {
             throw new Error('กรุณาระบุเลขที่ใบกำกับสินค้าผู้ขาย สำหรับเอกสารประเภทรับสินค้า+ตั้งหนี้อัตโนมัติ');
         }
-        if (['30', '31', '32'].includes(existing.rows[0].sys_doc_type) && !header.customer_id) {
-            throw new Error('กรุณาระบุลูกค้า สำหรับเอกสารประเภทส่งสินค้า');
+        if (['30', '31', '32', '35', '40', '45'].includes(existing.rows[0].sys_doc_type) && !header.customer_id) {
+            throw new Error('กรุณาระบุลูกค้า สำหรับเอกสารประเภทนี้');
+        }
+        if (['15', '35'].includes(existing.rows[0].sys_doc_type)) {
+            const sysType = existing.rows[0].sys_doc_type;
+            if (!header.ref_im_transaction_id) {
+                throw new Error('กรุณาระบุเอกสารต้นฉบับที่จะคืน สำหรับเอกสารประเภทนี้');
+            }
+            const refFamily = sysType === '15' ? ['10', '11', '12'] : ['30', '31', '32'];
+            const refStatuses = sysType === '15' ? ['Posted', 'Received'] : ['Posted', 'Delivered'];
+            const refRes = await client.query(`
+                SELECT t.vendor_id, t.customer_id, t.status, d.sys_doc_type FROM im_transaction t
+                JOIN sa_module_document d ON d.id = t.doc_id WHERE t.id = $1
+            `, [header.ref_im_transaction_id]);
+            if (refRes.rows.length === 0) throw new Error('ไม่พบเอกสารต้นฉบับที่อ้างอิง');
+            const refRow = refRes.rows[0];
+            if (!refFamily.includes(refRow.sys_doc_type) || !refStatuses.includes(refRow.status)) {
+                throw new Error('เอกสารต้นฉบับที่อ้างอิงต้องเป็นเอกสารรับ/ส่งสินค้าที่ Post แล้วในกลุ่มเดียวกันเท่านั้น');
+            }
+            if (sysType === '15' && Number(refRow.vendor_id) !== Number(header.vendor_id)) {
+                throw new Error('ผู้ขายของเอกสารคืนสินค้าต้องตรงกับผู้ขายของเอกสารต้นฉบับ');
+            }
+            if (sysType === '35' && Number(refRow.customer_id) !== Number(header.customer_id)) {
+                throw new Error('ลูกค้าของเอกสารรับคืนสินค้าต้องตรงกับลูกค้าของเอกสารต้นฉบับ');
+            }
         }
 
         let vendorCode = null, vendorNameTh = null;
@@ -1350,15 +1950,16 @@ const updateTransaction = async (req, res) => {
                 doc_date=$1, period_id=$2, warehouse_id=$3, to_warehouse_id=$4,
                 vendor_id=$5, vendor_code=$6, vendor_name_th=$7,
                 customer_id=$8, customer_code=$9, customer_name_th=$10,
-                ref_no=$11, ref_doc_id=$12, ref_doc_no=$13, description=$14,
-                dim1_id=$15, dim2_id=$16, dim3_id=$17, dim4_id=$18, dim5_id=$19,
-                branch_id=$20, updated_by=$21, updated_at=NOW()
-            WHERE id=$22
+                ref_no=$11, ref_doc_id=$12, ref_doc_no=$13, ref_im_transaction_id=$14, description=$15,
+                dim1_id=$16, dim2_id=$17, dim3_id=$18, dim4_id=$19, dim5_id=$20,
+                branch_id=$21, updated_by=$22, updated_at=NOW()
+            WHERE id=$23
         `, [
             header.doc_date, periodId, header.warehouse_id, header.to_warehouse_id || null,
             header.vendor_id || null, vendorCode, vendorNameTh,
             header.customer_id || null, customerCode, customerNameTh,
-            header.ref_no || null, header.ref_doc_id || null, header.ref_doc_no || null, header.description || null,
+            header.ref_no || null, header.ref_doc_id || null, header.ref_doc_no || null,
+            header.ref_im_transaction_id || null, header.description || null,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
             header.branch_id || null, header.updated_by || null, id,
         ]);
@@ -1369,12 +1970,14 @@ const updateTransaction = async (req, res) => {
             await client.query(`
                 INSERT INTO im_transaction_detail
                 (header_id, line_no, item_id, item_code, item_name, location_id, to_location_id, lot_no, serial_no, uom_id,
-                 system_qty, counted_qty, unit_cost, unit_price, description)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                 system_qty, counted_qty, unit_cost, unit_price, vat_type, vat_rate, ref_im_transaction_detail_id, description)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
             `, [
                 id, lineNo++, d.item_id, d.item_code || null, d.item_name || null,
                 d.location_id || null, d.to_location_id || null, d.lot_no || null, d.serial_no || null, d.uom_id || null,
-                d.system_qty ?? 0, d.counted_qty ?? 0, d.unit_cost ?? null, d.unit_price ?? null, d.description || null,
+                d.system_qty ?? 0, d.counted_qty ?? 0, d.unit_cost ?? null, d.unit_price ?? null,
+                d.vat_type || null, d.vat_rate ?? null,
+                d.ref_im_transaction_detail_id || null, d.description || null,
             ]);
         }
 
@@ -1636,7 +2239,7 @@ const deleteTransaction = async (req, res) => {
 
 module.exports = {
     ensureImTransactionTable,
-    fetchRows, fetchRow, fetchSystemQty,
+    fetchRows, fetchRow, fetchSystemQty, fetchReturnableDocs, fetchReturnableLines,
     createTransaction, updateTransaction, postTransaction, postBillingForGrn, postBillingForDln, voidTransaction, deleteTransaction,
     insertAndPostAdjustment, STOCK_BALANCE_KEY,
     upsertStockBalance, recomputeBalanceFromLayers,
