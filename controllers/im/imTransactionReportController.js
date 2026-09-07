@@ -50,13 +50,18 @@ const getTransactionReport = async (req, res) => {
         const txnIds = headerRes.rows.map(r => r.txn_id);
         const linesByHeader = new Map();
         if (txnIds.length > 0) {
+            // dt.item_name/dt.item_code เป็น snapshot ที่ INSERT path บางเส้นทางไม่ได้เซ็ตค่า (พบเป็น NULL ในข้อมูลจริง
+            // แม้ dt.item_id จะมีค่าเสมอ) — COALESCE กับข้อมูลปัจจุบันจาก im_item เป็น fallback เสมอ
             const detailRes = await client.query(`
                 SELECT
-                    dt.header_id, dt.line_no, dt.item_code, dt.item_name,
+                    dt.header_id, dt.line_no,
+                    COALESCE(dt.item_code, it.item_code) AS item_code,
+                    it.item_name_th, it.item_name_en,
                     dt.qty, dt.unit_cost, dt.unit_price, dt.billed_unit_cost,
                     dt.vat_type, dt.vat_rate, dt.lot_no, dt.serial_no, dt.total_value_lc,
-                    u.uom_code, l.location_code, tl.location_code AS to_location_code
+                    u.uom_code, u.uom_name_th, u.uom_name_en, l.location_code, tl.location_code AS to_location_code
                 FROM im_transaction_detail dt
+                LEFT JOIN im_item it     ON it.id = dt.item_id
                 LEFT JOIN im_uom u       ON u.id  = dt.uom_id
                 LEFT JOIN im_location l  ON l.id  = dt.location_id
                 LEFT JOIN im_location tl ON tl.id = dt.to_location_id
