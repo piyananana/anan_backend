@@ -24,6 +24,7 @@ const imGrBillingReportController = require('../controllers/im/imGrBillingReport
 const imDlnBillingReportController = require('../controllers/im/imDlnBillingReportController');
 const imResetController        = require('../controllers/im/imResetController');
 const imTransactionReportController = require('../controllers/im/imTransactionReportController');
+const imItemTransactionReportController = require('../controllers/im/imItemTransactionReportController');
 
 // im_gl_account_setup (per doc-type GL fallback, for the future im_transaction module)
 router.get('/im_gl_account_setup',           imGlAccountSetupController.fetchRows);
@@ -77,6 +78,7 @@ router.get('/im_transaction/returnable_docs', imTransactionController.fetchRetur
 router.get('/im_transaction/gr_billing_report', imGrBillingReportController.getGrBillingReport);
 router.get('/im_transaction/dln_billing_report', imDlnBillingReportController.getDlnBillingReport);
 router.get('/im_transaction_report', imTransactionReportController.getTransactionReport);
+router.get('/im_item_transaction_report', imItemTransactionReportController.getItemTransactionReport);
 router.get('/im_transaction',            imTransactionController.fetchRows);
 router.get('/im_transaction/:id',        imTransactionController.fetchRow);
 router.get('/im_transaction/:id/returnable_lines', imTransactionController.fetchReturnableLines);
