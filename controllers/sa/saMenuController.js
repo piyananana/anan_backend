@@ -18,9 +18,14 @@ const getAllMenu = async (req, res) => {
         await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_description_en TEXT');
 
         const isDeveloper = req.isDeveloper ?? false;
-        const query = isDeveloper
-            ? 'SELECT * FROM sa_menu WHERE is_active = TRUE ORDER BY parent_id ASC, sort_order ASC'
-            : 'SELECT * FROM sa_menu WHERE is_active = TRUE AND (is_system = FALSE OR is_system IS NULL) ORDER BY parent_id ASC, sort_order ASC';
+        // include_inactive=true — ใช้โดยหน้าจอจัดการเมนู (sa_menu_screen) เท่านั้น เพื่อให้ยังหาเมนูที่ถูกปิด
+        // ใช้งานแล้วเจอ และเปิดกลับมาใช้งานได้ใหม่ — ค่า default (ไม่ส่ง) ยังคงพฤติกรรมเดิมทุกจุดที่เรียกอยู่
+        const includeInactive = String(req.query.include_inactive || '').toLowerCase() === 'true';
+        const conditions = [];
+        if (!includeInactive) conditions.push('is_active = TRUE');
+        if (!isDeveloper) conditions.push('(is_system = FALSE OR is_system IS NULL)');
+        const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+        const query = `SELECT * FROM sa_menu ${whereClause} ORDER BY parent_id ASC, sort_order ASC`;
         const result = await req.dbPool.query(query);
         res.json(result.rows);
     } catch (err) {
