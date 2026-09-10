@@ -68,7 +68,7 @@ const getStockMovementReport = async (req, res) => {
                 SELECT
                     t.id AS txn_id, t.doc_no, t.doc_date, d.doc_code, d.doc_name_thai, d.doc_name_eng,
                     d.sys_doc_type, t.warehouse_id AS effective_warehouse_id,
-                    dt.item_id, dt.qty, dt.total_value_lc
+                    dt.item_id, dt.qty, dt.total_value_lc, dt.lot_no, dt.serial_no
                 FROM im_transaction t
                 JOIN sa_module_document d ON d.id = t.doc_id
                 JOIN im_transaction_detail dt ON dt.header_id = t.id
@@ -82,7 +82,7 @@ const getStockMovementReport = async (req, res) => {
                 SELECT
                     t.id, t.doc_no, t.doc_date, d.doc_code, d.doc_name_thai, d.doc_name_eng,
                     d.sys_doc_type, t.to_warehouse_id AS effective_warehouse_id,
-                    dt.item_id, -dt.qty AS qty, -dt.total_value_lc AS total_value_lc
+                    dt.item_id, -dt.qty AS qty, -dt.total_value_lc AS total_value_lc, dt.lot_no, dt.serial_no
                 FROM im_transaction t
                 JOIN sa_module_document d ON d.id = t.doc_id
                 JOIN im_transaction_detail dt ON dt.header_id = t.id
@@ -120,13 +120,14 @@ const getStockMovementReport = async (req, res) => {
             )
             SELECT
                 ir.txn_id, ir.doc_no, ir.doc_date, ir.doc_code, ir.doc_name_thai, ir.doc_name_eng, ir.sys_doc_type,
-                ir.qty, ir.total_value_lc,
+                ir.qty, ir.total_value_lc, ir.lot_no, ir.serial_no,
                 COALESCE(o.opening_qty, 0) + COALESCE(ir.cum_qty, 0)     AS running_qty,
                 COALESCE(o.opening_value, 0) + COALESCE(ir.cum_value, 0) AS running_value,
                 COALESCE(o.opening_qty, 0)   AS opening_qty,
                 COALESCE(o.opening_value, 0) AS opening_value,
                 w.id AS warehouse_id, w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
                 it.id AS item_id, it.item_code, it.item_name_th, it.item_name_en, it.costing_method,
+                it.is_lot_tracked, it.is_serial_tracked,
                 cat.id AS category_id, cat.category_code, cat.category_name_th, cat.category_name_en,
                 u.uom_code, u.uom_name_th, u.uom_name_en
             FROM scope s
