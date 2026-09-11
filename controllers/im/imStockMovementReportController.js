@@ -68,7 +68,7 @@ const getStockMovementReport = async (req, res) => {
                 SELECT
                     t.id AS txn_id, t.doc_no, t.doc_date, d.doc_code, d.doc_name_thai, d.doc_name_eng,
                     d.sys_doc_type, t.warehouse_id AS effective_warehouse_id,
-                    dt.item_id, dt.qty, dt.total_value_lc, dt.lot_no, dt.serial_no
+                    dt.item_id, dt.qty, dt.total_value_lc, dt.lot_no, dt.serial_no, dt.line_no
                 FROM im_transaction t
                 JOIN sa_module_document d ON d.id = t.doc_id
                 JOIN im_transaction_detail dt ON dt.header_id = t.id
@@ -82,7 +82,7 @@ const getStockMovementReport = async (req, res) => {
                 SELECT
                     t.id, t.doc_no, t.doc_date, d.doc_code, d.doc_name_thai, d.doc_name_eng,
                     d.sys_doc_type, t.to_warehouse_id AS effective_warehouse_id,
-                    dt.item_id, -dt.qty AS qty, -dt.total_value_lc AS total_value_lc, dt.lot_no, dt.serial_no
+                    dt.item_id, -dt.qty AS qty, -dt.total_value_lc AS total_value_lc, dt.lot_no, dt.serial_no, dt.line_no
                 FROM im_transaction t
                 JOIN sa_module_document d ON d.id = t.doc_id
                 JOIN im_transaction_detail dt ON dt.header_id = t.id
@@ -104,15 +104,19 @@ const getStockMovementReport = async (req, res) => {
                 GROUP BY effective_warehouse_id, item_id
             ),
             in_range AS (
+                -- line_no เป็น tiebreaker จำเป็น — เอกสารที่มีหลายบรรทัดของสินค้าเดียวกัน (เช่น AJS ที่ใส่
+                -- serial ทีละตัวในเอกสารเดียว) จะมี doc_date/txn_id ซ้ำกันทุกบรรทัด ถ้าไม่ระบุ tiebreaker ที่
+                -- ตรงกับ ORDER BY ของ query ชั้นนอก (ดูท้ายไฟล์) ลำดับ partial-sum ของ window function นี้จะไม่
+                -- สัมพันธ์กับลำดับแถวที่แสดงจริง ทำให้ยอดสะสมต่อบรรทัดผิด (verify แล้วกับ AJS26-0007/11010015)
                 SELECT m.*,
                     SUM(m.qty) OVER (
                         PARTITION BY m.effective_warehouse_id, m.item_id
-                        ORDER BY m.doc_date, m.txn_id
+                        ORDER BY m.doc_date, m.txn_id, m.line_no
                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                     ) AS cum_qty,
                     SUM(m.total_value_lc) OVER (
                         PARTITION BY m.effective_warehouse_id, m.item_id
-                        ORDER BY m.doc_date, m.txn_id
+                        ORDER BY m.doc_date, m.txn_id, m.line_no
                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                     ) AS cum_value
                 FROM movement m
@@ -140,7 +144,7 @@ const getStockMovementReport = async (req, res) => {
             WHERE 1=1
               ${warehouseFilter}
               ${itemFilter}
-            ORDER BY w.warehouse_code, cat.category_code, it.item_code, ir.doc_date NULLS FIRST, ir.txn_id
+            ORDER BY w.warehouse_code, cat.category_code, it.item_code, ir.doc_date NULLS FIRST, ir.txn_id, ir.line_no
         `;
 
         const result = await client.query(sql, params);
