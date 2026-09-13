@@ -2188,6 +2188,63 @@ const postBillingForDln = async (req, res) => {
 };
 
 // --- 3. Void ---
+// ย้อนกลับผลของการ Post ทั้งหมด (ตัดสต็อกกลับ, Void GL/AP/AR ที่ผูกไว้) — ใช้ร่วมกันทั้ง voidTransaction (จบที่
+// status='Void' ถาวร เก็บ audit trail) และ reverseToDraft (จบที่ status='Draft' ให้แก้ไขแล้ว Post ใหม่ได้) โยน
+// error กลับให้ผู้เรียก catch/ROLLBACK เอง (ไม่ COMMIT ในนี้) — action label ใช้แค่ปรับข้อความ error ให้ตรงบริบท
+const _reverseLinkedPostings = async (client, tx, action = 'Void') => {
+    const verb = action === 'Void' ? 'Void' : 'ถอยกลับเป็นฉบับร่าง';
+    // 'Received' = '12' ที่ Post IM แล้วแต่ยังไม่ Post AP/GL, 'Delivered' = '32' ที่ Post IM แล้วแต่ยังไม่ Post
+    // AR/GL — ย้อนกลับได้เหมือนกัน แค่บาง entry ยังไม่มีให้ย้อนกลับ (คู่ '32': COGS Post ไปแล้วตอน Delivered, ต่างจาก
+    // '12' ที่ยังไม่มี GL ใดๆ เลยตอน Received)
+    if (tx.status !== 'Posted' && tx.status !== 'Received' && tx.status !== 'Delivered') {
+        throw new Error(`${verb} ได้เฉพาะเอกสารที่ Posted, Received หรือ Delivered แล้วเท่านั้น`);
+    }
+
+    // GRN Billing ('11') สร้าง ap_transaction ไว้ — ต้อง Void ตามด้วยเสมอ เว้นแต่มีการจ่ายชำระ/จับคู่ไปแล้ว
+    if (tx.linked_ap_transaction_id) {
+        const apRes = await client.query(`SELECT * FROM ap_transaction WHERE id = $1 FOR UPDATE`, [tx.linked_ap_transaction_id]);
+        const apTx = apRes.rows[0];
+        if (apTx && apTx.status !== 'Void') {
+            const appliedRes = await client.query(
+                `SELECT COUNT(*) FROM ap_transaction_apply WHERE applied_to_id = $1`,
+                [tx.linked_ap_transaction_id]
+            );
+            if (Number(appliedRes.rows[0].count) > 0 || Number(apTx.paid_amount_lc) > 0) {
+                throw new Error(`ไม่สามารถ${verb}ได้ เนื่องจากใบตั้งหนี้ที่สร้างจากเอกสารนี้มีการจ่ายชำระ/จับคู่ไปแล้วในโมดูล AP`);
+            }
+            if (apTx.gl_entry_id) {
+                await client.query(`UPDATE gl_entry_header SET status='Void', updated_at=NOW() WHERE id=$1`, [apTx.gl_entry_id]);
+            }
+            await client.query(`UPDATE ap_transaction SET status='Void', updated_at=NOW() WHERE id=$1`, [tx.linked_ap_transaction_id]);
+        }
+    }
+
+    // DLN Billing ('31'/'32' หลัง Post AR/GL) สร้าง ar_transaction ไว้ — ต้อง Void ตามด้วยเสมอ เว้นแต่มีการรับชำระ/จับคู่ไปแล้ว
+    if (tx.linked_ar_transaction_id) {
+        const arRes = await client.query(`SELECT * FROM ar_transaction WHERE id = $1 FOR UPDATE`, [tx.linked_ar_transaction_id]);
+        const arTx = arRes.rows[0];
+        if (arTx && arTx.status !== 'Void') {
+            const appliedRes = await client.query(
+                `SELECT COUNT(*) FROM ar_transaction_apply WHERE applied_to_id = $1`,
+                [tx.linked_ar_transaction_id]
+            );
+            if (Number(appliedRes.rows[0].count) > 0 || Number(arTx.paid_amount_lc) > 0) {
+                throw new Error(`ไม่สามารถ${verb}ได้ เนื่องจากใบแจ้งหนี้ที่สร้างจากเอกสารนี้มีการรับชำระ/จับคู่ไปแล้วในโมดูล AR`);
+            }
+            if (arTx.gl_entry_id) {
+                await client.query(`UPDATE gl_entry_header SET status='Void', updated_at=NOW() WHERE id=$1`, [arTx.gl_entry_id]);
+            }
+            await client.query(`UPDATE ar_transaction SET status='Void', updated_at=NOW() WHERE id=$1`, [tx.linked_ar_transaction_id]);
+        }
+    }
+
+    await reverseStockMovement(client, tx.id);
+
+    if (tx.gl_entry_id) {
+        await client.query(`UPDATE gl_entry_header SET status='Void', updated_at=NOW() WHERE id=$1`, [tx.gl_entry_id]);
+    }
+};
+
 const voidTransaction = async (req, res) => {
     const { id } = req.params;
     const client = await req.dbPool.connect();
@@ -2196,57 +2253,9 @@ const voidTransaction = async (req, res) => {
         const existing = await client.query(`SELECT * FROM im_transaction WHERE id=$1 FOR UPDATE`, [id]);
         if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
         const tx = existing.rows[0];
-        // 'Received' = '12' ที่ Post IM แล้วแต่ยังไม่ Post AP/GL, 'Delivered' = '32' ที่ Post IM แล้วแต่ยังไม่ Post
-        // AR/GL — Void ได้เหมือนกัน แค่บาง entry ยังไม่มีให้ย้อนกลับ (คู่ '32': COGS Post ไปแล้วตอน Delivered, ต่างจาก
-        // '12' ที่ยังไม่มี GL ใดๆ เลยตอน Received)
-        if (tx.status !== 'Posted' && tx.status !== 'Received' && tx.status !== 'Delivered') {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: 'Void ได้เฉพาะเอกสารที่ Posted, Received หรือ Delivered แล้วเท่านั้น' });
-        }
+        tx.id = Number(id);
 
-        // GRN Billing ('11') สร้าง ap_transaction ไว้ — ต้อง Void ตามด้วยเสมอ เว้นแต่มีการจ่ายชำระ/จับคู่ไปแล้ว
-        if (tx.linked_ap_transaction_id) {
-            const apRes = await client.query(`SELECT * FROM ap_transaction WHERE id = $1 FOR UPDATE`, [tx.linked_ap_transaction_id]);
-            const apTx = apRes.rows[0];
-            if (apTx && apTx.status !== 'Void') {
-                const appliedRes = await client.query(
-                    `SELECT COUNT(*) FROM ap_transaction_apply WHERE applied_to_id = $1`,
-                    [tx.linked_ap_transaction_id]
-                );
-                if (Number(appliedRes.rows[0].count) > 0 || Number(apTx.paid_amount_lc) > 0) {
-                    throw new Error('ไม่สามารถ Void ได้ เนื่องจากใบตั้งหนี้ที่สร้างจากเอกสารนี้มีการจ่ายชำระ/จับคู่ไปแล้วในโมดูล AP');
-                }
-                if (apTx.gl_entry_id) {
-                    await client.query(`UPDATE gl_entry_header SET status='Void', updated_at=NOW() WHERE id=$1`, [apTx.gl_entry_id]);
-                }
-                await client.query(`UPDATE ap_transaction SET status='Void', updated_at=NOW() WHERE id=$1`, [tx.linked_ap_transaction_id]);
-            }
-        }
-
-        // DLN Billing ('31'/'32' หลัง Post AR/GL) สร้าง ar_transaction ไว้ — ต้อง Void ตามด้วยเสมอ เว้นแต่มีการรับชำระ/จับคู่ไปแล้ว
-        if (tx.linked_ar_transaction_id) {
-            const arRes = await client.query(`SELECT * FROM ar_transaction WHERE id = $1 FOR UPDATE`, [tx.linked_ar_transaction_id]);
-            const arTx = arRes.rows[0];
-            if (arTx && arTx.status !== 'Void') {
-                const appliedRes = await client.query(
-                    `SELECT COUNT(*) FROM ar_transaction_apply WHERE applied_to_id = $1`,
-                    [tx.linked_ar_transaction_id]
-                );
-                if (Number(appliedRes.rows[0].count) > 0 || Number(arTx.paid_amount_lc) > 0) {
-                    throw new Error('ไม่สามารถ Void ได้ เนื่องจากใบแจ้งหนี้ที่สร้างจากเอกสารนี้มีการรับชำระ/จับคู่ไปแล้วในโมดูล AR');
-                }
-                if (arTx.gl_entry_id) {
-                    await client.query(`UPDATE gl_entry_header SET status='Void', updated_at=NOW() WHERE id=$1`, [arTx.gl_entry_id]);
-                }
-                await client.query(`UPDATE ar_transaction SET status='Void', updated_at=NOW() WHERE id=$1`, [tx.linked_ar_transaction_id]);
-            }
-        }
-
-        await reverseStockMovement(client, id);
-
-        if (tx.gl_entry_id) {
-            await client.query(`UPDATE gl_entry_header SET status='Void', updated_at=NOW() WHERE id=$1`, [tx.gl_entry_id]);
-        }
+        await _reverseLinkedPostings(client, tx, 'Void');
         await client.query(`UPDATE im_transaction SET status='Void', updated_at=NOW() WHERE id=$1`, [id]);
         await client.query('COMMIT');
         const full = await fetchRowById(req.dbPool, id);
@@ -2254,6 +2263,36 @@ const voidTransaction = async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error voiding im_transaction:', error);
+        res.status(500).json({ message: error.message || 'Internal server error' });
+    } finally { client.release(); }
+};
+
+// ถอยเอกสารที่ Posted/Received/Delivered แล้วกลับไปเป็น Draft — มิเรอร์ voidTransaction ทุกประการ (ย้อนสต็อก, Void
+// AP/AR/GL ที่ผูกไว้) ต่างกันแค่สถานะปลายทางและการเคลียร์ field ที่เกิดจากการ Post ทิ้ง เพื่อให้แก้ไขแล้ว Post ใหม่
+// ได้สะอาดเหมือนเอกสาร Draft ทั่วไป (ใช้กรณีกรอกข้อมูลผิดแล้วต้องการแก้ไขเอกสารเดิม แทนที่จะ Void แล้วสร้างใหม่)
+const reverseToDraft = async (req, res) => {
+    const { id } = req.params;
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        const existing = await client.query(`SELECT * FROM im_transaction WHERE id=$1 FOR UPDATE`, [id]);
+        if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
+        const tx = existing.rows[0];
+        tx.id = Number(id);
+
+        await _reverseLinkedPostings(client, tx, 'Draft');
+        await client.query(`
+            UPDATE im_transaction SET
+                status='Draft', gl_entry_id=NULL, linked_ap_transaction_id=NULL, linked_ar_transaction_id=NULL,
+                total_qty=0, total_value_lc=0, updated_at=NOW()
+            WHERE id=$1
+        `, [id]);
+        await client.query('COMMIT');
+        const full = await fetchRowById(req.dbPool, id);
+        res.status(200).json(full);
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error reversing im_transaction to draft:', error);
         res.status(500).json({ message: error.message || 'Internal server error' });
     } finally { client.release(); }
 };
@@ -2280,7 +2319,7 @@ const deleteTransaction = async (req, res) => {
 module.exports = {
     ensureImTransactionTable,
     fetchRows, fetchRow, fetchSystemQty, fetchReturnableDocs, fetchReturnableLines,
-    createTransaction, updateTransaction, postTransaction, postBillingForGrn, postBillingForDln, voidTransaction, deleteTransaction,
+    createTransaction, updateTransaction, postTransaction, postBillingForGrn, postBillingForDln, voidTransaction, reverseToDraft, deleteTransaction,
     insertAndPostAdjustment, STOCK_BALANCE_KEY,
     upsertStockBalance, recomputeBalanceFromLayers,
     generateDocNo,

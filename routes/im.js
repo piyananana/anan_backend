@@ -95,6 +95,7 @@ router.put('/im_transaction/:id/post',   imTransactionController.postTransaction
 router.put('/im_transaction/:id/post_billing', imTransactionController.postBillingForGrn);
 router.put('/im_transaction/:id/post_billing_ar', imTransactionController.postBillingForDln);
 router.put('/im_transaction/:id/void',   imTransactionController.voidTransaction);
+router.put('/im_transaction/:id/reverse_to_draft', imTransactionController.reverseToDraft);
 router.delete('/im_transaction/:id',     imTransactionController.deleteTransaction);
 
 // im_accounting_setting (โหมดบัญชีสินค้า PERPETUAL/PERIODIC ระดับบริษัท)
