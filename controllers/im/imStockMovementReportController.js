@@ -12,7 +12,7 @@
 //    การเคลื่อนไหวในช่วงที่เลือกก็ต้องแสดง (การ์ดว่างไม่มีแถวรายการ แต่มียอดยกมา=ยอดคงเหลือ)
 'use strict';
 
-const RECEIVE_TYPES  = ['10', '11', '12', '25', '35', '40']; // GRN, GRB, GRP, DNS, RTC, CNC
+const RECEIVE_TYPES  = ['10', '11', '12', '13', '25', '35', '40']; // GRN, GRB, GRP, Consignment Receipt, DNS, RTC, CNC
 const ISSUE_TYPES     = ['30', '31', '32', '20', '45', '15']; // DLN, DLB, DLP, CNS, DNC, RTS
 const WITHDRAW_TYPE   = '60'; // ISS
 const TRANSFER_TYPE   = '70'; // TRF
@@ -68,7 +68,7 @@ const getStockMovementReport = async (req, res) => {
                 SELECT
                     t.id AS txn_id, t.doc_no, t.doc_date, d.doc_code, d.doc_name_thai, d.doc_name_eng,
                     d.sys_doc_type, t.warehouse_id AS effective_warehouse_id,
-                    dt.item_id, dt.qty, dt.total_value_lc, dt.lot_no, dt.serial_no, dt.line_no
+                    dt.item_id, dt.qty, dt.total_value_lc, dt.lot_no, dt.serial_no, dt.line_no, dt.is_free
                 FROM im_transaction t
                 JOIN sa_module_document d ON d.id = t.doc_id
                 JOIN im_transaction_detail dt ON dt.header_id = t.id
@@ -82,7 +82,7 @@ const getStockMovementReport = async (req, res) => {
                 SELECT
                     t.id, t.doc_no, t.doc_date, d.doc_code, d.doc_name_thai, d.doc_name_eng,
                     d.sys_doc_type, t.to_warehouse_id AS effective_warehouse_id,
-                    dt.item_id, -dt.qty AS qty, -dt.total_value_lc AS total_value_lc, dt.lot_no, dt.serial_no, dt.line_no
+                    dt.item_id, -dt.qty AS qty, -dt.total_value_lc AS total_value_lc, dt.lot_no, dt.serial_no, dt.line_no, dt.is_free
                 FROM im_transaction t
                 JOIN sa_module_document d ON d.id = t.doc_id
                 JOIN im_transaction_detail dt ON dt.header_id = t.id
@@ -124,7 +124,7 @@ const getStockMovementReport = async (req, res) => {
             )
             SELECT
                 ir.txn_id, ir.doc_no, ir.doc_date, ir.doc_code, ir.doc_name_thai, ir.doc_name_eng, ir.sys_doc_type,
-                ir.qty, ir.total_value_lc, ir.lot_no, ir.serial_no,
+                ir.qty, ir.total_value_lc, ir.lot_no, ir.serial_no, ir.is_free,
                 COALESCE(o.opening_qty, 0) + COALESCE(ir.cum_qty, 0)     AS running_qty,
                 COALESCE(o.opening_value, 0) + COALESCE(ir.cum_value, 0) AS running_value,
                 COALESCE(o.opening_qty, 0)   AS opening_qty,

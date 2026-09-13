@@ -57,7 +57,7 @@ const getTransactionReport = async (req, res) => {
                     dt.header_id, dt.line_no,
                     COALESCE(dt.item_code, it.item_code) AS item_code,
                     it.item_name_th, it.item_name_en,
-                    dt.qty, dt.unit_cost, dt.unit_price, dt.billed_unit_cost,
+                    dt.qty, dt.unit_cost, dt.unit_price, dt.billed_unit_cost, dt.is_free,
                     dt.vat_type, dt.vat_rate, dt.lot_no, dt.serial_no, dt.total_value_lc,
                     u.uom_code, u.uom_name_th, u.uom_name_en, l.location_code, tl.location_code AS to_location_code
                 FROM im_transaction_detail dt

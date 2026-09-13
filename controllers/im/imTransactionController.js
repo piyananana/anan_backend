@@ -112,6 +112,13 @@ const ensureImTransactionTable = async (client) => {
     await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS vat_type VARCHAR(10)`).catch(() => {});
     await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS vat_rate NUMERIC(5,2)`).catch(() => {});
 
+    // ของแถม — flag ระดับบรรทัด ใช้ได้ทั้งฝั่งรับ (GR family) และฝั่งขาย (DL family) เมื่อติ๊กไว้ ฝั่งรับจะยกเว้นการ
+    // บังคับ unit_cost>0 (ปล่อยเป็น 0 ได้ ไม่มีบัญชี GL ใหม่ — Dr สินค้าคงคลัง 0 / Cr GR-IR 0 ตามค่าเดิมที่มีอยู่แล้ว
+    // เพราะ unit_cost ขับทั้งมูลค่าสต็อกและยอดตั้งหนี้ AP อยู่แล้ว) ส่วนฝั่งขาย unit_price จะถูก auto-zero + lock
+    // (COGS ยังตัดตามปกติจาก unit_cost, revenue เป็น 0) — เป็นแค่ flag เพื่อความชัดเจน/ตรวจสอบย้อนหลัง ไม่กระทบ
+    // logic การผ่านบัญชีใดๆ ที่มีอยู่เดิม
+    await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS is_free BOOLEAN NOT NULL DEFAULT false`).catch(() => {});
+
     // audit ของการตัดต้นทุนจาก layer เดิม (FIFO/SPECIFIC เมื่อ variance ติดลบ) — ใช้ตอน Void เพื่อคืนค่า remaining_qty ให้ตรงเป๊ะ
     await client.query(`
         CREATE TABLE IF NOT EXISTS im_stock_layer_consumption (
@@ -124,6 +131,10 @@ const ensureImTransactionTable = async (client) => {
         )
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_im_stock_layer_consumption_header ON im_stock_layer_consumption(header_id)`);
+    // Consignment Settlement — เมื่อการตัด layer นี้ถูกรวมเข้าใบตั้งหนี้ AP ให้ผู้ฝากขายแล้ว (เฉพาะ layer ที่มาจาก
+    // เอกสารรับฝากขาย sys_doc_type='13') กันไม่ให้ถูกดึงมา settle ซ้ำ และกันไม่ให้ Void เอกสารขายทับ (ดู
+    // imConsignmentSettlementController.js)
+    await client.query(`ALTER TABLE im_stock_layer_consumption ADD COLUMN IF NOT EXISTS settlement_ap_transaction_id INTEGER`).catch(() => {});
 };
 
 // --- Helper: Generate Document Number (copied from apTransactionController.js — same per-module duplication convention as ap/ar/cm/gl) ---
@@ -256,7 +267,7 @@ const resolveRevenueAccount = async (client, itemId, fallbackAccountId) => {
 // เพื่อรับประกันว่า qty_on_hand หลัง Post จะเท่ากับ countedQty เป๊ะ ไม่ผูกกับ system_qty ที่ผู้ใช้เห็นตอนเพิ่มบรรทัด (อาจ stale)
 const applyStockMovement = async (client, {
     item, warehouseId, locationId, lotNo, serialNo, countedQty, enteredUnitCost,
-    docDate, docCode, headerId, docNo, detailId, updatedBy,
+    docDate, docCode, headerId, docNo, detailId, updatedBy, isFree,
 }) => {
     const costingMethod = item.costing_method;
 
@@ -303,7 +314,10 @@ const applyStockMovement = async (client, {
     const varianceQty = Number(countedQty) - balanceQtyBefore;
 
     if (costingMethod === 'STANDARD') {
-        const actualUnitCost = Number(item.standard_cost) || 0;
+        // ของแถม (isFree) บังคับต้นทุน = 0 เสมอ แม้ STANDARD ปกติจะตีมูลค่าด้วย item.standard_cost คงที่ทุกครั้งก็ตาม
+        // (verify แล้ว: ถ้าไม่ยกเว้นตรงนี้ unit_cost ที่ผู้ใช้กรอก 0 จะถูกเขียนทับด้วย standard_cost เสมอ ทำให้
+        // เอกสารของแถมของสินค้า STANDARD ไม่ฟรีจริงทั้งฝั่งมูลค่าสต็อกและยอดตั้งหนี้ AP)
+        const actualUnitCost = isFree ? 0 : (Number(item.standard_cost) || 0);
         const newQty = balanceQtyBefore + varianceQty;
         if (newQty < 0) throw new Error(`ยอดคงเหลือของ ${item.item_code} ไม่พอสำหรับปรับลด (คงเหลือ ${balanceQtyBefore})`);
         await upsertStockBalance(client, { itemId: item.id, warehouseId, locationId, lotNo, qty: newQty, avgCost: actualUnitCost, updatedBy });
@@ -449,6 +463,12 @@ const reverseStockMovement = async (client, headerId) => {
         const consumptions = await client.query(`
             SELECT * FROM im_stock_layer_consumption WHERE header_id = $1 AND detail_id = $2
         `, [headerId, d.id]);
+        // ถ้าการตัด layer นี้ถูกรวมเข้า Consignment Settlement (ตั้งหนี้ AP ให้ผู้ฝากขายแล้ว) ห้าม Void ทับ เพราะจะทำให้
+        // ยอดขายที่ตั้งหนี้ไปแล้วไม่มีร่องรอยการตัดสต็อกรองรับอีกต่อไป (ดู imConsignmentSettlementController.js)
+        const settled = consumptions.rows.find(c => c.settlement_ap_transaction_id);
+        if (settled) {
+            throw new Error(`ไม่สามารถยกเลิกได้ เนื่องจากรายการนี้ถูกตั้งหนี้กับผู้ฝากขายไปแล้วผ่าน Consignment Settlement (item ${d.item_code})`);
+        }
         for (const c of consumptions.rows) {
             await client.query(`UPDATE im_stock_layer SET remaining_qty = remaining_qty + $1 WHERE id = $2`, [c.qty, c.layer_id]);
         }
@@ -485,6 +505,12 @@ const resolveCounterAccount = (sysDocType, setup) => {
                 throw new Error(`ยังไม่ได้ตั้งค่าบัญชีพักรอใบกำกับ (grir_account_id) ใน im_gl_account_setup สำหรับประเภทเอกสารนี้`);
             }
             return { accountId: Number(setup.grir_account_id), label: 'รับสินค้า (รอใบกำกับ)' };
+        case '13': // รับฝากขาย (Consignment) — ต้นทุนจริงตั้งแต่รับ แต่ยังไม่เป็นหนี้ AP จริงจนกว่าจะขายออก (settle
+            // เป็นก้อนภายหลังผ่านหน้า Consignment Settlement) จึงพักไว้ที่บัญชีเจ้าหนี้ฝากขาย ไม่ใช่ GR/IR ปกติ
+            if (!setup.consignment_payable_account_id) {
+                throw new Error(`ยังไม่ได้ตั้งค่าบัญชีเจ้าหนี้ฝากขาย (consignment_payable_account_id) ใน im_gl_account_setup สำหรับประเภทเอกสารนี้`);
+            }
+            return { accountId: Number(setup.consignment_payable_account_id), label: 'รับฝากขาย (เจ้าหนี้ฝากขาย)' };
         case '30': // DLN — ส่งสินค้า (ธรรมดา/พร้อมตั้งหนี้/รอตั้งหนี้): รับรู้เป็นต้นทุนขาย ใช้บัญชีเดียวกับ ISS
         case '31':
         case '32':
@@ -533,9 +559,10 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
                 debit_lc: amt > 0 ? amt : 0, credit_lc: amt < 0 ? -amt : 0, debit_fc: 0, credit_fc: 0,
             });
         }
-    } else if (sysDocType === '10') {
-        // GRN — รับสินค้า (ไม่มีเลขที่อ้างอิง): Dr คลัง (Perpetual) หรือ Dr ซื้อสินค้า (Periodic) / Cr พักรอใบกำกับ (GR/IR)
-        // ทั้งสองโหมด Post ที่นี่เสมอ (ต่างจาก AJS/ISS/TRF ที่ถูกระงับใน Periodic) เพราะ GR/IR ต้องขยับทันทีที่รับของจริง
+    } else if (sysDocType === '10' || sysDocType === '13') {
+        // GRN — รับสินค้า (ไม่มีเลขที่อ้างอิง) / '13' รับฝากขาย: Dr คลัง (Perpetual) หรือ Dr ซื้อสินค้า (Periodic) /
+        // Cr พักรอใบกำกับ (GR/IR) หรือ Cr เจ้าหนี้ฝากขาย แล้วแต่ sys_doc_type (ดู resolveCounterAccount) ทั้งสองโหมด
+        // Post ที่นี่เสมอ (ต่างจาก AJS/ISS/TRF ที่ถูกระงับใน Periodic) เพราะเป็นการรับของจริงที่ต้องขยับทันที
         const { accountId: counterAccountId, label: counterLabel } = resolveCounterAccount(sysDocType, setup);
         let purchasesAccountId = null;
         if (mode === 'PERIODIC') {
@@ -1373,7 +1400,7 @@ const postDetailLines = async (client, headerId, header, docNo) => {
         const { actualUnitCost, balanceQtyBefore, balanceAvgCostBefore, varianceQty } = await applyStockMovement(client, {
             item, warehouseId: header.warehouse_id, locationId: d.location_id, lotNo: d.lot_no, serialNo: d.serial_no,
             countedQty: d.counted_qty, enteredUnitCost: d.unit_cost, docDate: header.doc_date, docCode: header.doc_code,
-            headerId, docNo, detailId: d.id, updatedBy,
+            headerId, docNo, detailId: d.id, updatedBy, isFree: d.is_free,
         });
         // '15'/'35' (คืนสินค้าผู้ขาย/รับคืนจากลูกค้า) ที่อ้างอิงบรรทัดต้นฉบับ — ตรวจคงเหลือที่คืนได้ *หลัง* ทราบ
         // จำนวนจริงที่เคลื่อนไหว (varianceQty) เพื่อเลี่ยงคำนวณ balance-before ซ้ำ ยัง throw ก่อน COMMIT ได้ทันเวลา
@@ -1464,7 +1491,7 @@ const postDetailLines = async (client, headerId, header, docNo) => {
             UPDATE im_transaction SET status='Delivered', gl_entry_id=$1, total_qty=$2, total_value_lc=$3, updated_at=NOW() WHERE id=$4
         `, [glEntryId, totalQty, totalValue, headerId]);
         return glEntryId;
-    } else if (sysDocType === '10' || mode !== 'PERIODIC') {
+    } else if (sysDocType === '10' || sysDocType === '13' || mode !== 'PERIODIC') {
         glEntryId = await postGlEntry(client, headerId, header, updatedDetails, docNo, sysDocType, mode);
     }
     await client.query(`
@@ -1694,7 +1721,7 @@ const insertAndPostAdjustment = async (client, {
     if (resolvedSysDocType === '70' && !toWarehouseId) {
         throw new Error('กรุณาระบุคลังปลายทาง (to_warehouse_id) สำหรับเอกสารประเภทโอนสินค้า');
     }
-    if (['10', '11', '12', '15', '20', '25'].includes(resolvedSysDocType) && !vendorId) {
+    if (['10', '11', '12', '13', '15', '20', '25'].includes(resolvedSysDocType) && !vendorId) {
         throw new Error('กรุณาระบุผู้ขาย สำหรับเอกสารประเภทนี้');
     }
     if (resolvedSysDocType === '11' && !refNo) {
@@ -1759,6 +1786,19 @@ const insertAndPostAdjustment = async (client, {
 
     if (!lines || lines.length === 0) throw new Error('ต้องมีรายการนับสต็อกอย่างน้อย 1 รายการ');
 
+    // '13' (รับฝากขาย/Consignment) — บังคับ FIFO/SPECIFIC เท่านั้น เพื่อไม่ให้ต้นทุนสินค้าฝากขายไปปนกับต้นทุนเฉลี่ย
+    // (AVG) ของสินค้าของเราเอง ซึ่งจะทำให้แยกไม่ออกว่าหน่วยที่ขายไปเป็นของฝากขายหรือของเราตอนทำ Settlement ภายหลัง
+    if (resolvedSysDocType === '13') {
+        const itemIds = [...new Set(lines.map(l => l.item_id))];
+        const itemsRes = await client.query(
+            `SELECT id, item_code, costing_method FROM im_item WHERE id = ANY($1::int[])`, [itemIds]
+        );
+        const badItem = itemsRes.rows.find(it => !['FIFO', 'SPECIFIC'].includes(it.costing_method));
+        if (badItem) {
+            throw new Error(`สินค้าฝากขายต้องใช้วิธีคิดต้นทุนแบบ FIFO หรือ Specific เท่านั้น (${badItem.item_code} ใช้ ${badItem.costing_method})`);
+        }
+    }
+
     const hRes = await client.query(`
         INSERT INTO im_transaction
         (doc_id, doc_no, doc_code, doc_date, period_id, warehouse_id, to_warehouse_id,
@@ -1781,14 +1821,14 @@ const insertAndPostAdjustment = async (client, {
         await client.query(`
             INSERT INTO im_transaction_detail
             (header_id, line_no, item_id, item_code, item_name, location_id, to_location_id, lot_no, serial_no, uom_id,
-             system_qty, counted_qty, unit_cost, unit_price, vat_type, vat_rate, ref_im_transaction_detail_id, description)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+             system_qty, counted_qty, unit_cost, unit_price, vat_type, vat_rate, ref_im_transaction_detail_id, description, is_free)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
         `, [
             newHeaderId, lineNo++, d.item_id, d.item_code || null, d.item_name || null,
             d.location_id || null, d.to_location_id || null, d.lot_no || null, d.serial_no || null, d.uom_id || null,
             d.system_qty ?? 0, d.counted_qty ?? 0, d.unit_cost ?? null, d.unit_price ?? null,
             d.vat_type || null, d.vat_rate ?? null,
-            d.ref_im_transaction_detail_id || null, d.description || null,
+            d.ref_im_transaction_detail_id || null, d.description || null, d.is_free === true,
         ]);
     }
 
@@ -1887,7 +1927,7 @@ const updateTransaction = async (req, res) => {
         if (existing.rows[0].sys_doc_type === '70' && !header.to_warehouse_id) {
             throw new Error('กรุณาระบุคลังปลายทาง (to_warehouse_id) สำหรับเอกสารประเภทโอนสินค้า');
         }
-        if (['10', '11', '12', '15', '20', '25'].includes(existing.rows[0].sys_doc_type) && !header.vendor_id) {
+        if (['10', '11', '12', '13', '15', '20', '25'].includes(existing.rows[0].sys_doc_type) && !header.vendor_id) {
             throw new Error('กรุณาระบุผู้ขาย สำหรับเอกสารประเภทนี้');
         }
         if (existing.rows[0].sys_doc_type === '11' && !header.ref_no) {
@@ -1970,14 +2010,14 @@ const updateTransaction = async (req, res) => {
             await client.query(`
                 INSERT INTO im_transaction_detail
                 (header_id, line_no, item_id, item_code, item_name, location_id, to_location_id, lot_no, serial_no, uom_id,
-                 system_qty, counted_qty, unit_cost, unit_price, vat_type, vat_rate, ref_im_transaction_detail_id, description)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+                 system_qty, counted_qty, unit_cost, unit_price, vat_type, vat_rate, ref_im_transaction_detail_id, description, is_free)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
             `, [
                 id, lineNo++, d.item_id, d.item_code || null, d.item_name || null,
                 d.location_id || null, d.to_location_id || null, d.lot_no || null, d.serial_no || null, d.uom_id || null,
                 d.system_qty ?? 0, d.counted_qty ?? 0, d.unit_cost ?? null, d.unit_price ?? null,
                 d.vat_type || null, d.vat_rate ?? null,
-                d.ref_im_transaction_detail_id || null, d.description || null,
+                d.ref_im_transaction_detail_id || null, d.description || null, d.is_free === true,
             ]);
         }
 

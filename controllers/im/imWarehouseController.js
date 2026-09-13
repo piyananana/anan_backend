@@ -22,6 +22,10 @@ const ensureImWarehouseTable = async (client) => {
     `);
     // เผื่อสำหรับ TRF (โอนสินค้า) — override บัญชีสต็อกของ im_item เมื่อผังบัญชีถูกแยกตามคลังในอนาคต; ยังไม่ตั้งค่าที่ใดวันนี้
     await client.query(`ALTER TABLE im_warehouse ADD COLUMN IF NOT EXISTS inventory_account_id INTEGER REFERENCES gl_account(id)`).catch(() => {});
+    // Consignment-OUT — คลังนี้แทนสถานที่ของผู้รับฝากขาย (consignee) สินค้าที่โอนเข้ามาด้วย TRF ยังเป็นของเราอยู่
+    // (ไม่กระทบ GL ใดๆ ตอนโอน) จนกว่าจะขายออกจากคลังนี้ด้วย DLN ตามปกติ — เป็นแค่ flag เพื่อความชัดเจน/กรองรายงาน
+    // ไม่มี logic พิเศษใดๆ ผูกกับ flag นี้ในเอนจิน เพราะ TRF/DLN ที่มีอยู่เดิมรองรับ flow นี้ได้อยู่แล้วโดยไม่ต้องแก้ไข
+    await client.query(`ALTER TABLE im_warehouse ADD COLUMN IF NOT EXISTS is_consignee BOOLEAN NOT NULL DEFAULT false`).catch(() => {});
 };
 
 const WAREHOUSE_SELECT = `
@@ -72,16 +76,16 @@ const fetchRow = async (req, res) => {
 
 const addRow = async (req, res) => {
     const client = await req.dbPool.connect();
-    const { warehouse_code, warehouse_name_th, warehouse_name_en, branch_id, address, is_active } = req.body;
+    const { warehouse_code, warehouse_name_th, warehouse_name_en, branch_id, address, is_active, is_consignee } = req.body;
     const userName = req.headers.username || null;
     try {
         await client.query('BEGIN');
         await ensureImWarehouseTable(client);
         const result = await client.query(
-            `INSERT INTO im_warehouse (warehouse_code, warehouse_name_th, warehouse_name_en, branch_id, address, is_active, created_by, updated_by)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$7)
+            `INSERT INTO im_warehouse (warehouse_code, warehouse_name_th, warehouse_name_en, branch_id, address, is_active, is_consignee, created_by, updated_by)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)
              RETURNING id`,
-            [(warehouse_code || '').trim().toUpperCase(), warehouse_name_th || '', warehouse_name_en || null, branch_id || null, address || null, is_active ?? true, userName]
+            [(warehouse_code || '').trim().toUpperCase(), warehouse_name_th || '', warehouse_name_en || null, branch_id || null, address || null, is_active ?? true, is_consignee === true, userName]
         );
         const newId = result.rows[0].id;
         await client.query('COMMIT');
@@ -98,7 +102,7 @@ const addRow = async (req, res) => {
 const updateRow = async (req, res) => {
     const { id } = req.params;
     const client = await req.dbPool.connect();
-    const { warehouse_name_th, warehouse_name_en, branch_id, address, is_active } = req.body;
+    const { warehouse_name_th, warehouse_name_en, branch_id, address, is_active, is_consignee } = req.body;
     const userName = req.headers.username || null;
     try {
         await client.query('BEGIN');
@@ -106,10 +110,10 @@ const updateRow = async (req, res) => {
         const result = await client.query(
             `UPDATE im_warehouse SET
                 warehouse_name_th = $1, warehouse_name_en = $2, branch_id = $3,
-                address = $4, is_active = $5, updated_by = $6, updated_at = NOW()
-             WHERE id = $7
+                address = $4, is_active = $5, is_consignee = $6, updated_by = $7, updated_at = NOW()
+             WHERE id = $8
              RETURNING id`,
-            [warehouse_name_th || '', warehouse_name_en || null, branch_id || null, address || null, is_active ?? true, userName, id]
+            [warehouse_name_th || '', warehouse_name_en || null, branch_id || null, address || null, is_active ?? true, is_consignee === true, userName, id]
         );
         if (result.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'ไม่พบคลังสินค้า' }); }
         await client.query('COMMIT');

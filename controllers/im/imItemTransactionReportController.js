@@ -65,7 +65,7 @@ const getItemTransactionReport = async (req, res) => {
                 COALESCE(dt.item_code, it.item_code) AS item_code,
                 it.item_name_th, it.item_name_en,
                 dt.qty, u.uom_code, u.uom_name_th, u.uom_name_en,
-                dt.total_value_lc
+                dt.total_value_lc, dt.is_free
             FROM im_transaction_detail dt
             JOIN im_transaction t      ON t.id = dt.header_id
             JOIN sa_module_document d  ON d.id = t.doc_id

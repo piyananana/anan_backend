@@ -11,6 +11,8 @@
 const DOC_TYPE_TARGET = {
     '10': { target_module: 'AP',   target_doc_code: '10' }, // รับสินค้า (GRN, ไม่มีเลขที่อ้างอิง) -> AP ตั้งหนี้เองภายหลัง
     '11': { target_module: 'AP',   target_doc_code: '10' }, // รับสินค้า+ตั้งหนี้อัตโนมัติ (GRN Billing) -> AP Billing
+    '13': { target_module: 'NONE', target_doc_code: null }, // รับฝากขาย (Consignment) -> ไม่สร้างบิล AP ที่นี่ ตั้งหนี้
+                                                              // ผ่านหน้า Consignment Settlement (ก้อนรวมตามยอดขายจริง)
     '15': { target_module: 'AP',   target_doc_code: '50' }, // คืนสินค้า (RTS)      -> AP CN
     '20': { target_module: 'AP',   target_doc_code: '50' }, // ลดหนี้เจ้าหนี้ (CNS)  -> AP CN
     '25': { target_module: 'AP',   target_doc_code: '30' }, // เพิ่มหนี้เจ้าหนี้ (DNS) -> AP DN
@@ -47,6 +49,9 @@ const ensureImGlAccountSetupTable = async (client) => {
     // '11'/'12'/'15'/'20'/'25', vat_output_account_id ฝั่งขาย '31'/'32'/'35'/'40'/'45') ดู imTransactionController.js
     await client.query(`ALTER TABLE im_gl_account_setup ADD COLUMN IF NOT EXISTS vat_output_account_id INTEGER REFERENCES gl_account(id)`).catch(() => {});
     await client.query(`ALTER TABLE im_gl_account_setup ADD COLUMN IF NOT EXISTS vat_input_account_id INTEGER REFERENCES gl_account(id)`).catch(() => {});
+    // บัญชีเจ้าหนี้ฝากขาย (Consignment Payable) — ใช้เฉพาะ sys_doc_type='13' (รับฝากขาย) แทน grir_account_id
+    // เพราะยังไม่เป็นหนี้ AP จริงจนกว่าจะขายออก (settle เป็นก้อนภายหลัง ดู resolveCounterAccount ใน imTransactionController.js)
+    await client.query(`ALTER TABLE im_gl_account_setup ADD COLUMN IF NOT EXISTS consignment_payable_account_id INTEGER REFERENCES gl_account(id)`).catch(() => {});
 };
 
 // Driven by sa_module_document (sys_module='31') so the left panel always reflects the
@@ -66,6 +71,7 @@ const SETUP_SELECT = `
         s.grir_account_id,      grir.account_code AS grir_account_code,     grir.account_name_thai AS grir_account_name,
         s.vat_output_account_id, vato.account_code AS vat_output_account_code, vato.account_name_thai AS vat_output_account_name,
         s.vat_input_account_id,  vati.account_code AS vat_input_account_code,  vati.account_name_thai AS vat_input_account_name,
+        s.consignment_payable_account_id, consp.account_code AS consignment_payable_account_code, consp.account_name_thai AS consignment_payable_account_name,
         s.gl_doc_id,             gl_d.doc_code AS gl_doc_code,               gl_d.doc_name_thai AS gl_doc_name,
         s.created_at, s.updated_at, s.created_by, s.updated_by
     FROM sa_module_document d
@@ -77,6 +83,7 @@ const SETUP_SELECT = `
     LEFT JOIN gl_account grir        ON grir.id = s.grir_account_id
     LEFT JOIN gl_account vato        ON vato.id = s.vat_output_account_id
     LEFT JOIN gl_account vati        ON vati.id = s.vat_input_account_id
+    LEFT JOIN gl_account consp       ON consp.id = s.consignment_payable_account_id
     LEFT JOIN sa_module_document gl_d ON gl_d.id = s.gl_doc_id
     WHERE d.sys_module = '31'
       AND d.is_doc_type = true
@@ -122,7 +129,7 @@ const upsertRow = async (req, res) => {
     const { doc_code } = req.params;
     const {
         inventory_account_id, cogs_account_id, variance_account_id, wip_account_id, grir_account_id,
-        vat_output_account_id, vat_input_account_id, gl_doc_id,
+        vat_output_account_id, vat_input_account_id, consignment_payable_account_id, gl_doc_id,
     } = req.body;
     const userName = req.headers.username || null;
     const client = await req.dbPool.connect();
@@ -139,8 +146,8 @@ const upsertRow = async (req, res) => {
         await client.query(
             `INSERT INTO im_gl_account_setup
                 (doc_code, inventory_account_id, cogs_account_id, variance_account_id, wip_account_id, grir_account_id,
-                 vat_output_account_id, vat_input_account_id, gl_doc_id, created_by, updated_by)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10)
+                 vat_output_account_id, vat_input_account_id, consignment_payable_account_id, gl_doc_id, created_by, updated_by)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11)
              ON CONFLICT (doc_code) DO UPDATE SET
                 inventory_account_id  = EXCLUDED.inventory_account_id,
                 cogs_account_id       = EXCLUDED.cogs_account_id,
@@ -149,12 +156,13 @@ const upsertRow = async (req, res) => {
                 grir_account_id       = EXCLUDED.grir_account_id,
                 vat_output_account_id = EXCLUDED.vat_output_account_id,
                 vat_input_account_id  = EXCLUDED.vat_input_account_id,
+                consignment_payable_account_id = EXCLUDED.consignment_payable_account_id,
                 gl_doc_id             = EXCLUDED.gl_doc_id,
                 updated_by            = EXCLUDED.updated_by,
                 updated_at            = NOW()`,
             [doc_code, inventory_account_id || null, cogs_account_id || null, variance_account_id || null,
              wip_account_id || null, grir_account_id || null, vat_output_account_id || null, vat_input_account_id || null,
-             gl_doc_id || null, userName]
+             consignment_payable_account_id || null, gl_doc_id || null, userName]
         );
 
         const updated = await client.query(`${SETUP_SELECT} AND d.doc_code = $1`, [doc_code]);
