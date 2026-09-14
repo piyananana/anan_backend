@@ -86,6 +86,8 @@ router.get('/im_stock_movement_report', imStockMovementReportController.getStock
 router.get('/im_stock_balance_by_item_report', imStockBalanceByItemReportController.getStockBalanceByItemReport);
 router.get('/im_consignment_settlement/pending', imConsignmentSettlementController.fetchPending);
 router.post('/im_consignment_settlement', imConsignmentSettlementController.postSettlement);
+router.get('/im_consignment_settlement', imConsignmentSettlementController.fetchSettled);
+router.put('/im_consignment_settlement/:id/void', imConsignmentSettlementController.voidSettlement);
 router.get('/im_transaction',            imTransactionController.fetchRows);
 router.get('/im_transaction/:id',        imTransactionController.fetchRow);
 router.get('/im_transaction/:id/returnable_lines', imTransactionController.fetchReturnableLines);

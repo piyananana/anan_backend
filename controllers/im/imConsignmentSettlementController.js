@@ -7,7 +7,7 @@
 //      => Dr เจ้าหนี้ฝากขาย / Cr เจ้าหนี้การค้า (AP)
 //   2. ไม่มี VAT (มิเรอร์ '10' GRN ธรรมดาที่ไม่มี VAT ตอน Post — ถ้าใบกำกับจริงจากผู้ฝากขายมี VAT ผู้ใช้ปรับเพิ่มเองใน AP ภายหลัง)
 //   3. มาจากการตัด im_stock_layer หลายใบของหลายเอกสารขายมารวมเป็นบิลเดียว ไม่ใช่ 1:1 กับเอกสารรับเหมือน '11'/'12'
-const { generateDocNo } = require('./imTransactionController');
+const { generateDocNo, voidLinkedApTransaction } = require('./imTransactionController');
 
 // หา consumption ที่มาจาก layer ของเอกสารรับฝากขาย (sys_doc_type='13') และยังไม่ถูก settle
 const PENDING_SELECT = `
@@ -197,4 +197,66 @@ const postSettlement = async (req, res) => {
     } finally { client.release(); }
 };
 
-module.exports = { fetchPending, postSettlement };
+// Marker set on every ap_transaction row postSettlement creates (see the two INSERTs above) — used to identify
+// "is this ap_transaction a consignment settlement" independent of im_stock_layer_consumption.settlement_ap_transaction_id,
+// which gets nulled out on void (so a join against it would make voided settlements vanish from history and make
+// voiding twice mis-report as "not found" instead of "already voided").
+const SETTLEMENT_DESCRIPTION_PREFIX = 'ตั้งหนี้สินค้าฝากขาย';
+
+// GET /im_consignment_settlement?vendor_id= — settlement history for one vendor, including voided ones.
+const fetchSettled = async (req, res) => {
+    const client = await req.dbPool.connect();
+    try {
+        const { vendor_id } = req.query;
+        if (!vendor_id) return res.status(400).json({ message: 'กรุณาระบุผู้ฝากขาย' });
+        const result = await client.query(`
+            SELECT id, doc_no, doc_date, status, total_amount_lc, ref_no
+            FROM ap_transaction
+            WHERE vendor_id = $1 AND description LIKE $2
+            ORDER BY doc_date DESC, id DESC
+        `, [vendor_id, `${SETTLEMENT_DESCRIPTION_PREFIX}%`]);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Error fetching consignment settlement history:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    } finally { client.release(); }
+};
+
+// PUT /im_consignment_settlement/:id/void — id is the ap_transaction id created by postSettlement. Voids the AP
+// bill + its GL entry (guarded against paid/applied via voidLinkedApTransaction) and releases the consumption
+// rows it settled back to pending, so they can be re-settled.
+const voidSettlement = async (req, res) => {
+    const { id } = req.params;
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const apRes = await client.query(
+            `SELECT status FROM ap_transaction WHERE id=$1 AND description LIKE $2`,
+            [id, `${SETTLEMENT_DESCRIPTION_PREFIX}%`]
+        );
+        if (apRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ message: 'ไม่พบรายการตั้งหนี้สินค้าฝากขายนี้' });
+        }
+        if (apRes.rows[0].status === 'Void') {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ message: 'เอกสารถูกยกเลิกแล้ว' });
+        }
+
+        await voidLinkedApTransaction(client, id, 'ยกเลิก');
+
+        const releasedRes = await client.query(
+            `UPDATE im_stock_layer_consumption SET settlement_ap_transaction_id=NULL WHERE settlement_ap_transaction_id=$1`, [id]
+        );
+
+        await client.query('COMMIT');
+        res.status(200).json({ voided: true, released_lines: releasedRes.rowCount });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error voiding consignment settlement:', error);
+        res.status(500).json({ message: error.message || 'Internal server error' });
+    } finally { client.release(); }
+};
+
+module.exports = { fetchPending, postSettlement, fetchSettled, voidSettlement };

@@ -2191,6 +2191,25 @@ const postBillingForDln = async (req, res) => {
 // ย้อนกลับผลของการ Post ทั้งหมด (ตัดสต็อกกลับ, Void GL/AP/AR ที่ผูกไว้) — ใช้ร่วมกันทั้ง voidTransaction (จบที่
 // status='Void' ถาวร เก็บ audit trail) และ reverseToDraft (จบที่ status='Draft' ให้แก้ไขแล้ว Post ใหม่ได้) โยน
 // error กลับให้ผู้เรียก catch/ROLLBACK เอง (ไม่ COMMIT ในนี้) — action label ใช้แค่ปรับข้อความ error ให้ตรงบริบท
+// Voids one ap_transaction + its GL entry, guarding against paid/applied — shared by _reverseLinkedPostings
+// (GRN/DLN reverse) and imConsignmentSettlementController.voidSettlement (which has no im_transaction of its own
+// to hang this off of, since a settlement bill is created directly, not via the normal Draft->Post flow).
+const voidLinkedApTransaction = async (client, apTransactionId, verb) => {
+    const apRes = await client.query(`SELECT * FROM ap_transaction WHERE id = $1 FOR UPDATE`, [apTransactionId]);
+    const apTx = apRes.rows[0];
+    if (!apTx || apTx.status === 'Void') return;
+    const appliedRes = await client.query(
+        `SELECT COUNT(*) FROM ap_transaction_apply WHERE applied_to_id = $1`, [apTransactionId]
+    );
+    if (Number(appliedRes.rows[0].count) > 0 || Number(apTx.paid_amount_lc) > 0) {
+        throw new Error(`ไม่สามารถ${verb}ได้ เนื่องจากใบตั้งหนี้ที่สร้างจากเอกสารนี้มีการจ่ายชำระ/จับคู่ไปแล้วในโมดูล AP`);
+    }
+    if (apTx.gl_entry_id) {
+        await client.query(`UPDATE gl_entry_header SET status='Void', updated_at=NOW() WHERE id=$1`, [apTx.gl_entry_id]);
+    }
+    await client.query(`UPDATE ap_transaction SET status='Void', updated_at=NOW() WHERE id=$1`, [apTransactionId]);
+};
+
 const _reverseLinkedPostings = async (client, tx, action = 'Void') => {
     const verb = action === 'Void' ? 'Void' : 'ถอยกลับเป็นฉบับร่าง';
     // 'Received' = '12' ที่ Post IM แล้วแต่ยังไม่ Post AP/GL, 'Delivered' = '32' ที่ Post IM แล้วแต่ยังไม่ Post
@@ -2202,21 +2221,7 @@ const _reverseLinkedPostings = async (client, tx, action = 'Void') => {
 
     // GRN Billing ('11') สร้าง ap_transaction ไว้ — ต้อง Void ตามด้วยเสมอ เว้นแต่มีการจ่ายชำระ/จับคู่ไปแล้ว
     if (tx.linked_ap_transaction_id) {
-        const apRes = await client.query(`SELECT * FROM ap_transaction WHERE id = $1 FOR UPDATE`, [tx.linked_ap_transaction_id]);
-        const apTx = apRes.rows[0];
-        if (apTx && apTx.status !== 'Void') {
-            const appliedRes = await client.query(
-                `SELECT COUNT(*) FROM ap_transaction_apply WHERE applied_to_id = $1`,
-                [tx.linked_ap_transaction_id]
-            );
-            if (Number(appliedRes.rows[0].count) > 0 || Number(apTx.paid_amount_lc) > 0) {
-                throw new Error(`ไม่สามารถ${verb}ได้ เนื่องจากใบตั้งหนี้ที่สร้างจากเอกสารนี้มีการจ่ายชำระ/จับคู่ไปแล้วในโมดูล AP`);
-            }
-            if (apTx.gl_entry_id) {
-                await client.query(`UPDATE gl_entry_header SET status='Void', updated_at=NOW() WHERE id=$1`, [apTx.gl_entry_id]);
-            }
-            await client.query(`UPDATE ap_transaction SET status='Void', updated_at=NOW() WHERE id=$1`, [tx.linked_ap_transaction_id]);
-        }
+        await voidLinkedApTransaction(client, tx.linked_ap_transaction_id, verb);
     }
 
     // DLN Billing ('31'/'32' หลัง Post AR/GL) สร้าง ar_transaction ไว้ — ต้อง Void ตามด้วยเสมอ เว้นแต่มีการรับชำระ/จับคู่ไปแล้ว
@@ -2325,7 +2330,7 @@ const deleteTransaction = async (req, res) => {
 module.exports = {
     ensureImTransactionTable,
     fetchRows, fetchRow, fetchSystemQty, fetchReturnableDocs, fetchReturnableLines,
-    createTransaction, updateTransaction, postTransaction, postBillingForGrn, postBillingForDln, voidTransaction, voidTransactionCore, reverseToDraft, deleteTransaction,
+    createTransaction, updateTransaction, postTransaction, postBillingForGrn, postBillingForDln, voidTransaction, voidTransactionCore, voidLinkedApTransaction, reverseToDraft, deleteTransaction,
     insertAndPostAdjustment, STOCK_BALANCE_KEY,
     upsertStockBalance, recomputeBalanceFromLayers,
     generateDocNo,
