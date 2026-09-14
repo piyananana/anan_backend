@@ -133,6 +133,7 @@ router.put('/im_stock_count/:id/print_count',   imStockCountController.increment
 router.put('/im_stock_count/:id/counts',        imStockCountController.updateCounts);
 router.put('/im_stock_count/:id/approve',       imStockCountController.approveCount);
 router.put('/im_stock_count/:id/close',         imStockCountController.closeCount);
+router.put('/im_stock_count/:id/reverse',       imStockCountController.reverseCount);
 router.get('/im_stock_count/:id/export',        imStockCountController.exportExcel);
 router.post('/im_stock_count/:id/import/validate', imStockCountController.importValidate);
 router.post('/im_stock_count/:id/import/confirm',  imStockCountController.importConfirm);

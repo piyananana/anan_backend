@@ -2245,25 +2245,31 @@ const _reverseLinkedPostings = async (client, tx, action = 'Void') => {
     }
 };
 
+// Core of Void, extracted so other controllers (e.g. imStockCountController's reverseCount, which needs to void
+// the linked '80' AJS transaction when un-closing a count sheet) can reuse it inside their own BEGIN/COMMIT.
+const voidTransactionCore = async (client, id) => {
+    const existing = await client.query(`SELECT * FROM im_transaction WHERE id=$1 FOR UPDATE`, [id]);
+    if (existing.rows.length === 0) throw new Error('Not found');
+    const tx = existing.rows[0];
+    tx.id = Number(id);
+
+    await _reverseLinkedPostings(client, tx, 'Void');
+    await client.query(`UPDATE im_transaction SET status='Void', updated_at=NOW() WHERE id=$1`, [id]);
+};
+
 const voidTransaction = async (req, res) => {
     const { id } = req.params;
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
-        const existing = await client.query(`SELECT * FROM im_transaction WHERE id=$1 FOR UPDATE`, [id]);
-        if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
-        const tx = existing.rows[0];
-        tx.id = Number(id);
-
-        await _reverseLinkedPostings(client, tx, 'Void');
-        await client.query(`UPDATE im_transaction SET status='Void', updated_at=NOW() WHERE id=$1`, [id]);
+        await voidTransactionCore(client, id);
         await client.query('COMMIT');
         const full = await fetchRowById(req.dbPool, id);
         res.status(200).json(full);
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error voiding im_transaction:', error);
-        res.status(500).json({ message: error.message || 'Internal server error' });
+        res.status(error.message === 'Not found' ? 404 : 500).json({ message: error.message || 'Internal server error' });
     } finally { client.release(); }
 };
 
@@ -2319,7 +2325,7 @@ const deleteTransaction = async (req, res) => {
 module.exports = {
     ensureImTransactionTable,
     fetchRows, fetchRow, fetchSystemQty, fetchReturnableDocs, fetchReturnableLines,
-    createTransaction, updateTransaction, postTransaction, postBillingForGrn, postBillingForDln, voidTransaction, reverseToDraft, deleteTransaction,
+    createTransaction, updateTransaction, postTransaction, postBillingForGrn, postBillingForDln, voidTransaction, voidTransactionCore, reverseToDraft, deleteTransaction,
     insertAndPostAdjustment, STOCK_BALANCE_KEY,
     upsertStockBalance, recomputeBalanceFromLayers,
     generateDocNo,

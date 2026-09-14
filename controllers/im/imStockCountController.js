@@ -17,6 +17,7 @@ const { ensureImStockBalanceTable } = require('./imStockBalanceController');
 const {
     ensureImTransactionTable,
     insertAndPostAdjustment,
+    voidTransactionCore,
     STOCK_BALANCE_KEY,
 } = require('./imTransactionController');
 const {
@@ -349,6 +350,44 @@ const voidCount = async (req, res) => {
         await client.query('ROLLBACK');
         console.error('Error voiding im_stock_count:', error);
         res.status(500).json({ message: error.message || 'Internal server error' });
+    } finally { client.release(); }
+};
+
+// --- Reverse (Approved or Closed -> Posted) — un-does the approval and, if Closed, voids the linked '80' AJS
+// im_transaction (reversing its stock movement + GL entry via voidTransactionCore) so the count sheet can be
+// re-recorded and re-approved/closed. Mirrors reverseToDraft's role for im_transaction, but lands on 'Posted'
+// (not 'Draft') because that's the only status updateCounts accepts — counted_qty is left untouched.
+const reverseCount = async (req, res) => {
+    const { id } = req.params;
+    const userName = req.headers.username || null;
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        const hRes = await client.query(`SELECT * FROM im_stock_count WHERE id=$1 FOR UPDATE`, [id]);
+        if (hRes.rows.length === 0) throw new Error('Not found');
+        const header = hRes.rows[0];
+        if (!['Approved', 'Closed'].includes(header.status)) {
+            throw new Error('ถอยกลับได้เฉพาะสถานะ Approved หรือ Closed เท่านั้น');
+        }
+
+        if (header.status === 'Closed' && header.im_transaction_id) {
+            await voidTransactionCore(client, header.im_transaction_id);
+        }
+
+        await client.query(`
+            UPDATE im_stock_count SET
+                status='Posted', approved_at=NULL, approved_by=NULL,
+                im_transaction_id=NULL, closed_at=NULL, closed_by=NULL,
+                updated_by=$1, updated_at=NOW()
+            WHERE id=$2
+        `, [userName, id]);
+        await client.query('COMMIT');
+        const full = await fetchRowById(req.dbPool, id);
+        res.status(200).json(full);
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error reversing im_stock_count:', error);
+        res.status(error.message === 'Not found' ? 404 : 500).json({ message: error.message || 'Internal server error' });
     } finally { client.release(); }
 };
 
@@ -775,7 +814,7 @@ module.exports = {
     fetchRows, fetchRow, addRow, updateHeader, resyncLines,
     postCount, voidCount, incrementPrintCount,
     fetchLinesForRecording, updateCounts,
-    checkResults, approveCount, closeCount,
+    checkResults, approveCount, closeCount, reverseCount,
     fetchVarianceReport,
     exportExcel, importValidate, importConfirm,
     fetchRowById,
