@@ -27,6 +27,7 @@ const imTransactionReportController = require('../controllers/im/imTransactionRe
 const imItemTransactionReportController = require('../controllers/im/imItemTransactionReportController');
 const imStockMovementReportController = require('../controllers/im/imStockMovementReportController');
 const imStockBalanceByItemReportController = require('../controllers/im/imStockBalanceByItemReportController');
+const imStockAgingReportController = require('../controllers/im/imStockAgingReportController');
 const imConsignmentSettlementController = require('../controllers/im/imConsignmentSettlementController');
 
 // im_gl_account_setup (per doc-type GL fallback, for the future im_transaction module)
@@ -84,6 +85,7 @@ router.get('/im_transaction_report', imTransactionReportController.getTransactio
 router.get('/im_item_transaction_report', imItemTransactionReportController.getItemTransactionReport);
 router.get('/im_stock_movement_report', imStockMovementReportController.getStockMovementReport);
 router.get('/im_stock_balance_by_item_report', imStockBalanceByItemReportController.getStockBalanceByItemReport);
+router.get('/im_stock_aging_report', imStockAgingReportController.getStockAgingReport);
 router.get('/im_consignment_settlement/pending', imConsignmentSettlementController.fetchPending);
 router.post('/im_consignment_settlement', imConsignmentSettlementController.postSettlement);
 router.get('/im_consignment_settlement', imConsignmentSettlementController.fetchSettled);
