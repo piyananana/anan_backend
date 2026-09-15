@@ -22,6 +22,36 @@ const ensureImOpeningBalanceBatchTable = async (client) => {
             created_by  VARCHAR(100)
         )
     `);
+    // reversed_at/by — the "Reverse" feature (see reverseBatch) marks a batch reversed rather than deleting it,
+    // same convention as im_stock_count's closed_at/by
+    await client.query(`ALTER TABLE im_opening_balance_batch ADD COLUMN IF NOT EXISTS reversed_at TIMESTAMPTZ`).catch(() => {});
+    await client.query(`ALTER TABLE im_opening_balance_batch ADD COLUMN IF NOT EXISTS reversed_by VARCHAR(100)`).catch(() => {});
+
+    // Per-row snapshot captured at import time — the only way to safely reverse an AVG/STANDARD row later, since
+    // those merge directly into im_stock_balance with no other trace of what this batch contributed (unlike
+    // FIFO/SPECIFIC, which get a traceable im_stock_layer row via stock_layer_id below).
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS im_opening_balance_batch_detail (
+            id            SERIAL PRIMARY KEY,
+            batch_id      INTEGER NOT NULL REFERENCES im_opening_balance_batch(id),
+            item_id       INTEGER NOT NULL,
+            item_code     VARCHAR(50),
+            warehouse_id  INTEGER NOT NULL,
+            location_id   INTEGER,
+            lot_no        VARCHAR(50),
+            serial_no     VARCHAR(50),
+            costing_method VARCHAR(20) NOT NULL,
+            qty           NUMERIC(18,4) NOT NULL,
+            unit_cost     NUMERIC(18,4) NOT NULL,
+            stock_layer_id INTEGER,
+            balance_qty_before      NUMERIC(18,4),
+            balance_avg_cost_before NUMERIC(18,4),
+            balance_qty_after       NUMERIC(18,4),
+            balance_avg_cost_after  NUMERIC(18,4),
+            created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_im_opening_balance_batch_detail_batch ON im_opening_balance_batch_detail(batch_id)`);
 };
 
 // ---------------------------------------------------------------------------
@@ -315,17 +345,30 @@ const confirmImport = async (req, res) => {
                         itemId: r.item_id, warehouseId: r.warehouse_id, locationId: r.location_id, lotNo: r.lot_no,
                         qty: newQty, avgCost: newAvg, updatedBy: userName,
                     });
-                } else if (costingMethod === 'FIFO') {
                     await client.query(`
+                        INSERT INTO im_opening_balance_batch_detail
+                        (batch_id, item_id, item_code, warehouse_id, location_id, lot_no, serial_no, costing_method, qty, unit_cost,
+                         balance_qty_before, balance_avg_cost_before, balance_qty_after, balance_avg_cost_after)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                    `, [batchId, r.item_id, r.item_code || null, r.warehouse_id, r.location_id || null, r.lot_no || null, r.serial_no || null,
+                        costingMethod, qty, unitCost, beforeQty, beforeAvg, newQty, newAvg]);
+                } else if (costingMethod === 'FIFO') {
+                    const layerRes = await client.query(`
                         INSERT INTO im_stock_layer
                         (item_id, warehouse_id, location_id, lot_no, layer_date, received_qty, remaining_qty, unit_cost,
                          source_doc_type, source_doc_id, source_doc_no, created_by)
-                        VALUES ($1,$2,$3,$4,$5,$6,$6,$7,'OPBAL',$8,$9,$10)
+                        VALUES ($1,$2,$3,$4,$5,$6,$6,$7,'OPBAL',$8,$9,$10) RETURNING id
                     `, [r.item_id, r.warehouse_id, r.location_id || null, r.lot_no || null, import_date, qty, unitCost,
                         batchId, batchDocNo, userName]);
                     await recomputeBalanceFromLayers(client, {
                         itemId: r.item_id, warehouseId: r.warehouse_id, locationId: r.location_id, lotNo: r.lot_no, updatedBy: userName,
                     });
+                    await client.query(`
+                        INSERT INTO im_opening_balance_batch_detail
+                        (batch_id, item_id, item_code, warehouse_id, location_id, lot_no, serial_no, costing_method, qty, unit_cost, stock_layer_id)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                    `, [batchId, r.item_id, r.item_code || null, r.warehouse_id, r.location_id || null, r.lot_no || null, r.serial_no || null,
+                        costingMethod, qty, unitCost, layerRes.rows[0].id]);
                 } else if (costingMethod === 'SPECIFIC') {
                     if (!r.serial_no) throw new Error(`กรุณาระบุ Serial No. สำหรับ ${r.item_code}`);
                     const dupRes = await client.query(
@@ -333,16 +376,22 @@ const confirmImport = async (req, res) => {
                         [r.item_id, r.serial_no]
                     );
                     if (dupRes.rows.length > 0) throw new Error(`Serial ${r.serial_no} มีอยู่ในสต็อกแล้ว`);
-                    await client.query(`
+                    const layerRes = await client.query(`
                         INSERT INTO im_stock_layer
                         (item_id, warehouse_id, location_id, lot_no, serial_no, layer_date, received_qty, remaining_qty, unit_cost,
                          source_doc_type, source_doc_id, source_doc_no, created_by)
-                        VALUES ($1,$2,$3,$4,$5,$6,1,1,$7,'OPBAL',$8,$9,$10)
+                        VALUES ($1,$2,$3,$4,$5,$6,1,1,$7,'OPBAL',$8,$9,$10) RETURNING id
                     `, [r.item_id, r.warehouse_id, r.location_id || null, r.lot_no || null, r.serial_no, import_date, unitCost,
                         batchId, batchDocNo, userName]);
                     await recomputeBalanceFromLayers(client, {
                         itemId: r.item_id, warehouseId: r.warehouse_id, locationId: r.location_id, lotNo: r.lot_no, updatedBy: userName,
                     });
+                    await client.query(`
+                        INSERT INTO im_opening_balance_batch_detail
+                        (batch_id, item_id, item_code, warehouse_id, location_id, lot_no, serial_no, costing_method, qty, unit_cost, stock_layer_id)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                    `, [batchId, r.item_id, r.item_code || null, r.warehouse_id, r.location_id || null, r.lot_no || null, r.serial_no || null,
+                        costingMethod, qty, unitCost, layerRes.rows[0].id]);
                 } else {
                     throw new Error(`ไม่รู้จัก costing_method '${costingMethod}'`);
                 }
@@ -366,4 +415,97 @@ const confirmImport = async (req, res) => {
     }
 };
 
-module.exports = { getTemplate, downloadTemplate, validateFile, confirmImport };
+// GET /im_opening_balance/batches — history list, newest first
+const fetchBatches = async (req, res) => {
+    const client = await req.dbPool.connect();
+    try {
+        await ensureImOpeningBalanceBatchTable(client);
+        const result = await client.query(`
+            SELECT b.id, b.import_date, b.description, b.created_at, b.created_by, b.reversed_at, b.reversed_by,
+                   (SELECT COUNT(*) FROM im_opening_balance_batch_detail d WHERE d.batch_id = b.id) AS line_count
+            FROM im_opening_balance_batch b
+            ORDER BY b.id DESC
+        `);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Error fetching opening balance batches:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    } finally { client.release(); }
+};
+
+// PUT /im_opening_balance/batch/:id/reverse — whole-batch, all-or-nothing. Checks every row is still untouched
+// since import before changing anything; if any row is blocked, nothing changes and the response names exactly
+// which rows and why.
+const reverseBatch = async (req, res) => {
+    const { id } = req.params;
+    const userName = req.headers.username || null;
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const batchRes = await client.query(`SELECT * FROM im_opening_balance_batch WHERE id=$1 FOR UPDATE`, [id]);
+        if (batchRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
+        if (batchRes.rows[0].reversed_at) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ message: 'ชุดข้อมูลนี้ถูกถอยกลับไปแล้ว' });
+        }
+
+        const detailRes = await client.query(`SELECT * FROM im_opening_balance_batch_detail WHERE batch_id=$1`, [id]);
+        const rows = detailRes.rows;
+        if (rows.length === 0) { await client.query('ROLLBACK'); return res.status(400).json({ message: 'ไม่พบรายการในชุดข้อมูลนี้' }); }
+
+        // Pass 1: check every row is still reversible before touching anything
+        const blocking = [];
+        for (const r of rows) {
+            if (r.stock_layer_id) {
+                const layerRes = await client.query(`SELECT received_qty, remaining_qty FROM im_stock_layer WHERE id=$1 FOR UPDATE`, [r.stock_layer_id]);
+                const layer = layerRes.rows[0];
+                if (!layer || Number(layer.remaining_qty) !== Number(layer.received_qty)) {
+                    blocking.push({ item_code: r.item_code, warehouse_id: r.warehouse_id, lot_no: r.lot_no,
+                        reason: 'มีการเบิก/จ่ายสินค้าล็อตนี้ไปแล้วหลังตั้งยอด' });
+                }
+            } else {
+                const balRes = await client.query(
+                    `SELECT qty_on_hand, avg_unit_cost FROM im_stock_balance WHERE ${STOCK_BALANCE_KEY} FOR UPDATE`,
+                    [r.item_id, r.warehouse_id, r.location_id, r.lot_no]
+                );
+                const bal = balRes.rows[0];
+                const currentQty = bal ? Number(bal.qty_on_hand) : 0;
+                const currentAvg = bal ? Number(bal.avg_unit_cost) : 0;
+                if (currentQty !== Number(r.balance_qty_after) || currentAvg !== Number(r.balance_avg_cost_after)) {
+                    blocking.push({ item_code: r.item_code, warehouse_id: r.warehouse_id, lot_no: r.lot_no,
+                        reason: 'มีรายการอื่นเคลื่อนไหวสินค้านี้ไปแล้วหลังตั้งยอด' });
+                }
+            }
+        }
+        if (blocking.length > 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ message: 'ไม่สามารถถอยกลับได้ เนื่องจากมีรายการที่เคลื่อนไหวไปแล้วหลังตั้งยอด', blocking_rows: blocking });
+        }
+
+        // Pass 2: apply the reversal
+        for (const r of rows) {
+            if (r.stock_layer_id) {
+                await client.query(`DELETE FROM im_stock_layer WHERE id=$1`, [r.stock_layer_id]);
+                await recomputeBalanceFromLayers(client, {
+                    itemId: r.item_id, warehouseId: r.warehouse_id, locationId: r.location_id, lotNo: r.lot_no, updatedBy: userName,
+                });
+            } else {
+                await upsertStockBalance(client, {
+                    itemId: r.item_id, warehouseId: r.warehouse_id, locationId: r.location_id, lotNo: r.lot_no,
+                    qty: r.balance_qty_before, avgCost: r.balance_avg_cost_before, updatedBy: userName,
+                });
+            }
+        }
+
+        await client.query(`UPDATE im_opening_balance_batch SET reversed_at=NOW(), reversed_by=$1 WHERE id=$2`, [userName, id]);
+        await client.query('COMMIT');
+        res.status(200).json({ reversed: true, line_count: rows.length });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error reversing opening balance batch:', error);
+        res.status(500).json({ message: error.message || 'Internal server error' });
+    } finally { client.release(); }
+};
+
+module.exports = { getTemplate, downloadTemplate, validateFile, confirmImport, fetchBatches, reverseBatch };

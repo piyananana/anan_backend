@@ -113,6 +113,8 @@ router.get('/im_opening_balance/import/template',          imOpeningBalanceImpor
 router.get('/im_opening_balance/import/template/download', imOpeningBalanceImportController.downloadTemplate);
 router.post('/im_opening_balance/import/validate',         imOpeningBalanceImportController.validateFile);
 router.post('/im_opening_balance/import/confirm',          imOpeningBalanceImportController.confirmImport);
+router.get('/im_opening_balance/batches',                  imOpeningBalanceImportController.fetchBatches);
+router.put('/im_opening_balance/batch/:id/reverse',        imOpeningBalanceImportController.reverseBatch);
 
 // im_stock_count_running (เลขที่ใบตรวจนับอัตโนมัติ)
 router.get('/im_stock_count_running/preview_code', imStockCountRunningController.previewCode);
