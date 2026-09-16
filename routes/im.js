@@ -37,6 +37,7 @@ router.post('/im_gl_account_setup/:doc_code', imGlAccountSetupController.upsertR
 
 // im_price_list (im_price_list + im_price_list_detail)
 router.get('/im_price_list',                     imPriceListController.fetchRows);
+router.get('/im_price_list/resolve_price',       imPriceListController.resolvePriceHandler); // ต้องมาก่อน /:id ด้านล่าง ไม่งั้น "resolve_price" จะถูกจับเป็นค่า :id
 router.get('/im_price_list/:id',                 imPriceListController.fetchRow);
 router.get('/im_price_list_detail/by_item/:itemId', imPriceListController.fetchByItem);
 router.post('/im_price_list',                    imPriceListController.addRow);

@@ -74,6 +74,11 @@ const imRoutes = require('./routes/im');
 app.use('/api/im', imRoutes);
 // ----------------
 
+// po = Purchasing (Purchase Order)
+const poRoutes = require('./routes/po');
+app.use('/api/po', poRoutes);
+// ----------------
+
 // sa = System Administration
 const saRoutes = require('./routes/sa');
 const saPasswordPolicyController = require('./controllers/sa/saPasswordPolicyController');

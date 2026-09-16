@@ -38,6 +38,13 @@ const ensureImPriceListTable = async (client) => {
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_im_price_list_detail_list ON im_price_list_detail(price_list_id)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_im_price_list_detail_item ON im_price_list_detail(item_id)`);
+
+    // ผูกลิสต์ราคากับผู้ขาย/ลูกค้ารายตัวได้ (nullable) — NULL = ลิสต์ราคากลาง ใช้เป็น fallback เมื่อไม่มีลิสต์เฉพาะราย
+    // vendor_id คู่กับ list_type='PURCHASE', customer_id คู่กับ list_type='SALES' (ไม่บังคับ constraint ระดับ DB,
+    // แค่ convention — ดู resolveItemPrice) ผู้ใช้แรกของคอลัมน์นี้คือ PO (ฝั่ง SALES/customer_id ยังไม่มีผู้ใช้จนกว่า
+    // จะมี SO)
+    await client.query(`ALTER TABLE im_price_list ADD COLUMN IF NOT EXISTS vendor_id   INTEGER REFERENCES ap_vendor(id)`).catch(() => {});
+    await client.query(`ALTER TABLE im_price_list ADD COLUMN IF NOT EXISTS customer_id INTEGER REFERENCES ar_customer(id)`).catch(() => {});
 };
 
 const HEADER_SELECT = `
@@ -118,6 +125,56 @@ const fetchByItem = async (req, res) => {
     } finally { client.release(); }
 };
 
+// หาราคาที่ควรใช้สำหรับ item หนึ่งตัว — เลือกลิสต์ที่ผูกกับ vendor_id/customer_id เจาะจงก่อน (ตาม list_type) ถ้าไม่
+// เจอ fallback ไปลิสต์กลาง (vendor_id/customer_id เป็น NULL) จากนั้นในลิสต์ที่เลือกได้ หา min_qty ที่สูงสุดที่ไม่เกิน
+// qty ที่ขอ และ effective_from/to ครอบคลุม docDate — คืน null ถ้าไม่พบเลย (ผู้เรียกต้องรองรับการกรอกราคาเองได้เสมอ
+// ไม่ใช่ error) เรียกจากทั้งหน้าจอ PO (list_type='PURCHASE', vendorId) และในอนาคต SO (list_type='SALES', customerId)
+const resolveItemPrice = async (client, { itemId, listType, vendorId, customerId, qty, docDate }) => {
+    const partyCol = listType === 'PURCHASE' ? 'vendor_id' : 'customer_id';
+    const partyId = listType === 'PURCHASE' ? vendorId : customerId;
+    const date = docDate || new Date().toISOString().slice(0, 10);
+    const q = Number(qty) || 0;
+
+    const listRes = await client.query(`
+        SELECT id FROM im_price_list
+        WHERE list_type = $1 AND is_active = true AND (${partyCol} = $2 OR ${partyCol} IS NULL)
+        ORDER BY ${partyCol} IS NULL ASC
+        LIMIT 1
+    `, [listType, partyId || null]);
+    if (listRes.rows.length === 0) return null;
+    const priceListId = listRes.rows[0].id;
+
+    const detailRes = await client.query(`
+        SELECT unit_price_fc, uom_id, min_qty
+        FROM im_price_list_detail
+        WHERE price_list_id = $1 AND item_id = $2 AND min_qty <= $3
+          AND (effective_from IS NULL OR effective_from <= $4::date)
+          AND (effective_to   IS NULL OR effective_to   >= $4::date)
+        ORDER BY min_qty DESC
+        LIMIT 1
+    `, [priceListId, itemId, q, date]);
+    if (detailRes.rows.length === 0) return null;
+    return { price_list_id: priceListId, unit_price_fc: Number(detailRes.rows[0].unit_price_fc), uom_id: detailRes.rows[0].uom_id };
+};
+
+// GET /im_price_list/resolve_price?item_id=&list_type=PURCHASE|SALES&vendor_id=&customer_id=&qty=&doc_date=
+const resolvePriceHandler = async (req, res) => {
+    const client = await req.dbPool.connect();
+    try {
+        await ensureImPriceListTable(client);
+        const { item_id, list_type, vendor_id, customer_id, qty, doc_date } = req.query;
+        if (!item_id || !list_type) return res.status(400).json({ message: 'กรุณาระบุ item_id และ list_type' });
+        const result = await resolveItemPrice(client, {
+            itemId: item_id, listType: list_type, vendorId: vendor_id || null, customerId: customer_id || null,
+            qty: qty || 0, docDate: doc_date || null,
+        });
+        res.status(200).json(result || {});
+    } catch (error) {
+        console.error('Error resolving item price:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    } finally { client.release(); }
+};
+
 const validateDetails = (details) => {
     if (!Array.isArray(details) || details.length === 0) return 'กรุณาระบุรายการราคาอย่างน้อย 1 รายการ';
     for (const line of details) {
@@ -149,12 +206,13 @@ const addRow = async (req, res) => {
         }
 
         const header = await client.query(
-            `INSERT INTO im_price_list (price_list_code, price_list_name, list_type, currency_id, is_active, created_by, updated_by)
-             VALUES ($1,$2,$3,$4,$5,$6,$6)
+            `INSERT INTO im_price_list (price_list_code, price_list_name, list_type, currency_id, vendor_id, customer_id, is_active, created_by, updated_by)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)
              RETURNING id`,
             [
                 b.price_list_code.trim().toUpperCase(), b.price_list_name.trim(),
-                b.list_type || 'SALES', b.currency_id || null, b.is_active ?? true, userName,
+                b.list_type || 'SALES', b.currency_id || null, b.vendor_id || null, b.customer_id || null,
+                b.is_active ?? true, userName,
             ]
         );
         const headerId = header.rows[0].id;
@@ -203,12 +261,15 @@ const updateRow = async (req, res) => {
                 price_list_name = $1,
                 list_type       = $2,
                 currency_id     = $3,
-                is_active       = $4,
-                updated_by      = $5,
+                vendor_id       = $4,
+                customer_id     = $5,
+                is_active       = $6,
+                updated_by      = $7,
                 updated_at      = NOW()
-             WHERE id = $6
+             WHERE id = $8
              RETURNING id`,
-            [b.price_list_name || '', b.list_type || 'SALES', b.currency_id || null, b.is_active ?? true, userName, id]
+            [b.price_list_name || '', b.list_type || 'SALES', b.currency_id || null, b.vendor_id || null,
+             b.customer_id || null, b.is_active ?? true, userName, id]
         );
         if (result.rows.length === 0) {
             await client.query('ROLLBACK');
@@ -249,4 +310,7 @@ const deleteRow = async (req, res) => {
     } finally { client.release(); }
 };
 
-module.exports = { ensureImPriceListTable, fetchRows, fetchRow, fetchByItem, addRow, updateRow, deleteRow, LIST_TYPES };
+module.exports = {
+    ensureImPriceListTable, fetchRows, fetchRow, fetchByItem, addRow, updateRow, deleteRow, LIST_TYPES,
+    resolveItemPrice, resolvePriceHandler,
+};
