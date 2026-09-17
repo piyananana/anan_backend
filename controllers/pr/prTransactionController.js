@@ -585,7 +585,7 @@ const fetchConvertibleLines = async (req, res) => {
         await ensurePrTransactionTable(client);
         const { search } = req.query;
         let query = `
-            SELECT t.id AS header_id, t.doc_no, t.doc_date, t.status,
+            SELECT t.id AS header_id, t.doc_no, t.doc_date, t.status, t.currency_code, t.exchange_rate,
                    dt.id AS detail_id, dt.line_no, dt.item_id, dt.item_code, dt.item_name, dt.uom_id,
                    dt.qty_requested, dt.estimated_unit_cost, u.uom_code,
                    COALESCE((
