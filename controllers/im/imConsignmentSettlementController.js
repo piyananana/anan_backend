@@ -15,6 +15,7 @@ const PENDING_SELECT = `
         c.id AS consumption_id, c.qty, c.layer_id,
         l.unit_cost, l.lot_no, l.serial_no, l.source_doc_id AS receipt_header_id, l.source_doc_no AS receipt_doc_no,
         rt.id AS receipt_txn_id, rt.doc_code AS receipt_doc_code, rt.vendor_id,
+        rt.currency_code AS receipt_currency_code, rt.exchange_rate AS receipt_exchange_rate,
         v.vendor_code, v.vendor_name_th, v.tax_id AS vendor_tax_id,
         st.id AS sale_txn_id, st.doc_no AS sale_doc_no, st.doc_date AS sale_doc_date,
         it.id AS item_id, it.item_code, it.item_name_th, it.item_name_en,
@@ -75,6 +76,14 @@ const postSettlement = async (req, res) => {
         if (missingAccount) {
             throw new Error(`ยังไม่ได้ตั้งค่าบัญชีเจ้าหนี้ฝากขาย (consignment_payable_account_id) สำหรับเอกสาร ${missingAccount.receipt_doc_code}`);
         }
+        // ใบตั้งหนี้ AP มีสกุลเงินเดียวต่อเอกสาร — ถ้ารายการที่เลือกมาจากใบรับฝากขายคนละสกุลเงิน (เช่น ผู้ฝากขายเคย
+        // ส่งของมาเป็น USD ครั้งหนึ่ง แล้วเปลี่ยนมาเป็น THB อีกครั้ง) ต้อง Settlement แยกชุดตามสกุลเงิน
+        const docCurrencyCode = rows[0].receipt_currency_code || 'THB';
+        const mixedCurrency = rows.find(r => (r.receipt_currency_code || 'THB') !== docCurrencyCode);
+        if (mixedCurrency) {
+            throw new Error('รายการที่เลือกมาจากใบรับฝากขายคนละสกุลเงิน กรุณา Settlement แยกตามสกุลเงิน');
+        }
+        const docExchangeRate = Number(rows[0].receipt_exchange_rate) || 1;
 
         const apDocRes = await client.query(`
             SELECT id, doc_code FROM sa_module_document
@@ -113,12 +122,21 @@ const postSettlement = async (req, res) => {
             if (userRes.rows.length > 0) createdByUserId = userRes.rows[0].id;
         }
 
-        const lineRows = rows.map(r => ({
-            itemCode: r.item_code, itemName: r.item_name_th,
-            quantity: Number(r.qty), unitPriceFc: Number(r.unit_cost), amount: Number(r.qty) * Number(r.unit_cost),
-            consignmentPayableAccountId: Number(r.consignment_payable_account_id),
-        }));
-        const totalAmount = lineRows.reduce((s, l) => s + l.amount, 0);
+        // unit_cost บน im_stock_layer เป็นบาทเสมอ (ไม่มี FC บน stock layer — ดู plan) แปลงกลับเป็นสกุลเงินของใบรับ
+        // ฝากขายต้นทาง (docExchangeRate ตรวจแล้วว่าทุกบรรทัดมาจากอัตราเดียวกันข้างบน) เพื่อให้ใบตั้งหนี้ AP ที่สร้าง
+        // อัตโนมัตินี้ตรงกับสกุลเงินจริงของผู้ฝากขาย แทนที่จะ hardcode 'THB'/1 เหมือนเดิม
+        const lineRows = rows.map(r => {
+            const unitCostLc = Number(r.unit_cost);
+            const unitCostFc = unitCostLc / docExchangeRate;
+            const qty = Number(r.qty);
+            return {
+                itemCode: r.item_code, itemName: r.item_name_th,
+                quantity: qty, unitPriceFc: unitCostFc, amountLc: qty * unitCostLc, amountFc: qty * unitCostFc,
+                consignmentPayableAccountId: Number(r.consignment_payable_account_id),
+            };
+        });
+        const totalAmountLc = lineRows.reduce((s, l) => s + l.amountLc, 0);
+        const totalAmountFc = lineRows.reduce((s, l) => s + l.amountFc, 0);
 
         const apHeaderRes = await client.query(`
             INSERT INTO ap_transaction
@@ -126,11 +144,12 @@ const postSettlement = async (req, res) => {
              currency_code, exchange_rate, subtotal_fc, before_vat_fc, vat_amount_fc, total_amount_fc,
              subtotal_lc, before_vat_lc, vat_amount_lc, total_amount_lc,
              balance_amount_lc, ref_no, description, status, created_by, updated_by)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'THB',1,$10,$10,0,$10,$10,$10,0,$10,$10,$11,$12,'Posted',$13,$13)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12,0,$12,$13,$13,0,$13,$13,$14,$15,'Posted',$16,$16)
             RETURNING id
         `, [
             apDocId, apDocNo, settleDate, periodId, vendor_id, vendorRow.vendor_code, vendorRow.vendor_name_th, apAccountId, apSetup.gl_doc_id,
-            totalAmount, ref_no || null, `ตั้งหนี้สินค้าฝากขาย (Consignment Settlement) ${apDocNo}`, createdByUserId,
+            docCurrencyCode, docExchangeRate, totalAmountFc,
+            totalAmountLc, ref_no || null, `ตั้งหนี้สินค้าฝากขาย (Consignment Settlement) ${apDocNo}`, createdByUserId,
         ]);
         const apTransactionId = apHeaderRes.rows[0].id;
 
@@ -140,21 +159,21 @@ const postSettlement = async (req, res) => {
                 INSERT INTO ap_transaction_detail
                 (header_id, line_no, description, quantity, unit_price_fc, subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
                  expense_account_id, subtotal_lc, vat_amount_lc, total_amount_lc)
-                VALUES ($1,$2,$3,$4,$5,$6,'NOVAT',0,0,$6,$7,$6,0,$6)
-            `, [apTransactionId, lineNo++, l.itemName || l.itemCode, l.quantity, l.unitPriceFc, l.amount, l.consignmentPayableAccountId]);
+                VALUES ($1,$2,$3,$4,$5,$6,'NOVAT',0,0,$6,$7,$8,0,$8)
+            `, [apTransactionId, lineNo++, l.itemName || l.itemCode, l.quantity, l.unitPriceFc, l.amountFc, l.consignmentPayableAccountId, l.amountLc]);
         }
 
         const debitByAccount = {};
         for (const l of lineRows) {
-            debitByAccount[l.consignmentPayableAccountId] = (debitByAccount[l.consignmentPayableAccountId] || 0) + l.amount;
+            debitByAccount[l.consignmentPayableAccountId] = (debitByAccount[l.consignmentPayableAccountId] || 0) + l.amountLc;
         }
         const apGlDetails = [];
         for (const [accId, amt] of Object.entries(debitByAccount)) {
             if (amt === 0) continue;
             apGlDetails.push({ account_id: Number(accId), description: `Settle เจ้าหนี้ฝากขาย ${apDocNo}`, debit_lc: amt, credit_lc: 0 });
         }
-        if (totalAmount !== 0) {
-            apGlDetails.push({ account_id: apAccountId, description: `ตั้งหนี้ผู้ฝากขาย ${apDocNo}`, debit_lc: 0, credit_lc: totalAmount });
+        if (totalAmountLc !== 0) {
+            apGlDetails.push({ account_id: apAccountId, description: `ตั้งหนี้ผู้ฝากขาย ${apDocNo}`, debit_lc: 0, credit_lc: totalAmountLc });
         }
 
         if (apGlDetails.length > 0) {
@@ -189,7 +208,7 @@ const postSettlement = async (req, res) => {
         );
 
         await client.query('COMMIT');
-        res.status(201).json({ ap_transaction_id: apTransactionId, ap_doc_no: apDocNo, total_amount: totalAmount, line_count: lineRows.length });
+        res.status(201).json({ ap_transaction_id: apTransactionId, ap_doc_no: apDocNo, total_amount: totalAmountLc, line_count: lineRows.length });
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error posting consignment settlement:', error);
