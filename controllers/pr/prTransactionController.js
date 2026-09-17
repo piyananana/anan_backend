@@ -22,6 +22,9 @@ const ensurePrTransactionTable = async (client) => {
             vendor_code     VARCHAR(50),
             vendor_name_th  VARCHAR(255),
             warehouse_id    INTEGER REFERENCES im_warehouse(id),
+            currency_id     INTEGER REFERENCES cd_currency(id),
+            currency_code   VARCHAR(10) DEFAULT 'THB',
+            exchange_rate   NUMERIC(15,6) NOT NULL DEFAULT 1,
             status          VARCHAR(20) NOT NULL DEFAULT 'Draft',
             approval_mode   VARCHAR(10) NOT NULL DEFAULT 'ALL',
             total_qty       NUMERIC(18,4) NOT NULL DEFAULT 0,
@@ -80,6 +83,12 @@ const ensurePrTransactionTable = async (client) => {
     // มาก่อนแล้วเท่านั้น (ทั้งสองไฟล์ ALTER คอลัมน์เดียวกันแบบ idempotent ซ้ำกันได้อย่างปลอดภัย)
     await client.query(`ALTER TABLE po_transaction ADD COLUMN IF NOT EXISTS ref_pr_id INTEGER`);
     await client.query(`ALTER TABLE po_transaction_detail ADD COLUMN IF NOT EXISTS ref_pr_detail_id INTEGER`);
+
+    // เผื่อตาราง pr_transaction ถูกสร้างไว้แล้วก่อนเพิ่มฟีลด์สกุลเงิน (CREATE TABLE IF NOT EXISTS ด้านบนจะไม่เพิ่ม
+    // คอลัมน์ให้ตารางที่มีอยู่แล้ว) — รองรับการสั่งซื้อ/ขอซื้อสินค้าจากต่างประเทศเป็นสกุลเงินต่างประเทศได้
+    await client.query(`ALTER TABLE pr_transaction ADD COLUMN IF NOT EXISTS currency_id INTEGER REFERENCES cd_currency(id)`);
+    await client.query(`ALTER TABLE pr_transaction ADD COLUMN IF NOT EXISTS currency_code VARCHAR(10) DEFAULT 'THB'`);
+    await client.query(`ALTER TABLE pr_transaction ADD COLUMN IF NOT EXISTS exchange_rate NUMERIC(15,6) NOT NULL DEFAULT 1`);
 };
 
 // --- Fetch helpers ---
@@ -199,12 +208,14 @@ const createTransaction = async (req, res) => {
         const hRes = await client.query(`
             INSERT INTO pr_transaction
             (doc_id, doc_no, doc_code, doc_date, requested_by, vendor_id, vendor_code, vendor_name_th, warehouse_id,
+             currency_id, currency_code, exchange_rate,
              description, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id, created_by, updated_by)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$20)
             RETURNING id
         `, [
             header.doc_id, docNo, docCode, header.doc_date, header.requested_by || userId || null,
             header.vendor_id || null, vendorCode, vendorNameTh, header.warehouse_id || null,
+            header.currency_id || null, header.currency_code || 'THB', header.exchange_rate || 1,
             header.description || null,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
             header.branch_id || null, userName,
@@ -215,7 +226,7 @@ const createTransaction = async (req, res) => {
         for (const d of details) {
             const qty = Number(d.qty_requested) || 0;
             const cost = Number(d.estimated_unit_cost) || 0;
-            const value = qty * cost;
+            const value = qty * cost * (Number(header.exchange_rate) || 1);
             totalQty += qty;
             totalValue += value;
             await client.query(`
@@ -262,12 +273,14 @@ const updateTransaction = async (req, res) => {
         await client.query(`
             UPDATE pr_transaction SET
                 doc_date=$1, vendor_id=$2, vendor_code=$3, vendor_name_th=$4, warehouse_id=$5, description=$6,
-                dim1_id=$7, dim2_id=$8, dim3_id=$9, dim4_id=$10, dim5_id=$11, branch_id=$12,
-                status='Draft', updated_by=$13, updated_at=NOW()
-            WHERE id=$14
+                currency_id=$7, currency_code=$8, exchange_rate=$9,
+                dim1_id=$10, dim2_id=$11, dim3_id=$12, dim4_id=$13, dim5_id=$14, branch_id=$15,
+                status='Draft', updated_by=$16, updated_at=NOW()
+            WHERE id=$17
         `, [
             header.doc_date, header.vendor_id || null, vendorCode, vendorNameTh, header.warehouse_id || null,
             header.description || null,
+            header.currency_id || null, header.currency_code || 'THB', header.exchange_rate || 1,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
             header.branch_id || null, userName, id,
         ]);
@@ -280,7 +293,7 @@ const updateTransaction = async (req, res) => {
         for (const d of details) {
             const qty = Number(d.qty_requested) || 0;
             const cost = Number(d.estimated_unit_cost) || 0;
-            const value = qty * cost;
+            const value = qty * cost * (Number(header.exchange_rate) || 1);
             totalQty += qty;
             totalValue += value;
             await client.query(`
