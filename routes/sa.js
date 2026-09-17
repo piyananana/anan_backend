@@ -132,6 +132,7 @@ router.delete('/sa_menu/:menuId/doc_types/:docType', saMenuController.deleteMenu
 router.get('/sa_module_document', saModuleDocumentController.fetchRows);
 router.get('/sa_module_document/user/:userId', saModuleDocumentController.fetchRowsByUserId);
 router.get('/sa_module_document/module_user/:docCode/:userId', saModuleDocumentController.fetchRowsByModuleUserId);
+router.get('/sa_module_document/sys_module_user/:sysModule/:userId', saModuleDocumentController.fetchRowsBySysModuleUserId);
 router.post('/sa_module_document', saModuleDocumentController.addRow);
 router.put('/sa_module_document/:id', saModuleDocumentController.updateRow);
 router.delete('/sa_module_document/:id', saModuleDocumentController.deleteRow);

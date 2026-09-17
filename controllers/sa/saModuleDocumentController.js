@@ -132,7 +132,7 @@ const fetchRowsByModuleUserId = async (req, res) => {
     const { docCode, userId } = req.params;
     try {
         const result = await req.dbPool.query(
-            `SELECT md.* 
+            `SELECT md.*
                 FROM sa_module_document md
                 LEFT OUTER JOIN sa_module_document m
                 ON md.parent_id = m.id
@@ -144,6 +144,27 @@ const fetchRowsByModuleUserId = async (req, res) => {
         res.json(result.rows);
     } catch (err) {
         console.error('Error fetching User document:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+};
+
+// เหมือน fetchRowsByModuleUserId แต่กรองด้วย sys_module (เช่น '51'=PO, ดู sa_anan_module.dart) แทนที่จะ join ผ่าน
+// doc_code ของโหนดแม่ที่ตายตัวโหนดเดียว — ให้ผู้ใช้สร้างโหนดแม่/ประเภทเอกสารได้หลายชุดภายใต้ sys_module เดียวกัน
+// (เช่น แยกตามประเภทการบันทึกบัญชี) แล้วยังค้นเจอได้ทั้งหมด ไม่ผูกกับชื่อโหนดแม่ใดโหนดหนึ่ง — ใช้โดยโมดูลใหม่ (PO/SO)
+// ที่ยังไม่ fix โครงสร้างโหนดแม่ตายตัวแบบโมดูลเดิม (GL/AR/AP/IM/CM ที่ผูกกับ doc_code='GL'/'AR'/'AP'/'IM'/'CM' ตรงๆ)
+const fetchRowsBySysModuleUserId = async (req, res) => {
+    const { sysModule, userId } = req.params;
+    try {
+        const result = await req.dbPool.query(
+            `SELECT md.*
+                FROM sa_module_document md
+                INNER JOIN sa_user_document u ON md.id = u.doc_id
+                WHERE md.sys_module = $1 AND md.is_doc_type = TRUE AND u.user_id = $2 AND md.is_active = TRUE
+                ORDER BY md.parent_id ASC, md.sort_order ASC`,
+            [sysModule, userId]);
+        res.json(result.rows);
+    } catch (err) {
+        console.error('Error fetching User document by sys_module:', err);
         res.status(500).json({ error: 'Internal server error' });
     }
 };
@@ -435,6 +456,7 @@ module.exports = {
     fetchRows,
     fetchRowsByUserId,
     fetchRowsByModuleUserId,
+    fetchRowsBySysModuleUserId,
     addRow,
     updateRow,
     deleteRow,
