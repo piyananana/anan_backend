@@ -43,6 +43,9 @@ const ensurePoTransactionTable = async (client) => {
     await client.query(`CREATE INDEX IF NOT EXISTS idx_po_transaction_date   ON po_transaction(doc_date)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_po_transaction_status ON po_transaction(status)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_po_transaction_vendor ON po_transaction(vendor_id)`);
+    // อ้างอิงใบขอซื้อ (PR) ต้นทาง — สะดวก/แสดงผลเท่านั้น การตรวจสอบจริงใช้ ref_pr_detail_id รายบรรทัดด้านล่าง
+    // (มิเรอร์ ref_po_id/ref_po_detail_id ที่ im_transaction ใช้อ้างอิงกลับมาที่ po_transaction)
+    await client.query(`ALTER TABLE po_transaction ADD COLUMN IF NOT EXISTS ref_pr_id INTEGER`);
 
     await client.query(`
         CREATE TABLE IF NOT EXISTS po_transaction_detail (
@@ -61,6 +64,9 @@ const ensurePoTransactionTable = async (client) => {
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_po_transaction_detail_header ON po_transaction_detail(header_id)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_po_transaction_detail_item   ON po_transaction_detail(item_id)`);
+    // บรรทัดนี้แปลงมาจากบรรทัดใบขอซื้อ (PR) ใบไหน — ใช้ตรวจคงเหลือที่แปลงได้ผ่าน validatePrConvertibleQty
+    // (nullable — บรรทัด PO ที่เพิ่มเองโดยไม่มีต้นทางจาก PR ไม่ต้องมีค่านี้)
+    await client.query(`ALTER TABLE po_transaction_detail ADD COLUMN IF NOT EXISTS ref_pr_detail_id INTEGER`);
 };
 
 // --- Fetch helpers ---
@@ -70,12 +76,14 @@ const fetchRowById = async (pool, id) => {
                d.doc_code AS d_doc_code, d.doc_name_thai, d.doc_name_eng, d.is_auto_numbering,
                v.vendor_code AS v_vendor_code, v.vendor_name_th AS v_vendor_name_th,
                w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
-               b.branch_code, b.branch_name_thai
+               b.branch_code, b.branch_name_thai,
+               pr.doc_no AS ref_pr_doc_no
         FROM po_transaction t
         JOIN sa_module_document d ON d.id = t.doc_id
         LEFT JOIN ap_vendor v     ON v.id = t.vendor_id
         LEFT JOIN im_warehouse w  ON w.id = t.warehouse_id
         LEFT JOIN cd_branch b     ON b.id = t.branch_id
+        LEFT JOIN pr_transaction pr ON pr.id = t.ref_pr_id
         WHERE t.id = $1`, [id]);
     if (hRes.rows.length === 0) return null;
     const dRes = await pool.query(`
@@ -169,19 +177,24 @@ const createTransaction = async (req, res) => {
         const hRes = await client.query(`
             INSERT INTO po_transaction
             (doc_id, doc_no, doc_code, doc_date, vendor_id, vendor_code, vendor_name_th, warehouse_id,
-             currency_id, currency_code, exchange_rate, due_date, description,
+             currency_id, currency_code, exchange_rate, due_date, description, ref_pr_id,
              dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id, created_by, updated_by)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$20)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$21)
             RETURNING id
         `, [
             header.doc_id, docNo, docCode, header.doc_date, header.vendor_id, vendor.vendor_code, vendor.vendor_name_th,
             header.warehouse_id, header.currency_id || null, header.currency_code || 'THB', header.exchange_rate || 1,
-            header.due_date || null, header.description || null,
+            header.due_date || null, header.description || null, header.ref_pr_id || null,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
             header.branch_id || null, header.created_by || null,
         ]);
         const headerId = hRes.rows[0].id;
 
+        // อ้างอิงบรรทัด PR (ถ้ามี) — ตรวจคงเหลือที่แปลงได้ก่อนบันทึกทุกบรรทัด แล้วรีเฟรชสถานะ PR ต้นทางทั้งหมด
+        // ที่ถูกอ้างอิงหลังบันทึกครบ (lazy require กัน circular กับ prTransactionController.js ที่ require
+        // imTransactionController.js ที่ระดับบนสุดของไฟล์อยู่แล้ว — มิเรอร์รูปแบบเดียวกับ im/po)
+        const { validatePrConvertibleQty, refreshPrStatus } = require('../pr/prTransactionController');
+        const affectedPrIds = new Set();
         let lineNo = 1, totalQty = 0, totalValue = 0;
         for (const d of details) {
             const qty = Number(d.qty_ordered) || 0;
@@ -189,14 +202,19 @@ const createTransaction = async (req, res) => {
             const value = qty * price * (Number(header.exchange_rate) || 1);
             totalQty += qty;
             totalValue += value;
+            if (d.ref_pr_detail_id) {
+                const { prTransactionId } = await validatePrConvertibleQty(client, { refPrDetailId: d.ref_pr_detail_id, requestedQty: qty });
+                affectedPrIds.add(prTransactionId);
+            }
             await client.query(`
                 INSERT INTO po_transaction_detail
-                (header_id, line_no, item_id, item_code, item_name, uom_id, qty_ordered, unit_price_fc, total_value_lc, description)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                (header_id, line_no, item_id, item_code, item_name, uom_id, qty_ordered, unit_price_fc, total_value_lc, description, ref_pr_detail_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
             `, [headerId, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                qty, price, value, d.description || null]);
+                qty, price, value, d.description || null, d.ref_pr_detail_id || null]);
         }
         await client.query(`UPDATE po_transaction SET total_qty=$1, total_value_lc=$2 WHERE id=$3`, [totalQty, totalValue, headerId]);
+        for (const prId of affectedPrIds) { await refreshPrStatus(client, prId); }
 
         await client.query('COMMIT');
         const full = await fetchRowById(req.dbPool, headerId);
@@ -242,6 +260,12 @@ const updateTransaction = async (req, res) => {
             header.branch_id || null, header.updated_by || null, id,
         ]);
 
+        const { validatePrConvertibleQty, refreshPrStatus } = require('../pr/prTransactionController');
+        const affectedPrIds = new Set();
+        const oldPrLines = await client.query(`SELECT DISTINCT prd.header_id FROM po_transaction_detail pod
+            JOIN pr_transaction_detail prd ON prd.id = pod.ref_pr_detail_id WHERE pod.header_id=$1`, [id]);
+        for (const r of oldPrLines.rows) affectedPrIds.add(r.header_id);
+
         await client.query(`DELETE FROM po_transaction_detail WHERE header_id=$1`, [id]);
         let lineNo = 1, totalQty = 0, totalValue = 0;
         for (const d of details) {
@@ -250,14 +274,19 @@ const updateTransaction = async (req, res) => {
             const value = qty * price * (Number(header.exchange_rate) || 1);
             totalQty += qty;
             totalValue += value;
+            if (d.ref_pr_detail_id) {
+                const { prTransactionId } = await validatePrConvertibleQty(client, { refPrDetailId: d.ref_pr_detail_id, requestedQty: qty });
+                affectedPrIds.add(prTransactionId);
+            }
             await client.query(`
                 INSERT INTO po_transaction_detail
-                (header_id, line_no, item_id, item_code, item_name, uom_id, qty_ordered, unit_price_fc, total_value_lc, description)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                (header_id, line_no, item_id, item_code, item_name, uom_id, qty_ordered, unit_price_fc, total_value_lc, description, ref_pr_detail_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
             `, [id, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                qty, price, value, d.description || null]);
+                qty, price, value, d.description || null, d.ref_pr_detail_id || null]);
         }
         await client.query(`UPDATE po_transaction SET total_qty=$1, total_value_lc=$2 WHERE id=$3`, [totalQty, totalValue, id]);
+        for (const prId of affectedPrIds) { await refreshPrStatus(client, prId); }
 
         await client.query('COMMIT');
         const full = await fetchRowById(req.dbPool, id);
