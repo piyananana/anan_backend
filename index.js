@@ -74,14 +74,10 @@ const imRoutes = require('./routes/im');
 app.use('/api/im', imRoutes);
 // ----------------
 
-// po = Purchasing (Purchase Order)
+// po = Purchasing (Purchase Order + Purchase Requisition, รวมกันเพราะ PR เป็นส่วนหนึ่งของ workflow จัดซื้อเดียวกัน
+// — pr_transaction/* จึงย้ายมาอยู่ใต้ /api/po ด้วย ไม่มี /api/pr แยกต่างหากอีกต่อไป)
 const poRoutes = require('./routes/po');
 app.use('/api/po', poRoutes);
-// ----------------
-
-// pr = Purchasing (Purchase Requisition)
-const prRoutes = require('./routes/pr');
-app.use('/api/pr', prRoutes);
 // ----------------
 
 // sa = System Administration

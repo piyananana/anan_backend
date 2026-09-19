@@ -191,9 +191,10 @@ const createTransaction = async (req, res) => {
         const headerId = hRes.rows[0].id;
 
         // อ้างอิงบรรทัด PR (ถ้ามี) — ตรวจคงเหลือที่แปลงได้ก่อนบันทึกทุกบรรทัด แล้วรีเฟรชสถานะ PR ต้นทางทั้งหมด
-        // ที่ถูกอ้างอิงหลังบันทึกครบ (lazy require กัน circular กับ prTransactionController.js ที่ require
-        // imTransactionController.js ที่ระดับบนสุดของไฟล์อยู่แล้ว — มิเรอร์รูปแบบเดียวกับ im/po)
-        const { validatePrConvertibleQty, refreshPrStatus } = require('../pr/prTransactionController');
+        // ที่ถูกอ้างอิงหลังบันทึกครบ (lazy require กัน circular กับ poPrTransactionController.js ที่ require
+        // imTransactionController.js ที่ระดับบนสุดของไฟล์อยู่แล้ว — มิเรอร์รูปแบบเดียวกับ im/po, ทั้งสองไฟล์อยู่ใน
+        // controllers/po/ ด้วยกันแล้วตั้งแต่ PR ย้ายมารวม)
+        const { validatePrConvertibleQty, refreshPrStatus } = require('./poPrTransactionController');
         const affectedPrIds = new Set();
         let lineNo = 1, totalQty = 0, totalValue = 0;
         for (const d of details) {
@@ -260,7 +261,7 @@ const updateTransaction = async (req, res) => {
             header.branch_id || null, header.updated_by || null, id,
         ]);
 
-        const { validatePrConvertibleQty, refreshPrStatus } = require('../pr/prTransactionController');
+        const { validatePrConvertibleQty, refreshPrStatus } = require('./poPrTransactionController');
         const affectedPrIds = new Set();
         const oldPrLines = await client.query(`SELECT DISTINCT prd.header_id FROM po_transaction_detail pod
             JOIN pr_transaction_detail prd ON prd.id = pod.ref_pr_detail_id WHERE pod.header_id=$1`, [id]);

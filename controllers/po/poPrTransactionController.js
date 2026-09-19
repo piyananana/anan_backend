@@ -1,4 +1,6 @@
-// controllers/pr/prTransactionController.js — ใบขอซื้อ (Purchase Requisition, sys_module='51', อยู่ใต้โหนด PO เดิม)
+// controllers/po/poPrTransactionController.js — ใบขอซื้อ (Purchase Requisition, sys_module='51', อยู่ใต้โหนด PO เดิม)
+// ย้ายมารวมกับโฟลเดอร์ po (เดิมอยู่ controllers/pr/) เพราะ PR เป็นส่วนหนึ่งของ workflow จัดซื้อเดียวกับ PO —
+// ชื่อฟังก์ชัน/export/schema/URL sub-path (/pr_transaction/...) ทั้งหมดยังคงเดิมทุกประการ ย้ายแค่ตำแหน่งไฟล์
 // เอกสารขอ/อนุมัติภายในเท่านั้น — ไม่แตะ GL, ไม่แตะสต็อก, ไม่แตะผู้ขาย/คลังโดยจำเป็น (ต่างจาก PO ที่ทั้งสองฟิลด์บังคับ)
 // workflow: Draft (แก้ไขได้) -> Submitted (เข้าคิวอนุมัติจริงผ่าน sa_module_approver/syncMenuApprovers มิเรอร์
 // apPaymentRunController.js ทุกประการ) -> Approved/Rejected (Rejected แก้ไข+ส่งใหม่ได้เหมือน Draft) ->
