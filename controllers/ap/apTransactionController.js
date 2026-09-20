@@ -165,6 +165,14 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
     const isExpenseBased   = ['10', '30', '50'].includes(sysDocType); // PI, CN, DN
     const isRa             = sysDocType === '70'; // RA: no GL
 
+    // sys_doc_type '35'/'55' (CN-AP/DN-AP "...Billing" variants) มี doc_code/ap_gl_account_setup อยู่แล้ว แต่ยังไม่มี
+    // branch คำนวณ GL ด้านล่างรองรับ — เดิมปล่อยผ่านเงียบๆ กลายเป็น gl_entry_header ที่มี 0 บรรทัด/ยอด 0 ดูเหมือน
+    // ลงบัญชีสำเร็จทั้งที่ไม่ได้ลงอะไรเลย กันไว้ก่อนจนกว่าจะออกแบบ logic ที่ถูกต้องสำหรับสองประเภทนี้
+    const isKnownGlType = isPayment || isCreditNote || isAdvancePayment || isAdvanceRefund || isExpenseBased || isRa;
+    if (!isKnownGlType) {
+        throw new Error(`ยังไม่รองรับการลงบัญชีสำหรับประเภทเอกสารนี้ (sys_doc_type='${sysDocType}') กรุณาติดต่อผู้ดูแลระบบ`);
+    }
+
     if (isRa) return null;
 
     // --- Resolve AP account ---
