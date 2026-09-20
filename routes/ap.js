@@ -105,6 +105,7 @@ router.get('/ap_transaction/open_advances',          apTransactionController.fet
 router.get('/ap_transaction/open_remittance_advices', apTransactionController.fetchOpenRemittanceAdvices);
 router.get('/ap_transaction/ra_invoices',            apTransactionController.fetchRaInvoices);
 router.get('/ap_transaction/remittance_advice_by_doc_no', apTransactionController.fetchRemittanceAdviceByDocNo);
+router.get('/ap_transaction/my_pending',             apTransactionController.fetchMyPending);
 router.get('/ap_transaction',                        apTransactionController.fetchRows);
 router.get('/ap_transaction/:id',                    apTransactionController.fetchRow);
 router.post('/ap_transaction',                       apTransactionController.createTransaction);

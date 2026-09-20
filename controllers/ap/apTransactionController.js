@@ -839,6 +839,31 @@ const fetchRows = async (req, res) => {
     }
 };
 
+// GET /ap_transaction/my_pending — เอกสารที่รอผู้ใช้คนปัจจุบันอนุมัติ (มิเรอร์ ap_payment_run/pr_transaction
+// my_pending ทุกประการ — ใช้ประกอบกระดิ่งแจ้งเตือนรวมทุกโมดูลที่ home screen)
+const fetchMyPending = async (req, res) => {
+    const userId = req.headers['userid'];
+    if (!userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
+    try {
+        const result = await req.dbPool.query(`
+            SELECT t.id, t.doc_no, t.doc_date, t.description, t.total_amount_lc, t.status,
+                   t.updated_by AS submitted_by, v.vendor_name_th, d.doc_name_thai, d.doc_name_eng
+            FROM ap_transaction t
+            JOIN sa_module_document d ON d.id = t.doc_id
+            LEFT JOIN ap_vendor v ON v.id = t.vendor_id
+            WHERE t.status = 'Submitted'
+              AND EXISTS (
+                SELECT 1 FROM ap_transaction_approval a
+                WHERE a.transaction_id = t.id AND a.approver_user_id = $1 AND a.status = 'Pending'
+              )
+            ORDER BY t.doc_date DESC, t.id DESC`, [userId]);
+        res.status(200).json(result.rows);
+    } catch (error) {
+        console.error('Error fetching ap_transaction my_pending:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    }
+};
+
 // --- GET one ---
 const fetchRow = async (req, res) => {
     const { id } = req.params;
@@ -1695,7 +1720,7 @@ const deleteTransaction = async (req, res) => {
 };
 
 module.exports = {
-    fetchRows, fetchRow,
+    fetchRows, fetchRow, fetchMyPending,
     fetchOpenInvoices, fetchOpenAdvances,
     fetchOpenRemittanceAdvices, fetchRaInvoices,
     fetchRemittanceAdviceByDocNo,

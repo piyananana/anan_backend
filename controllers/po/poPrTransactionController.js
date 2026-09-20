@@ -564,7 +564,7 @@ const fetchMyPending = async (req, res) => {
     if (!userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
     try {
         const result = await req.dbPool.query(`
-            SELECT t.id, t.doc_no, t.doc_date, t.description, t.total_value_lc, t.status
+            SELECT t.id, t.doc_no, t.doc_date, t.description, t.total_value_lc, t.status, t.submitted_by
             FROM pr_transaction t
             WHERE t.status = 'Submitted'
               AND EXISTS (
