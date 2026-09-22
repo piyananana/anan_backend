@@ -290,7 +290,20 @@ const updateTransaction = async (req, res) => {
         // แก้ไขแล้วถือว่าเป็นรอบ Draft ใหม่ — ล้างคิวอนุมัติเดิมทิ้ง (ถ้ามีจากรอบที่ถูกปฏิเสธ)
         await client.query(`DELETE FROM pr_transaction_approval WHERE header_id=$1`, [id]);
 
-        await client.query(`DELETE FROM pr_transaction_detail WHERE header_id=$1`, [id]);
+        // แก้ไขบรรทัดแบบ diff (UPDATE ของเดิม / INSERT ใหม่ / DELETE ที่ถูกลบ) แทนการ DELETE ทั้งหมดแล้ว INSERT ใหม่
+        // ทุกครั้ง — เดิมทำให้ id ของทุกบรรทัดเปลี่ยนทุกครั้งที่ save แม้ไม่ได้แก้ไขอะไรเลย ซึ่งทำให้สิ่งที่ผูกกับ
+        // id บรรทัดตรงๆ (เช่น ไฟล์แนบใน sa_attachment) หลุดหายทุกครั้งที่แก้ไขเอกสาร
+        const existingIdsRes = await client.query(`SELECT id FROM pr_transaction_detail WHERE header_id=$1`, [id]);
+        const existingIds = new Set(existingIdsRes.rows.map(r => r.id));
+        const incomingIds = new Set(details.filter(d => d.id).map(d => d.id));
+        const removedIds = [...existingIds].filter(x => !incomingIds.has(x));
+
+        if (removedIds.length > 0) {
+            const { deleteAttachmentsForEntities } = require('../sa/saAttachmentController');
+            await deleteAttachmentsForEntities(client, 'pr_transaction_detail', removedIds);
+            await client.query(`DELETE FROM pr_transaction_detail WHERE id = ANY($1::int[])`, [removedIds]);
+        }
+
         let lineNo = 1, totalQty = 0, totalValue = 0;
         for (const d of details) {
             const qty = Number(d.qty_requested) || 0;
@@ -298,12 +311,22 @@ const updateTransaction = async (req, res) => {
             const value = qty * cost * (Number(header.exchange_rate) || 1);
             totalQty += qty;
             totalValue += value;
-            await client.query(`
-                INSERT INTO pr_transaction_detail
-                (header_id, line_no, item_id, item_code, item_name, uom_id, qty_requested, needed_by_date, estimated_unit_cost, total_value_lc, description)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-            `, [id, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                qty, d.needed_by_date || null, cost, value, d.description || null]);
+            if (d.id && existingIds.has(d.id)) {
+                await client.query(`
+                    UPDATE pr_transaction_detail SET
+                        line_no=$1, item_id=$2, item_code=$3, item_name=$4, uom_id=$5, qty_requested=$6,
+                        needed_by_date=$7, estimated_unit_cost=$8, total_value_lc=$9, description=$10
+                    WHERE id=$11
+                `, [lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
+                    qty, d.needed_by_date || null, cost, value, d.description || null, d.id]);
+            } else {
+                await client.query(`
+                    INSERT INTO pr_transaction_detail
+                    (header_id, line_no, item_id, item_code, item_name, uom_id, qty_requested, needed_by_date, estimated_unit_cost, total_value_lc, description)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                `, [id, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
+                    qty, d.needed_by_date || null, cost, value, d.description || null]);
+            }
         }
         await client.query(`UPDATE pr_transaction SET total_qty=$1, total_value_lc=$2 WHERE id=$3`, [totalQty, totalValue, id]);
 

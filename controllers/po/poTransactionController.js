@@ -195,6 +195,8 @@ const createTransaction = async (req, res) => {
         // imTransactionController.js ที่ระดับบนสุดของไฟล์อยู่แล้ว — มิเรอร์รูปแบบเดียวกับ im/po, ทั้งสองไฟล์อยู่ใน
         // controllers/po/ ด้วยกันแล้วตั้งแต่ PR ย้ายมารวม)
         const { validatePrConvertibleQty, refreshPrStatus } = require('./poPrTransactionController');
+        const { copyAttachmentsToEntity } = require('../sa/saAttachmentController');
+        const dbName = req.header('X-Database-Name');
         const affectedPrIds = new Set();
         let lineNo = 1, totalQty = 0, totalValue = 0;
         for (const d of details) {
@@ -207,12 +209,23 @@ const createTransaction = async (req, res) => {
                 const { prTransactionId } = await validatePrConvertibleQty(client, { refPrDetailId: d.ref_pr_detail_id, requestedQty: qty });
                 affectedPrIds.add(prTransactionId);
             }
-            await client.query(`
+            const newDetailRes = await client.query(`
                 INSERT INTO po_transaction_detail
                 (header_id, line_no, item_id, item_code, item_name, uom_id, qty_ordered, unit_price_fc, total_value_lc, description, ref_pr_detail_id)
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                RETURNING id
             `, [headerId, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
                 qty, price, value, d.description || null, d.ref_pr_detail_id || null]);
+            // คัดลอกไฟล์แนบจากบรรทัด PR ต้นทาง (ถ้ามี) มาไว้ที่บรรทัด PO ใหม่นี้ทันที เพื่อให้ผู้อนุมัติ PO เห็น
+            // หลักฐานชุดเดียวกับที่ผู้อนุมัติ PR เคยเห็น — ดู copyAttachmentsToEntity สำหรับเหตุผลที่คัดลอกไฟล์จริง
+            // แทนการ share file_path เดียวกัน
+            if (d.ref_pr_detail_id) {
+                await copyAttachmentsToEntity(client, {
+                    dbName, sourceModule: 'pr_transaction_detail', sourceEntityId: d.ref_pr_detail_id,
+                    targetModule: 'po_transaction_detail', targetEntityId: newDetailRes.rows[0].id,
+                    uploadedBy: header.created_by || null,
+                });
+            }
         }
         await client.query(`UPDATE po_transaction SET total_qty=$1, total_value_lc=$2 WHERE id=$3`, [totalQty, totalValue, headerId]);
         for (const prId of affectedPrIds) { await refreshPrStatus(client, prId); }
@@ -267,7 +280,22 @@ const updateTransaction = async (req, res) => {
             JOIN pr_transaction_detail prd ON prd.id = pod.ref_pr_detail_id WHERE pod.header_id=$1`, [id]);
         for (const r of oldPrLines.rows) affectedPrIds.add(r.header_id);
 
-        await client.query(`DELETE FROM po_transaction_detail WHERE header_id=$1`, [id]);
+        // แก้ไขบรรทัดแบบ diff (UPDATE ของเดิม / INSERT ใหม่ / DELETE ที่ถูกลบ) แทนการ DELETE ทั้งหมดแล้ว INSERT ใหม่
+        // ทุกครั้ง — เดิมทำให้ id ของทุกบรรทัดเปลี่ยนทุกครั้งที่ save แม้ไม่ได้แก้ไขอะไรเลย ซึ่งทำให้สิ่งที่ผูกกับ
+        // id บรรทัดตรงๆ (เช่น ไฟล์แนบใน sa_attachment) หลุดหายทุกครั้งที่แก้ไขเอกสาร (มิเรอร์ pr_transaction ทุกประการ)
+        const { copyAttachmentsToEntity, deleteAttachmentsForEntities } = require('../sa/saAttachmentController');
+        const dbName = req.header('X-Database-Name');
+
+        const existingIdsRes = await client.query(`SELECT id FROM po_transaction_detail WHERE header_id=$1`, [id]);
+        const existingIds = new Set(existingIdsRes.rows.map(r => r.id));
+        const incomingIds = new Set(details.filter(d => d.id).map(d => d.id));
+        const removedIds = [...existingIds].filter(x => !incomingIds.has(x));
+
+        if (removedIds.length > 0) {
+            await deleteAttachmentsForEntities(client, 'po_transaction_detail', removedIds);
+            await client.query(`DELETE FROM po_transaction_detail WHERE id = ANY($1::int[])`, [removedIds]);
+        }
+
         let lineNo = 1, totalQty = 0, totalValue = 0;
         for (const d of details) {
             const qty = Number(d.qty_ordered) || 0;
@@ -279,12 +307,30 @@ const updateTransaction = async (req, res) => {
                 const { prTransactionId } = await validatePrConvertibleQty(client, { refPrDetailId: d.ref_pr_detail_id, requestedQty: qty });
                 affectedPrIds.add(prTransactionId);
             }
-            await client.query(`
-                INSERT INTO po_transaction_detail
-                (header_id, line_no, item_id, item_code, item_name, uom_id, qty_ordered, unit_price_fc, total_value_lc, description, ref_pr_detail_id)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-            `, [id, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                qty, price, value, d.description || null, d.ref_pr_detail_id || null]);
+            if (d.id && existingIds.has(d.id)) {
+                await client.query(`
+                    UPDATE po_transaction_detail SET
+                        line_no=$1, item_id=$2, item_code=$3, item_name=$4, uom_id=$5, qty_ordered=$6,
+                        unit_price_fc=$7, total_value_lc=$8, description=$9, ref_pr_detail_id=$10
+                    WHERE id=$11
+                `, [lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
+                    qty, price, value, d.description || null, d.ref_pr_detail_id || null, d.id]);
+            } else {
+                const newDetailRes = await client.query(`
+                    INSERT INTO po_transaction_detail
+                    (header_id, line_no, item_id, item_code, item_name, uom_id, qty_ordered, unit_price_fc, total_value_lc, description, ref_pr_detail_id)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                    RETURNING id
+                `, [id, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
+                    qty, price, value, d.description || null, d.ref_pr_detail_id || null]);
+                if (d.ref_pr_detail_id) {
+                    await copyAttachmentsToEntity(client, {
+                        dbName, sourceModule: 'pr_transaction_detail', sourceEntityId: d.ref_pr_detail_id,
+                        targetModule: 'po_transaction_detail', targetEntityId: newDetailRes.rows[0].id,
+                        uploadedBy: header.updated_by || null,
+                    });
+                }
+            }
         }
         await client.query(`UPDATE po_transaction SET total_qty=$1, total_value_lc=$2 WHERE id=$3`, [totalQty, totalValue, id]);
         for (const prId of affectedPrIds) { await refreshPrStatus(client, prId); }

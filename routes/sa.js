@@ -20,6 +20,7 @@ const saModuleApproverController = require('../controllers/sa/saModuleApproverCo
 const saSmtpConfigController     = require('../controllers/sa/saSmtpConfigController');
 const saDashboardController      = require('../controllers/sa/saDashboardController');
 const saUserAuditLogController   = require('../controllers/sa/saUserAuditLogController');
+const saAttachmentController     = require('../controllers/sa/saAttachmentController');
 // const saOrganizationController = require('../controllers/sa/saOrganizationController');
 
 const xlsx = require('xlsx'); // Import xlsx
@@ -51,6 +52,22 @@ const imageUpload = multer({
         const allowedTypes = ['image/jpeg', 'image/png', 'image/gif'];
         if (!allowedTypes.includes(file.mimetype)) {
             cb(new Error('Invalid file type. Only JPEG, PNG, GIF are allowed.'), false);
+        } else {
+            cb(null, true);
+        }
+    }
+});
+
+// ไฟล์แนบท้ายรายการ (generic, ใช้ร่วมกันได้ทุกโมดูล) — ใช้ memoryStorage แทน diskStorage เพราะปลายทางบน disk เป็น
+// dynamic (แยกตาม database/module_code/entity_id ซึ่งอยู่ใน req.body) ต่างจาก company logo ที่ปลายทางคงที่รู้ล่วงหน้า
+// ได้ตั้งแต่ตอนตั้งค่า route — ให้ controller เขียนไฟล์เองหลัง multer parse body ครบแล้ว
+const attachmentUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 15 * 1024 * 1024 }, // 15MB — ใหญ่กว่า logo (5MB) เพราะ PDF สแกนหลายหน้าไฟล์ใหญ่กว่ารูปโลโก้มาก
+    fileFilter: (req, file, cb) => {
+        const allowedTypes = ['image/jpeg', 'image/png', 'application/pdf'];
+        if (!allowedTypes.includes(file.mimetype)) {
+            cb(new Error('Invalid file type. Only JPEG, PNG, PDF are allowed.'), false);
         } else {
             cb(null, true);
         }
@@ -187,6 +204,20 @@ router.get('/user_audit_log',              saAuthController.injectUserRole, saUs
 router.get('/user_audit_log/users',        saAuthController.injectUserRole, saUserAuditLogController.getUsers);
 router.get('/user_audit_log/counts',       saAuthController.requireDeveloper, saUserAuditLogController.getCounts);
 router.delete('/user_audit_log/reset',     saAuthController.requireDeveloper, saUserAuditLogController.deleteLog);
+
+// For saAttachmentController — ไฟล์แนบท้ายรายการ (generic, ใช้ร่วมกันได้ทุกโมดูล) — batch ต้องมาก่อน route เปล่า
+// ด้านล่างไม่ได้ เพราะเป็นคนละ path segment (/attachment/batch vs /attachment) จึงไม่ชนกัน
+// ห่อ attachmentUpload.single ด้วย error handler ของตัวเอง เพราะ error จาก fileFilter/limits ของ multer (เช่น
+// ประเภทไฟล์ไม่ถูกต้อง, ไฟล์ใหญ่เกิน) จะหลุดไปเจอ error handler กลางของแอปซึ่งตอบ 500 เสมอ ไม่ใช่ 400 ที่ควรจะเป็น
+router.post('/attachment', (req, res, next) => {
+    attachmentUpload.single('file')(req, res, (err) => {
+        if (err) return res.status(400).json({ message: err.message || 'อัปโหลดไฟล์ล้มเหลว' });
+        next();
+    });
+}, saAttachmentController.uploadAttachment);
+router.get('/attachment/batch',  saAttachmentController.fetchByEntities);
+router.get('/attachment',        saAttachmentController.fetchByEntity);
+router.delete('/attachment/:id', saAttachmentController.deleteAttachment);
 
 // router.get('/sa_organization', saOrganizationController.getAllOrganization); // Get all organizational units
 // router.get('/sa_organization/:id', saOrganizationController.getOrganizationById); // Get organizational unit by ID
