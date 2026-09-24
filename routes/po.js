@@ -4,6 +4,7 @@ const router = express.Router();
 const poTransactionController = require('../controllers/po/poTransactionController');
 const poReplenishmentController = require('../controllers/po/poReplenishmentController');
 const poPrTransactionController = require('../controllers/po/poPrTransactionController');
+const poPrPoStatusReportController = require('../controllers/po/poPrPoStatusReportController');
 
 // po_transaction (ใบสั่งซื้อ — Draft->Approved->[PartiallyReceived/FullyReceived คำนวณอัตโนมัติจาก GRN ที่อ้างอิง]
 // ->Closed, กิ่ง Void แยกได้ แต่บล็อกถ้ามี GRN อ้างอิงแล้ว) receivable_lines ต้องมาก่อน /:id ด้านล่าง
@@ -36,5 +37,8 @@ router.put('/pr_transaction/:id/reject',        poPrTransactionController.reject
 router.put('/pr_transaction/:id/close',         poPrTransactionController.closeTransaction);
 router.put('/pr_transaction/:id/void',          poPrTransactionController.voidTransaction);
 router.delete('/pr_transaction/:id',            poPrTransactionController.deleteTransaction);
+
+// pr_po_status_report (ติดตามสถานะใบขอซื้อ/ใบสั่งซื้อคู่กัน — อ่านอย่างเดียว)
+router.get('/pr_po_status_report', poPrPoStatusReportController.fetchReport);
 
 module.exports = router;
