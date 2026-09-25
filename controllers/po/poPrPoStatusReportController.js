@@ -23,13 +23,13 @@ const fetchReport = async (req, res) => {
                 JOIN pr_transaction_detail prd ON prd.id = pod.ref_pr_detail_id
             ),
             combined AS (
-                SELECT pr.id AS pr_id, pr.doc_no AS pr_doc_no, pr.doc_date AS pr_doc_date, pr.updated_at AS pr_updated_at,
+                SELECT pr.id AS pr_id, pr.doc_no AS pr_doc_no, pr.doc_date AS pr_doc_date,
                        ru.user_name AS pr_requested_by_name,
                        (SELECT string_agg(a.approver_user_name, ', ' ORDER BY a.sequence_no)
                         FROM pr_transaction_approval a
                         WHERE a.header_id = pr.id AND a.status IN ('Approved','Rejected')) AS pr_approver_name,
                        pr.status AS pr_status,
-                       po.id AS po_id, po.doc_no AS po_doc_no, po.doc_date AS po_doc_date, po.updated_at AS po_updated_at,
+                       po.id AS po_id, po.doc_no AS po_doc_no, po.doc_date AS po_doc_date, po.approved_at AS po_approved_at,
                        po.created_by AS po_created_by, po.approved_by AS po_approver_name, po.status AS po_status
                 FROM pr_transaction pr
                 LEFT JOIN sa_user ru ON ru.id = pr.requested_by
@@ -41,8 +41,8 @@ const fetchReport = async (req, res) => {
 
                 UNION ALL
 
-                SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-                       po.id, po.doc_no, po.doc_date, po.updated_at, po.created_by, po.approved_by, po.status
+                SELECT NULL, NULL, NULL, NULL, NULL, NULL,
+                       po.id, po.doc_no, po.doc_date, po.approved_at, po.created_by, po.approved_by, po.status
                 FROM po_transaction po
                 WHERE NOT EXISTS (
                         SELECT 1 FROM po_transaction_detail pod
