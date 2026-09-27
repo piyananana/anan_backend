@@ -4,15 +4,23 @@
 // จะพา PO ที่แปลงมาจากมันมาแสดงด้วยเสมอไม่ว่า PO จะสถานะ/วันที่อะไรก็ตาม (ไม่ถูกกรองซ้ำด้วยเงื่อนไข PO) — ส่วน
 // เงื่อนไข PO ใช้เลือกเฉพาะ PO ที่ไม่มีใบขอซื้ออ้างอิงเลย (สร้างตรงโดยไม่ผ่าน PR) เท่านั้น
 //
+// show_pr/show_po (จาก switch "แสดงใบขอซื้อ"/"แสดงใบสั่งซื้อ" ที่ filter panel) ปิดทั้งฝั่งนั้นได้ทั้งหมด:
+// - show_pr=false: ไม่ query ฝั่ง PR เลย (ทุกเงื่อนไข PR ไม่มีผล)
+// - show_po=false: ไม่แสดงข้อมูล PO เลยแม้จะมี PR โยงถึงก็ตาม (join ถูกตัดทิ้ง) และไม่ query PO แบบยืนเดี่ยวด้วย
+// - show_pr=false แต่ show_po=true: PO ทุกใบแสดงเป็น "ยืนเดี่ยว" หมด (ไม่กรองด้วยเงื่อนไข "ไม่มี PR อ้างอิง" อีก
+//   ต่อไป เพราะไม่ได้ track ฝั่ง PR อยู่แล้วในโหมดนี้)
+//
 // จับคู่ที่ระดับหัวเอกสาร (distinct PR header + PO header ที่มีอย่างน้อย 1 บรรทัดโยงกันผ่าน ref_pr_detail_id) —
 // ถ้า PR ใบเดียวถูกแยกไปหลาย PO จะเห็นหลายแถว (ข้อมูล PR ซ้ำ, PO ต่างกัน) แต่ละแถวแสดงบรรทัดสินค้า "ทั้งหมด" ของ
 // ทั้งสองฝั่ง ไม่ใช่เฉพาะบรรทัดที่โยงกันจริง — เป็นข้อจำกัดที่ยอมรับได้เพราะส่วนใหญ่ 1 PR แปลงเป็น 1 PO เท่านั้น
 'use strict';
 
 const fetchReport = async (req, res) => {
-    const { pr_date_from, pr_date_to, po_date_from, po_date_to, pr_statuses, po_statuses } = req.query;
+    const { pr_date_from, pr_date_to, po_date_from, po_date_to, pr_statuses, po_statuses, show_pr, show_po } = req.query;
     const prStatusList = (pr_statuses || '').split(',').map(s => s.trim()).filter(Boolean);
     const poStatusList = (po_statuses || '').split(',').map(s => s.trim()).filter(Boolean);
+    const showPr = show_pr !== 'false';
+    const showPo = show_po !== 'false';
 
     const client = await req.dbPool.connect();
     try {
@@ -28,25 +36,30 @@ const fetchReport = async (req, res) => {
                        (SELECT string_agg(a.approver_user_name, ', ' ORDER BY a.sequence_no)
                         FROM pr_transaction_approval a
                         WHERE a.header_id = pr.id AND a.status IN ('Approved','Rejected')) AS pr_approver_name,
+                       (SELECT MAX(a.approved_at)
+                        FROM pr_transaction_approval a
+                        WHERE a.header_id = pr.id AND a.status IN ('Approved','Rejected')) AS pr_decided_at,
                        pr.status AS pr_status,
                        po.id AS po_id, po.doc_no AS po_doc_no, po.doc_date AS po_doc_date, po.approved_at AS po_approved_at,
                        po.created_by AS po_created_by, po.approved_by AS po_approver_name, po.status AS po_status
                 FROM pr_transaction pr
                 LEFT JOIN sa_user ru ON ru.id = pr.requested_by
-                LEFT JOIN pr_po_links l ON l.pr_id = pr.id
+                LEFT JOIN pr_po_links l ON l.pr_id = pr.id AND $7::boolean = true
                 LEFT JOIN po_transaction po ON po.id = l.po_id
-                WHERE ($1::text[] IS NULL OR pr.status = ANY($1::text[]))
+                WHERE $8::boolean = true
+                  AND ($1::text[] IS NULL OR pr.status = ANY($1::text[]))
                   AND ($2::date IS NULL OR pr.doc_date >= $2::date)
                   AND ($3::date IS NULL OR pr.doc_date <= $3::date)
 
                 UNION ALL
 
-                SELECT NULL, NULL, NULL, NULL, NULL, NULL,
+                SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL,
                        po.id, po.doc_no, po.doc_date, po.approved_at, po.created_by, po.approved_by, po.status
                 FROM po_transaction po
-                WHERE NOT EXISTS (
+                WHERE $7::boolean = true
+                  AND ($8::boolean = false OR NOT EXISTS (
                         SELECT 1 FROM po_transaction_detail pod
-                        WHERE pod.header_id = po.id AND pod.ref_pr_detail_id IS NOT NULL)
+                        WHERE pod.header_id = po.id AND pod.ref_pr_detail_id IS NOT NULL))
                   AND ($4::text[] IS NULL OR po.status = ANY($4::text[]))
                   AND ($5::date IS NULL OR po.doc_date >= $5::date)
                   AND ($6::date IS NULL OR po.doc_date <= $6::date)
@@ -56,6 +69,7 @@ const fetchReport = async (req, res) => {
         `, [
             prStatusList.length > 0 ? prStatusList : null, pr_date_from || null, pr_date_to || null,
             poStatusList.length > 0 ? poStatusList : null, po_date_from || null, po_date_to || null,
+            showPo, showPr,
         ]);
 
         const rows = result.rows;
