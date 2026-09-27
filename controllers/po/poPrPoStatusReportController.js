@@ -39,9 +39,9 @@ const fetchReport = async (req, res) => {
                        (SELECT MAX(a.approved_at)
                         FROM pr_transaction_approval a
                         WHERE a.header_id = pr.id AND a.status IN ('Approved','Rejected')) AS pr_decided_at,
-                       pr.status AS pr_status,
+                       pr.status AS pr_status, pr.updated_at AS pr_updated_at,
                        po.id AS po_id, po.doc_no AS po_doc_no, po.doc_date AS po_doc_date, po.approved_at AS po_approved_at,
-                       po.created_by AS po_created_by, po.approved_by AS po_approver_name, po.status AS po_status
+                       po.created_by AS po_created_by, po.approved_by AS po_approver_name, po.status AS po_status, po.updated_at AS po_updated_at
                 FROM pr_transaction pr
                 LEFT JOIN sa_user ru ON ru.id = pr.requested_by
                 LEFT JOIN pr_po_links l ON l.pr_id = pr.id AND $7::boolean = true
@@ -53,8 +53,8 @@ const fetchReport = async (req, res) => {
 
                 UNION ALL
 
-                SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-                       po.id, po.doc_no, po.doc_date, po.approved_at, po.created_by, po.approved_by, po.status
+                SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                       po.id, po.doc_no, po.doc_date, po.approved_at, po.created_by, po.approved_by, po.status, po.updated_at
                 FROM po_transaction po
                 WHERE $7::boolean = true
                   AND ($8::boolean = false OR NOT EXISTS (
