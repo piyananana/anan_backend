@@ -6,10 +6,12 @@ const poReplenishmentController = require('../controllers/po/poReplenishmentCont
 const poPrTransactionController = require('../controllers/po/poPrTransactionController');
 const poPrPoStatusReportController = require('../controllers/po/poPrPoStatusReportController');
 const poPendingReceiptReportController = require('../controllers/po/poPendingReceiptReportController');
+const poBulkCloseController = require('../controllers/po/poBulkCloseController');
 
 // po_transaction (ใบสั่งซื้อ — Draft->Approved->[PartiallyReceived/FullyReceived คำนวณอัตโนมัติจาก GRN ที่อ้างอิง]
-// ->Closed, กิ่ง Void แยกได้ แต่บล็อกถ้ามี GRN อ้างอิงแล้ว) receivable_lines ต้องมาก่อน /:id ด้านล่าง
+// ->Closed, กิ่ง Void แยกได้ แต่บล็อกถ้ามี GRN อ้างอิงแล้ว) receivable_lines/closable_list ต้องมาก่อน /:id ด้านล่าง
 router.get('/po_transaction/receivable_lines', poTransactionController.fetchReceivableLines);
+router.get('/po_transaction/closable_list',    poBulkCloseController.fetchClosableList);
 router.get('/po_transaction',                  poTransactionController.fetchRows);
 router.get('/po_transaction/:id',              poTransactionController.fetchRow);
 router.post('/po_transaction',                 poTransactionController.createTransaction);
