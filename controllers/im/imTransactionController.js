@@ -23,6 +23,8 @@ const ensureImTransactionTable = async (client) => {
     // lazy require — fetchRowById's LEFT JOIN po_transaction (ref_po_id) needs this table to exist even if no PO
     // endpoint has ever been hit yet; circular-require-safe for the same reason as postDetailLines' lazy require above
     await require('../po/poTransactionController').ensurePoTransactionTable(client);
+    // เหตุผลเดียวกันฝั่งขาย — fetchRowById's LEFT JOIN so_transaction (ref_so_id) ต้องมีตารางนี้อยู่ก่อนเสมอ
+    await require('../so/soTransactionController').ensureSoTransactionTable(client);
     await client.query(`
         CREATE TABLE IF NOT EXISTS im_transaction (
             id              SERIAL PRIMARY KEY,
@@ -116,6 +118,11 @@ const ensureImTransactionTable = async (client) => {
     // refreshPoStatus ใน poTransactionController.js สำหรับตรรกะการตรวจ+อัปเดตสถานะ PO
     await client.query(`ALTER TABLE im_transaction ADD COLUMN IF NOT EXISTS ref_po_id INTEGER`).catch(() => {});
     await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS ref_po_detail_id INTEGER`).catch(() => {});
+
+    // สำหรับ DLN ('30'/'31'/'32') ที่ส่งสินค้าตามใบสั่งขาย (SO, sys_module='41') — มิเรอร์ ref_po_id/ref_po_detail_id
+    // ข้างบนทุกประการ ฝั่งขาย ดู validateSoDeliverableQty/refreshSoStatus ใน soTransactionController.js
+    await client.query(`ALTER TABLE im_transaction ADD COLUMN IF NOT EXISTS ref_so_id INTEGER`).catch(() => {});
+    await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS ref_so_detail_id INTEGER`).catch(() => {});
 
     // VAT ต่อบรรทัด — ใช้เฉพาะประเภทเอกสารที่สร้าง/อ้างอิงใบกำกับ AP/AR อัตโนมัติ ('11'/'12'/'15'/'20'/'25'/'31'/
     // '32'/'35'/'40'/'45') อ้างอิง cd_vat_rate เดียวกับที่ AR/AP ใช้ (vat_type=vat_code, vat_rate=snapshot ณ ตอนโพสต์
@@ -1408,6 +1415,7 @@ const postDetailLines = async (client, headerId, header, docNo) => {
     // imTransactionController.js สำหรับ generateDocNo ที่ module top-level) เรียกใช้แค่ตอนฟังก์ชันนี้ทำงานจริง
     // (หลัง server startup ทั้งสองไฟล์โหลดเสร็จสมบูรณ์แล้วแน่นอน) ไม่ใช่ตอน import
     const { validatePoReceivableQty, refreshPoStatus } = require('../po/poTransactionController');
+    const { validateSoDeliverableQty, refreshSoStatus } = require('../so/soTransactionController');
 
     const docTypeRes = await client.query(
         `SELECT sys_doc_type FROM sa_module_document WHERE doc_code=$1 AND sys_module='31' LIMIT 1`,
@@ -1418,6 +1426,7 @@ const postDetailLines = async (client, headerId, header, docNo) => {
     const detailsRes = await client.query(`SELECT * FROM im_transaction_detail WHERE header_id = $1 ORDER BY line_no`, [headerId]);
     const updatedDetails = [];
     const touchedPoIds = new Set();
+    const touchedSoIds = new Set();
     let totalQty = 0, totalValue = 0;
     for (const d of detailsRes.rows) {
         const itemRes = await client.query(`SELECT * FROM im_item WHERE id = $1`, [d.item_id]);
@@ -1467,6 +1476,13 @@ const postDetailLines = async (client, headerId, header, docNo) => {
                 refPoDetailId: d.ref_po_detail_id, requestedQty: Math.abs(varianceQty), vendorId: header.vendor_id,
             });
             touchedPoIds.add(poTransactionId);
+        }
+        // DLN ('30'/'31'/'32') ที่อ้างอิงบรรทัด SO — มิเรอร์ GRN/PO block ข้างบนทุกประการ ฝั่งขาย
+        if (['30', '31', '32'].includes(sysDocType) && d.ref_so_detail_id) {
+            const { soTransactionId } = await validateSoDeliverableQty(client, {
+                refSoDetailId: d.ref_so_detail_id, requestedQty: Math.abs(varianceQty), customerId: header.customer_id,
+            });
+            touchedSoIds.add(soTransactionId);
         }
         const valueLc = varianceQty * actualUnitCost;
         await client.query(`
@@ -1554,6 +1570,12 @@ const postDetailLines = async (client, headerId, header, docNo) => {
         await client.query(`
             UPDATE im_transaction SET status='Delivered', gl_entry_id=$1, total_qty=$2, total_value_lc=$3, updated_at=NOW() WHERE id=$4
         `, [glEntryId, totalQty, totalValue, headerId]);
+        // อัปเดตสถานะ SO ที่ DLN นี้อ้างอิงถึง (ถ้ามี) — ต้องทำ *หลัง* UPDATE สถานะ DLN เป็น Delivered ข้างบนเสมอ
+        // (เหตุผลเดียวกับ GRN '12'/refreshPoStatus — refreshSoStatus นับจำนวนที่ส่งแล้วจาก im_transaction.status
+        // IN ('Posted','Delivered') เท่านั้น ถ้าเรียกก่อนหน้านี้ DLN เองยังเป็น Draft จะนับไม่เจอตัวเอง)
+        for (const soId of touchedSoIds) {
+            await refreshSoStatus(client, soId);
+        }
         return glEntryId;
     } else if (sysDocType === '10' || sysDocType === '13' || mode !== 'PERIODIC') {
         glEntryId = await postGlEntry(client, headerId, header, updatedDetails, docNo, sysDocType, mode);
@@ -1565,6 +1587,9 @@ const postDetailLines = async (client, headerId, header, docNo) => {
     // ต้องทำ *หลัง* UPDATE สถานะ GRN เป็น Posted ข้างบนเสมอ (ดูเหตุผลเดียวกับ branch '12' ข้างบน)
     for (const poId of touchedPoIds) {
         await refreshPoStatus(client, poId);
+    }
+    for (const soId of touchedSoIds) {
+        await refreshSoStatus(client, soId);
     }
     return glEntryId;
 };
@@ -1579,6 +1604,7 @@ const fetchRowById = async (pool, id) => {
                b.branch_code, b.branch_name_thai,
                reft.doc_no AS ref_im_transaction_doc_no,
                refpo.doc_no AS ref_po_doc_no,
+               refso.doc_no AS ref_so_doc_no,
                dim1.value_name_thai AS dim1_name, dim2.value_name_thai AS dim2_name, dim3.value_name_thai AS dim3_name,
                dim4.value_name_thai AS dim4_name, dim5.value_name_thai AS dim5_name
         FROM im_transaction t
@@ -1588,6 +1614,7 @@ const fetchRowById = async (pool, id) => {
         LEFT JOIN cd_branch b     ON b.id = t.branch_id
         LEFT JOIN im_transaction reft ON reft.id = t.ref_im_transaction_id
         LEFT JOIN po_transaction refpo ON refpo.id = t.ref_po_id
+        LEFT JOIN so_transaction refso ON refso.id = t.ref_so_id
         LEFT JOIN gl_dimension_value dim1 ON dim1.id = t.dim1_id
         LEFT JOIN gl_dimension_value dim2 ON dim2.id = t.dim2_id
         LEFT JOIN gl_dimension_value dim3 ON dim3.id = t.dim3_id
@@ -1752,7 +1779,7 @@ const fetchReturnableLines = async (req, res) => {
 //     ให้ resolve เอาเองว่าจะใช้ doc_code ไหนใต้มาตรฐานนี้ (เผื่อมีหลาย doc_code ต่อ sys_doc_type)
 const insertAndPostAdjustment = async (client, {
     docId, docCode, sysDocType, docNo, docDate, warehouseId, toWarehouseId, vendorId, customerId,
-    refNo, refDocId, refDocNo, refImTransactionId, refPoId, description,
+    refNo, refDocId, refDocNo, refImTransactionId, refPoId, refSoId, description,
     currencyId, currencyCode, exchangeRate,
     dim1Id, dim2Id, dim3Id, dim4Id, dim5Id, branchId, createdBy,
     lines, action,
@@ -1874,15 +1901,15 @@ const insertAndPostAdjustment = async (client, {
         INSERT INTO im_transaction
         (doc_id, doc_no, doc_code, doc_date, period_id, warehouse_id, to_warehouse_id,
          vendor_id, vendor_code, vendor_name_th, customer_id, customer_code, customer_name_th,
-         ref_no, ref_doc_id, ref_doc_no, ref_im_transaction_id, ref_po_id, description, status,
+         ref_no, ref_doc_id, ref_doc_no, ref_im_transaction_id, ref_po_id, ref_so_id, description, status,
          currency_id, currency_code, exchange_rate,
          dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id, created_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
         RETURNING id
     `, [
         resolvedDocId, finalDocNo, resolvedDocCode, docDate, periodId, warehouseId, toWarehouseId || null,
         vendorId || null, vendorCode, vendorNameTh, customerId || null, customerCode, customerNameTh,
-        refNo || null, refDocId || null, refDocNo || null, refImTransactionId || null, refPoId || null, description || null, 'Draft',
+        refNo || null, refDocId || null, refDocNo || null, refImTransactionId || null, refPoId || null, refSoId || null, description || null, 'Draft',
         currencyId || null, currencyCode || 'THB', exchangeRate || 1,
         dim1Id || null, dim2Id || null, dim3Id || null, dim4Id || null, dim5Id || null,
         branchId || null, createdBy || null,
@@ -1899,14 +1926,14 @@ const insertAndPostAdjustment = async (client, {
         await client.query(`
             INSERT INTO im_transaction_detail
             (header_id, line_no, item_id, item_code, item_name, location_id, to_location_id, lot_no, serial_no, uom_id,
-             system_qty, counted_qty, unit_cost, unit_cost_fc, unit_price, vat_type, vat_rate, ref_im_transaction_detail_id, ref_po_detail_id, description, is_free)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+             system_qty, counted_qty, unit_cost, unit_cost_fc, unit_price, vat_type, vat_rate, ref_im_transaction_detail_id, ref_po_detail_id, ref_so_detail_id, description, is_free)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
         `, [
             newHeaderId, lineNo++, d.item_id, d.item_code || null, d.item_name || null,
             d.location_id || null, d.to_location_id || null, d.lot_no || null, d.serial_no || null, d.uom_id || null,
             d.system_qty ?? 0, d.counted_qty ?? 0, unitCost, d.unit_cost_fc ?? null, d.unit_price ?? null,
             d.vat_type || null, d.vat_rate ?? null,
-            d.ref_im_transaction_detail_id || null, d.ref_po_detail_id || null, d.description || null, d.is_free === true,
+            d.ref_im_transaction_detail_id || null, d.ref_po_detail_id || null, d.ref_so_detail_id || null, d.description || null, d.is_free === true,
         ]);
     }
 
@@ -1937,7 +1964,7 @@ const createTransaction = async (req, res) => {
             warehouseId: header.warehouse_id, toWarehouseId: header.to_warehouse_id, vendorId: header.vendor_id,
             customerId: header.customer_id,
             refNo: header.ref_no, refDocId: header.ref_doc_id, refDocNo: header.ref_doc_no,
-            refImTransactionId: header.ref_im_transaction_id, refPoId: header.ref_po_id,
+            refImTransactionId: header.ref_im_transaction_id, refPoId: header.ref_po_id, refSoId: header.ref_so_id,
             description: header.description,
             currencyId: header.currency_id, currencyCode: header.currency_code, exchangeRate: header.exchange_rate,
             dim1Id: header.dim1_id, dim2Id: header.dim2_id, dim3Id: header.dim3_id,
@@ -2074,17 +2101,17 @@ const updateTransaction = async (req, res) => {
                 doc_date=$1, period_id=$2, warehouse_id=$3, to_warehouse_id=$4,
                 vendor_id=$5, vendor_code=$6, vendor_name_th=$7,
                 customer_id=$8, customer_code=$9, customer_name_th=$10,
-                ref_no=$11, ref_doc_id=$12, ref_doc_no=$13, ref_im_transaction_id=$14, ref_po_id=$15, description=$16,
-                currency_id=$17, currency_code=$18, exchange_rate=$19,
-                dim1_id=$20, dim2_id=$21, dim3_id=$22, dim4_id=$23, dim5_id=$24,
-                branch_id=$25, updated_by=$26, updated_at=NOW()
-            WHERE id=$27
+                ref_no=$11, ref_doc_id=$12, ref_doc_no=$13, ref_im_transaction_id=$14, ref_po_id=$15, ref_so_id=$16, description=$17,
+                currency_id=$18, currency_code=$19, exchange_rate=$20,
+                dim1_id=$21, dim2_id=$22, dim3_id=$23, dim4_id=$24, dim5_id=$25,
+                branch_id=$26, updated_by=$27, updated_at=NOW()
+            WHERE id=$28
         `, [
             header.doc_date, periodId, header.warehouse_id, header.to_warehouse_id || null,
             header.vendor_id || null, vendorCode, vendorNameTh,
             header.customer_id || null, customerCode, customerNameTh,
             header.ref_no || null, header.ref_doc_id || null, header.ref_doc_no || null,
-            header.ref_im_transaction_id || null, header.ref_po_id || null, header.description || null,
+            header.ref_im_transaction_id || null, header.ref_po_id || null, header.ref_so_id || null, header.description || null,
             header.currency_id || null, header.currency_code || 'THB', header.exchange_rate || 1,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
             header.branch_id || null, header.updated_by || null, id,
@@ -2099,14 +2126,14 @@ const updateTransaction = async (req, res) => {
             await client.query(`
                 INSERT INTO im_transaction_detail
                 (header_id, line_no, item_id, item_code, item_name, location_id, to_location_id, lot_no, serial_no, uom_id,
-                 system_qty, counted_qty, unit_cost, unit_cost_fc, unit_price, vat_type, vat_rate, ref_im_transaction_detail_id, ref_po_detail_id, description, is_free)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+                 system_qty, counted_qty, unit_cost, unit_cost_fc, unit_price, vat_type, vat_rate, ref_im_transaction_detail_id, ref_po_detail_id, ref_so_detail_id, description, is_free)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
             `, [
                 id, lineNo++, d.item_id, d.item_code || null, d.item_name || null,
                 d.location_id || null, d.to_location_id || null, d.lot_no || null, d.serial_no || null, d.uom_id || null,
                 d.system_qty ?? 0, d.counted_qty ?? 0, unitCost, d.unit_cost_fc ?? null, d.unit_price ?? null,
                 d.vat_type || null, d.vat_rate ?? null,
-                d.ref_im_transaction_detail_id || null, d.ref_po_detail_id || null, d.description || null, d.is_free === true,
+                d.ref_im_transaction_detail_id || null, d.ref_po_detail_id || null, d.ref_so_detail_id || null, d.description || null, d.is_free === true,
             ]);
         }
 

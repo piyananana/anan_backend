@@ -80,6 +80,11 @@ const poRoutes = require('./routes/po');
 app.use('/api/po', poRoutes);
 // ----------------
 
+// so = Sales (Sale Order) — มิเรอร์ po (Purchase Order) ฝั่งขาย
+const soRoutes = require('./routes/so');
+app.use('/api/so', soRoutes);
+// ----------------
+
 // sa = System Administration
 const saRoutes = require('./routes/sa');
 const saPasswordPolicyController = require('./controllers/sa/saPasswordPolicyController');
