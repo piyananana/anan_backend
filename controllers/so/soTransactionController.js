@@ -70,17 +70,23 @@ const fetchRowById = async (pool, id) => {
     // ฝั่ง IM ถูกเรียกเลยก็ตาม — เรียกทางเดียว (so ensure im ได้ แต่ im ensure so ต้องไม่เรียกกลับมาที่นี่ ป้องกัน
     // recursion) ดู ensureImTransactionTable ที่เรียก ensureSoTransactionTable ด้านเดียวสำหรับสร้างตาราง
     await ensureImTransactionTable(pool);
+    // lazy require — เลี่ยง circular require ตอน module load (soQuoteTransactionController.js เอง require
+    // soTransactionController.js ที่ระดับบนสุดของไฟล์อยู่แล้วสำหรับ ensureSoTransactionTable) — join ด้านล่างต้องมี
+    // ตาราง quote_transaction อยู่ก่อนเสมอแม้ยังไม่มี endpoint ฝั่ง Quote ถูกเรียกเลยก็ตาม
+    await require('./soQuoteTransactionController').ensureQuoteTransactionTable(pool);
     const hRes = await pool.query(`
         SELECT t.*,
                d.doc_code AS d_doc_code, d.doc_name_thai, d.doc_name_eng, d.is_auto_numbering,
                c.customer_code AS c_customer_code, c.customer_name_th AS c_customer_name_th,
                w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
-               b.branch_code, b.branch_name_thai
+               b.branch_code, b.branch_name_thai,
+               qt.doc_no AS ref_quote_doc_no
         FROM so_transaction t
         JOIN sa_module_document d  ON d.id = t.doc_id
         LEFT JOIN ar_customer c    ON c.id = t.customer_id
         LEFT JOIN im_warehouse w   ON w.id = t.warehouse_id
         LEFT JOIN cd_branch b      ON b.id = t.branch_id
+        LEFT JOIN quote_transaction qt ON qt.id = t.ref_quote_id
         WHERE t.id = $1`, [id]);
     if (hRes.rows.length === 0) return null;
     const dRes = await pool.query(`
@@ -152,6 +158,7 @@ const createTransaction = async (req, res) => {
     try {
         await client.query('BEGIN');
         await ensureSoTransactionTable(client);
+        await require('./soQuoteTransactionController').ensureQuoteTransactionTable(client); // ต้องมี ref_quote_id/ref_quote_detail_id อยู่ก่อนเสมอ
 
         if (!header.customer_id) throw new Error('กรุณาระบุลูกค้า');
         if (!header.warehouse_id) throw new Error('กรุณาระบุคลังต้นทาง');
@@ -174,19 +181,25 @@ const createTransaction = async (req, res) => {
         const hRes = await client.query(`
             INSERT INTO so_transaction
             (doc_id, doc_no, doc_code, doc_date, customer_id, customer_code, customer_name_th, warehouse_id,
-             currency_id, currency_code, exchange_rate, due_date, description,
+             currency_id, currency_code, exchange_rate, due_date, description, ref_quote_id,
              dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id, created_by, updated_by)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$20)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$21)
             RETURNING id
         `, [
             header.doc_id, docNo, docCode, header.doc_date, header.customer_id, customer.customer_code, customer.customer_name_th,
             header.warehouse_id, header.currency_id || null, header.currency_code || 'THB', header.exchange_rate || 1,
-            header.due_date || null, header.description || null,
+            header.due_date || null, header.description || null, header.ref_quote_id || null,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
             header.branch_id || null, header.created_by || null,
         ]);
         const headerId = hRes.rows[0].id;
 
+        // อ้างอิงบรรทัดใบเสนอราคา (ถ้ามี) — ตรวจคงเหลือที่แปลงได้ก่อนบันทึกทุกบรรทัด แล้วรีเฟรชสถานะ Quote ต้นทาง
+        // ทั้งหมดที่ถูกอ้างอิงหลังบันทึกครบ — มิเรอร์ poTransactionController.js:createTransaction ทุกประการ
+        const { validateQuoteConvertibleQty, refreshQuoteStatus } = require('./soQuoteTransactionController');
+        const { copyAttachmentsToEntity } = require('../sa/saAttachmentController');
+        const dbName = req.header('X-Database-Name');
+        const affectedQuoteIds = new Set();
         let lineNo = 1, totalQty = 0, totalValue = 0;
         for (const d of details) {
             const qty = Number(d.qty_ordered) || 0;
@@ -194,14 +207,27 @@ const createTransaction = async (req, res) => {
             const value = qty * price * (Number(header.exchange_rate) || 1);
             totalQty += qty;
             totalValue += value;
-            await client.query(`
+            if (d.ref_quote_detail_id) {
+                const { quoteTransactionId } = await validateQuoteConvertibleQty(client, { refQuoteDetailId: d.ref_quote_detail_id, requestedQty: qty });
+                affectedQuoteIds.add(quoteTransactionId);
+            }
+            const newDetailRes = await client.query(`
                 INSERT INTO so_transaction_detail
-                (header_id, line_no, item_id, item_code, item_name, uom_id, qty_ordered, unit_price_fc, total_value_lc, description)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                (header_id, line_no, item_id, item_code, item_name, uom_id, qty_ordered, unit_price_fc, total_value_lc, description, ref_quote_detail_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                RETURNING id
             `, [headerId, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                qty, price, value, d.description || null]);
+                qty, price, value, d.description || null, d.ref_quote_detail_id || null]);
+            if (d.ref_quote_detail_id) {
+                await copyAttachmentsToEntity(client, {
+                    dbName, sourceModule: 'quote_transaction_detail', sourceEntityId: d.ref_quote_detail_id,
+                    targetModule: 'so_transaction_detail', targetEntityId: newDetailRes.rows[0].id,
+                    uploadedBy: header.created_by || null,
+                });
+            }
         }
         await client.query(`UPDATE so_transaction SET total_qty=$1, total_value_lc=$2 WHERE id=$3`, [totalQty, totalValue, headerId]);
+        for (const quoteId of affectedQuoteIds) { await refreshQuoteStatus(client, quoteId); }
 
         await client.query('COMMIT');
         const full = await fetchRowById(req.dbPool, headerId);
@@ -220,6 +246,7 @@ const updateTransaction = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
+        await require('./soQuoteTransactionController').ensureQuoteTransactionTable(client);
         const existing = await client.query(`SELECT status FROM so_transaction WHERE id=$1`, [id]);
         if (existing.rows.length === 0) throw new Error('Not found');
         if (existing.rows[0].status !== 'Draft') throw new Error('แก้ไขได้เฉพาะเอกสาร Draft เท่านั้น');
@@ -247,14 +274,24 @@ const updateTransaction = async (req, res) => {
             header.branch_id || null, header.updated_by || null, id,
         ]);
 
+        const { validateQuoteConvertibleQty, refreshQuoteStatus } = require('./soQuoteTransactionController');
+        const affectedQuoteIds = new Set();
+        const oldQuoteLines = await client.query(`SELECT DISTINCT qtd.header_id FROM so_transaction_detail sod
+            JOIN quote_transaction_detail qtd ON qtd.id = sod.ref_quote_detail_id WHERE sod.header_id=$1`, [id]);
+        for (const r of oldQuoteLines.rows) affectedQuoteIds.add(r.header_id);
+
         // แก้ไขบรรทัดแบบ diff (UPDATE ของเดิม / INSERT ใหม่ / DELETE ที่ถูกลบ) แทนการ DELETE ทั้งหมดแล้ว INSERT ใหม่
         // ทุกครั้ง — มิเรอร์ po_transaction_detail ทุกประการ (ดู comment เดียวกันที่นั่น)
+        const { copyAttachmentsToEntity, deleteAttachmentsForEntities } = require('../sa/saAttachmentController');
+        const dbName = req.header('X-Database-Name');
+
         const existingIdsRes = await client.query(`SELECT id FROM so_transaction_detail WHERE header_id=$1`, [id]);
         const existingIds = new Set(existingIdsRes.rows.map(r => r.id));
         const incomingIds = new Set(details.filter(d => d.id).map(d => d.id));
         const removedIds = [...existingIds].filter(x => !incomingIds.has(x));
 
         if (removedIds.length > 0) {
+            await deleteAttachmentsForEntities(client, 'so_transaction_detail', removedIds);
             await client.query(`DELETE FROM so_transaction_detail WHERE id = ANY($1::int[])`, [removedIds]);
         }
 
@@ -265,24 +302,37 @@ const updateTransaction = async (req, res) => {
             const value = qty * price * (Number(header.exchange_rate) || 1);
             totalQty += qty;
             totalValue += value;
+            if (d.ref_quote_detail_id) {
+                const { quoteTransactionId } = await validateQuoteConvertibleQty(client, { refQuoteDetailId: d.ref_quote_detail_id, requestedQty: qty });
+                affectedQuoteIds.add(quoteTransactionId);
+            }
             if (d.id && existingIds.has(d.id)) {
                 await client.query(`
                     UPDATE so_transaction_detail SET
                         line_no=$1, item_id=$2, item_code=$3, item_name=$4, uom_id=$5, qty_ordered=$6,
-                        unit_price_fc=$7, total_value_lc=$8, description=$9
-                    WHERE id=$10
+                        unit_price_fc=$7, total_value_lc=$8, description=$9, ref_quote_detail_id=$10
+                    WHERE id=$11
                 `, [lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                    qty, price, value, d.description || null, d.id]);
+                    qty, price, value, d.description || null, d.ref_quote_detail_id || null, d.id]);
             } else {
-                await client.query(`
+                const newDetailRes = await client.query(`
                     INSERT INTO so_transaction_detail
-                    (header_id, line_no, item_id, item_code, item_name, uom_id, qty_ordered, unit_price_fc, total_value_lc, description)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                    (header_id, line_no, item_id, item_code, item_name, uom_id, qty_ordered, unit_price_fc, total_value_lc, description, ref_quote_detail_id)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                    RETURNING id
                 `, [id, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                    qty, price, value, d.description || null]);
+                    qty, price, value, d.description || null, d.ref_quote_detail_id || null]);
+                if (d.ref_quote_detail_id) {
+                    await copyAttachmentsToEntity(client, {
+                        dbName, sourceModule: 'quote_transaction_detail', sourceEntityId: d.ref_quote_detail_id,
+                        targetModule: 'so_transaction_detail', targetEntityId: newDetailRes.rows[0].id,
+                        uploadedBy: header.updated_by || null,
+                    });
+                }
             }
         }
         await client.query(`UPDATE so_transaction SET total_qty=$1, total_value_lc=$2 WHERE id=$3`, [totalQty, totalValue, id]);
+        for (const quoteId of affectedQuoteIds) { await refreshQuoteStatus(client, quoteId); }
 
         await client.query('COMMIT');
         const full = await fetchRowById(req.dbPool, id);
