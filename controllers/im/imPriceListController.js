@@ -39,6 +39,15 @@ const ensureImPriceListTable = async (client) => {
     await client.query(`CREATE INDEX IF NOT EXISTS idx_im_price_list_detail_list ON im_price_list_detail(price_list_id)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_im_price_list_detail_item ON im_price_list_detail(item_id)`);
 
+    // audit trail ระดับบรรทัด — updateRow เดิม delete-all-then-reinsert ทุกครั้งที่บันทึกทำให้ไม่รู้ว่าใครแก้ราคา
+    // บรรทัดไหนเมื่อไหร่จากเท่าไหร่เป็นเท่าไหร่ ตอนนี้เปลี่ยนเป็น diff-based update (จับคู่ด้วย id) แล้ว จึงต้องมี
+    // คอลัมน์เหล่านี้ไว้บอกว่าบรรทัดที่ "คงอยู่" ถูกแก้ล่าสุดโดยใครเมื่อไหร่ (บรรทัดที่ถูกลบ/แทนที่ยังไม่มีประวัติ
+    // เก็บแยกเป็นตาราง — ดู comment ใน updateRow)
+    await client.query(`ALTER TABLE im_price_list_detail ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`).catch(() => {});
+    await client.query(`ALTER TABLE im_price_list_detail ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`).catch(() => {});
+    await client.query(`ALTER TABLE im_price_list_detail ADD COLUMN IF NOT EXISTS created_by VARCHAR(100)`).catch(() => {});
+    await client.query(`ALTER TABLE im_price_list_detail ADD COLUMN IF NOT EXISTS updated_by VARCHAR(100)`).catch(() => {});
+
     // ผูกลิสต์ราคากับผู้ขาย/ลูกค้ารายตัวได้ (nullable) — NULL = ลิสต์ราคากลาง ใช้เป็น fallback เมื่อไม่มีลิสต์เฉพาะราย
     // vendor_id คู่กับ list_type='PURCHASE', customer_id คู่กับ list_type='SALES' (ไม่บังคับ constraint ระดับ DB,
     // แค่ convention — ดู resolveItemPrice) ผู้ใช้แรกของคอลัมน์นี้คือ PO (ฝั่ง SALES/customer_id ยังไม่มีผู้ใช้จนกว่า
@@ -183,6 +192,40 @@ const validateDetails = (details) => {
     return null;
 };
 
+// resolveItemPrice เลือกบรรทัดด้วย (price_list_id, item_id, min_qty) — ไม่สนใจ uom_id เลย ดังนั้นสองบรรทัดที่
+// item_id/min_qty เดียวกันแล้วช่วง effective_from/to คาบเกี่ยวกัน จะทำให้ผลลัพธ์ไม่แน่นอน (ORDER BY min_qty DESC
+// LIMIT 1 ไม่การันตีว่าจะได้บรรทัดที่ตั้งใจ) ตรวจก่อนบันทึกเสมอ — เทียบเฉพาะภายใน details ที่ส่งมาในคำขอเดียวกัน
+// เพราะ details ที่ส่งมาคือ "สถานะที่ต้องการทั้งหมด" ของตารางราคานี้อยู่แล้ว (ทั้ง addRow และ updateRow แบบ diff)
+const rangesOverlap = (aFrom, aTo, bFrom, bTo) => {
+    const aStart = aFrom || '0001-01-01';
+    const aEnd = aTo || '9999-12-31';
+    const bStart = bFrom || '0001-01-01';
+    const bEnd = bTo || '9999-12-31';
+    return aStart <= bEnd && bStart <= aEnd;
+};
+
+const findOverlappingPair = (details) => {
+    for (let i = 0; i < details.length; i++) {
+        for (let j = i + 1; j < details.length; j++) {
+            const a = details[i], b = details[j];
+            if (a.item_id === b.item_id && Number(a.min_qty ?? 0) === Number(b.min_qty ?? 0)) {
+                if (rangesOverlap(a.effective_from, a.effective_to, b.effective_from, b.effective_to)) {
+                    return [a, b];
+                }
+            }
+        }
+    }
+    return null;
+};
+
+const checkOverlap = async (client, details) => {
+    const pair = findOverlappingPair(details);
+    if (!pair) return null;
+    const itemRes = await client.query(`SELECT item_code FROM im_item WHERE id = $1`, [pair[0].item_id]);
+    const itemCode = itemRes.rows[0]?.item_code || pair[0].item_id;
+    return `ช่วงวันที่มีผลของสินค้า '${itemCode}' (จำนวนขั้นต่ำ ${Number(pair[0].min_qty ?? 0)}) มีสองรายการที่ช่วงวันคาบเกี่ยวกัน กรุณาแก้ช่วงวันที่ไม่ให้ทับซ้อนก่อนบันทึก`;
+};
+
 const addRow = async (req, res) => {
     const client = await req.dbPool.connect();
     const b = req.body;
@@ -204,6 +247,11 @@ const addRow = async (req, res) => {
             await client.query('ROLLBACK');
             return res.status(400).json({ message: detailErr });
         }
+        const overlapErr = await checkOverlap(client, b.details || []);
+        if (overlapErr) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ message: overlapErr });
+        }
 
         const header = await client.query(
             `INSERT INTO im_price_list (price_list_code, price_list_name, list_type, currency_id, vendor_id, customer_id, is_active, created_by, updated_by)
@@ -219,9 +267,9 @@ const addRow = async (req, res) => {
 
         for (const line of (b.details || [])) {
             await client.query(
-                `INSERT INTO im_price_list_detail (price_list_id, item_id, uom_id, min_qty, unit_price_fc, effective_from, effective_to)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-                [headerId, line.item_id, line.uom_id || null, line.min_qty ?? 0, line.unit_price_fc ?? 0, line.effective_from || null, line.effective_to || null]
+                `INSERT INTO im_price_list_detail (price_list_id, item_id, uom_id, min_qty, unit_price_fc, effective_from, effective_to, created_by, updated_by)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)`,
+                [headerId, line.item_id, line.uom_id || null, line.min_qty ?? 0, line.unit_price_fc ?? 0, line.effective_from || null, line.effective_to || null, userName]
             );
         }
 
@@ -255,6 +303,11 @@ const updateRow = async (req, res) => {
             await client.query('ROLLBACK');
             return res.status(400).json({ message: detailErr });
         }
+        const overlapErr = await checkOverlap(client, b.details || []);
+        if (overlapErr) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ message: overlapErr });
+        }
 
         const result = await client.query(
             `UPDATE im_price_list SET
@@ -276,13 +329,34 @@ const updateRow = async (req, res) => {
             return res.status(404).json({ message: 'ไม่พบตารางราคา' });
         }
 
-        await client.query(`DELETE FROM im_price_list_detail WHERE price_list_id = $1`, [id]);
+        // แก้ไขบรรทัดแบบ diff (UPDATE ของเดิม / INSERT ใหม่ / DELETE ที่ถูกลบ) แทน delete-all-then-reinsert เดิม —
+        // เพื่อรักษา updated_by/updated_at ต่อบรรทัดไว้เป็น audit trail จริง (บรรทัดที่ id ไม่เปลี่ยนแต่ค่าเปลี่ยน
+        // จะเห็นว่าใครแก้ล่าสุดเมื่อไหร่ ไม่ใช่ทุกบรรทัดโดนเขียนทับเป็น "ตอนนี้" หมดทุกครั้งที่กดบันทึก)
+        const existingIdsRes = await client.query(`SELECT id FROM im_price_list_detail WHERE price_list_id = $1`, [id]);
+        const existingIds = new Set(existingIdsRes.rows.map(r => r.id));
+        const incomingIds = new Set((b.details || []).filter(d => d.id).map(d => d.id));
+        const removedIds = [...existingIds].filter(x => !incomingIds.has(x));
+
+        if (removedIds.length > 0) {
+            await client.query(`DELETE FROM im_price_list_detail WHERE id = ANY($1::int[])`, [removedIds]);
+        }
         for (const line of (b.details || [])) {
-            await client.query(
-                `INSERT INTO im_price_list_detail (price_list_id, item_id, uom_id, min_qty, unit_price_fc, effective_from, effective_to)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-                [id, line.item_id, line.uom_id || null, line.min_qty ?? 0, line.unit_price_fc ?? 0, line.effective_from || null, line.effective_to || null]
-            );
+            if (line.id && existingIds.has(line.id)) {
+                await client.query(
+                    `UPDATE im_price_list_detail SET
+                        item_id = $1, uom_id = $2, min_qty = $3, unit_price_fc = $4,
+                        effective_from = $5, effective_to = $6, updated_by = $7, updated_at = NOW()
+                     WHERE id = $8`,
+                    [line.item_id, line.uom_id || null, line.min_qty ?? 0, line.unit_price_fc ?? 0,
+                     line.effective_from || null, line.effective_to || null, userName, line.id]
+                );
+            } else {
+                await client.query(
+                    `INSERT INTO im_price_list_detail (price_list_id, item_id, uom_id, min_qty, unit_price_fc, effective_from, effective_to, created_by, updated_by)
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)`,
+                    [id, line.item_id, line.uom_id || null, line.min_qty ?? 0, line.unit_price_fc ?? 0, line.effective_from || null, line.effective_to || null, userName]
+                );
+            }
         }
 
         await client.query('COMMIT');
