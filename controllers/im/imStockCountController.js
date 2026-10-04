@@ -150,7 +150,7 @@ const fetchRowById = async (pool, id) => {
     `, [id]);
     if (hRes.rows.length === 0) return null;
     const dRes = await pool.query(`
-        SELECT d.*, u.uom_code, l.location_code, l.sort_order AS location_sort_order
+        SELECT d.*, u.uom_code, u.uom_name_th, u.uom_name_en, l.location_code, l.sort_order AS location_sort_order
         FROM im_stock_count_detail d
         LEFT JOIN im_uom u      ON u.id = d.uom_id
         LEFT JOIN im_location l ON l.id = d.location_id
@@ -422,7 +422,7 @@ const fetchLinesForRecording = async (req, res) => {
         }
         const result = await client.query(`
             ${LOCATION_SUBTREE_CTE.replace('$LOC_PARAM', '$2')}
-            SELECT d.*, u.uom_code, l.location_code,
+            SELECT d.*, u.uom_code, u.uom_name_th, u.uom_name_en, l.location_code,
                    w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en
             FROM im_stock_count_detail d
             LEFT JOIN im_uom u      ON u.id = d.uom_id

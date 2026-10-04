@@ -8,6 +8,7 @@ const imUomController          = require('../controllers/im/imUomController');
 const imWarehouseController    = require('../controllers/im/imWarehouseController');
 const imBomController          = require('../controllers/im/imBomController');
 const imPriceListController    = require('../controllers/im/imPriceListController');
+const imPriceGroupController   = require('../controllers/im/imPriceGroupController');
 const imGlAccountSetupController = require('../controllers/im/imGlAccountSetupController');
 const imItemImportController   = require('../controllers/im/imItemImportController');
 const imLocationController     = require('../controllers/im/imLocationController');
@@ -152,6 +153,14 @@ router.get('/im_uom/:id',    imUomController.fetchRow);
 router.post('/im_uom',       imUomController.addRow);
 router.put('/im_uom/:id',    imUomController.updateRow);
 router.delete('/im_uom/:id', imUomController.deleteRow);
+
+// im_price_group — กลุ่มราคา (ค้าปลีก/ค้าส่ง/ตัวแทนจำหน่าย/VIP) แยกจาก ar_customer_group/ap_vendor_group
+router.get('/im_price_group',        imPriceGroupController.fetchRows);
+router.get('/im_price_group/active', imPriceGroupController.fetchActiveRows);
+router.get('/im_price_group/:id',    imPriceGroupController.fetchRow);
+router.post('/im_price_group',       imPriceGroupController.addRow);
+router.put('/im_price_group/:id',    imPriceGroupController.updateRow);
+router.delete('/im_price_group/:id', imPriceGroupController.deleteRow);
 
 // im_item_category
 router.get('/im_item_category',        imItemCategoryController.fetchRows);

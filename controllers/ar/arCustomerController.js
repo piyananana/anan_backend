@@ -1,8 +1,17 @@
 // controllers/ar/arCustomerController.js
 const { generateNextCode } = require('./arCustomerRunningController');
 const { generateNextCodeForGroup } = require('./arCustomerGroupController');
+// price_list_id แยกจาก customer_group_id (นโยบายบัญชี/เครดิต) โดยสิ้นเชิง — คือรหัสตารางราคา (im_price_list) ที่
+// ลูกค้ารายนี้ใช้ ลูกค้าแต่ละรายใช้ได้รหัสเดียวเท่านั้น (ดู resolveItemPrice ใน imPriceListController.js) — ไม่ใช่
+// price_group_id (im_price_group เป็นแค่หมวดหมู่ของตารางราคา ไม่ใช่สิ่งที่ลูกค้าผูกตรง)
+const { ensureImPriceListTable } = require('../im/imPriceListController');
 
 const fetchRowById = async (pool, id) => {
+  await ensureImPriceListTable(pool);
+  await pool.query(`ALTER TABLE ar_customer ADD COLUMN IF NOT EXISTS price_list_id INTEGER REFERENCES im_price_list(id)`).catch(() => {});
+  // price_group_id รุ่นก่อนหน้า (ผูกกับ im_price_group ตรงๆ) ไม่มีข้อมูลจริงเลยตอนที่แก้ (เช็คแล้ว) แทนที่ด้วย
+  // price_list_id ข้างบนนี้ทั้งหมด — ลบคอลัมน์เก่าทิ้งได้ปลอดภัย
+  await pool.query(`ALTER TABLE ar_customer DROP COLUMN IF EXISTS price_group_id`).catch(() => {});
   const [mainResult, addresses, contacts, banks, billingConds, paymentConds] =
     await Promise.all([
       pool.query(`
@@ -24,7 +33,9 @@ const fetchRowById = async (pool, id) => {
           ga.account_name_thai   AS ar_account_name_thai,
           acg.gl_account_id AS group_ar_account_id,
           gacg.account_code AS group_ar_account_code,
-          gacg.account_name_thai AS group_ar_account_name_thai
+          gacg.account_name_thai AS group_ar_account_name_thai,
+          ipl.price_list_code,
+          ipl.price_list_name
         FROM ar_customer c
         LEFT JOIN cd_business_type    cbt ON c.business_type_id       = cbt.id
         LEFT JOIN ar_customer_group   acg ON c.customer_group_id      = acg.id
@@ -34,6 +45,7 @@ const fetchRowById = async (pool, id) => {
         LEFT JOIN ar_collector        cc  ON c.collection_collector_id = cc.id
         LEFT JOIN gl_account          ga  ON c.ar_account_id           = ga.id
         LEFT JOIN gl_account           gacg ON gacg.id = acg.gl_account_id
+        LEFT JOIN im_price_list       ipl ON c.price_list_id          = ipl.id
         WHERE c.id = $1`, [id]),
       pool.query(`SELECT * FROM ar_customer_address      WHERE customer_id=$1 ORDER BY id`, [id]),
       pool.query(`SELECT * FROM ar_customer_contact      WHERE customer_id=$1 ORDER BY id`, [id]),
@@ -59,6 +71,9 @@ const fetchRows = async (req, res) => {
     await req.dbPool.query(
       `ALTER TABLE ar_customer ADD COLUMN IF NOT EXISTS is_code_auto_generated BOOLEAN NOT NULL DEFAULT false`
     ).catch(() => {});
+    await ensureImPriceListTable(req.dbPool);
+    await req.dbPool.query(`ALTER TABLE ar_customer ADD COLUMN IF NOT EXISTS price_list_id INTEGER REFERENCES im_price_list(id)`).catch(() => {});
+    await req.dbPool.query(`ALTER TABLE ar_customer DROP COLUMN IF EXISTS price_group_id`).catch(() => {});
     let query = `
       SELECT
         c.id, c.customer_code, c.old_customer_code, c.customer_name_th, c.customer_name_en,
@@ -67,6 +82,7 @@ const fetchRows = async (req, res) => {
         c.business_type_id,  cbt.business_type_code, cbt.business_type_name_thai,
         c.customer_group_id, acg.group_code AS customer_group_code,
                              acg.group_name_thai AS customer_group_name,
+        c.price_list_id,     ipl.price_list_code, ipl.price_list_name,
         c.sales_territory_id, t.territory_code      AS sales_territory_code,
                               t.territory_name_thai AS sales_territory_name_thai,
         c.salesperson_id,     sp.salesperson_code,
@@ -83,6 +99,7 @@ const fetchRows = async (req, res) => {
       FROM ar_customer c
       LEFT JOIN cd_business_type   cbt ON c.business_type_id      = cbt.id
       LEFT JOIN ar_customer_group  acg ON c.customer_group_id     = acg.id
+      LEFT JOIN im_price_list      ipl ON c.price_list_id         = ipl.id
       LEFT JOIN cd_sales_territory t   ON c.sales_territory_id    = t.id
       LEFT JOIN cd_salesperson     sp  ON c.salesperson_id         = sp.id
       LEFT JOIN ar_collector        bc ON c.billing_collector_id   = bc.id
@@ -196,7 +213,7 @@ const insertRelated = async (client, cid, addresses, contacts, bank_accounts, bi
 const addRow = async (req, res) => {
   const {
     customer_code, old_customer_code, customer_name_th, customer_name_en, tax_id,
-    business_type_id, customer_group_id,
+    business_type_id, customer_group_id, price_list_id,
     credit_term_months, credit_term_days, credit_limit, discount_percent,
     currency_code, is_active, remark,
     requires_billing,
@@ -211,6 +228,9 @@ const addRow = async (req, res) => {
   try {
     await client.query('BEGIN');
     await client.query(`ALTER TABLE ar_customer ADD COLUMN IF NOT EXISTS is_code_auto_generated BOOLEAN NOT NULL DEFAULT false`).catch(() => {});
+    await ensureImPriceListTable(client);
+    await client.query(`ALTER TABLE ar_customer ADD COLUMN IF NOT EXISTS price_list_id INTEGER REFERENCES im_price_list(id)`).catch(() => {});
+    await client.query(`ALTER TABLE ar_customer DROP COLUMN IF EXISTS price_group_id`).catch(() => {});
     const codeWasProvided = !!(customer_code && customer_code.trim() !== '');
     let finalCode = codeWasProvided ? customer_code.trim().toUpperCase() : null;
     if (!finalCode) {
@@ -229,7 +249,7 @@ const addRow = async (req, res) => {
     const result = await client.query(
       `INSERT INTO ar_customer
          (customer_code, old_customer_code, customer_name_th, customer_name_en, tax_id,
-          business_type_id, customer_group_id,
+          business_type_id, customer_group_id, price_list_id,
           credit_term_months, credit_term_days, credit_limit, discount_percent,
           currency_code, is_active, remark, requires_billing,
           ar_account_id,
@@ -237,13 +257,13 @@ const addRow = async (req, res) => {
           billing_collector_id, collection_collector_id,
           is_code_auto_generated,
           created_by, updated_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$22)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$23)
        RETURNING id`,
       [
         finalCode, old_customer_code || null,
         customer_name_th, customer_name_en || null,
         tax_id || null,
-        business_type_id || null, customer_group_id || null,
+        business_type_id || null, customer_group_id || null, price_list_id || null,
         credit_term_months ?? 0, credit_term_days ?? 30,
         credit_limit ?? 0, discount_percent ?? 0,
         currency_code || 'THB',
@@ -277,7 +297,7 @@ const updateRow = async (req, res) => {
   const { id } = req.params;
   const {
     customer_code, old_customer_code, customer_name_th, customer_name_en, tax_id,
-    business_type_id, customer_group_id,
+    business_type_id, customer_group_id, price_list_id,
     credit_term_months, credit_term_days, credit_limit, discount_percent,
     currency_code, is_active, remark,
     requires_billing,
@@ -292,6 +312,9 @@ const updateRow = async (req, res) => {
   try {
     await client.query('BEGIN');
     await client.query(`ALTER TABLE ar_customer ADD COLUMN IF NOT EXISTS is_code_auto_generated BOOLEAN NOT NULL DEFAULT false`).catch(() => {});
+    await ensureImPriceListTable(client);
+    await client.query(`ALTER TABLE ar_customer ADD COLUMN IF NOT EXISTS price_list_id INTEGER REFERENCES im_price_list(id)`).catch(() => {});
+    await client.query(`ALTER TABLE ar_customer DROP COLUMN IF EXISTS price_group_id`).catch(() => {});
 
     const currentResult = await client.query(
       `SELECT customer_group_id, is_code_auto_generated FROM ar_customer WHERE id = $1`, [id]
@@ -321,22 +344,22 @@ const updateRow = async (req, res) => {
          customer_code      = $1,  old_customer_code  = $2,
          customer_name_th   = $3,  customer_name_en   = $4,
          tax_id             = $5,
-         business_type_id   = $6,  customer_group_id  = $7,
-         credit_term_months = $8,  credit_term_days   = $9,
-         credit_limit       = $10, discount_percent   = $11,
-         currency_code      = $12, is_active          = $13,
-         remark             = $14, requires_billing   = $15,
-         ar_account_id      = $16,
-         sales_territory_id = $17, salesperson_id     = $18,
-         billing_collector_id    = $19, collection_collector_id = $20,
-         updated_by         = $21, updated_at         = NOW()
-       WHERE id = $22
+         business_type_id   = $6,  customer_group_id  = $7,  price_list_id = $8,
+         credit_term_months = $9,  credit_term_days   = $10,
+         credit_limit       = $11, discount_percent   = $12,
+         currency_code      = $13, is_active          = $14,
+         remark             = $15, requires_billing   = $16,
+         ar_account_id      = $17,
+         sales_territory_id = $18, salesperson_id     = $19,
+         billing_collector_id    = $20, collection_collector_id = $21,
+         updated_by         = $22, updated_at         = NOW()
+       WHERE id = $23
        RETURNING id`,
       [
         customer_code.toUpperCase(), old_customer_code || null,
         customer_name_th, customer_name_en || null,
         tax_id || null,
-        business_type_id || null, customer_group_id || null,
+        business_type_id || null, customer_group_id || null, price_list_id || null,
         credit_term_months ?? 0, credit_term_days ?? 30,
         credit_limit ?? 0, discount_percent ?? 0,
         currency_code || 'THB', is_active,

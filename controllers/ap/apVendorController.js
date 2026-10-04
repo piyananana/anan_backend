@@ -1,5 +1,9 @@
 // controllers/ap/apVendorController.js
 const { generateNextCode } = require('./apVendorRunningController');
+// price_list_id แยกจาก vendor_group_id (นโยบายบัญชี/เครดิต) โดยสิ้นเชิง — คือรหัสตารางราคา (im_price_list) ที่
+// ผู้ขายรายนี้ใช้ ผู้ขายแต่ละรายใช้ได้รหัสเดียวเท่านั้น (ดู resolveItemPrice ใน imPriceListController.js) มิเรอร์
+// ar_customer price_list_id ทุกประการ
+const { ensureImPriceListTable } = require('../im/imPriceListController');
 
 const fetchRowById = async (pool, id) => {
   // เพิ่ม column แบบ idempotent
@@ -7,6 +11,9 @@ const fetchRowById = async (pool, id) => {
   await pool.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS credit_limit NUMERIC(18,4) NOT NULL DEFAULT 0`).catch(() => {});
   await pool.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS payment_method_id INTEGER`).catch(() => {});
   await pool.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS is_code_auto_generated BOOLEAN NOT NULL DEFAULT false`).catch(() => {});
+  await ensureImPriceListTable(pool);
+  await pool.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS price_list_id INTEGER REFERENCES im_price_list(id)`).catch(() => {});
+  await pool.query(`ALTER TABLE ap_vendor DROP COLUMN IF EXISTS price_group_id`).catch(() => {});
   const [mainResult, addresses, contacts, banks] = await Promise.all([
     pool.query(`
       SELECT
@@ -19,12 +26,15 @@ const fetchRowById = async (pool, id) => {
         ga.account_name_thai AS ap_account_name_thai,
         pm.method_code     AS payment_method_code,
         pm.method_name_th  AS payment_method_name_thai,
-        pm.method_name_en  AS payment_method_name_eng
+        pm.method_name_en  AS payment_method_name_eng,
+        ipl.price_list_code,
+        ipl.price_list_name
       FROM ap_vendor v
       LEFT JOIN ap_vendor_group    vg  ON v.vendor_group_id  = vg.id
       LEFT JOIN cd_business_type cbt ON v.business_type_id = cbt.id
       LEFT JOIN gl_account       ga  ON v.ap_account_id    = ga.id
       LEFT JOIN cm_payment_method pm ON v.payment_method_id = pm.id
+      LEFT JOIN im_price_list   ipl ON v.price_list_id     = ipl.id
       WHERE v.id = $1`, [id]),
     pool.query(`SELECT * FROM ap_vendor_address      WHERE vendor_id=$1 ORDER BY id`, [id]),
     pool.query(`SELECT * FROM ap_vendor_contact      WHERE vendor_id=$1 ORDER BY id`, [id]),
@@ -54,12 +64,16 @@ const fetchRows = async (req, res) => {
     await req.dbPool.query(
       `ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS is_code_auto_generated BOOLEAN NOT NULL DEFAULT false`
     ).catch(() => {});
+    await ensureImPriceListTable(req.dbPool);
+    await req.dbPool.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS price_list_id INTEGER REFERENCES im_price_list(id)`).catch(() => {});
+    await req.dbPool.query(`ALTER TABLE ap_vendor DROP COLUMN IF EXISTS price_group_id`).catch(() => {});
     let query = `
       SELECT
         v.id, v.vendor_code, v.old_vendor_code, v.vendor_name_th, v.vendor_name_en,
         v.tax_id, v.credit_term_months, v.credit_term_days, v.credit_limit,
         v.currency_code, v.is_active, v.vendor_type, v.is_code_auto_generated,
         v.vendor_group_id,   vg.group_code AS vendor_group_code, vg.group_name_thai AS vendor_group_name,
+        v.price_list_id,     ipl.price_list_code, ipl.price_list_name,
         v.business_type_id,  cbt.business_type_code, cbt.business_type_name_thai,
         v.ap_account_id,     ga.account_code  AS ap_account_code,
                              ga.account_name_thai AS ap_account_name_thai,
@@ -68,6 +82,7 @@ const fetchRows = async (req, res) => {
                              pm.method_name_en AS payment_method_name_eng
       FROM ap_vendor v
       LEFT JOIN ap_vendor_group    vg  ON v.vendor_group_id  = vg.id
+      LEFT JOIN im_price_list     ipl  ON v.price_list_id    = ipl.id
       LEFT JOIN cd_business_type cbt ON v.business_type_id = cbt.id
       LEFT JOIN gl_account       ga  ON v.ap_account_id    = ga.id
       LEFT JOIN cm_payment_method pm ON v.payment_method_id = pm.id
@@ -159,7 +174,7 @@ const insertRelated = async (client, vid, addresses, contacts, bank_accounts) =>
 const addRow = async (req, res) => {
   const {
     vendor_code, old_vendor_code, vendor_name_th, vendor_name_en, tax_id,
-    vendor_group_id,
+    vendor_group_id, price_list_id,
     business_type_id,
     vendor_type,
     credit_term_months, credit_term_days, credit_limit,
@@ -176,6 +191,9 @@ const addRow = async (req, res) => {
     await client.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS credit_limit NUMERIC(18,4) NOT NULL DEFAULT 0`).catch(() => {});
     await client.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS payment_method_id INTEGER`).catch(() => {});
     await client.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS is_code_auto_generated BOOLEAN NOT NULL DEFAULT false`).catch(() => {});
+    await ensureImPriceListTable(client);
+    await client.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS price_list_id INTEGER REFERENCES im_price_list(id)`).catch(() => {});
+    await client.query(`ALTER TABLE ap_vendor DROP COLUMN IF EXISTS price_group_id`).catch(() => {});
     const codeWasProvided = !!(vendor_code && vendor_code.trim() !== '');
     let finalCode = codeWasProvided ? vendor_code.trim().toUpperCase() : null;
     if (!finalCode) {
@@ -189,7 +207,7 @@ const addRow = async (req, res) => {
     const result = await client.query(
       `INSERT INTO ap_vendor
          (vendor_code, old_vendor_code, vendor_name_th, vendor_name_en, tax_id,
-          vendor_group_id,
+          vendor_group_id, price_list_id,
           business_type_id,
           vendor_type,
           credit_term_months, credit_term_days, credit_limit,
@@ -198,13 +216,13 @@ const addRow = async (req, res) => {
           payment_method_id,
           is_code_auto_generated,
           created_by, updated_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$18)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$19)
        RETURNING id`,
       [
         finalCode, old_vendor_code || null,
         vendor_name_th, vendor_name_en || null,
         tax_id || null,
-        vendor_group_id || null,
+        vendor_group_id || null, price_list_id || null,
         business_type_id || null,
         vendor_type || null,
         credit_term_months ?? 0, credit_term_days ?? 30, credit_limit ?? 0,
@@ -237,7 +255,7 @@ const updateRow = async (req, res) => {
   const { id } = req.params;
   const {
     vendor_code, old_vendor_code, vendor_name_th, vendor_name_en, tax_id,
-    vendor_group_id,
+    vendor_group_id, price_list_id,
     business_type_id,
     vendor_type,
     credit_term_months, credit_term_days, credit_limit,
@@ -252,6 +270,9 @@ const updateRow = async (req, res) => {
     await client.query('BEGIN');
     await client.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS payment_method_id INTEGER`).catch(() => {});
     await client.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS is_code_auto_generated BOOLEAN NOT NULL DEFAULT false`).catch(() => {});
+    await ensureImPriceListTable(client);
+    await client.query(`ALTER TABLE ap_vendor ADD COLUMN IF NOT EXISTS price_list_id INTEGER REFERENCES im_price_list(id)`).catch(() => {});
+    await client.query(`ALTER TABLE ap_vendor DROP COLUMN IF EXISTS price_group_id`).catch(() => {});
 
     const currentResult = await client.query(
       `SELECT vendor_group_id, is_code_auto_generated FROM ap_vendor WHERE id = $1`, [id]
@@ -281,23 +302,23 @@ const updateRow = async (req, res) => {
          vendor_code         = $1,  old_vendor_code     = $2,
          vendor_name_th      = $3,  vendor_name_en      = $4,
          tax_id              = $5,
-         vendor_group_id     = $6,
-         business_type_id    = $7,
-         vendor_type         = $8,
-         credit_term_months  = $9,  credit_term_days    = $10,
-         credit_limit        = $11,
-         currency_code       = $12, is_active           = $13,
-         remark              = $14,
-         ap_account_id       = $15,
-         payment_method_id   = $16,
-         updated_by          = $17, updated_at          = NOW()
-       WHERE id = $18
+         vendor_group_id     = $6,  price_list_id       = $7,
+         business_type_id    = $8,
+         vendor_type         = $9,
+         credit_term_months  = $10, credit_term_days    = $11,
+         credit_limit        = $12,
+         currency_code       = $13, is_active           = $14,
+         remark              = $15,
+         ap_account_id       = $16,
+         payment_method_id   = $17,
+         updated_by          = $18, updated_at          = NOW()
+       WHERE id = $19
        RETURNING id`,
       [
         vendor_code.toUpperCase(), old_vendor_code || null,
         vendor_name_th, vendor_name_en || null,
         tax_id || null,
-        vendor_group_id || null,
+        vendor_group_id || null, price_list_id || null,
         business_type_id || null,
         vendor_type || null,
         credit_term_months ?? 0, credit_term_days ?? 30,
