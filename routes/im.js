@@ -9,6 +9,8 @@ const imWarehouseController    = require('../controllers/im/imWarehouseControlle
 const imBomController          = require('../controllers/im/imBomController');
 const imPriceListController    = require('../controllers/im/imPriceListController');
 const imPriceGroupController   = require('../controllers/im/imPriceGroupController');
+const imPriceChangeController  = require('../controllers/im/imPriceChangeController');
+const imPriceChangeReportController = require('../controllers/im/imPriceChangeReportController');
 const imGlAccountSetupController = require('../controllers/im/imGlAccountSetupController');
 const imItemImportController   = require('../controllers/im/imItemImportController');
 const imLocationController     = require('../controllers/im/imLocationController');
@@ -44,6 +46,22 @@ router.get('/im_price_list_detail/by_item/:itemId', imPriceListController.fetchB
 router.post('/im_price_list',                    imPriceListController.addRow);
 router.put('/im_price_list/:id',                 imPriceListController.updateRow);
 router.delete('/im_price_list/:id',               imPriceListController.deleteRow);
+
+// im_price_change (ธุรกรรมเปลี่ยนแปลงราคา — Draft -> Pending -> Approved, กิ่ง Void แยกจาก Draft/Pending)
+router.get('/im_price_change/preview_lines',     imPriceChangeController.previewLines); // ต้องมาก่อน /:id ด้านล่าง
+router.get('/im_price_change',                   imPriceChangeController.fetchRows);
+router.get('/im_price_change/:id',               imPriceChangeController.fetchRow);
+router.post('/im_price_change',                  imPriceChangeController.addRow);
+router.put('/im_price_change/:id',               imPriceChangeController.updateHeader);
+router.put('/im_price_change/:id/submit',        imPriceChangeController.submitChange);
+router.put('/im_price_change/:id/approve',       imPriceChangeController.approveChange);
+router.put('/im_price_change/:id/reject',        imPriceChangeController.rejectChange);
+router.put('/im_price_change/:id/void',          imPriceChangeController.voidChange);
+
+// im_price_change_report (รายงานตรวจเช็คการเปลี่ยนแปลงราคา — อ่านอย่างเดียว)
+router.get('/im_price_change_report/categories', imPriceChangeReportController.fetchCategories); // ต้องมาก่อน endpoint หลัก
+router.get('/im_price_change_report/items',      imPriceChangeReportController.searchItems);
+router.get('/im_price_change_report',            imPriceChangeReportController.fetchReport);
 
 // im_bom (im_bom_header + im_bom_detail)
 router.get('/im_bom',        imBomController.fetchRows);

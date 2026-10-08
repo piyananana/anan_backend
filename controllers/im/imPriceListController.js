@@ -156,10 +156,14 @@ const fetchRows = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await ensureImPriceListTable(client);
-        const { list_type } = req.query;
+        const { list_type, price_group_ids } = req.query;
         let where = 'WHERE 1=1';
         const params = [];
-        if (list_type) { where += ` AND h.list_type = $1`; params.push(list_type); }
+        if (list_type) { params.push(list_type); where += ` AND h.list_type = $${params.length}`; }
+        if (price_group_ids) {
+            const ids = String(price_group_ids).split(',').map((s) => parseInt(s, 10)).filter((n) => !isNaN(n));
+            if (ids.length > 0) { params.push(ids); where += ` AND h.price_group_id = ANY($${params.length}::int[])`; }
+        }
         const result = await client.query(`${HEADER_SELECT} ${where} ORDER BY h.price_list_code`, params);
         res.status(200).json(result.rows);
     } catch (error) {
@@ -192,11 +196,13 @@ const fetchByItem = async (req, res) => {
         await ensureImPriceListTable(client);
         const result = await client.query(
             `SELECT d.*,
-                    h.price_list_code, h.price_list_name, h.list_type,
+                    h.price_list_code, h.price_list_name, h.list_type, h.is_default,
+                    pg.price_group_code, pg.price_group_name_th, pg.price_group_name_en,
                     c.currency_code,
                     u.uom_code, u.uom_name_th, u.uom_name_en
              FROM im_price_list_detail d
              JOIN im_price_list h ON h.id = d.price_list_id
+             LEFT JOIN im_price_group pg ON pg.id = h.price_group_id
              LEFT JOIN cd_currency c ON c.id = h.currency_id
              LEFT JOIN im_uom u ON u.id = d.uom_id
              WHERE d.item_id = $1 AND h.is_active = true
@@ -242,6 +248,9 @@ const resolveItemPrice = async (client, { itemId, listType, vendorId, customerId
     }
     if (!priceListId) return null;
 
+    // ORDER BY price_type='PROMOTION' DESC มาก่อน min_qty/uom เสมอ — ถ้าบรรทัดโปรโมชั่นกับราคาปกติตรงกันทั้งคู่
+    // (วันที่/min_qty/uom ตรงกันหมด ซึ่งเกิดได้ตั้งใจจากธุรกรรมเปลี่ยนแปลงราคาที่แทรกโปรโมชั่นคาบราคาปกติ) ให้
+    // โปรโมชั่นชนะเสมอ ไม่งั้นราคาปกติจะบังโปรโมชั่นที่กำลังจะมีผลอยู่
     const detailRes = await client.query(`
         SELECT unit_price_fc, uom_id, min_qty
         FROM im_price_list_detail
@@ -249,7 +258,7 @@ const resolveItemPrice = async (client, { itemId, listType, vendorId, customerId
           AND (uom_id = $4 OR uom_id IS NULL OR $4::int IS NULL)
           AND (effective_from IS NULL OR effective_from <= $5::date)
           AND (effective_to   IS NULL OR effective_to   >= $5::date)
-        ORDER BY (uom_id IS NULL) ASC, min_qty DESC
+        ORDER BY (price_type = 'PROMOTION') DESC, (uom_id IS NULL) ASC, min_qty DESC
         LIMIT 1
     `, [priceListId, itemId, q, uomId || null, date]);
     if (detailRes.rows.length === 0) return null;
@@ -282,10 +291,13 @@ const validateDetails = (details) => {
     return null;
 };
 
-// resolveItemPrice เลือกบรรทัดด้วย (price_list_id, item_id, min_qty) — ไม่สนใจ uom_id เลย ดังนั้นสองบรรทัดที่
-// item_id/min_qty เดียวกันแล้วช่วง effective_from/to คาบเกี่ยวกัน จะทำให้ผลลัพธ์ไม่แน่นอน (ORDER BY min_qty DESC
-// LIMIT 1 ไม่การันตีว่าจะได้บรรทัดที่ตั้งใจ) ตรวจก่อนบันทึกเสมอ — เทียบเฉพาะภายใน details ที่ส่งมาในคำขอเดียวกัน
-// เพราะ details ที่ส่งมาคือ "สถานะที่ต้องการทั้งหมด" ของตารางราคานี้อยู่แล้ว (ทั้ง addRow และ updateRow แบบ diff)
+// resolveItemPrice เลือกบรรทัดด้วย (price_list_id, item_id, min_qty) ภายใน price_type เดียวกัน (ดู ORDER BY
+// price_type='PROMOTION' DESC ด้านบน) — ดังนั้นสองบรรทัด "price_type เดียวกัน" ที่ item_id/min_qty เดียวกันแล้ว
+// ช่วง effective_from/to คาบเกี่ยวกัน จะทำให้ผลลัพธ์ไม่แน่นอน ต้อง block ไว้ก่อนบันทึก — แต่ STANDARD คาบ PROMOTION
+// ที่ item_id/min_qty เดียวกัน **ต้องอนุญาต** (เป็นเคสตั้งใจของธุรกรรมเปลี่ยนแปลงราคา: ราคาโปรโมชั่นชั่วคราวคาบ
+// ราคาปกติที่ยืนตลอด จึงเทียบ price_type ด้วยเสมอ ไม่ใช่แค่ item_id/min_qty) — เทียบเฉพาะภายใน details ที่ส่งมาใน
+// คำขอเดียวกัน เพราะ details ที่ส่งมาคือ "สถานะที่ต้องการทั้งหมด" ของตารางราคานี้อยู่แล้ว (ทั้ง addRow และ
+// updateRow แบบ diff)
 const rangesOverlap = (aFrom, aTo, bFrom, bTo) => {
     const aStart = aFrom || '0001-01-01';
     const aEnd = aTo || '9999-12-31';
@@ -298,7 +310,9 @@ const findOverlappingPair = (details) => {
     for (let i = 0; i < details.length; i++) {
         for (let j = i + 1; j < details.length; j++) {
             const a = details[i], b = details[j];
-            if (a.item_id === b.item_id && Number(a.min_qty ?? 0) === Number(b.min_qty ?? 0)) {
+            const aType = a.price_type || 'STANDARD';
+            const bType = b.price_type || 'STANDARD';
+            if (a.item_id === b.item_id && aType === bType && Number(a.min_qty ?? 0) === Number(b.min_qty ?? 0)) {
                 if (rangesOverlap(a.effective_from, a.effective_to, b.effective_from, b.effective_to)) {
                     return [a, b];
                 }
@@ -327,6 +341,20 @@ const checkOverlap = async (client, details) => {
     const itemRes = await client.query(`SELECT item_code FROM im_item WHERE id = $1`, [pair[0].item_id]);
     const itemCode = itemRes.rows[0]?.item_code || pair[0].item_id;
     return `ช่วงวันที่มีผลของสินค้า '${itemCode}' (จำนวนขั้นต่ำ ${Number(pair[0].min_qty ?? 0)}) มีสองรายการที่ช่วงวันคาบเกี่ยวกัน กรุณาแก้ช่วงวันที่ไม่ให้ทับซ้อนก่อนบันทึก`;
+};
+
+// เวอร์ชันใช้ตรวจกับบรรทัดที่ "มีอยู่แล้วในฐานข้อมูล" (ต่าง checkOverlap ด้านบนที่เทียบแค่ภายใน details ชุดเดียวกัน
+// ที่ส่งมาพร้อมกัน) — ใช้โดย imPriceChangeController ตอน Approve ก่อน insert บรรทัดราคาใหม่จากธุรกรรมเปลี่ยนแปลง
+// ราคา เพื่อกัน PROMOTION/PROMOTION หรือ STANDARD/STANDARD ชนกันเอง (STANDARD คาบ PROMOTION อนุญาตได้ตามปกติ)
+// excludeDetailId: ไม่เทียบกับบรรทัดนี้เอง (ใช้ตอน REVISE ที่กำลังจะปิด source_detail_id นั้นอยู่แล้ว)
+const findOverlapAgainstExisting = async (client, { priceListId, itemId, uomId, minQty, priceType, effectiveFrom, effectiveTo, excludeDetailId }) => {
+    const result = await client.query(`
+        SELECT id, effective_from, effective_to FROM im_price_list_detail
+        WHERE price_list_id = $1 AND item_id = $2 AND price_type = $3 AND min_qty = $4
+          AND (uom_id = $5 OR (uom_id IS NULL AND $5::int IS NULL))
+          AND ($6::int IS NULL OR id != $6)
+    `, [priceListId, itemId, priceType, minQty, uomId || null, excludeDetailId || null]);
+    return result.rows.some(r => rangesOverlap(r.effective_from, r.effective_to, effectiveFrom, effectiveTo));
 };
 
 const addRow = async (req, res) => {
@@ -498,5 +526,5 @@ const deleteRow = async (req, res) => {
 
 module.exports = {
     ensureImPriceListTable, fetchRows, fetchRow, fetchByItem, addRow, updateRow, deleteRow, LIST_TYPES,
-    resolveItemPrice, resolvePriceHandler,
+    resolveItemPrice, resolvePriceHandler, findOverlapAgainstExisting,
 };
