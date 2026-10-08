@@ -38,7 +38,7 @@ const getCounts = async (req, res) => {
         const [
             txCount, txDetailCount, stockLayerCount, stockLayerConsCount, stockBalanceCount,
             stockCountCount, stockCountDetailCount, periodClosingCount, openingBalanceBatchCount,
-            bomHeaderCount, priceListCount, itemCount, itemCategoryCount, uomCount, warehouseCount,
+            bomHeaderCount, priceListCount, priceChangeHeaderCount, itemCount, itemCategoryCount, uomCount, warehouseCount,
             locationCount, glAccountSetupCount,
         ] = await Promise.all([
             _countTable(req.dbPool, 'im_transaction'),
@@ -52,6 +52,7 @@ const getCounts = async (req, res) => {
             _countTable(req.dbPool, 'im_opening_balance_batch'),
             _countTable(req.dbPool, 'im_bom_header'),
             _countTable(req.dbPool, 'im_price_list'),
+            _countTable(req.dbPool, 'im_price_change_header'),
             _countTable(req.dbPool, 'im_item'),
             _countTable(req.dbPool, 'im_item_category'),
             _countTable(req.dbPool, 'im_uom'),
@@ -111,6 +112,7 @@ const getCounts = async (req, res) => {
             im_doc_number_rows:         imDocCount,
             im_bom_header:              bomHeaderCount,
             im_price_list:              priceListCount,
+            im_price_change_header:     priceChangeHeaderCount,
             im_item:                    itemCount,
             im_item_category:           itemCategoryCount,
             im_uom:                     uomCount,
@@ -137,6 +139,7 @@ const resetTransactions = async (req, res) => {
         deleteTransactions = true,
         resetDocNumbers = false,
         resetBom = false,
+        resetPriceChange = false,
         resetPriceList = false,
         resetItems = false,
         resetItemCategories = false,
@@ -229,7 +232,26 @@ const resetTransactions = async (req, res) => {
             });
         }
 
+        // ธุรกรรมการเปลี่ยนแปลงราคา (im_price_change_header/detail) — im_price_list_detail.source_price_change_id
+        // อ้างอิง im_price_change_header แบบไม่มี CASCADE (แค่ trace ย้อนกลับ ไม่ใช่ความสัมพันธ์ parent-child จริง)
+        // ต้องล้างคอลัมน์นี้ก่อนเสมอ ไม่เช่นนั้นจะลบ header ไม่ได้ — ล้างแยกจาก resetPriceList ด้านล่างเพราะอยากให้
+        // ลบ "ธุรกรรม" กับ "ราคาที่มีผลแล้ว" เป็นอิสระจากกันได้ (ไม่บังคับว่าเลือกอันหนึ่งต้องเลือกอีกอันด้วย)
+        if (resetPriceChange) {
+            await runStep('im_price_change', async () => {
+                await client.query(`
+                    UPDATE im_price_list_detail SET source_price_change_id = NULL
+                    WHERE source_price_change_id IS NOT NULL
+                `);
+                const d = await client.query(`DELETE FROM im_price_change_detail RETURNING id`);
+                const h = await client.query(`DELETE FROM im_price_change_header RETURNING id`);
+                deleted.im_price_change_detail = d.rowCount;
+                deleted.im_price_change_header = h.rowCount;
+            });
+        }
+
         // ราคาขาย (Price List) — im_price_list_detail.item_id อ้างอิง im_item แบบไม่มี CASCADE เช่นกัน
+        // im_price_change_header.price_list_id อ้างอิง im_price_list แบบ NOT NULL ไม่มี CASCADE ด้วย — ถ้ายังมี
+        // ธุรกรรมเปลี่ยนแปลงราคาอ้างอิงลิสต์นี้อยู่ (ไม่ได้เลือก resetPriceChange ด้วย) ขั้นตอนนี้จะลบไม่ได้
         if (resetPriceList) {
             await runStep('im_price_list', async () => {
                 const d = await client.query(`DELETE FROM im_price_list_detail RETURNING id`);

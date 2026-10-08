@@ -5,15 +5,18 @@ const { generateNextCode } = require('./imItemRunningController');
 const { generateNextCodeForCategory } = require('./imItemCategoryController');
 const imUomConversion = require('./imUomConversionController');
 const imItemWarehouse = require('./imItemWarehouseController');
+const { ensureImPriceListTable } = require('./imPriceListController');
 
 const upload = multer({ storage: multer.memoryStorage() });
 
 const ITEM_TYPES = ['STOCK', 'SERVICE', 'NON_STOCK'];
 const COSTING_METHODS = ['FIFO', 'AVG', 'STANDARD', 'SPECIFIC'];
+const PRICE_TYPES = ['STANDARD', 'PROMOTION'];
 const YES_VALUES = ['y', 'yes', 'true', '1', 'ใช่'];
 
 // ---------------------------------------------------------------------------
-// Template sheet definitions — 1 sheet ต่อหัวข้อใน im_item_detail_widget
+// Template sheet definitions — 1 sheet ต่อหัวข้อใน im_item_detail_widget (ยกเว้น sheet สุดท้าย "ตารางราคา" ซึ่ง
+// เป็นการตั้งราคาตั้งต้นให้สินค้าที่นำเข้า ไม่ได้อยู่ใน im_item_detail_widget)
 // ทุก sheet (ยกเว้น "ข้อมูลพื้นฐาน") ใช้ old_item_code เป็นคอลัมน์แรกเพื่อเชื่อม
 // ข้อมูลกับสินค้าใน sheet "ข้อมูลพื้นฐาน"
 // ---------------------------------------------------------------------------
@@ -82,7 +85,44 @@ const TEMPLATE_SHEETS = [
       { key: 'expense_account_code',   label: 'รหัสบัญชีค่าใช้จ่าย',                             required: false, example: '5510' },
     ],
   },
+  {
+    // ตั้งราคาตั้งต้นให้สินค้าที่นำเข้าใหม่ (เขียนลง im_price_list_detail ของตารางราคาที่มีอยู่แล้วในระบบ) — ไม่ได้
+    // สร้างตารางราคาใหม่ sheet นี้ สร้างได้เฉพาะบรรทัดราคาของสินค้าที่อยู่ใน sheet "ข้อมูลพื้นฐาน" เดียวกันนี้เท่านั้น
+    key: 'price_list',
+    name: 'ตารางราคา',
+    columns: [
+      { key: 'old_item_code',   label: 'รหัสสินค้าเก่า — เชื่อมกับ sheet ข้อมูลพื้นฐาน',           required: true,  example: 'IA0001' },
+      { key: 'price_list_code', label: 'รหัสตารางราคา (ต้องมีอยู่แล้วในระบบ)',                     required: true,  example: 'WSL1' },
+      { key: 'uom_code',        label: 'รหัสหน่วยนับ (ว่าง = ใช้ได้ทุกหน่วยของสินค้า, ไม่ว่างต้องเป็นหน่วยหลักหรือหน่วยทางเลือกของสินค้านี้)', required: false, example: '' },
+      { key: 'min_qty',         label: 'จำนวนขั้นต่ำ',                                             required: false, example: '0' },
+      { key: 'unit_price_fc',   label: 'ราคาต่อหน่วย',                                            required: true,  example: '100' },
+      { key: 'price_type',      label: `ชนิดราคา (${PRICE_TYPES.join('/')})`,                      required: false, example: 'STANDARD' },
+      { key: 'effective_from',  label: 'มีผลตั้งแต่ (YYYY-MM-DD)',                                 required: false, example: '' },
+      { key: 'effective_to',    label: 'มีผลถึง (YYYY-MM-DD)',                                     required: false, example: '' },
+    ],
+  },
 ];
+
+// หาคู่บรรทัดราคาของสินค้าเดียวกันที่ price_list_id/uom_id/price_type/min_qty เดียวกันแต่ช่วงวันที่มีผลคาบเกี่ยวกัน —
+// มิเรอร์ตรรกะเดียวกับ findOverlappingPair ใน imPriceListController.js (ที่นั่นกลุ่มตาม item_id เพราะ details ทั้ง
+// ชุดอยู่ใน price_list เดียวกันแน่ๆ ส่วนที่นี่ item ถูก fix ไว้แล้วจาก sheet เดียวกัน จึงกลุ่มตาม price_list_id แทน)
+const rangesOverlap = (aFrom, aTo, bFrom, bTo) => {
+  const aStart = aFrom || '0001-01-01', aEnd = aTo || '9999-12-31';
+  const bStart = bFrom || '0001-01-01', bEnd = bTo || '9999-12-31';
+  return aStart <= bEnd && bStart <= aEnd;
+};
+const findPriceLineOverlap = (lines) => {
+  for (let i = 0; i < lines.length; i++) {
+    for (let j = i + 1; j < lines.length; j++) {
+      const a = lines[i], b = lines[j];
+      if (a.price_list_id === b.price_list_id && a.price_type === b.price_type &&
+          Number(a.min_qty) === Number(b.min_qty) && (a.uom_id || null) === (b.uom_id || null)) {
+        if (rangesOverlap(a.effective_from, a.effective_to, b.effective_from, b.effective_to)) return [a, b];
+      }
+    }
+  }
+  return null;
+};
 
 // GET /im_item/import/template
 const getTemplate = (req, res) => {
@@ -153,6 +193,24 @@ const buildCodeMap = (rows, codeField) => {
   return map;
 };
 
+// แปลงเซลล์วันที่ (Date object จาก cellDates:true หรือ string 'YYYY-MM-DD'/'DD/MM/YYYY') -> 'YYYY-MM-DD' หรือ null
+const parseDateCell = (val) => {
+  if (val instanceof Date) {
+    if (isNaN(val.getTime())) return null;
+    const y = val.getFullYear();
+    const m = String(val.getMonth() + 1).padStart(2, '0');
+    const d = String(val.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  }
+  const s = String(val ?? '').trim();
+  if (!s) return null;
+  let m = s.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})$/);
+  if (m) return `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
+  m = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/);
+  if (m) return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+  return null;
+};
+
 // ---------------------------------------------------------------------------
 // POST /im_item/import/validate  (multipart file)
 // ---------------------------------------------------------------------------
@@ -163,13 +221,13 @@ const validateFile = [
 
     let workbook;
     try {
-      workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
+      workbook = XLSX.read(req.file.buffer, { type: 'buffer', cellDates: true });
     } catch (err) {
       return res.status(500).json({ message: 'ไม่สามารถอ่านไฟล์ได้: ' + err.message });
     }
 
     try {
-      const [generalDef, uomConvDef, itemWhDef, glAccountDef] = TEMPLATE_SHEETS;
+      const [generalDef, uomConvDef, itemWhDef, glAccountDef, priceListDef] = TEMPLATE_SHEETS;
 
       const general = readSheet(workbook, generalDef, { required: true });
       if (!general.present || general.rows.length === 0) {
@@ -180,9 +238,10 @@ const validateFile = [
       const uomConversions = readSheet(workbook, uomConvDef);
       const itemWarehouses = readSheet(workbook, itemWhDef);
       const glAccounts     = readSheet(workbook, glAccountDef);
+      const priceListRows  = readSheet(workbook, priceListDef);
 
       // Pre-fetch lookup tables
-      const [categoriesR, uomsR, warehousesR, locationsR, accountsR, runningR, vatRatesR] = await Promise.all([
+      const [categoriesR, uomsR, warehousesR, locationsR, accountsR, runningR, vatRatesR, priceListsR] = await Promise.all([
         req.dbPool.query(`SELECT id, category_code, is_auto_number FROM im_item_category WHERE is_active = true AND category_type = 'CATEGORY'`),
         req.dbPool.query(`SELECT id, uom_code FROM im_uom WHERE is_active = true`),
         req.dbPool.query(`SELECT id, warehouse_code FROM im_warehouse WHERE is_active = true`),
@@ -190,11 +249,13 @@ const validateFile = [
         req.dbPool.query(`SELECT id, account_code FROM gl_account WHERE is_active = true`),
         req.dbPool.query(`SELECT is_auto_numbering FROM im_item_running LIMIT 1`),
         req.dbPool.query(`SELECT DISTINCT vat_code FROM cd_vat_rate WHERE is_active = true`),
+        req.dbPool.query(`SELECT id, price_list_code FROM im_price_list WHERE is_active = true`),
       ]);
       const categoryMap  = buildCodeMap(categoriesR.rows, 'category_code');
       const uomMap        = buildCodeMap(uomsR.rows, 'uom_code');
       const warehouseMap  = buildCodeMap(warehousesR.rows, 'warehouse_code');
       const accountMap    = buildCodeMap(accountsR.rows, 'account_code');
+      const priceListMap  = buildCodeMap(priceListsR.rows, 'price_list_code');
       const vatCodeSet    = new Set(vatRatesR.rows.map(r => String(r.vat_code).toUpperCase()));
       const firstActiveVatCode = vatRatesR.rows.length > 0 ? String(vatRatesR.rows[0].vat_code).toUpperCase() : null;
       const locationMap   = {};
@@ -342,6 +403,7 @@ const validateFile = [
           expense_account_code:   null, expense_account_id:   null,
           uom_conversions:        [],
           item_warehouses:        [],
+          price_lines:            [],
         };
         item.is_purchase_item  = get('is_purchase_item')  ? parseBool(get('is_purchase_item'))  : true;
         item.is_sales_item     = get('is_sales_item')     ? parseBool(get('is_sales_item'))     : true;
@@ -489,10 +551,107 @@ const validateFile = [
         resolveAccount('expense_account_code',   'expense_account_code',   'expense_account_id');
       }
 
+      // ── Sheet 5: ตารางราคา (ตั้งราคาตั้งต้นให้สินค้าที่นำเข้าใหม่ ไม่ได้สร้างตารางราคาใหม่) ─────────────
+      for (let i = 0; i < priceListRows.rows.length; i++) {
+        const row    = priceListRows.rows[i];
+        const rowNum = priceListRows.rowNums[i];
+        const found  = findItem(priceListDef, row, priceListRows.colIdx, rowNum);
+        if (!found) continue;
+        const { item } = found;
+        const get = (key) => String(row[priceListRows.colIdx[key]] ?? '').trim();
+
+        const priceListCode = get('price_list_code').toUpperCase();
+        if (!priceListCode) {
+          item.__rowErrors.push({ column: `${priceListDef.name}: price_list_code`, message: 'จำเป็นต้องระบุรหัสตารางราคา' });
+          continue;
+        }
+        const priceListRow = priceListMap[priceListCode];
+        if (!priceListRow) {
+          item.__rowErrors.push({ column: `${priceListDef.name}: price_list_code`, message: `ไม่พบตารางราคา "${priceListCode}"` });
+          continue;
+        }
+
+        // หน่วยนับของบรรทัดราคา ถ้าระบุมาต้องเป็นหน่วยหลักหรือหนึ่งในหน่วยทางเลือกของสินค้านี้เท่านั้น (มิเรอร์การ
+        // จำกัดตัวเลือกหน่วยนับในฟอร์มเพิ่ม/แก้ไขบรรทัดราคาของหน้าจอตารางราคา — ดู im_price_list_detail_widget.dart)
+        let uomId = null;
+        const uomCode = get('uom_code').toUpperCase();
+        if (uomCode) {
+          const uom = uomMap[uomCode];
+          if (!uom) {
+            item.__rowErrors.push({ column: `${priceListDef.name}: uom_code`, message: `ไม่พบหน่วยนับ "${uomCode}"` });
+          } else if (uomCode !== item.base_uom_code && !item.uom_conversions.some(c => c.uom_id === uom.id)) {
+            item.__rowErrors.push({ column: `${priceListDef.name}: uom_code`, message: `หน่วยนับ "${uomCode}" ไม่ใช่หน่วยหลักหรือหน่วยทางเลือกของสินค้านี้` });
+          } else {
+            uomId = uom.id;
+          }
+        }
+
+        let minQty = 0;
+        const minQtyStr = get('min_qty');
+        if (minQtyStr) {
+          const n = Number(minQtyStr);
+          if (isNaN(n) || n < 0) item.__rowErrors.push({ column: `${priceListDef.name}: min_qty`, message: 'จำนวนขั้นต่ำต้องเป็นตัวเลขไม่ติดลบ' });
+          else minQty = n;
+        }
+
+        let unitPriceFc = 0;
+        const priceStr = get('unit_price_fc');
+        if (!priceStr) {
+          item.__rowErrors.push({ column: `${priceListDef.name}: unit_price_fc`, message: 'จำเป็นต้องระบุราคาต่อหน่วย' });
+        } else {
+          const n = Number(priceStr);
+          if (isNaN(n) || n < 0) item.__rowErrors.push({ column: `${priceListDef.name}: unit_price_fc`, message: 'ราคาต่อหน่วยต้องเป็นตัวเลขไม่ติดลบ' });
+          else unitPriceFc = n;
+        }
+
+        const priceTypeRaw = get('price_type').toUpperCase();
+        const priceType = priceTypeRaw || 'STANDARD';
+        if (priceTypeRaw && !PRICE_TYPES.includes(priceTypeRaw)) {
+          item.__rowErrors.push({ column: `${priceListDef.name}: price_type`, message: `ชนิดราคาต้องเป็นหนึ่งใน ${PRICE_TYPES.join(', ')}` });
+        }
+
+        // วันที่มีผล — อ่านจากเซลล์ดิบ (ไม่ผ่าน get() ที่ String()-ify ทิ้งรูปแบบ Date object ของ Excel ไปแล้ว)
+        let effectiveFrom = null, effectiveTo = null;
+        const fromRaw = row[priceListRows.colIdx['effective_from']];
+        const toRaw   = row[priceListRows.colIdx['effective_to']];
+        if (String(fromRaw ?? '').trim()) {
+          effectiveFrom = parseDateCell(fromRaw);
+          if (!effectiveFrom) item.__rowErrors.push({ column: `${priceListDef.name}: effective_from`, message: 'รูปแบบวันที่ไม่ถูกต้อง' });
+        }
+        if (String(toRaw ?? '').trim()) {
+          effectiveTo = parseDateCell(toRaw);
+          if (!effectiveTo) item.__rowErrors.push({ column: `${priceListDef.name}: effective_to`, message: 'รูปแบบวันที่ไม่ถูกต้อง' });
+        }
+        if (effectiveFrom && effectiveTo && effectiveFrom > effectiveTo) {
+          item.__rowErrors.push({ column: `${priceListDef.name}: effective_to`, message: 'วันที่มีผลถึงต้องไม่น้อยกว่าวันที่มีผลตั้งแต่' });
+        }
+
+        item.price_lines.push({
+          price_list_id:   priceListRow.id,
+          price_list_code: priceListCode,
+          uom_id:           uomId,
+          uom_code:         uomCode || null,
+          min_qty:          minQty,
+          unit_price_fc:    unitPriceFc,
+          price_type:       priceType,
+          effective_from:   effectiveFrom,
+          effective_to:     effectiveTo,
+        });
+      }
+
       // ── สรุปผล ────────────────────────────────────────────────────────────
       const validatedRows = [];
       for (const code of order) {
         const item = items.get(code);
+        if (item.price_lines.length > 1) {
+          const pair = findPriceLineOverlap(item.price_lines);
+          if (pair) {
+            item.__rowErrors.push({
+              column: priceListDef.name,
+              message: `ตารางราคา "${pair[0].price_list_code}" มีสองบรรทัดราคา (จำนวนขั้นต่ำ ${pair[0].min_qty}) ที่ช่วงวันที่มีผลคาบเกี่ยวกัน`,
+            });
+          }
+        }
         if (item.__rowErrors.length > 0) {
           errors.push({ row: item.__rowNum, itemCode: item.old_item_code || item.item_code || '(อัตโนมัติ)', errors: item.__rowErrors });
         } else {
@@ -534,6 +693,7 @@ const confirmImport = async (req, res) => {
   try {
     await client.query('BEGIN');
     await client.query(`ALTER TABLE im_item ADD COLUMN IF NOT EXISTS is_code_auto_generated BOOLEAN NOT NULL DEFAULT false`).catch(() => {});
+    await ensureImPriceListTable(client);
     for (let idx = 0; idx < rows.length; idx++) {
       const r = rows[idx];
       const savepointName = `sp_row_${idx}`;
@@ -594,6 +754,16 @@ const confirmImport = async (req, res) => {
         const newId = result.rows[0].id;
         await imUomConversion.replaceForItem(client, newId, r.uom_conversions);
         await imItemWarehouse.replaceForItem(client, newId, r.item_warehouses);
+
+        for (const line of (r.price_lines || [])) {
+          await client.query(
+            `INSERT INTO im_price_list_detail
+                (price_list_id, item_id, uom_id, min_qty, unit_price_fc, price_type, effective_from, effective_to, created_by, updated_by)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)`,
+            [line.price_list_id, newId, line.uom_id || null, line.min_qty ?? 0, line.unit_price_fc ?? 0,
+             line.price_type || 'STANDARD', line.effective_from || null, line.effective_to || null, userName]
+          );
+        }
 
         await client.query(`RELEASE SAVEPOINT ${savepointName}`);
         imported++;
