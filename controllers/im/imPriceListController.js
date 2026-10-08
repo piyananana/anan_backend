@@ -222,8 +222,10 @@ const fetchByItem = async (req, res) => {
 // ชั้น 2 การันตีด้วย partial unique index ใน ensureImPriceListTable) จากนั้นในลิสต์ที่เลือกได้ หา min_qty ที่
 // สูงสุดที่ไม่เกิน qty ที่ขอ, uom_id ตรงกับที่ระบุ (บรรทัดที่ uom_id เป็น NULL ถือว่าใช้ได้ทุกหน่วยนับ แต่บรรทัดที่
 // uom_id ตรงเป๊ะมาก่อนเสมอถ้ามีให้เลือก), และ effective_from/to ครอบคลุม docDate — คืน null ถ้าไม่พบเลย (ผู้เรียก
-// ต้องรองรับการกรอกราคาเองได้เสมอ ไม่ใช่ error) เรียกจากทั้งหน้าจอ PO (list_type='PURCHASE', vendorId) และ SO/Quote
-// (list_type='SALES', customerId)
+// ต้องรองรับการกรอกราคาเองได้เสมอ ไม่ใช่ error) เรียกจากหน้าจอ PO/SO/Quote (list_type='PURCHASE'+vendorId หรือ
+// 'SALES'+customerId ตามลำดับ) ตอนเพิ่มรายการ และจาก im_transaction_detail_widget.dart ตอนเพิ่มรายการตรง (ไม่ผ่าน
+// picker PO/SO) ให้ GRN/DLN Billing ('11'/'12' ฝั่งซื้อ, '31'/'32' ฝั่งขาย) เท่านั้น — เอกสาร IM ประเภทอื่นไม่ตั้ง
+// หนี้ AP/AR จากราคานี้เลย (ไม่มีช่องราคาให้กรอก หรือดึงราคามาจาก PO/SO/เอกสารต้นฉบับที่อ้างอิงอยู่แล้ว)
 const resolveItemPrice = async (client, { itemId, listType, vendorId, customerId, uomId, qty, docDate }) => {
     const partyTable = listType === 'PURCHASE' ? 'ap_vendor' : 'ar_customer';
     const partyId = listType === 'PURCHASE' ? vendorId : customerId;
