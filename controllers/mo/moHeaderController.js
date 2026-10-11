@@ -12,6 +12,7 @@
 'use strict';
 
 const { generateDocNo } = require('../im/imTransactionController');
+const { fetchSetupByDocCode } = require('../im/imGlAccountSetupController');
 const { ensureImItemTable } = require('../im/imItemController');
 const { ensureImUomTable } = require('../im/imUomController');
 const { ensureImWarehouseTable } = require('../im/imWarehouseController');
@@ -61,6 +62,9 @@ const ensureMoHeaderTable = async (client) => {
     // widen costing_mode for DBs where mo_header was created before this column was VARCHAR(20) —
     // 'OVERHEAD_PERCENT' is 16 chars, didn't fit the original VARCHAR(10)
     await client.query(`ALTER TABLE mo_header ALTER COLUMN costing_mode TYPE VARCHAR(20)`).catch(() => {});
+    // Closed (ปิดใบสั่งผลิตพร้อม WIP true-up) — ดู closeTransaction ด้านล่าง
+    await client.query(`ALTER TABLE mo_header ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ`).catch(() => {});
+    await client.query(`ALTER TABLE mo_header ADD COLUMN IF NOT EXISTS closed_by VARCHAR(100)`).catch(() => {});
 
     await client.query(`
         CREATE TABLE IF NOT EXISTS mo_component_detail (
@@ -446,6 +450,101 @@ const cancelTransaction = async (req, res) => {
     } finally { client.release(); }
 };
 
+// --- ปิดใบสั่งผลิต (Close MO / WIP True-up) — Completed -> Closed เท่านั้น ---
+// wip_balance_lc ที่เหลืออยู่ตอนนี้คือต้นทุนแปรรูป (overhead%/routing hours) ที่ถูก "พักไว้ที่ WIP" ตอนรับสินค้า
+// เข้าคลัง (Dr สินค้า / Cr WIP เต็มมูลค่ารวมต้นทุนแปรรูป) แต่ไม่มี leg ใดเคย Dr WIP ด้วยต้นทุนแปรรูปนี้มาก่อนเลย
+// (ดู comment ที่ computeMoReceiptUnitCost — เป็น simplification ที่ตั้งใจไว้แต่แรก) Close MO จึงต้อง Post GL อีก
+// รายการเพื่อเกลี่ย WIP ของ MO นี้ให้เป็น 0 โดยอีกฝั่งลงที่ variance_account_id (ใช้ชุดบัญชีเดียวกับ MOR เพราะเป็น
+// บัญชีผลต่างต้นทุนการผลิตชุดเดียวกัน ไม่แยกตั้งค่าใหม่) หลังจาก Closed แล้ว Issue/Receipt/Time Log ทั้งหมดจะถูก
+// ปฏิเสธอัตโนมัติอยู่แล้วเพราะ validateMoComponentIssueQty/validateMoOutputReceiptQty/logOperationTime ข้างบน
+// ทั้งหมดเช็ค mo_header.status ต้องเป็น Released/InProgress เท่านั้น — ไม่ต้องเพิ่ม guard ซ้ำที่นี่
+const closeTransaction = async (req, res) => {
+    const { id } = req.params;
+    const { close_date } = req.body || {};
+    const userName = req.headers.username || null;
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        const existing = await client.query(`SELECT * FROM mo_header WHERE id=$1 FOR UPDATE`, [id]);
+        if (existing.rows.length === 0) throw new Error('Not found');
+        const mo = existing.rows[0];
+        if (mo.status !== 'Completed') {
+            throw new Error('ปิดใบสั่งผลิตได้เฉพาะเอกสารที่รับสินค้าครบตามแผนแล้ว (สถานะ Completed) เท่านั้น');
+        }
+
+        const residual = Number(mo.wip_balance_lc) || 0;
+        const closeDate = close_date || new Date().toISOString().slice(0, 10);
+        let glEntryId = null;
+
+        if (Math.abs(residual) > 0.0001) {
+            const setup = await fetchSetupByDocCode(client, 'MOR');
+            if (!setup || !setup.wip_account_id || !setup.variance_account_id || !setup.gl_doc_id) {
+                throw new Error('ยังไม่ได้ตั้งค่าบัญชีงานระหว่างผลิต (wip_account_id) และบัญชีผลต่างต้นทุนการผลิต (variance_account_id) ใน im_gl_account_setup ของ MOR ให้ครบก่อนปิดใบสั่งผลิตได้');
+            }
+
+            const periodRes = await client.query(
+                `SELECT id FROM gl_posting_period WHERE $1::date BETWEEN period_start_date AND period_end_date AND gl_status = 'OPEN' AND im_status != 'CLOSED' LIMIT 1`,
+                [closeDate]
+            );
+            if (periodRes.rows.length === 0) throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่ปิด ${closeDate}`);
+            const periodId = periodRes.rows[0].id;
+
+            let createdByUserId = null;
+            if (userName) {
+                const userRes = await client.query(`SELECT id FROM sa_user WHERE user_name = $1 LIMIT 1`, [userName]);
+                if (userRes.rows.length > 0) createdByUserId = userRes.rows[0].id;
+            }
+
+            let glDocNo = await generateDocNo(client, setup.gl_doc_id, closeDate, mo.branch_id || null);
+            if (!glDocNo) glDocNo = `GL-CLOSE-${mo.doc_no}`;
+
+            const amount = Math.abs(residual);
+            // residual < 0 = WIP ถูก Cr ไปมากกว่าที่เคย Dr (ต้นทุนแปรรูปที่ไม่เคยเข้า WIP) -> Dr WIP / Cr ผลต่าง
+            // residual > 0 = WIP ยังเหลือค้าง (เบิกเข้าแล้วแต่ยังไม่ได้ตัดออกเท่าที่ควร) -> Dr ผลต่าง / Cr WIP
+            const wipDebit = residual < 0 ? amount : 0;
+            const wipCredit = residual > 0 ? amount : 0;
+            const varianceDebit = residual > 0 ? amount : 0;
+            const varianceCredit = residual < 0 ? amount : 0;
+            const description = `ปิดใบสั่งผลิต ${mo.doc_no} - ปรับปรุงยอดคงเหลือ WIP`;
+
+            const glHeaderRes = await client.query(`
+                INSERT INTO gl_entry_header
+                (doc_id, doc_no, doc_date, posting_date, period_id, description,
+                 currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
+                 created_by, ref_doc_id, ref_doc_no)
+                VALUES ($1,$2,$3,$3,$4,$5,1,1,'Posted',$6,$6,0,0,$7,$8,$9)
+                RETURNING id
+            `, [
+                setup.gl_doc_id, glDocNo, closeDate, periodId, description,
+                amount, createdByUserId, mo.doc_id, mo.doc_no,
+            ]);
+            glEntryId = glHeaderRes.rows[0].id;
+
+            await client.query(`
+                INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
+                VALUES ($1,1,$2,$3,$4,$5,0,0)
+            `, [glEntryId, setup.wip_account_id, description, wipDebit, wipCredit]);
+            await client.query(`
+                INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
+                VALUES ($1,2,$2,$3,$4,$5,0,0)
+            `, [glEntryId, setup.variance_account_id, description, varianceDebit, varianceCredit]);
+        }
+
+        await client.query(`
+            UPDATE mo_header SET status='Closed', wip_balance_lc=0, closed_at=NOW(), closed_by=$1, updated_by=$1, updated_at=NOW()
+            WHERE id=$2
+        `, [userName, id]);
+
+        await client.query('COMMIT');
+        const full = await fetchRowById(req.dbPool, id);
+        res.status(200).json({ ...full, close_gl_entry_id: glEntryId });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error closing mo_header:', error);
+        res.status(error.message === 'Not found' ? 404 : 500).json({ message: error.message || 'Internal server error' });
+    } finally { client.release(); }
+};
+
 // --- 5. Delete (Draft only) ---
 const deleteTransaction = async (req, res) => {
     const { id } = req.params;
@@ -676,7 +775,7 @@ const logOperationTime = async (req, res) => {
 
 module.exports = {
     ensureMoHeaderTable, fetchRows, fetchRow, createTransaction, updateTransaction,
-    releaseTransaction, cancelTransaction, deleteTransaction,
+    releaseTransaction, cancelTransaction, closeTransaction, deleteTransaction,
     validateMoComponentIssueQty, validateMoOutputReceiptQty, refreshMoStatus,
     computeMoReceiptUnitCost, logOperationTime,
 };

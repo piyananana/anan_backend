@@ -27,6 +27,7 @@ router.post('/mo_header',            moHeaderController.createTransaction);
 router.put('/mo_header/:id',         moHeaderController.updateTransaction);
 router.put('/mo_header/:id/release', moHeaderController.releaseTransaction);
 router.put('/mo_header/:id/cancel',  moHeaderController.cancelTransaction);
+router.put('/mo_header/:id/close',   moHeaderController.closeTransaction);
 router.delete('/mo_header/:id',      moHeaderController.deleteTransaction);
 // บันทึกเวลาปฏิบัติงาน (เฉพาะ MO costing_mode='ROUTING') — ไม่ใช่ im_transaction ไม่มีผล GL/สต็อก
 router.put('/mo_header/:moId/operations/:opId/log_time', moHeaderController.logOperationTime);
