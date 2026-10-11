@@ -25,6 +25,8 @@ const ensureImTransactionTable = async (client) => {
     await require('../po/poTransactionController').ensurePoTransactionTable(client);
     // เหตุผลเดียวกันฝั่งขาย — fetchRowById's LEFT JOIN so_transaction (ref_so_id) ต้องมีตารางนี้อยู่ก่อนเสมอ
     await require('../so/soTransactionController').ensureSoTransactionTable(client);
+    // เหตุผลเดียวกัน — fetchRowById's LEFT JOIN mo_header (ref_mo_id) ต้องมีตารางนี้อยู่ก่อนเสมอ
+    await require('../mo/moHeaderController').ensureMoHeaderTable(client);
     await client.query(`
         CREATE TABLE IF NOT EXISTS im_transaction (
             id              SERIAL PRIMARY KEY,
@@ -123,6 +125,16 @@ const ensureImTransactionTable = async (client) => {
     // ข้างบนทุกประการ ฝั่งขาย ดู validateSoDeliverableQty/refreshSoStatus ใน soTransactionController.js
     await client.query(`ALTER TABLE im_transaction ADD COLUMN IF NOT EXISTS ref_so_id INTEGER`).catch(() => {});
     await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS ref_so_detail_id INTEGER`).catch(() => {});
+
+    // สำหรับ '90' (เบิกวัตถุดิบเข้าผลิต) / '95' (รับสินค้าเข้าคลังจากการผลิต) ที่อ้างอิงใบสั่งผลิต (MO, sys_module=
+    // '61') — มิเรอร์ ref_po_id/ref_po_detail_id ทุกประการ header ref_mo_id เก็บไว้เพื่อความสะดวกในการแสดงผล/กรอง
+    // (ธุรกรรมหนึ่งใบอ้างอิง MO ใบเดียวเสมอ ไม่เหมือน GRN ที่รวมได้หลาย PO) ส่วนการตรวจ/ติดตามจำนวนคงเหลือที่เบิก/
+    // รับได้จริงคำนวณระดับบรรทัดเสมอ (ref_mo_component_detail_id สำหรับ '90', ref_mo_output_detail_id สำหรับ '95'
+    // — บรรทัดหนึ่งอ้างอิงได้แค่ฝั่งเดียวเท่านั้น) ดู validateMoComponentIssueQty/validateMoOutputReceiptQty/
+    // refreshMoStatus ใน moHeaderController.js สำหรับตรรกะการตรวจ+อัปเดตสถานะ MO
+    await client.query(`ALTER TABLE im_transaction ADD COLUMN IF NOT EXISTS ref_mo_id INTEGER`).catch(() => {});
+    await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS ref_mo_component_detail_id INTEGER`).catch(() => {});
+    await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS ref_mo_output_detail_id INTEGER`).catch(() => {});
 
     // VAT ต่อบรรทัด — ใช้เฉพาะประเภทเอกสารที่สร้าง/อ้างอิงใบกำกับ AP/AR อัตโนมัติ ('11'/'12'/'15'/'20'/'25'/'31'/
     // '32'/'35'/'40'/'45') อ้างอิง cd_vat_rate เดียวกับที่ AR/AP ใช้ (vat_type=vat_code, vat_rate=snapshot ณ ตอนโพสต์
@@ -529,6 +541,13 @@ const resolveCounterAccount = (sysDocType, setup) => {
                 throw new Error(`ยังไม่ได้ตั้งค่าบัญชีต้นทุน (cogs_account_id) ใน im_gl_account_setup สำหรับประเภทเอกสารนี้`);
             }
             return { accountId: Number(setup.cogs_account_id), label: 'เบิกใช้สินค้า' };
+        case '90': // MOI — เบิกวัตถุดิบเข้าผลิต: พักไว้ที่งานระหว่างผลิต (WIP)
+        case '95': // MOR — รับสินค้าเข้าคลังจากการผลิต: ตัดออกจากงานระหว่างผลิต (WIP) — ทิศทาง Dr/Cr มาจากเครื่องหมาย
+            // ของ qty ใน postGlEntry เอง ('90' ติดลบ=ลดสต็อก/เพิ่ม WIP, '95' บวก=เพิ่มสต็อก/ลด WIP) เหมือน '30'/'35'/'40' ข้างบน
+            if (!setup.wip_account_id) {
+                throw new Error(`ยังไม่ได้ตั้งค่าบัญชีงานระหว่างผลิต (wip_account_id) ใน im_gl_account_setup สำหรับประเภทเอกสารนี้`);
+            }
+            return { accountId: Number(setup.wip_account_id), label: 'งานระหว่างผลิต (WIP)' };
         case '10': // GRN — รับสินค้า (ไม่มีเลขที่อ้างอิง): พักไว้รอ AP ตั้งหนี้เอง
             if (!setup.grir_account_id) {
                 throw new Error(`ยังไม่ได้ตั้งค่าบัญชีพักรอใบกำกับ (grir_account_id) ใน im_gl_account_setup สำหรับประเภทเอกสารนี้`);
@@ -1416,6 +1435,7 @@ const postDetailLines = async (client, headerId, header, docNo) => {
     // (หลัง server startup ทั้งสองไฟล์โหลดเสร็จสมบูรณ์แล้วแน่นอน) ไม่ใช่ตอน import
     const { validatePoReceivableQty, refreshPoStatus } = require('../po/poTransactionController');
     const { validateSoDeliverableQty, refreshSoStatus } = require('../so/soTransactionController');
+    const { validateMoComponentIssueQty, validateMoOutputReceiptQty, refreshMoStatus } = require('../mo/moHeaderController');
 
     const docTypeRes = await client.query(
         `SELECT sys_doc_type FROM sa_module_document WHERE doc_code=$1 AND sys_module='31' LIMIT 1`,
@@ -1427,6 +1447,7 @@ const postDetailLines = async (client, headerId, header, docNo) => {
     const updatedDetails = [];
     const touchedPoIds = new Set();
     const touchedSoIds = new Set();
+    const touchedMoIds = new Set();
     let totalQty = 0, totalValue = 0;
     for (const d of detailsRes.rows) {
         const itemRes = await client.query(`SELECT * FROM im_item WHERE id = $1`, [d.item_id]);
@@ -1483,6 +1504,20 @@ const postDetailLines = async (client, headerId, header, docNo) => {
                 refSoDetailId: d.ref_so_detail_id, requestedQty: Math.abs(varianceQty), customerId: header.customer_id,
             });
             touchedSoIds.add(soTransactionId);
+        }
+        // '90' (เบิกวัตถุดิบเข้าผลิต) ที่อ้างอิงบรรทัดส่วนประกอบ MO — มิเรอร์ GRN/PO block ข้างบนทุกประการ
+        if (sysDocType === '90' && d.ref_mo_component_detail_id) {
+            const { moHeaderId } = await validateMoComponentIssueQty(client, {
+                refMoComponentDetailId: d.ref_mo_component_detail_id, requestedQty: Math.abs(varianceQty),
+            });
+            touchedMoIds.add(moHeaderId);
+        }
+        // '95' (รับสินค้าเข้าคลังจากการผลิต) ที่อ้างอิงบรรทัดผลผลิต MO — มิเรอร์ DLN/SO block ข้างบนทุกประการ
+        if (sysDocType === '95' && d.ref_mo_output_detail_id) {
+            const { moHeaderId } = await validateMoOutputReceiptQty(client, {
+                refMoOutputDetailId: d.ref_mo_output_detail_id, requestedQty: Math.abs(varianceQty),
+            });
+            touchedMoIds.add(moHeaderId);
         }
         const valueLc = varianceQty * actualUnitCost;
         await client.query(`
@@ -1577,7 +1612,10 @@ const postDetailLines = async (client, headerId, header, docNo) => {
             await refreshSoStatus(client, soId);
         }
         return glEntryId;
-    } else if (sysDocType === '10' || sysDocType === '13' || mode !== 'PERIODIC') {
+    } else if (['10', '13', '90', '95'].includes(sysDocType) || mode !== 'PERIODIC') {
+        // '90'/'95' (เบิกวัตถุดิบเข้าผลิต/รับสินค้าเข้าคลังจากการผลิต) Post ที่นี่เสมอไม่ว่าโหมดใด มิเรอร์ '10'/'13'
+        // ทุกประการ — งานระหว่างผลิต (WIP) เป็นบัญชีคุมยอดที่ต้องขยับทันทีตามธุรกรรมจริง ไม่ใช่การตีมูลค่าสต็อกที่รอ
+        // คำนวณรวมตอนปิดงวดแบบ Periodic ได้ (ถ้าระงับไว้ ยอด wip_balance_lc ของใบสั่งผลิตจะไม่ sync กับ GL จริง)
         glEntryId = await postGlEntry(client, headerId, header, updatedDetails, docNo, sysDocType, mode);
     }
     await client.query(`
@@ -1590,6 +1628,9 @@ const postDetailLines = async (client, headerId, header, docNo) => {
     }
     for (const soId of touchedSoIds) {
         await refreshSoStatus(client, soId);
+    }
+    for (const moId of touchedMoIds) {
+        await refreshMoStatus(client, moId);
     }
     return glEntryId;
 };
@@ -1605,6 +1646,7 @@ const fetchRowById = async (pool, id) => {
                reft.doc_no AS ref_im_transaction_doc_no,
                refpo.doc_no AS ref_po_doc_no,
                refso.doc_no AS ref_so_doc_no,
+               refmo.doc_no AS ref_mo_doc_no,
                dim1.value_name_thai AS dim1_name, dim2.value_name_thai AS dim2_name, dim3.value_name_thai AS dim3_name,
                dim4.value_name_thai AS dim4_name, dim5.value_name_thai AS dim5_name
         FROM im_transaction t
@@ -1615,6 +1657,7 @@ const fetchRowById = async (pool, id) => {
         LEFT JOIN im_transaction reft ON reft.id = t.ref_im_transaction_id
         LEFT JOIN po_transaction refpo ON refpo.id = t.ref_po_id
         LEFT JOIN so_transaction refso ON refso.id = t.ref_so_id
+        LEFT JOIN mo_header refmo ON refmo.id = t.ref_mo_id
         LEFT JOIN gl_dimension_value dim1 ON dim1.id = t.dim1_id
         LEFT JOIN gl_dimension_value dim2 ON dim2.id = t.dim2_id
         LEFT JOIN gl_dimension_value dim3 ON dim3.id = t.dim3_id
@@ -1637,11 +1680,11 @@ const fetchRows = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await ensureImTransactionTable(client);
-        const { doc_code, status, warehouse_id, date_from, date_to, search } = req.query;
+        const { doc_code, status, warehouse_id, date_from, date_to, search, ref_mo_id } = req.query;
         let query = `
             SELECT t.id, t.doc_no, t.doc_date, t.status, t.warehouse_id,
                    w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
-                   t.total_qty, t.total_value_lc, t.ref_no, t.description,
+                   t.total_qty, t.total_value_lc, t.ref_no, t.description, t.ref_mo_id,
                    d.doc_code, d.doc_name_thai, d.doc_name_eng, d.sys_doc_type
             FROM im_transaction t
             JOIN sa_module_document d ON d.id = t.doc_id
@@ -1654,6 +1697,7 @@ const fetchRows = async (req, res) => {
         if (warehouse_id) { params.push(warehouse_id); query += ` AND t.warehouse_id = $${pi++}`; }
         if (date_from)    { params.push(date_from);    query += ` AND t.doc_date >= $${pi++}`; }
         if (date_to)      { params.push(date_to);      query += ` AND t.doc_date <= $${pi++}`; }
+        if (ref_mo_id)    { params.push(ref_mo_id);    query += ` AND t.ref_mo_id = $${pi++}`; }
         if (search) {
             params.push(`%${search.toUpperCase()}%`);
             query += ` AND (UPPER(t.doc_no) LIKE $${pi} OR UPPER(COALESCE(t.ref_no,'')) LIKE $${pi})`;
@@ -1779,7 +1823,7 @@ const fetchReturnableLines = async (req, res) => {
 //     ให้ resolve เอาเองว่าจะใช้ doc_code ไหนใต้มาตรฐานนี้ (เผื่อมีหลาย doc_code ต่อ sys_doc_type)
 const insertAndPostAdjustment = async (client, {
     docId, docCode, sysDocType, docNo, docDate, warehouseId, toWarehouseId, vendorId, customerId,
-    refNo, refDocId, refDocNo, refImTransactionId, refPoId, refSoId, description,
+    refNo, refDocId, refDocNo, refImTransactionId, refPoId, refSoId, refMoId, description,
     currencyId, currencyCode, exchangeRate,
     dim1Id, dim2Id, dim3Id, dim4Id, dim5Id, branchId, createdBy,
     lines, action,
@@ -1903,8 +1947,8 @@ const insertAndPostAdjustment = async (client, {
          vendor_id, vendor_code, vendor_name_th, customer_id, customer_code, customer_name_th,
          ref_no, ref_doc_id, ref_doc_no, ref_im_transaction_id, ref_po_id, ref_so_id, description, status,
          currency_id, currency_code, exchange_rate,
-         dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id, created_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
+         dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id, created_by, ref_mo_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32)
         RETURNING id
     `, [
         resolvedDocId, finalDocNo, resolvedDocCode, docDate, periodId, warehouseId, toWarehouseId || null,
@@ -1912,7 +1956,7 @@ const insertAndPostAdjustment = async (client, {
         refNo || null, refDocId || null, refDocNo || null, refImTransactionId || null, refPoId || null, refSoId || null, description || null, 'Draft',
         currencyId || null, currencyCode || 'THB', exchangeRate || 1,
         dim1Id || null, dim2Id || null, dim3Id || null, dim4Id || null, dim5Id || null,
-        branchId || null, createdBy || null,
+        branchId || null, createdBy || null, refMoId || null,
     ]);
     const newHeaderId = hRes.rows[0].id;
 
@@ -1926,14 +1970,16 @@ const insertAndPostAdjustment = async (client, {
         await client.query(`
             INSERT INTO im_transaction_detail
             (header_id, line_no, item_id, item_code, item_name, location_id, to_location_id, lot_no, serial_no, uom_id,
-             system_qty, counted_qty, unit_cost, unit_cost_fc, unit_price, vat_type, vat_rate, ref_im_transaction_detail_id, ref_po_detail_id, ref_so_detail_id, description, is_free)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+             system_qty, counted_qty, unit_cost, unit_cost_fc, unit_price, vat_type, vat_rate, ref_im_transaction_detail_id, ref_po_detail_id, ref_so_detail_id, description, is_free,
+             ref_mo_component_detail_id, ref_mo_output_detail_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
         `, [
             newHeaderId, lineNo++, d.item_id, d.item_code || null, d.item_name || null,
             d.location_id || null, d.to_location_id || null, d.lot_no || null, d.serial_no || null, d.uom_id || null,
             d.system_qty ?? 0, d.counted_qty ?? 0, unitCost, d.unit_cost_fc ?? null, d.unit_price ?? null,
             d.vat_type || null, d.vat_rate ?? null,
             d.ref_im_transaction_detail_id || null, d.ref_po_detail_id || null, d.ref_so_detail_id || null, d.description || null, d.is_free === true,
+            d.ref_mo_component_detail_id || null, d.ref_mo_output_detail_id || null,
         ]);
     }
 
@@ -1965,6 +2011,7 @@ const createTransaction = async (req, res) => {
             customerId: header.customer_id,
             refNo: header.ref_no, refDocId: header.ref_doc_id, refDocNo: header.ref_doc_no,
             refImTransactionId: header.ref_im_transaction_id, refPoId: header.ref_po_id, refSoId: header.ref_so_id,
+            refMoId: header.ref_mo_id,
             description: header.description,
             currencyId: header.currency_id, currencyCode: header.currency_code, exchangeRate: header.exchange_rate,
             dim1Id: header.dim1_id, dim2Id: header.dim2_id, dim3Id: header.dim3_id,
@@ -1979,6 +2026,70 @@ const createTransaction = async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error creating im_transaction:', error);
+        res.status(500).json({ message: error.message || 'Internal server error' });
+    } finally { client.release(); }
+};
+
+// --- 1b. Create + Post a Manufacturing Receipt ('95') — คำนวณ unit_cost ให้อัตโนมัติจากนโยบายต้นทุนของ MO เอง
+// (ดู computeMoReceiptUnitCost ใน moHeaderController.js) ต่างจาก createTransaction ทั่วไปข้างบนที่ผู้เรียกต้องรู้
+// unit_cost เอง (ใช้ได้กับ GRN/DLN/ISS ที่ unit_cost มาจาก stock ledger เดิมหรือผู้ใช้กรอกตรงๆ) — MO Receipt ไม่มี
+// ราคาที่ผู้ใช้กรอกเองเลย ต้นทุนมาจากวัตถุดิบที่เบิกจริง+ต้นทุนแปรรูปเท่านั้น จึงต้องมี endpoint เฉพาะที่คำนวณให้
+// ก่อนส่งต่อไปที่ insertAndPostAdjustment ตัวเดียวกับทุก doc type ใช้ (ไม่ fork ส่วนสต็อก/GL เลย)
+const createMoReceipt = async (req, res) => {
+    const { mo_id, doc_id, doc_no, doc_date, lines, description, created_by } = req.body;
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        await ensureImTransactionTable(client);
+
+        if (!mo_id) throw new Error('กรุณาระบุใบสั่งผลิตที่อ้างอิง');
+        const moRes = await client.query(`SELECT * FROM mo_header WHERE id = $1 FOR UPDATE`, [mo_id]);
+        if (moRes.rows.length === 0) throw new Error('ไม่พบใบสั่งผลิตที่อ้างอิง');
+        const mo = moRes.rows[0];
+        if (!['Released', 'InProgress'].includes(mo.status)) {
+            throw new Error('ใบสั่งผลิตต้องอยู่สถานะ Released หรือ InProgress เท่านั้นจึงจะรับสินค้าเข้าคลังได้');
+        }
+        if (!lines || lines.length === 0) throw new Error('ไม่มีรายการที่จะรับเข้าคลัง');
+
+        const { computeMoReceiptUnitCost } = require('../mo/moHeaderController');
+        const builtLines = [];
+        for (const l of lines) {
+            const qty = Number(l.qty) || 0;
+            if (!l.ref_mo_output_detail_id || qty <= 0) continue;
+            const outRes = await client.query(
+                `SELECT * FROM mo_output_detail WHERE id = $1 AND header_id = $2`,
+                [l.ref_mo_output_detail_id, mo_id]
+            );
+            if (outRes.rows.length === 0) throw new Error('ไม่พบรายการผลผลิตของใบสั่งผลิตที่อ้างอิง');
+            const outputDetail = outRes.rows[0];
+            const unitCost = await computeMoReceiptUnitCost(client, { moHeader: mo, outputDetail });
+
+            const balRes = await client.query(
+                `SELECT qty_on_hand FROM im_stock_balance WHERE ${STOCK_BALANCE_KEY}`,
+                [outputDetail.output_item_id, mo.warehouse_id, null, null]
+            );
+            const systemQty = balRes.rows.length ? Number(balRes.rows[0].qty_on_hand) : 0;
+
+            builtLines.push({
+                item_id: outputDetail.output_item_id, item_code: outputDetail.item_code, item_name: outputDetail.item_name,
+                uom_id: outputDetail.uom_id, system_qty: systemQty, counted_qty: systemQty + qty, unit_cost: unitCost,
+                ref_mo_output_detail_id: outputDetail.id,
+            });
+        }
+        if (builtLines.length === 0) throw new Error('ไม่มีรายการที่จะรับเข้าคลัง');
+
+        const newHeaderId = await insertAndPostAdjustment(client, {
+            docId: doc_id, docNo: doc_no, docDate: doc_date, warehouseId: mo.warehouse_id,
+            refMoId: mo_id, description: description || null, createdBy: created_by || null,
+            lines: builtLines, action: 'Post',
+        });
+
+        await client.query('COMMIT');
+        const full = await fetchRowById(req.dbPool, newHeaderId);
+        res.status(201).json(full);
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error creating MO receipt:', error);
         res.status(500).json({ message: error.message || 'Internal server error' });
     } finally { client.release(); }
 };
@@ -2104,7 +2215,7 @@ const updateTransaction = async (req, res) => {
                 ref_no=$11, ref_doc_id=$12, ref_doc_no=$13, ref_im_transaction_id=$14, ref_po_id=$15, ref_so_id=$16, description=$17,
                 currency_id=$18, currency_code=$19, exchange_rate=$20,
                 dim1_id=$21, dim2_id=$22, dim3_id=$23, dim4_id=$24, dim5_id=$25,
-                branch_id=$26, updated_by=$27, updated_at=NOW()
+                branch_id=$26, updated_by=$27, updated_at=NOW(), ref_mo_id=$29
             WHERE id=$28
         `, [
             header.doc_date, periodId, header.warehouse_id, header.to_warehouse_id || null,
@@ -2114,7 +2225,7 @@ const updateTransaction = async (req, res) => {
             header.ref_im_transaction_id || null, header.ref_po_id || null, header.ref_so_id || null, header.description || null,
             header.currency_id || null, header.currency_code || 'THB', header.exchange_rate || 1,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
-            header.branch_id || null, header.updated_by || null, id,
+            header.branch_id || null, header.updated_by || null, id, header.ref_mo_id || null,
         ]);
 
         await client.query(`DELETE FROM im_transaction_detail WHERE header_id=$1`, [id]);
@@ -2126,14 +2237,16 @@ const updateTransaction = async (req, res) => {
             await client.query(`
                 INSERT INTO im_transaction_detail
                 (header_id, line_no, item_id, item_code, item_name, location_id, to_location_id, lot_no, serial_no, uom_id,
-                 system_qty, counted_qty, unit_cost, unit_cost_fc, unit_price, vat_type, vat_rate, ref_im_transaction_detail_id, ref_po_detail_id, ref_so_detail_id, description, is_free)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+                 system_qty, counted_qty, unit_cost, unit_cost_fc, unit_price, vat_type, vat_rate, ref_im_transaction_detail_id, ref_po_detail_id, ref_so_detail_id, description, is_free,
+                 ref_mo_component_detail_id, ref_mo_output_detail_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
             `, [
                 id, lineNo++, d.item_id, d.item_code || null, d.item_name || null,
                 d.location_id || null, d.to_location_id || null, d.lot_no || null, d.serial_no || null, d.uom_id || null,
                 d.system_qty ?? 0, d.counted_qty ?? 0, unitCost, d.unit_cost_fc ?? null, d.unit_price ?? null,
                 d.vat_type || null, d.vat_rate ?? null,
                 d.ref_im_transaction_detail_id || null, d.ref_po_detail_id || null, d.ref_so_detail_id || null, d.description || null, d.is_free === true,
+                d.ref_mo_component_detail_id || null, d.ref_mo_output_detail_id || null,
             ]);
         }
 
@@ -2448,7 +2561,7 @@ const deleteTransaction = async (req, res) => {
 module.exports = {
     ensureImTransactionTable,
     fetchRows, fetchRow, fetchSystemQty, fetchReturnableDocs, fetchReturnableLines,
-    createTransaction, updateTransaction, postTransaction, postBillingForGrn, postBillingForDln, voidTransaction, voidTransactionCore, voidLinkedApTransaction, reverseToDraft, deleteTransaction,
+    createTransaction, createMoReceipt, updateTransaction, postTransaction, postBillingForGrn, postBillingForDln, voidTransaction, voidTransactionCore, voidLinkedApTransaction, reverseToDraft, deleteTransaction,
     insertAndPostAdjustment, STOCK_BALANCE_KEY,
     upsertStockBalance, recomputeBalanceFromLayers,
     generateDocNo,

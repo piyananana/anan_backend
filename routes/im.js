@@ -106,6 +106,7 @@ router.get('/im_transaction',            imTransactionController.fetchRows);
 router.get('/im_transaction/:id',        imTransactionController.fetchRow);
 router.get('/im_transaction/:id/returnable_lines', imTransactionController.fetchReturnableLines);
 router.post('/im_transaction',           imTransactionController.createTransaction);
+router.post('/im_transaction/mo_receipt', imTransactionController.createMoReceipt); // '95' รับสินค้าเข้าคลังจากการผลิต — คำนวณ unit_cost ให้อัตโนมัติจากนโยบายต้นทุนของ MO
 router.put('/im_transaction/:id',        imTransactionController.updateTransaction);
 router.put('/im_transaction/:id/post',   imTransactionController.postTransaction);
 router.put('/im_transaction/:id/post_billing', imTransactionController.postBillingForGrn);
