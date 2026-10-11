@@ -625,9 +625,58 @@ const computeMoReceiptUnitCost = async (client, { moHeader, outputDetail }) => {
     return plannedQty > 0 ? allocatedCost / plannedQty : 0;
 };
 
+// บันทึกเวลาปฏิบัติงาน (Operation Time Log) — ใช้เฉพาะ MO ที่ costing_mode='ROUTING' เท่านั้น ไม่ใช่ธุรกรรม
+// im_transaction (ไม่มีผล GL/สต็อกตรงนี้เลย) แค่สะสมชั่วโมงแรงงาน/เครื่องจักรจริงไว้ที่ mo_operation_detail ให้
+// computeMoReceiptUnitCost ด้านบนไปอ่านตอน Post ธุรกรรม '95' — เป็นการ "เพิ่มสะสม" (actual_*_hours += delta) ไม่ใช่
+// ตั้งค่าทับ เพราะฝ่ายผลิตอาจบันทึกเวลาหลายรอบระหว่างทำงานขั้นตอนเดียวกัน (เช้า/บ่าย) ก่อนจะกดเสร็จสิ้นครั้งเดียว
+const logOperationTime = async (req, res) => {
+    const { moId, opId } = req.params;
+    const { labor_hours, machine_hours, mark_done } = req.body;
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        await ensureMoHeaderTable(client);
+
+        const moRes = await client.query(`SELECT status, costing_mode FROM mo_header WHERE id = $1 FOR UPDATE`, [moId]);
+        if (moRes.rows.length === 0) throw new Error('ไม่พบใบสั่งผลิต');
+        if (!['Released', 'InProgress'].includes(moRes.rows[0].status)) {
+            throw new Error('ใบสั่งผลิตต้องอยู่สถานะ Released หรือ InProgress เท่านั้นจึงจะบันทึกเวลาปฏิบัติงานได้');
+        }
+        if (moRes.rows[0].costing_mode !== 'ROUTING') {
+            throw new Error('ใบสั่งผลิตนี้ไม่ได้ใช้การคิดต้นทุนแบบ Routing จึงไม่ต้องบันทึกเวลาปฏิบัติงาน');
+        }
+
+        const opRes = await client.query(`SELECT status FROM mo_operation_detail WHERE id = $1 AND header_id = $2`, [opId, moId]);
+        if (opRes.rows.length === 0) throw new Error('ไม่พบขั้นตอนการผลิตที่ระบุ');
+        if (opRes.rows[0].status === 'Done') throw new Error('ขั้นตอนนี้บันทึกเสร็จสิ้นแล้ว ไม่สามารถบันทึกเพิ่มได้');
+
+        const laborDelta = Number(labor_hours) || 0;
+        const machineDelta = Number(machine_hours) || 0;
+        if (laborDelta <= 0 && machineDelta <= 0 && !mark_done) {
+            throw new Error('กรุณาระบุชั่วโมงแรงงานหรือเครื่องจักรที่บันทึก หรือเลือกเสร็จสิ้นขั้นตอน');
+        }
+        const newStatus = mark_done ? 'Done' : 'InProgress';
+        await client.query(`
+            UPDATE mo_operation_detail
+            SET actual_labor_hours = actual_labor_hours + $1,
+                actual_machine_hours = actual_machine_hours + $2,
+                status = $3
+            WHERE id = $4
+        `, [laborDelta, machineDelta, newStatus, opId]);
+
+        await client.query('COMMIT');
+        const full = await fetchRowById(req.dbPool, moId);
+        res.status(200).json(full);
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error logging operation time:', error);
+        res.status(500).json({ message: error.message || 'Internal server error' });
+    } finally { client.release(); }
+};
+
 module.exports = {
     ensureMoHeaderTable, fetchRows, fetchRow, createTransaction, updateTransaction,
     releaseTransaction, cancelTransaction, deleteTransaction,
     validateMoComponentIssueQty, validateMoOutputReceiptQty, refreshMoStatus,
-    computeMoReceiptUnitCost,
+    computeMoReceiptUnitCost, logOperationTime,
 };
