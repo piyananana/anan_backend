@@ -64,7 +64,7 @@ const ensureMoBomTable = async (client) => {
     // default ของสูตรนี้ ใบสั่งผลิต (mo_header) override ได้เป็นรายใบ (ดูแผนออกแบบโมดูล MO)
     await client.query(`ALTER TABLE mo_bom_header ADD COLUMN IF NOT EXISTS issue_method VARCHAR(10) NOT NULL DEFAULT 'EXPLICIT'`).catch(() => {});
     await client.query(`ALTER TABLE mo_bom_header ADD COLUMN IF NOT EXISTS costing_method VARCHAR(10) NOT NULL DEFAULT 'ACTUAL'`).catch(() => {});
-    await client.query(`ALTER TABLE mo_bom_header ADD COLUMN IF NOT EXISTS costing_mode VARCHAR(10) NOT NULL DEFAULT 'OVERHEAD_PERCENT'`).catch(() => {});
+    await client.query(`ALTER TABLE mo_bom_header ADD COLUMN IF NOT EXISTS costing_mode VARCHAR(20) NOT NULL DEFAULT 'OVERHEAD_PERCENT'`).catch(() => {});
     await client.query(`ALTER TABLE mo_bom_header ADD COLUMN IF NOT EXISTS overhead_percent NUMERIC(5,2) NOT NULL DEFAULT 0`).catch(() => {});
 
     // component_bom_header_id — ปักหมุดว่า component ตัวนี้ (ถ้าผลิตเองและมี BOM ของตัวเอง) ใช้ mo_bom_header

@@ -38,7 +38,7 @@ const ensureMoHeaderTable = async (client) => {
             uom_id            INTEGER REFERENCES im_uom(id),
             issue_method      VARCHAR(10) NOT NULL DEFAULT 'EXPLICIT',
             costing_method    VARCHAR(10) NOT NULL DEFAULT 'ACTUAL',
-            costing_mode      VARCHAR(10) NOT NULL DEFAULT 'OVERHEAD_PERCENT',
+            costing_mode      VARCHAR(20) NOT NULL DEFAULT 'OVERHEAD_PERCENT',
             overhead_percent  NUMERIC(5,2) NOT NULL DEFAULT 0,
             due_date          DATE,
             status            VARCHAR(20) NOT NULL DEFAULT 'Draft',
@@ -58,6 +58,9 @@ const ensureMoHeaderTable = async (client) => {
     await client.query(`CREATE INDEX IF NOT EXISTS idx_mo_header_date      ON mo_header(doc_date)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_mo_header_status    ON mo_header(status)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_mo_header_warehouse ON mo_header(warehouse_id)`);
+    // widen costing_mode for DBs where mo_header was created before this column was VARCHAR(20) —
+    // 'OVERHEAD_PERCENT' is 16 chars, didn't fit the original VARCHAR(10)
+    await client.query(`ALTER TABLE mo_header ALTER COLUMN costing_mode TYPE VARCHAR(20)`).catch(() => {});
 
     await client.query(`
         CREATE TABLE IF NOT EXISTS mo_component_detail (
