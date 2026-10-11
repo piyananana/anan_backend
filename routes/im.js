@@ -6,7 +6,6 @@ const imItemController         = require('../controllers/im/imItemController');
 const imItemRunningController  = require('../controllers/im/imItemRunningController');
 const imUomController          = require('../controllers/im/imUomController');
 const imWarehouseController    = require('../controllers/im/imWarehouseController');
-const imBomController          = require('../controllers/im/imBomController');
 const imPriceListController    = require('../controllers/im/imPriceListController');
 const imPriceGroupController   = require('../controllers/im/imPriceGroupController');
 const imPriceChangeController  = require('../controllers/im/imPriceChangeController');
@@ -62,13 +61,6 @@ router.put('/im_price_change/:id/void',          imPriceChangeController.voidCha
 router.get('/im_price_change_report/categories', imPriceChangeReportController.fetchCategories); // ต้องมาก่อน endpoint หลัก
 router.get('/im_price_change_report/items',      imPriceChangeReportController.searchItems);
 router.get('/im_price_change_report',            imPriceChangeReportController.fetchReport);
-
-// im_bom (im_bom_header + im_bom_detail)
-router.get('/im_bom',        imBomController.fetchRows);
-router.get('/im_bom/:id',    imBomController.fetchRow);
-router.post('/im_bom',       imBomController.addRow);
-router.put('/im_bom/:id',    imBomController.updateRow);
-router.delete('/im_bom/:id', imBomController.deleteRow);
 
 // im_warehouse
 router.get('/im_warehouse',        imWarehouseController.fetchRows);

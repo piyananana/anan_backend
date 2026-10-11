@@ -50,7 +50,7 @@ const getCounts = async (req, res) => {
             _countTable(req.dbPool, 'im_stock_count_detail'),
             _countTable(req.dbPool, 'im_period_closing'),
             _countTable(req.dbPool, 'im_opening_balance_batch'),
-            _countTable(req.dbPool, 'im_bom_header'),
+            _countTable(req.dbPool, 'mo_bom_header'),
             _countTable(req.dbPool, 'im_price_list'),
             _countTable(req.dbPool, 'im_price_change_header'),
             _countTable(req.dbPool, 'im_item'),
@@ -110,7 +110,7 @@ const getCounts = async (req, res) => {
             im_period_closing:          periodClosingCount,
             im_opening_balance_batch:   openingBalanceBatchCount,
             im_doc_number_rows:         imDocCount,
-            im_bom_header:              bomHeaderCount,
+            mo_bom_header:              bomHeaderCount,
             im_price_list:              priceListCount,
             im_price_change_header:     priceChangeHeaderCount,
             im_item:                    itemCount,
@@ -221,14 +221,15 @@ const resetTransactions = async (req, res) => {
             });
         }
 
-        // สูตรการผลิต (BOM) — im_bom_header.parent_item_id / im_bom_detail.component_item_id อ้างอิง im_item
-        // แบบไม่มี CASCADE จึงต้องลบก่อน "สินค้า" เสมอ ถ้ายังมี BOM ค้างอยู่ การลบสินค้าจะถูกบล็อก
+        // สูตรการผลิต (BOM) — mo_bom_header.parent_item_id / mo_bom_detail.component_item_id อ้างอิง im_item
+        // แบบไม่มี CASCADE จึงต้องลบก่อน "สินค้า" เสมอ ถ้ายังมี BOM ค้างอยู่ การลบสินค้าจะถูกบล็อก (BOM ย้ายไปอยู่
+        // ใต้โมดูล MO แล้ว แต่การล้างข้อมูลยังทำที่หน้าจอ IM Reset นี้เหมือนเดิม เพราะ BOM ยังผูกกับ im_item อยู่)
         if (resetBom) {
-            await runStep('im_bom', async () => {
-                const d = await client.query(`DELETE FROM im_bom_detail RETURNING id`);
-                const h = await client.query(`DELETE FROM im_bom_header RETURNING id`);
-                deleted.im_bom_detail = d.rowCount;
-                deleted.im_bom_header = h.rowCount;
+            await runStep('mo_bom', async () => {
+                const d = await client.query(`DELETE FROM mo_bom_detail RETURNING id`);
+                const h = await client.query(`DELETE FROM mo_bom_header RETURNING id`);
+                deleted.mo_bom_detail = d.rowCount;
+                deleted.mo_bom_header = h.rowCount;
             });
         }
 

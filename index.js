@@ -85,6 +85,11 @@ const soRoutes = require('./routes/so');
 app.use('/api/so', soRoutes);
 // ----------------
 
+// mo = Manufacturing (Manufacturing Order) — sys_module='61'
+const moRoutes = require('./routes/mo');
+app.use('/api/mo', moRoutes);
+// ----------------
+
 // sa = System Administration
 const saRoutes = require('./routes/sa');
 const saPasswordPolicyController = require('./controllers/sa/saPasswordPolicyController');
