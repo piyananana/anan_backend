@@ -596,6 +596,145 @@ const checkMaterialAvailability = async (req, res) => {
     } finally { client.release(); }
 };
 
+// --- สร้างใบสั่งผลิตย่อย (Explode Sub-Assembly) — รายการที่เสนอให้ explode ได้ ---
+// เดินแค่ "ชั้นเดียว" จากส่วนประกอบของ MO นี้ (ไม่ไล่ลึกหลายชั้นในคำขอเดียว) เพราะ explodeSubAssembly ด้านล่าง
+// สร้าง MO ย่อยทีละใบต่อทีละ component เท่านั้น — ถ้าส่วนประกอบของ MO ย่อยที่สร้างใหม่นั้นมี sub-BOM ของตัวเองอีก
+// ผู้ใช้ (Planning) ก็แค่เรียก endpoint นี้ซ้ำกับ MO ย่อยที่สร้างไปแล้ว ไล่ลึกได้ "หลายชั้นเท่าที่ต้องการ" ตามแผน
+// โดยไม่ต้องมี UI/transaction ที่ซับซ้อนสำหรับเดินทั้งต้นไม้ในครั้งเดียว
+const fetchExplosionCandidates = async (req, res) => {
+    const { id } = req.params;
+    const client = await req.dbPool.connect();
+    try {
+        const moRes = await client.query(`SELECT id, status FROM mo_header WHERE id = $1`, [id]);
+        if (moRes.rows.length === 0) return res.status(404).json({ message: 'ไม่พบใบสั่งผลิต' });
+
+        const result = await client.query(`
+            SELECT c.id AS component_detail_id, c.component_item_id, c.item_code, c.item_name,
+                   c.planned_qty, c.issued_qty, c.uom_id, u.uom_code,
+                   bh.id AS candidate_bom_header_id, bh.bom_version AS candidate_bom_version
+            FROM mo_component_detail c
+            LEFT JOIN im_uom u ON u.id = c.uom_id
+            LEFT JOIN mo_bom_header bh ON bh.parent_item_id = c.component_item_id AND bh.is_active = true
+            WHERE c.header_id = $1
+            ORDER BY c.line_no
+        `, [id]);
+
+        const lines = result.rows.map((r) => {
+            const remainingQty = Number(r.planned_qty) - Number(r.issued_qty);
+            return { ...r, remaining_qty: remainingQty, can_explode: r.candidate_bom_header_id != null && remainingQty > 0.0001 };
+        });
+        res.status(200).json({ mo_id: Number(id), lines });
+    } catch (error) {
+        console.error('Error fetching MO explosion candidates:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    } finally { client.release(); }
+};
+
+// สร้างใบสั่งผลิตย่อย (Draft) จากส่วนประกอบหนึ่งรายการของ MO หลัก ที่เลือก opt-in เอง — ปริมาณ = ส่วนที่ยังไม่ได้
+// เบิก (planned_qty - issued_qty) ของบรรทัดนั้น ขยายสัดส่วนทุกรายการของสูตร (component/output/operation) ด้วย
+// scale = remainingQty / bom.bom_qty มิเรอร์สูตรการสเกลเดียวกับ _loadFromBom ใน mo_header_detail_widget.dart
+// ทุกประการ ผูก parent_mo_id/parent_mo_detail_id ไว้สำหรับ traceability แต่ไม่ auto-link อะไรเพิ่มเติม (ไม่หัก
+// planned_qty ของ MO หลัก, ไม่เปลี่ยน status ของ MO หลัก) — MO ย่อยที่สร้างขึ้นเป็น Draft ปกติทุกประการ ต้อง Release
+// เองต่างหาก
+const explodeSubAssembly = async (req, res) => {
+    const { id } = req.params;
+    const { component_detail_id, due_date } = req.body;
+    const userName = req.headers.username || null;
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        await ensureMoHeaderTable(client);
+
+        const parentRes = await client.query(`SELECT * FROM mo_header WHERE id = $1`, [id]);
+        if (parentRes.rows.length === 0) throw new Error('ไม่พบใบสั่งผลิตหลัก');
+        const parentMo = parentRes.rows[0];
+
+        const compRes = await client.query(`SELECT * FROM mo_component_detail WHERE id = $1 AND header_id = $2`, [component_detail_id, id]);
+        if (compRes.rows.length === 0) throw new Error('ไม่พบรายการส่วนประกอบที่ระบุ');
+        const comp = compRes.rows[0];
+
+        const remainingQty = Number(comp.planned_qty) - Number(comp.issued_qty);
+        if (remainingQty <= 0.0001) throw new Error('ส่วนประกอบนี้เบิกครบแล้ว ไม่มีจำนวนคงเหลือให้สร้างใบสั่งผลิตย่อย');
+
+        const bomRes = await client.query(`SELECT * FROM mo_bom_header WHERE parent_item_id = $1 AND is_active = true LIMIT 1`, [comp.component_item_id]);
+        if (bomRes.rows.length === 0) throw new Error('สินค้านี้ไม่มีสูตรการผลิต (BOM) ที่ใช้งานอยู่ ไม่สามารถสร้างใบสั่งผลิตย่อยได้');
+        const bom = bomRes.rows[0];
+        const bomQty = Number(bom.bom_qty) || 1;
+        const scale = remainingQty / bomQty;
+
+        const docDate = due_date || new Date().toISOString().slice(0, 10);
+        let docNo = await generateDocNo(client, parentMo.doc_id, docDate, parentMo.branch_id || null);
+        if (!docNo) throw new Error('สร้างเลขที่เอกสารอัตโนมัติไม่สำเร็จ');
+
+        const hRes = await client.query(`
+            INSERT INTO mo_header
+                (doc_id, doc_no, doc_code, doc_date, bom_header_id, warehouse_id, order_qty, uom_id,
+                 issue_method, costing_method, costing_mode, overhead_percent, due_date,
+                 parent_mo_id, parent_mo_detail_id, branch_id, created_by, updated_by)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17)
+            RETURNING id
+        `, [
+            parentMo.doc_id, docNo, parentMo.doc_code, docDate, bom.id, parentMo.warehouse_id, remainingQty, bom.output_uom_id,
+            bom.issue_method, bom.costing_method, bom.costing_mode, bom.overhead_percent, due_date || null,
+            parentMo.id, comp.id, parentMo.branch_id || null, userName,
+        ]);
+        const childId = hRes.rows[0].id;
+
+        const bomDetailsRes = await client.query(`
+            SELECT d.*, ci.item_code, ci.item_name_th, ci.item_name_en
+            FROM mo_bom_detail d LEFT JOIN im_item ci ON ci.id = d.component_item_id
+            WHERE d.bom_header_id = $1 ORDER BY d.line_no
+        `, [bom.id]);
+        let lineNo = 1;
+        for (const d of bomDetailsRes.rows) {
+            const plannedQty = Number(d.quantity_per) * scale * (1 + Number(d.scrap_percent) / 100);
+            await client.query(`
+                INSERT INTO mo_component_detail (header_id, line_no, component_item_id, item_code, item_name, planned_qty, uom_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$7)
+            `, [childId, lineNo++, d.component_item_id, d.item_code, d.item_name_th, plannedQty, d.uom_id]);
+        }
+
+        const parentItemRes = await client.query(`SELECT item_code, item_name_th FROM im_item WHERE id = $1`, [bom.parent_item_id]);
+        await client.query(`
+            INSERT INTO mo_output_detail (header_id, line_no, output_item_id, item_code, item_name, planned_qty, uom_id, is_primary_output)
+            VALUES ($1,1,$2,$3,$4,$5,$6,true)
+        `, [childId, bom.parent_item_id, parentItemRes.rows[0]?.item_code, parentItemRes.rows[0]?.item_name_th, remainingQty, bom.output_uom_id]);
+
+        const bomOutputsRes = await client.query(`
+            SELECT o.*, oi.item_code, oi.item_name_th
+            FROM mo_bom_output_detail o LEFT JOIN im_item oi ON oi.id = o.output_item_id
+            WHERE o.bom_header_id = $1 ORDER BY o.line_no
+        `, [bom.id]);
+        let outLineNo = 2;
+        for (const o of bomOutputsRes.rows) {
+            const plannedQty = Number(o.output_qty_per) * scale;
+            await client.query(`
+                INSERT INTO mo_output_detail (header_id, line_no, output_item_id, item_code, item_name, planned_qty, uom_id, is_primary_output)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,false)
+            `, [childId, outLineNo++, o.output_item_id, o.item_code, o.item_name_th, plannedQty, o.uom_id]);
+        }
+
+        const bomOperationsRes = await client.query(`SELECT * FROM mo_bom_operation_detail WHERE bom_header_id = $1 ORDER BY line_no`, [bom.id]);
+        let opLineNo = 1;
+        for (const op of bomOperationsRes.rows) {
+            const plannedLaborHours = Number(op.standard_labor_hours) * scale + Number(op.setup_hours);
+            const plannedMachineHours = Number(op.standard_machine_hours) * scale;
+            await client.query(`
+                INSERT INTO mo_operation_detail (header_id, line_no, work_center_id, operation_name, planned_labor_hours, planned_machine_hours)
+                VALUES ($1,$2,$3,$4,$5,$6)
+            `, [childId, opLineNo++, op.work_center_id, op.operation_name, plannedLaborHours, plannedMachineHours]);
+        }
+
+        await client.query('COMMIT');
+        const full = await fetchRowById(req.dbPool, childId);
+        res.status(201).json(full);
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error exploding MO sub-assembly:', error);
+        res.status(500).json({ message: error.message || 'Internal server error' });
+    } finally { client.release(); }
+};
+
 // --- 5. Delete (Draft only) ---
 const deleteTransaction = async (req, res) => {
     const { id } = req.params;
@@ -843,4 +982,5 @@ module.exports = {
     releaseTransaction, cancelTransaction, closeTransaction, deleteTransaction,
     validateMoComponentIssueQty, validateMoOutputReceiptQty, refreshMoStatus,
     computeMoReceiptUnitCost, logOperationTime, checkMaterialAvailability,
+    fetchExplosionCandidates, explodeSubAssembly,
 };
