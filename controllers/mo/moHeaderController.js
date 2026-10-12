@@ -545,6 +545,57 @@ const closeTransaction = async (req, res) => {
     } finally { client.release(); }
 };
 
+// --- ตรวจสอบวัตถุดิบพร้อมผลิต (Material Availability Check) — read-only, ไม่แก้ไขอะไรเลย เทียบจำนวนที่ยังต้อง
+// เบิกอีก (planned_qty - issued_qty ต่อบรรทัด) กับคงเหลือในคลังปลายทางของ MO ตอนนี้ ใช้เช็คก่อน Release/ก่อนเบิกจริง
+// ได้ (ไม่บังคับสถานะ Released เท่านั้น — Draft ก็เช็คได้เพื่อวางแผนล่วงหน้า) กันไว้แค่ Closed/Cancelled ที่ไม่มี
+// ประโยชน์จะเช็คแล้ว
+const checkMaterialAvailability = async (req, res) => {
+    const { id } = req.params;
+    const client = await req.dbPool.connect();
+    try {
+        const moRes = await client.query(`SELECT id, doc_no, warehouse_id, status FROM mo_header WHERE id = $1`, [id]);
+        if (moRes.rows.length === 0) return res.status(404).json({ message: 'ไม่พบใบสั่งผลิต' });
+        const mo = moRes.rows[0];
+        if (['Closed', 'Cancelled'].includes(mo.status)) {
+            return res.status(400).json({ message: 'ใบสั่งผลิตนี้ปิดหรือยกเลิกไปแล้ว ไม่ต้องตรวจสอบวัตถุดิบอีก' });
+        }
+
+        const compRes = await client.query(`
+            SELECT c.id, c.component_item_id, c.item_code, c.item_name, c.planned_qty, c.issued_qty, c.uom_id,
+                   u.uom_code, u.uom_name_th, u.uom_name_en,
+                   COALESCE((
+                       SELECT SUM(b.qty_on_hand) FROM im_stock_balance b
+                       WHERE b.item_id = c.component_item_id AND b.warehouse_id = $2
+                   ), 0) AS available_qty
+            FROM mo_component_detail c
+            LEFT JOIN im_uom u ON u.id = c.uom_id
+            WHERE c.header_id = $1
+            ORDER BY c.line_no
+        `, [id, mo.warehouse_id]);
+
+        const lines = compRes.rows.map((r) => {
+            const remainingQty = Number(r.planned_qty) - Number(r.issued_qty);
+            const availableQty = Number(r.available_qty);
+            const shortageQty = Math.max(0, remainingQty - availableQty);
+            return {
+                ...r,
+                remaining_qty: remainingQty,
+                available_qty: availableQty,
+                shortage_qty: shortageQty,
+                is_short: shortageQty > 0.0001,
+            };
+        });
+
+        res.status(200).json({
+            mo_id: mo.id, doc_no: mo.doc_no, warehouse_id: mo.warehouse_id,
+            lines, has_shortage: lines.some((l) => l.is_short),
+        });
+    } catch (error) {
+        console.error('Error checking MO material availability:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    } finally { client.release(); }
+};
+
 // --- 5. Delete (Draft only) ---
 const deleteTransaction = async (req, res) => {
     const { id } = req.params;
@@ -791,5 +842,5 @@ module.exports = {
     ensureMoHeaderTable, fetchRows, fetchRow, createTransaction, updateTransaction,
     releaseTransaction, cancelTransaction, closeTransaction, deleteTransaction,
     validateMoComponentIssueQty, validateMoOutputReceiptQty, refreshMoStatus,
-    computeMoReceiptUnitCost, logOperationTime,
+    computeMoReceiptUnitCost, logOperationTime, checkMaterialAvailability,
 };
