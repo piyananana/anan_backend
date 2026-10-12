@@ -223,6 +223,57 @@ const fetchRows = async (req, res) => {
     } finally { client.release(); }
 };
 
+// --- รายงานสถานะใบสั่งผลิต (MO Status Report) — เหมือน fetchRows แต่เพิ่มยอดสรุปเบิก/รับสะสม+% สำเร็จต่อ MO —
+// แยก endpoint ต่างหากจาก fetchRows เพราะ fetchRows ถูกใช้เป็น picker ในหลายหน้าจอ (Issue/Receipt/Explode/
+// Availability) ที่ไม่ต้องการ subquery เพิ่มเติมเหล่านี้ทุกครั้งที่เรียก ===
+const fetchStatusReport = async (req, res) => {
+    const client = await req.dbPool.connect();
+    try {
+        await ensureMoHeaderTable(client);
+        const { status, warehouse_id, date_from, date_to, search } = req.query;
+        let query = `
+            SELECT h.id, h.doc_no, h.doc_date, h.due_date, h.status, h.warehouse_id, h.order_qty, h.wip_balance_lc,
+                   w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
+                   u.uom_code,
+                   bh.parent_item_id AS bom_parent_item_id, pi.item_code AS bom_parent_item_code,
+                   pi.item_name_th AS bom_parent_item_name_th, pi.item_name_en AS bom_parent_item_name_en,
+                   COALESCE((SELECT SUM(c.planned_qty) FROM mo_component_detail c WHERE c.header_id = h.id), 0) AS component_planned_qty,
+                   COALESCE((SELECT SUM(c.issued_qty)  FROM mo_component_detail c WHERE c.header_id = h.id), 0) AS component_issued_qty,
+                   COALESCE((SELECT SUM(o.planned_qty)  FROM mo_output_detail o    WHERE o.header_id = h.id), 0) AS output_planned_qty,
+                   COALESCE((SELECT SUM(o.received_qty) FROM mo_output_detail o    WHERE o.header_id = h.id), 0) AS output_received_qty
+            FROM mo_header h
+            JOIN sa_module_document d ON d.id = h.doc_id
+            LEFT JOIN im_warehouse w  ON w.id = h.warehouse_id
+            LEFT JOIN im_uom u        ON u.id = h.uom_id
+            LEFT JOIN mo_bom_header bh ON bh.id = h.bom_header_id
+            LEFT JOIN im_item pi      ON pi.id = bh.parent_item_id
+            WHERE 1=1`;
+        const params = [];
+        let pi2 = 1;
+        if (status)       { params.push(status);       query += ` AND h.status = $${pi2++}`; }
+        if (warehouse_id)  { params.push(warehouse_id);  query += ` AND h.warehouse_id = $${pi2++}`; }
+        if (date_from)     { params.push(date_from);     query += ` AND h.doc_date >= $${pi2++}`; }
+        if (date_to)       { params.push(date_to);       query += ` AND h.doc_date <= $${pi2++}`; }
+        if (search) {
+            params.push(`%${search.toUpperCase()}%`);
+            query += ` AND (UPPER(h.doc_no) LIKE $${pi2} OR UPPER(COALESCE(pi.item_code,'')) LIKE $${pi2})`;
+            pi2++;
+        }
+        query += ` ORDER BY h.doc_date DESC, h.id DESC`;
+        const result = await client.query(query, params);
+        const rows = result.rows.map((r) => {
+            const outputPlanned = Number(r.output_planned_qty);
+            const outputReceived = Number(r.output_received_qty);
+            const percentComplete = outputPlanned > 0 ? (outputReceived / outputPlanned) * 100 : 0;
+            return { ...r, percent_complete: percentComplete };
+        });
+        res.status(200).json(rows);
+    } catch (error) {
+        console.error('Error fetching MO status report:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    } finally { client.release(); }
+};
+
 // --- GET one ---
 const fetchRow = async (req, res) => {
     const client = await req.dbPool.connect();
@@ -982,5 +1033,5 @@ module.exports = {
     releaseTransaction, cancelTransaction, closeTransaction, deleteTransaction,
     validateMoComponentIssueQty, validateMoOutputReceiptQty, refreshMoStatus,
     computeMoReceiptUnitCost, logOperationTime, checkMaterialAvailability,
-    fetchExplosionCandidates, explodeSubAssembly,
+    fetchExplosionCandidates, explodeSubAssembly, fetchStatusReport,
 };
