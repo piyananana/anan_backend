@@ -652,7 +652,10 @@ const refreshMoStatus = async (client, moHeaderId) => {
                   AND imd.ref_mo_component_detail_id IS NOT NULL AND imt.status = 'Posted'
             ), 0) AS issued_value,
             COALESCE((
-                SELECT SUM(ABS(imd.qty) * imd.unit_cost) FROM im_transaction_detail imd
+                -- ใช้ mo_actual_unit_cost ถ้ามี (MO costing_method='STANDARD') ไม่ใช่ unit_cost (ค่ามาตรฐานที่โชว์/
+                -- ตีมูลค่าสต็อก) เพราะ WIP ถูก Cr ออกด้วยต้นทุนจริงเสมอ (ดู postGlEntry sysDocType==='95' branch ใน
+                -- imTransactionController.js) — ถ้าใช้ unit_cost ที่นี่ wip_balance_lc จะไม่ตรงกับยอด WIP จริงใน GL เลย
+                SELECT SUM(ABS(imd.qty) * COALESCE(imd.mo_actual_unit_cost, imd.unit_cost)) FROM im_transaction_detail imd
                 JOIN im_transaction imt ON imt.id = imd.header_id
                 WHERE imd.header_id IN (SELECT id FROM im_transaction WHERE ref_mo_id = $1)
                   AND imd.ref_mo_output_detail_id IS NOT NULL AND imt.status = 'Posted'
@@ -676,21 +679,21 @@ const refreshMoStatus = async (client, moHeaderId) => {
     await client.query(`UPDATE mo_header SET status=$1, wip_balance_lc=$2, updated_at=NOW() WHERE id=$3`, [newStatus, wipBalance, moHeaderId]);
 };
 
-// คำนวณต้นทุนต่อหน่วยของผลผลิตที่กำลังจะรับเข้าคลังจากการผลิต (ธุรกรรม '95') ตามนโยบายต้นทุนของใบสั่งผลิต — ใช้
-// เฉพาะ costing_method='ACTUAL' ในเฟสนี้เท่านั้น (STANDARD ต้อง throw ชัดเจน ไม่คำนวณผิดแบบเงียบๆ เพราะต้องมี GL
-// leg ที่ 3 สำหรับผลต่างมาตรฐาน/จริง ซึ่งยังไม่ได้ทำ — ดูแผนออกแบบโมดูล MO)
+// คำนวณต้นทุนต่อหน่วยของผลผลิตที่กำลังจะรับเข้าคลังจากการผลิต (ธุรกรรม '95') ตามนโยบายต้นทุนของใบสั่งผลิต
 //
-// ต้นทุนรวม = ต้นทุนวัตถุดิบที่เบิกเข้า WIP สะสมจริงของ MO นี้ (ธุรกรรม '90' ที่ Posted ทั้งหมด) + ต้นทุนแปรรูป
-// (overhead % ของต้นทุนวัตถุดิบ หรือผลรวมชั่วโมงแรงงาน/เครื่องจักร×อัตราศูนย์งาน ตาม costing_mode) — ปันส่วนตาม
-// สัดส่วน planned_qty ของผลผลิตแต่ละบรรทัดเทียบกับผลผลิตทั้งหมดที่วางแผนไว้ (ไม่ใช่ received_qty เพราะต้นทุนทั้งก้อน
-// ควรกระจายตามแผนเดิมเสมอ) แล้วหารด้วย planned_qty ของบรรทัดนั้นเพื่อให้ได้ต้นทุน/หน่วยที่คงที่ไม่ผันแปรตามว่า
-// รับครั้งไหนก่อน/หลัง (ยกเว้นต้นทุนวัตถุดิบสะสมเองที่ยังเพิ่มขึ้นได้ถ้ามีการเบิกเพิ่มทีหลัง — เป็นข้อจำกัดที่ทราบ
-// อยู่แล้วของระบบตีมูลค่าแบบ actual-cost ที่รับหลายรอบ ได้รับการแก้ไขให้ตรงเป๊ะตอน Close MO ในขั้นถัดไป)
+// ต้นทุนจริงรวม (actualUnitCost) = ต้นทุนวัตถุดิบที่เบิกเข้า WIP สะสมจริงของ MO นี้ (ธุรกรรม '90' ที่ Posted ทั้งหมด)
+// + ต้นทุนแปรรูป (overhead % ของต้นทุนวัตถุดิบ หรือผลรวมชั่วโมงแรงงาน/เครื่องจักร×อัตราศูนย์งาน ตาม costing_mode) —
+// ปันส่วนตามสัดส่วน planned_qty ของผลผลิตแต่ละบรรทัดเทียบกับผลผลิตทั้งหมดที่วางแผนไว้ (ไม่ใช่ received_qty เพราะ
+// ต้นทุนทั้งก้อนควรกระจายตามแผนเดิมเสมอ) แล้วหารด้วย planned_qty ของบรรทัดนั้นเพื่อให้ได้ต้นทุน/หน่วยที่คงที่ไม่
+// ผันแปรตามว่ารับครั้งไหนก่อน/หลัง (ยกเว้นต้นทุนวัตถุดิบสะสมเองที่ยังเพิ่มขึ้นได้ถ้ามีการเบิกเพิ่มทีหลัง — เป็น
+// ข้อจำกัดที่ทราบอยู่แล้วของระบบตีมูลค่าแบบ actual-cost ที่รับหลายรอบ ได้รับการแก้ไขให้ตรงเป๊ะตอน Close MO)
+//
+// ACTUAL: ตีมูลค่าสต็อก (unitCost) ด้วยต้นทุนจริงนี้เลย — unitCost===actualUnitCost เสมอ จึงไม่มีผลต่างให้
+// postGlEntry โพสต์ (ดู sysDocType==='95' branch ใน imTransactionController.js)
+// STANDARD: ตีมูลค่าสต็อกด้วย im_item.standard_cost ที่ตรึงไว้แทน (unitCost!==actualUnitCost โดยทั่วไป) ส่วนต่าง
+// ระหว่างสองค่านี้โพสต์เข้า variance_account_id ทันทีที่ Receipt นี้เลย ไม่ต้องรอ Close MO (ต่างจากผลต่างของ
+// ต้นทุนแปรรูปที่ยังไม่มี GL leg เข้า WIP เลยและยังต้องรอ Close MO ไปเกลี่ยเสมอไม่ว่า costing_method จะเป็นอะไร)
 const computeMoReceiptUnitCost = async (client, { moHeader, outputDetail }) => {
-    if (moHeader.costing_method !== 'ACTUAL') {
-        throw new Error(`ยังไม่รองรับการตีมูลค่าแบบ ${moHeader.costing_method} สำหรับการรับสินค้าเข้าคลังจากการผลิต (รองรับเฉพาะ ACTUAL ในเวอร์ชันนี้)`);
-    }
-
     const materialRes = await client.query(`
         SELECT COALESCE(SUM(ABS(imd.qty) * imd.unit_cost), 0) AS total
         FROM im_transaction_detail imd JOIN im_transaction imt ON imt.id = imd.header_id
@@ -721,7 +724,18 @@ const computeMoReceiptUnitCost = async (client, { moHeader, outputDetail }) => {
     const allocatedCost = totalCost * outputShare;
 
     const plannedQty = Number(outputDetail.planned_qty);
-    return plannedQty > 0 ? allocatedCost / plannedQty : 0;
+    const actualUnitCost = plannedQty > 0 ? allocatedCost / plannedQty : 0;
+
+    if (moHeader.costing_method === 'STANDARD') {
+        const itemRes = await client.query(`SELECT standard_cost, item_code FROM im_item WHERE id = $1`, [outputDetail.output_item_id]);
+        if (itemRes.rows.length === 0) throw new Error('ไม่พบสินค้าผลผลิต');
+        const standardCost = Number(itemRes.rows[0].standard_cost) || 0;
+        if (standardCost <= 0) {
+            throw new Error(`กรุณาตั้งค่าต้นทุนมาตรฐาน (standard_cost) ของสินค้า ${itemRes.rows[0].item_code} ก่อนรับเข้าคลังจากการผลิตแบบ STANDARD`);
+        }
+        return { unitCost: standardCost, actualUnitCost };
+    }
+    return { unitCost: actualUnitCost, actualUnitCost };
 };
 
 // บันทึกเวลาปฏิบัติงาน (Operation Time Log) — ใช้เฉพาะ MO ที่ costing_mode='ROUTING' เท่านั้น ไม่ใช่ธุรกรรม

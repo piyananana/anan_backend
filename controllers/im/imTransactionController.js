@@ -135,6 +135,12 @@ const ensureImTransactionTable = async (client) => {
     await client.query(`ALTER TABLE im_transaction ADD COLUMN IF NOT EXISTS ref_mo_id INTEGER`).catch(() => {});
     await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS ref_mo_component_detail_id INTEGER`).catch(() => {});
     await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS ref_mo_output_detail_id INTEGER`).catch(() => {});
+    // เฉพาะ '95' ที่ MO ใช้ costing_method='STANDARD' — unit_cost ของบรรทัด (Dr สินค้า) ถูกตรึงไว้ที่
+    // im_item.standard_cost แล้ว ไม่ใช่ต้นทุนจริงที่เกิดขึ้น mo_actual_unit_cost เก็บต้นทุนจริงต่อหน่วยไว้แยกเพื่อให้
+    // postGlEntry คำนวณผลต่างมาตรฐาน/จริงไปลง variance_account_id ทันทีตอน Post (ไม่รอ Close MO) — NULL เสมอสำหรับ
+    // MO ที่ใช้ costing_method='ACTUAL' (unit_cost ก็คือต้นทุนจริงอยู่แล้ว ไม่มีผลต่างให้คำนวณ) ดู
+    // computeMoReceiptUnitCost/createMoReceipt ด้านล่าง และ postGlEntry (sysDocType==='95' branch)
+    await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS mo_actual_unit_cost NUMERIC(18,4)`).catch(() => {});
 
     // VAT ต่อบรรทัด — ใช้เฉพาะประเภทเอกสารที่สร้าง/อ้างอิงใบกำกับ AP/AR อัตโนมัติ ('11'/'12'/'15'/'20'/'25'/'31'/
     // '32'/'35'/'40'/'45') อ้างอิง cd_vat_rate เดียวกับที่ AR/AP ใช้ (vat_type=vat_code, vat_rate=snapshot ณ ตอนโพสต์
@@ -638,6 +644,48 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
             glDetails.push({
                 account_id: counterAccountId, description: `${counterLabel} ${docNo}`,
                 debit_lc: totalValue < 0 ? -totalValue : 0, credit_lc: totalValue > 0 ? totalValue : 0, debit_fc: 0, credit_fc: 0,
+            });
+        }
+    } else if (sysDocType === '95') {
+        // MOR — รับสินค้าเข้าคลังจากการผลิต: Dr สินค้า ตีมูลค่าตาม unit_cost ของบรรทัดเสมอ (ACTUAL = ต้นทุนจริง,
+        // STANDARD = im_item.standard_cost ที่ตรึงไว้) แต่ Cr งานระหว่างผลิต (WIP) ต้อง relieve ตามต้นทุนจริงที่
+        // เกิดขึ้นเท่านั้น (mo_actual_unit_cost ถ้ามี — มีเฉพาะ MO ที่ costing_method='STANDARD' เท่านั้น ไม่งั้นเท่ากับ
+        // unit_cost พอดีจึงไม่มีผลต่างเกิดขึ้นเลยสำหรับ ACTUAL) ส่วนต่างระหว่างสองค่านี้ (ถ้ามี) ลงบัญชีผลต่างต้นทุน
+        // การผลิตทันทีที่ Receipt นี้เลย ไม่ต้องรอ Close MO — ต่างจากผลต่างของต้นทุนแปรรูป (overhead/routing) ที่ไม่มี
+        // leg ใดเคย Dr WIP มาก่อนเลยและยังต้องรอ Close MO ไปเกลี่ย (ดู closeTransaction ใน moHeaderController.js)
+        const { accountId: wipAccountId, label: wipLabel } = resolveCounterAccount(sysDocType, setup);
+        let totalInvValue = 0, totalWipValue = 0;
+        for (const d of details) {
+            const invAcc = await resolveInventoryAccount(client, d.item_id, header.warehouse_id, setup.inventory_account_id);
+            const qty = Number(d.qty);
+            const unitCost = Number(d.unit_cost);
+            const actualUnitCost = d.mo_actual_unit_cost != null ? Number(d.mo_actual_unit_cost) : unitCost;
+            const invValue = qty * unitCost;
+            invDebitByAccount[invAcc] = (invDebitByAccount[invAcc] || 0) + invValue;
+            totalInvValue += invValue;
+            totalWipValue += qty * actualUnitCost;
+        }
+        for (const [accId, amt] of Object.entries(invDebitByAccount)) {
+            if (amt === 0) continue;
+            glDetails.push({
+                account_id: Number(accId), description: `${wipLabel} ${docNo}`,
+                debit_lc: amt > 0 ? amt : 0, credit_lc: amt < 0 ? -amt : 0, debit_fc: 0, credit_fc: 0,
+            });
+        }
+        if (totalWipValue !== 0) {
+            glDetails.push({
+                account_id: wipAccountId, description: `${wipLabel} ${docNo}`,
+                debit_lc: totalWipValue < 0 ? -totalWipValue : 0, credit_lc: totalWipValue > 0 ? totalWipValue : 0, debit_fc: 0, credit_fc: 0,
+            });
+        }
+        const standardVsActual = totalInvValue - totalWipValue;
+        if (Math.abs(standardVsActual) > 0.0001) {
+            if (!setup.variance_account_id) {
+                throw new Error('ยังไม่ได้ตั้งค่าบัญชีผลต่างต้นทุนการผลิต (variance_account_id) ใน im_gl_account_setup สำหรับประเภทเอกสารนี้');
+            }
+            glDetails.push({
+                account_id: Number(setup.variance_account_id), description: `ผลต่างต้นทุนมาตรฐาน/จริง ${docNo}`,
+                debit_lc: standardVsActual < 0 ? -standardVsActual : 0, credit_lc: standardVsActual > 0 ? standardVsActual : 0, debit_fc: 0, credit_fc: 0,
             });
         }
     } else {
@@ -1971,15 +2019,15 @@ const insertAndPostAdjustment = async (client, {
             INSERT INTO im_transaction_detail
             (header_id, line_no, item_id, item_code, item_name, location_id, to_location_id, lot_no, serial_no, uom_id,
              system_qty, counted_qty, unit_cost, unit_cost_fc, unit_price, vat_type, vat_rate, ref_im_transaction_detail_id, ref_po_detail_id, ref_so_detail_id, description, is_free,
-             ref_mo_component_detail_id, ref_mo_output_detail_id)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+             ref_mo_component_detail_id, ref_mo_output_detail_id, mo_actual_unit_cost)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
         `, [
             newHeaderId, lineNo++, d.item_id, d.item_code || null, d.item_name || null,
             d.location_id || null, d.to_location_id || null, d.lot_no || null, d.serial_no || null, d.uom_id || null,
             d.system_qty ?? 0, d.counted_qty ?? 0, unitCost, d.unit_cost_fc ?? null, d.unit_price ?? null,
             d.vat_type || null, d.vat_rate ?? null,
             d.ref_im_transaction_detail_id || null, d.ref_po_detail_id || null, d.ref_so_detail_id || null, d.description || null, d.is_free === true,
-            d.ref_mo_component_detail_id || null, d.ref_mo_output_detail_id || null,
+            d.ref_mo_component_detail_id || null, d.ref_mo_output_detail_id || null, d.mo_actual_unit_cost ?? null,
         ]);
     }
 
@@ -2062,7 +2110,7 @@ const createMoReceipt = async (req, res) => {
             );
             if (outRes.rows.length === 0) throw new Error('ไม่พบรายการผลผลิตของใบสั่งผลิตที่อ้างอิง');
             const outputDetail = outRes.rows[0];
-            const unitCost = await computeMoReceiptUnitCost(client, { moHeader: mo, outputDetail });
+            const { unitCost, actualUnitCost } = await computeMoReceiptUnitCost(client, { moHeader: mo, outputDetail });
 
             const balRes = await client.query(
                 `SELECT qty_on_hand FROM im_stock_balance WHERE ${STOCK_BALANCE_KEY}`,
@@ -2074,6 +2122,7 @@ const createMoReceipt = async (req, res) => {
                 item_id: outputDetail.output_item_id, item_code: outputDetail.item_code, item_name: outputDetail.item_name,
                 uom_id: outputDetail.uom_id, system_qty: systemQty, counted_qty: systemQty + qty, unit_cost: unitCost,
                 ref_mo_output_detail_id: outputDetail.id,
+                mo_actual_unit_cost: mo.costing_method === 'STANDARD' ? actualUnitCost : null,
             });
         }
         if (builtLines.length === 0) throw new Error('ไม่มีรายการที่จะรับเข้าคลัง');
