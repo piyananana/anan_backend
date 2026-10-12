@@ -17,6 +17,7 @@ router.delete('/mo_bom/:id', moBomController.deleteRow);
 // mo_work_center (ศูนย์งาน — อัตราค่าแรง/ค่าเครื่องจักร/overhead ต่อชั่วโมง สำหรับ Routing)
 router.get('/mo_work_center',        moWorkCenterController.fetchRows);
 router.get('/mo_work_center/active', moWorkCenterController.fetchActiveRows); // ต้องมาก่อน /:id ด้านล่าง
+router.get('/mo_work_center/report/efficiency', moWorkCenterController.fetchEfficiencyReport); // ต้องมาก่อน /:id ด้านล่าง
 router.get('/mo_work_center/:id',    moWorkCenterController.fetchRow);
 router.post('/mo_work_center',       moWorkCenterController.addRow);
 router.put('/mo_work_center/:id',    moWorkCenterController.updateRow);

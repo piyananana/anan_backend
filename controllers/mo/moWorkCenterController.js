@@ -141,4 +141,78 @@ const deleteRow = async (req, res) => {
     } finally { client.release(); }
 };
 
-module.exports = { ensureMoWorkCenterTable, fetchRows, fetchActiveRows, fetchRow, addRow, updateRow, deleteRow };
+// --- รายงานประสิทธิภาพศูนย์งาน (Work Center Efficiency Report) — เทียบชั่วโมงแรงงาน/เครื่องจักรที่วางแผน (จาก
+// mo_operation_detail.planned_*_hours ซึ่ง scale มาจากสูตรตอนสร้าง MO) กับที่เกิดขึ้นจริง (actual_*_hours ที่
+// บันทึกผ่านหน้าจอ "บันทึกเวลาปฏิบัติงาน") รวมทุกศูนย์งาน — มีความหมายเฉพาะ MO ที่ costing_mode='ROUTING' เท่านั้น
+// (MO แบบ OVERHEAD_PERCENT ไม่มี mo_operation_detail เลย) แสดงศูนย์งานทุกตัวที่มีอยู่ (แม้ยังไม่เคยถูกใช้ในช่วงที่
+// กรอง — COALESCE เป็น 0) ไม่ใช่แค่ตัวที่มีข้อมูล เพื่อให้เห็นภาพรวมการใช้งานทุกศูนย์งานในคราวเดียว
+const fetchEfficiencyReport = async (req, res) => {
+    const client = await req.dbPool.connect();
+    try {
+        await ensureMoWorkCenterTable(client);
+        const { status, warehouse_id, date_from, date_to, search } = req.query;
+        const aggParams = [];
+        let ai = 1;
+        let aggFilter = 'WHERE 1=1';
+        if (status)       { aggParams.push(status);       aggFilter += ` AND h.status = $${ai++}`; }
+        if (warehouse_id)  { aggParams.push(warehouse_id);  aggFilter += ` AND h.warehouse_id = $${ai++}`; }
+        if (date_from)     { aggParams.push(date_from);     aggFilter += ` AND h.doc_date >= $${ai++}`; }
+        if (date_to)       { aggParams.push(date_to);       aggFilter += ` AND h.doc_date <= $${ai++}`; }
+
+        let query = `
+            SELECT wc.id, wc.work_center_code, wc.work_center_name_th, wc.work_center_name_en,
+                   wc.labor_rate_per_hour, wc.machine_rate_per_hour, wc.overhead_rate_per_hour, wc.is_active,
+                   COALESCE(agg.mo_count, 0) AS mo_count,
+                   COALESCE(agg.operation_count, 0) AS operation_count,
+                   COALESCE(agg.planned_labor_hours, 0) AS planned_labor_hours,
+                   COALESCE(agg.actual_labor_hours, 0) AS actual_labor_hours,
+                   COALESCE(agg.planned_machine_hours, 0) AS planned_machine_hours,
+                   COALESCE(agg.actual_machine_hours, 0) AS actual_machine_hours,
+                   COALESCE(agg.actual_cost, 0) AS actual_cost
+            FROM mo_work_center wc
+            LEFT JOIN (
+                SELECT op.work_center_id,
+                       COUNT(DISTINCT op.header_id) AS mo_count,
+                       COUNT(op.id) AS operation_count,
+                       SUM(op.planned_labor_hours) AS planned_labor_hours,
+                       SUM(op.actual_labor_hours) AS actual_labor_hours,
+                       SUM(op.planned_machine_hours) AS planned_machine_hours,
+                       SUM(op.actual_machine_hours) AS actual_machine_hours,
+                       SUM(op.actual_labor_hours * wc2.labor_rate_per_hour
+                           + op.actual_machine_hours * (wc2.machine_rate_per_hour + wc2.overhead_rate_per_hour)) AS actual_cost
+                FROM mo_operation_detail op
+                JOIN mo_header h ON h.id = op.header_id
+                JOIN mo_work_center wc2 ON wc2.id = op.work_center_id
+                ${aggFilter}
+                GROUP BY op.work_center_id
+            ) agg ON agg.work_center_id = wc.id
+            WHERE 1=1`;
+        const params = [...aggParams];
+        let pi2 = aggParams.length + 1;
+        if (search) {
+            params.push(`%${search.toUpperCase()}%`);
+            query += ` AND (UPPER(wc.work_center_code) LIKE $${pi2} OR UPPER(wc.work_center_name_th) LIKE $${pi2} OR UPPER(COALESCE(wc.work_center_name_en,'')) LIKE $${pi2})`;
+            pi2++;
+        }
+        query += ` ORDER BY wc.work_center_code`;
+        const result = await client.query(query, params);
+
+        const rows = result.rows.map((r) => {
+            const plannedLabor = Number(r.planned_labor_hours);
+            const actualLabor = Number(r.actual_labor_hours);
+            const plannedMachine = Number(r.planned_machine_hours);
+            const actualMachine = Number(r.actual_machine_hours);
+            return {
+                ...r,
+                labor_utilization_pct: plannedLabor > 0 ? (actualLabor / plannedLabor) * 100 : 0,
+                machine_utilization_pct: plannedMachine > 0 ? (actualMachine / plannedMachine) * 100 : 0,
+            };
+        });
+        res.status(200).json(rows);
+    } catch (error) {
+        console.error('Error fetching work center efficiency report:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    } finally { client.release(); }
+};
+
+module.exports = { ensureMoWorkCenterTable, fetchRows, fetchActiveRows, fetchRow, addRow, updateRow, deleteRow, fetchEfficiencyReport };
