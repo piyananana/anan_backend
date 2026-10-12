@@ -7,6 +7,8 @@ const moHeaderController = require('../controllers/mo/moHeaderController');
 
 // mo_bom (mo_bom_header + mo_bom_detail) — ย้ายมาจาก /api/im/im_bom
 router.get('/mo_bom',        moBomController.fetchRows);
+router.get('/mo_bom/report/cost_rollup', moBomController.fetchCostRollupReport); // ต้องมาก่อน /mo_bom/:id ด้านล่าง
+router.get('/mo_bom/report/where_used',  moBomController.fetchWhereUsedReport);  // ต้องมาก่อน /mo_bom/:id ด้านล่าง
 router.get('/mo_bom/:id',    moBomController.fetchRow);
 router.post('/mo_bom',       moBomController.addRow);
 router.put('/mo_bom/:id',    moBomController.updateRow);

@@ -405,4 +405,161 @@ const deleteRow = async (req, res) => {
     } finally { client.release(); }
 };
 
-module.exports = { ensureMoBomTable, fetchRows, fetchRow, addRow, updateRow, deleteRow, ISSUE_METHODS, COSTING_METHODS, COSTING_MODES };
+// --- ต้นทุนสูตรการผลิตแบบไล่ลึกหลายชั้น (BOM Cost Rollup) — เดินจาก BOM บนสุดลงไปตาม component_bom_header_id
+// (ปักหมุดไว้แน่นอน) หรือ "มี BOM active อยู่พอดี 1 ตัว" (ไม่ปักหมุด) แบบเดียวกับที่ explodeSubAssembly ใน
+// moHeaderController.js ใช้เลือก BOM ให้ — ต้นทุนที่ชั้นล่างสุด (leaf, ไม่มี sub-BOM) = im_item.standard_cost
+// ต้นทุนแปรรูปต่อชั้นคำนวณแบบเดียวกับ computeMoReceiptUnitCost ทุกประการ แต่ใช้ชั่วโมง "มาตรฐาน" จากสูตร
+// (standard_labor_hours/standard_machine_hours/setup_hours) แทนชั่วโมงจริงที่เกิดขึ้น เพราะเป็นการประมาณต้นทุน
+// ก่อนผลิตจริง ไม่ใช่ต้นทุนที่เกิดขึ้นแล้ว — visiting (Set) ป้องกัน BOM อ้างอิงกันเป็นวง (circular reference)
+const computeBomRolledUpCost = async (client, bomHeaderId, visiting = new Set()) => {
+    if (visiting.has(bomHeaderId)) {
+        throw new Error(`พบสูตรการผลิตอ้างอิงกันเป็นวง (circular BOM reference) ที่ bom_header_id=${bomHeaderId}`);
+    }
+    visiting.add(bomHeaderId);
+
+    const bomRes = await client.query(`
+        SELECT h.*, pi.item_code AS parent_item_code, pi.item_name_th AS parent_item_name_th, pi.item_name_en AS parent_item_name_en
+        FROM mo_bom_header h LEFT JOIN im_item pi ON pi.id = h.parent_item_id
+        WHERE h.id = $1
+    `, [bomHeaderId]);
+    if (bomRes.rows.length === 0) throw new Error(`ไม่พบสูตรการผลิต bom_header_id=${bomHeaderId}`);
+    const bom = bomRes.rows[0];
+    const bomQty = Number(bom.bom_qty) || 1;
+
+    const detailsRes = await client.query(`
+        SELECT d.*, ci.item_code AS component_item_code, ci.item_name_th AS component_item_name_th, ci.item_name_en AS component_item_name_en,
+               ci.standard_cost AS component_standard_cost
+        FROM mo_bom_detail d LEFT JOIN im_item ci ON ci.id = d.component_item_id
+        WHERE d.bom_header_id = $1 ORDER BY d.line_no
+    `, [bomHeaderId]);
+
+    let materialCost = 0;
+    const breakdown = [];
+    for (const d of detailsRes.rows) {
+        let subBomHeaderId = d.component_bom_header_id;
+        if (!subBomHeaderId) {
+            const activeRes = await client.query(`SELECT id FROM mo_bom_header WHERE parent_item_id = $1 AND is_active = true LIMIT 1`, [d.component_item_id]);
+            if (activeRes.rows.length > 0) subBomHeaderId = activeRes.rows[0].id;
+        }
+        let unitCost;
+        let isSubAssembly = false;
+        if (subBomHeaderId) {
+            const sub = await computeBomRolledUpCost(client, subBomHeaderId, visiting);
+            unitCost = sub.unitCost;
+            isSubAssembly = true;
+        } else {
+            unitCost = Number(d.component_standard_cost) || 0;
+        }
+        const qtyNeeded = Number(d.quantity_per) * (1 + Number(d.scrap_percent) / 100);
+        const lineTotal = qtyNeeded * unitCost;
+        materialCost += lineTotal;
+        breakdown.push({
+            component_item_id: d.component_item_id, component_item_code: d.component_item_code,
+            component_item_name_th: d.component_item_name_th, component_item_name_en: d.component_item_name_en,
+            quantity_per: Number(d.quantity_per), scrap_percent: Number(d.scrap_percent),
+            unit_cost: unitCost, line_total: lineTotal, is_sub_assembly: isSubAssembly,
+        });
+    }
+
+    let conversionCost = 0;
+    if (bom.costing_mode === 'ROUTING') {
+        const opsRes = await client.query(`
+            SELECT op.*, wc.labor_rate_per_hour, wc.machine_rate_per_hour, wc.overhead_rate_per_hour
+            FROM mo_bom_operation_detail op JOIN mo_work_center wc ON wc.id = op.work_center_id
+            WHERE op.bom_header_id = $1
+        `, [bomHeaderId]);
+        for (const op of opsRes.rows) {
+            conversionCost += Number(op.standard_labor_hours) * Number(op.labor_rate_per_hour)
+                + Number(op.standard_machine_hours) * (Number(op.machine_rate_per_hour) + Number(op.overhead_rate_per_hour))
+                + Number(op.setup_hours) * Number(op.labor_rate_per_hour);
+        }
+    } else {
+        conversionCost = materialCost * (Number(bom.overhead_percent) || 0) / 100;
+    }
+
+    const totalCost = materialCost + conversionCost;
+    visiting.delete(bomHeaderId);
+    return {
+        bomHeaderId, bomVersion: bom.bom_version, bomQty,
+        parentItemId: bom.parent_item_id, parentItemCode: bom.parent_item_code,
+        parentItemNameTh: bom.parent_item_name_th, parentItemNameEn: bom.parent_item_name_en,
+        costingMode: bom.costing_mode, overheadPercent: Number(bom.overhead_percent) || 0,
+        outputUomId: bom.output_uom_id,
+        materialCost, conversionCost, totalCost, unitCost: totalCost / bomQty,
+        breakdown,
+    };
+};
+
+const fetchCostRollupReport = async (req, res) => {
+    const client = await req.dbPool.connect();
+    try {
+        await ensureMoBomTable(client);
+        const { bom_header_id, search } = req.query;
+        let query = `
+            SELECT h.id FROM mo_bom_header h LEFT JOIN im_item pi ON pi.id = h.parent_item_id
+            WHERE h.is_active = true`;
+        const params = [];
+        let pi2 = 1;
+        if (bom_header_id) { params.push(bom_header_id); query += ` AND h.id = $${pi2++}`; }
+        if (search) {
+            params.push(`%${search.toUpperCase()}%`);
+            query += ` AND UPPER(COALESCE(pi.item_code,'')) LIKE $${pi2++}`;
+        }
+        query += ` ORDER BY h.id`;
+        const idsRes = await client.query(query, params);
+
+        const rows = [];
+        for (const row of idsRes.rows) {
+            try {
+                rows.push(await computeBomRolledUpCost(client, row.id, new Set()));
+            } catch (err) {
+                rows.push({ bomHeaderId: row.id, error: err.message });
+            }
+        }
+        res.status(200).json(rows);
+    } catch (error) {
+        console.error('Error fetching BOM cost rollup report:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    } finally { client.release(); }
+};
+
+// --- Where-Used — หาว่าสินค้า (component) ชิ้นหนึ่งถูกใช้เป็นส่วนประกอบของ BOM ไหนบ้าง (เฉพาะชั้นตรง ไม่ไล่ลึก
+// ขึ้นหลายชั้น — ถ้าต้องการไล่ว่า BOM นั้นเองถูกใช้เป็นส่วนประกอบของ BOM อื่นอีกต่อหนึ่ง ให้ค้นหา parent_item_id
+// ของ BOM นั้นต่อด้วยตัวเองอีกครั้ง) ไม่ระบุ component_item_id = แสดงทุกคู่ component -> BOM ที่ใช้ในระบบ
+const fetchWhereUsedReport = async (req, res) => {
+    const client = await req.dbPool.connect();
+    try {
+        await ensureMoBomTable(client);
+        const { component_item_id, search } = req.query;
+        let query = `
+            SELECT d.component_item_id, ci.item_code AS component_item_code,
+                   ci.item_name_th AS component_item_name_th, ci.item_name_en AS component_item_name_en,
+                   h.id AS bom_header_id, h.bom_version, h.is_active,
+                   pi.item_code AS parent_item_code, pi.item_name_th AS parent_item_name_th, pi.item_name_en AS parent_item_name_en,
+                   d.quantity_per, d.scrap_percent
+            FROM mo_bom_detail d
+            JOIN mo_bom_header h ON h.id = d.bom_header_id
+            LEFT JOIN im_item ci ON ci.id = d.component_item_id
+            LEFT JOIN im_item pi ON pi.id = h.parent_item_id
+            WHERE 1=1`;
+        const params = [];
+        let pi2 = 1;
+        if (component_item_id) { params.push(component_item_id); query += ` AND d.component_item_id = $${pi2++}`; }
+        if (search) {
+            params.push(`%${search.toUpperCase()}%`);
+            query += ` AND (UPPER(COALESCE(ci.item_code,'')) LIKE $${pi2} OR UPPER(COALESCE(pi.item_code,'')) LIKE $${pi2})`;
+            pi2++;
+        }
+        query += ` ORDER BY ci.item_code, pi.item_code`;
+        const result = await client.query(query, params);
+        res.status(200).json(result.rows);
+    } catch (error) {
+        console.error('Error fetching BOM where-used report:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    } finally { client.release(); }
+};
+
+module.exports = {
+    ensureMoBomTable, fetchRows, fetchRow, addRow, updateRow, deleteRow, ISSUE_METHODS, COSTING_METHODS, COSTING_MODES,
+    computeBomRolledUpCost, fetchCostRollupReport, fetchWhereUsedReport,
+};
