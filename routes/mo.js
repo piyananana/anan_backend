@@ -23,6 +23,7 @@ router.delete('/mo_work_center/:id', moWorkCenterController.deleteRow);
 // mo_header (ใบสั่งผลิต) + mo_component_detail/mo_output_detail/mo_operation_detail
 router.get('/mo_header',             moHeaderController.fetchRows);
 router.get('/mo_header/report/status', moHeaderController.fetchStatusReport);
+router.get('/mo_header/report/cost_variance', moHeaderController.fetchCostVarianceReport);
 router.get('/mo_header/:id',         moHeaderController.fetchRow);
 router.post('/mo_header',            moHeaderController.createTransaction);
 router.put('/mo_header/:id',         moHeaderController.updateTransaction);

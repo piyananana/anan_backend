@@ -274,6 +274,99 @@ const fetchStatusReport = async (req, res) => {
     } finally { client.release(); }
 };
 
+// --- รายงานต้นทุนการผลิต/ผลต่าง (Cost/Variance Report) — ต่อ MO: material/labor/machine/overhead breakdown,
+// ต้นทุนเฉลี่ย/หน่วยที่ตีมูลค่าจริงตอนรับเข้าคลัง (ถัวเฉลี่ยตาม qty รับจริงทุกครั้ง), และผลต่างมาตรฐาน/จริงที่
+// โพสต์ไปแล้ว (เกิดเฉพาะ MO ที่ costing_method='STANDARD' เท่านั้น — ACTUAL จะเป็น 0 เสมอเพราะ unit_cost ที่ตีสต็อก
+// เท่ากับต้นทุนจริงพอดี ไม่มีผลต่างให้โพสต์) สูตรคำนวณ labor/machine/overhead มิเรอร์ computeMoReceiptUnitCost
+// ทุกประการ แต่รวมทั้ง MO ไม่ได้ปันส่วนต่อหน่วย/ต่อบรรทัดผลผลิตแบบตอน Post จริง
+const fetchCostVarianceReport = async (req, res) => {
+    const client = await req.dbPool.connect();
+    try {
+        await ensureMoHeaderTable(client);
+        const { status, warehouse_id, date_from, date_to, search } = req.query;
+        let query = `
+            SELECT h.id, h.doc_no, h.doc_date, h.status, h.costing_method, h.costing_mode, h.overhead_percent, h.wip_balance_lc,
+                   w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
+                   u.uom_code, u.uom_name_th, u.uom_name_en,
+                   bh.parent_item_id AS bom_parent_item_id, pi.item_code AS bom_parent_item_code,
+                   pi.item_name_th AS bom_parent_item_name_th, pi.item_name_en AS bom_parent_item_name_en,
+                   COALESCE((
+                       SELECT SUM(ABS(imd.qty) * imd.unit_cost) FROM im_transaction_detail imd
+                       JOIN im_transaction imt ON imt.id = imd.header_id
+                       WHERE imt.ref_mo_id = h.id AND imd.ref_mo_component_detail_id IS NOT NULL AND imt.status = 'Posted'
+                   ), 0) AS material_cost,
+                   COALESCE((
+                       SELECT SUM(op.actual_labor_hours * wc.labor_rate_per_hour)
+                       FROM mo_operation_detail op JOIN mo_work_center wc ON wc.id = op.work_center_id
+                       WHERE op.header_id = h.id
+                   ), 0) AS routing_labor_cost,
+                   COALESCE((
+                       SELECT SUM(op.actual_machine_hours * wc.machine_rate_per_hour)
+                       FROM mo_operation_detail op JOIN mo_work_center wc ON wc.id = op.work_center_id
+                       WHERE op.header_id = h.id
+                   ), 0) AS routing_machine_cost,
+                   COALESCE((
+                       SELECT SUM(op.actual_machine_hours * wc.overhead_rate_per_hour)
+                       FROM mo_operation_detail op JOIN mo_work_center wc ON wc.id = op.work_center_id
+                       WHERE op.header_id = h.id
+                   ), 0) AS routing_overhead_cost,
+                   COALESCE((
+                       SELECT SUM(ABS(imd.qty)) FROM im_transaction_detail imd
+                       JOIN im_transaction imt ON imt.id = imd.header_id
+                       WHERE imt.ref_mo_id = h.id AND imd.ref_mo_output_detail_id IS NOT NULL AND imt.status = 'Posted'
+                   ), 0) AS output_received_qty,
+                   COALESCE((
+                       SELECT SUM(ABS(imd.qty) * imd.unit_cost) FROM im_transaction_detail imd
+                       JOIN im_transaction imt ON imt.id = imd.header_id
+                       WHERE imt.ref_mo_id = h.id AND imd.ref_mo_output_detail_id IS NOT NULL AND imt.status = 'Posted'
+                   ), 0) AS output_weighted_value,
+                   COALESCE((
+                       SELECT SUM(ABS(imd.qty) * (imd.unit_cost - COALESCE(imd.mo_actual_unit_cost, imd.unit_cost))) FROM im_transaction_detail imd
+                       JOIN im_transaction imt ON imt.id = imd.header_id
+                       WHERE imt.ref_mo_id = h.id AND imd.ref_mo_output_detail_id IS NOT NULL AND imt.status = 'Posted'
+                   ), 0) AS variance_posted
+            FROM mo_header h
+            JOIN sa_module_document d ON d.id = h.doc_id
+            LEFT JOIN im_warehouse w  ON w.id = h.warehouse_id
+            LEFT JOIN im_uom u        ON u.id = h.uom_id
+            LEFT JOIN mo_bom_header bh ON bh.id = h.bom_header_id
+            LEFT JOIN im_item pi      ON pi.id = bh.parent_item_id
+            WHERE 1=1`;
+        const params = [];
+        let pi2 = 1;
+        if (status)       { params.push(status);       query += ` AND h.status = $${pi2++}`; }
+        if (warehouse_id)  { params.push(warehouse_id);  query += ` AND h.warehouse_id = $${pi2++}`; }
+        if (date_from)     { params.push(date_from);     query += ` AND h.doc_date >= $${pi2++}`; }
+        if (date_to)       { params.push(date_to);       query += ` AND h.doc_date <= $${pi2++}`; }
+        if (search) {
+            params.push(`%${search.toUpperCase()}%`);
+            query += ` AND (UPPER(h.doc_no) LIKE $${pi2} OR UPPER(COALESCE(pi.item_code,'')) LIKE $${pi2})`;
+            pi2++;
+        }
+        query += ` ORDER BY h.doc_date DESC, h.id DESC`;
+        const result = await client.query(query, params);
+        const rows = result.rows.map((r) => {
+            const isRouting = r.costing_mode === 'ROUTING';
+            const materialCost = Number(r.material_cost);
+            const laborCost = isRouting ? Number(r.routing_labor_cost) : 0;
+            const machineCost = isRouting ? Number(r.routing_machine_cost) : 0;
+            const overheadCost = isRouting ? Number(r.routing_overhead_cost) : materialCost * (Number(r.overhead_percent) || 0) / 100;
+            const totalCost = materialCost + laborCost + machineCost + overheadCost;
+            const outputReceivedQty = Number(r.output_received_qty);
+            const avgUnitCost = outputReceivedQty > 0 ? Number(r.output_weighted_value) / outputReceivedQty : 0;
+            return {
+                ...r, material_cost: materialCost, labor_cost: laborCost, machine_cost: machineCost,
+                overhead_cost: overheadCost, total_cost: totalCost, avg_unit_cost: avgUnitCost,
+                variance_posted: Number(r.variance_posted),
+            };
+        });
+        res.status(200).json(rows);
+    } catch (error) {
+        console.error('Error fetching MO cost/variance report:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    } finally { client.release(); }
+};
+
 // --- GET one ---
 const fetchRow = async (req, res) => {
     const client = await req.dbPool.connect();
@@ -1033,5 +1126,5 @@ module.exports = {
     releaseTransaction, cancelTransaction, closeTransaction, deleteTransaction,
     validateMoComponentIssueQty, validateMoOutputReceiptQty, refreshMoStatus,
     computeMoReceiptUnitCost, logOperationTime, checkMaterialAvailability,
-    fetchExplosionCandidates, explodeSubAssembly, fetchStatusReport,
+    fetchExplosionCandidates, explodeSubAssembly, fetchStatusReport, fetchCostVarianceReport,
 };
