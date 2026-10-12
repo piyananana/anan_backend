@@ -367,6 +367,79 @@ const fetchCostVarianceReport = async (req, res) => {
     } finally { client.release(); }
 };
 
+// --- รายงานมูลค่างานระหว่างผลิต (WIP Valuation Report) — ยอด wip_balance_lc ของทุก MO ที่ยังเปิดอยู่ (Released/
+// InProgress/Completed — Closed แล้ว wip_balance_lc=0 เสมอ ไม่มีความหมายให้แสดง, Draft/Cancelled ยังไม่เคย Post
+// เข้า WIP เลย) เทียบกับยอดจริงในบัญชี wip_account_id (ของ MOR) รวมตรงจาก gl_entry_detail (ดูหมายเหตุที่ query
+// ด้านล่างว่าทำไมไม่ใช้ gl_balance_accum) — ถ้าไม่มีการ journal entry อื่นใดแตะบัญชีนี้นอกจากธุรกรรม '90'/'95'/
+// Close MO ยอดทั้งสองฝั่งควรเท่ากันเป๊ะเสมอ ถ้าไม่เท่ากันคือสัญญาณว่ามีผลต่างต้องตรวจสอบ (เช่น manual journal
+// entry เข้าบัญชีนี้ตรงๆ)
+const fetchWipValuationReport = async (req, res) => {
+    const client = await req.dbPool.connect();
+    try {
+        await ensureMoHeaderTable(client);
+        const { warehouse_id, date_from, date_to, search } = req.query;
+        let query = `
+            SELECT h.id, h.doc_no, h.doc_date, h.status, h.wip_balance_lc,
+                   w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
+                   bh.parent_item_id AS bom_parent_item_id, pi.item_code AS bom_parent_item_code,
+                   pi.item_name_th AS bom_parent_item_name_th, pi.item_name_en AS bom_parent_item_name_en
+            FROM mo_header h
+            JOIN sa_module_document d ON d.id = h.doc_id
+            LEFT JOIN im_warehouse w  ON w.id = h.warehouse_id
+            LEFT JOIN mo_bom_header bh ON bh.id = h.bom_header_id
+            LEFT JOIN im_item pi      ON pi.id = bh.parent_item_id
+            WHERE h.status IN ('Released', 'InProgress', 'Completed')`;
+        const params = [];
+        let pi2 = 1;
+        if (warehouse_id)  { params.push(warehouse_id);  query += ` AND h.warehouse_id = $${pi2++}`; }
+        if (date_from)     { params.push(date_from);     query += ` AND h.doc_date >= $${pi2++}`; }
+        if (date_to)       { params.push(date_to);       query += ` AND h.doc_date <= $${pi2++}`; }
+        if (search) {
+            params.push(`%${search.toUpperCase()}%`);
+            query += ` AND (UPPER(h.doc_no) LIKE $${pi2} OR UPPER(COALESCE(pi.item_code,'')) LIKE $${pi2})`;
+            pi2++;
+        }
+        query += ` ORDER BY h.doc_date DESC, h.id DESC`;
+        const result = await client.query(query, params);
+
+        const setup = await fetchSetupByDocCode(client, 'MOR');
+        let glBalance = null;
+        let wipAccountCode = null;
+        let wipAccountName = null;
+        if (setup?.wip_account_id) {
+            const accRes = await client.query(`SELECT account_code, account_name_thai, account_name_eng FROM gl_account WHERE id = $1`, [setup.wip_account_id]);
+            if (accRes.rows.length > 0) {
+                wipAccountCode = accRes.rows[0].account_code;
+                wipAccountName = accRes.rows[0].account_name_thai;
+            }
+            // gl_balance_accum ไม่ใช่แหล่งข้อมูลที่เชื่อถือได้ที่นี่ — มันถูกอัปเดตเฉพาะตอน Post ผ่าน
+            // glEntryController.js (รายการบัญชีที่สร้างตรงจากโมดูล GL เอง) เท่านั้น ธุรกรรม IM ('90'/'95'/Close MO)
+            // insert ตรงเข้า gl_entry_header/gl_entry_detail โดยไม่เคยเรียก updateBalanceAccum เลย จึงต้องรวมยอด
+            // จาก gl_entry_detail ตรงๆ ซึ่งเป็นแหล่งข้อมูลจริงที่ทุก module ใช้ร่วมกันเสมอ
+            const balRes = await client.query(`
+                SELECT COALESCE(SUM(ged.debit_lc - ged.credit_lc), 0) AS balance
+                FROM gl_entry_detail ged
+                JOIN gl_entry_header geh ON geh.id = ged.header_id
+                WHERE ged.account_id = $1 AND geh.status = 'Posted' AND geh.posting_date <= CURRENT_DATE
+            `, [setup.wip_account_id]);
+            glBalance = Number(balRes.rows[0].balance);
+        }
+
+        const totalMoWip = result.rows.reduce((s, r) => s + Number(r.wip_balance_lc), 0);
+        res.status(200).json({
+            lines: result.rows,
+            total_mo_wip: totalMoWip,
+            wip_account_code: wipAccountCode,
+            wip_account_name: wipAccountName,
+            gl_balance: glBalance,
+            difference: glBalance != null ? glBalance - totalMoWip : null,
+        });
+    } catch (error) {
+        console.error('Error fetching MO WIP valuation report:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    } finally { client.release(); }
+};
+
 // --- GET one ---
 const fetchRow = async (req, res) => {
     const client = await req.dbPool.connect();
@@ -1127,4 +1200,5 @@ module.exports = {
     validateMoComponentIssueQty, validateMoOutputReceiptQty, refreshMoStatus,
     computeMoReceiptUnitCost, logOperationTime, checkMaterialAvailability,
     fetchExplosionCandidates, explodeSubAssembly, fetchStatusReport, fetchCostVarianceReport,
+    fetchWipValuationReport,
 };

@@ -24,6 +24,7 @@ router.delete('/mo_work_center/:id', moWorkCenterController.deleteRow);
 router.get('/mo_header',             moHeaderController.fetchRows);
 router.get('/mo_header/report/status', moHeaderController.fetchStatusReport);
 router.get('/mo_header/report/cost_variance', moHeaderController.fetchCostVarianceReport);
+router.get('/mo_header/report/wip_valuation', moHeaderController.fetchWipValuationReport);
 router.get('/mo_header/:id',         moHeaderController.fetchRow);
 router.post('/mo_header',            moHeaderController.createTransaction);
 router.put('/mo_header/:id',         moHeaderController.updateTransaction);
