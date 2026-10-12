@@ -234,7 +234,7 @@ const fetchStatusReport = async (req, res) => {
         let query = `
             SELECT h.id, h.doc_no, h.doc_date, h.due_date, h.status, h.warehouse_id, h.order_qty, h.wip_balance_lc,
                    w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
-                   u.uom_code,
+                   u.uom_code, u.uom_name_th, u.uom_name_en,
                    bh.parent_item_id AS bom_parent_item_id, pi.item_code AS bom_parent_item_code,
                    pi.item_name_th AS bom_parent_item_name_th, pi.item_name_en AS bom_parent_item_name_en,
                    COALESCE((SELECT SUM(c.planned_qty) FROM mo_component_detail c WHERE c.header_id = h.id), 0) AS component_planned_qty,
@@ -661,7 +661,7 @@ const fetchExplosionCandidates = async (req, res) => {
 
         const result = await client.query(`
             SELECT c.id AS component_detail_id, c.component_item_id, c.item_code, c.item_name,
-                   c.planned_qty, c.issued_qty, c.uom_id, u.uom_code,
+                   c.planned_qty, c.issued_qty, c.uom_id, u.uom_code, u.uom_name_th, u.uom_name_en,
                    bh.id AS candidate_bom_header_id, bh.bom_version AS candidate_bom_version
             FROM mo_component_detail c
             LEFT JOIN im_uom u ON u.id = c.uom_id
