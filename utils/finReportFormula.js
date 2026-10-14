@@ -5,6 +5,8 @@
 // Syntax:
 //   cell ref : (R100, C20)          → value of row_seq_no 100, column_seq_no 20
 //   col ref  : [CUR]                → report-level column (gl_fin_report_col.col_code) in the same row
+//   row ref  : REV_TOTAL            → row with row_code REV_TOTAL, same column as the cell being computed
+//              REV_TOTAL[PY]        → row REV_TOTAL, report-level column PY
 //   operators: + - * /  unary -  ( )
 //   functions: ABS(x)  ROUND(x[, digits])  MIN(a, b, ...)  MAX(a, b, ...)
 //   numbers  : 123  1.5  .5
@@ -14,7 +16,7 @@ class FormulaError extends Error {
     constructor(code, message, detail = {}) {
         super(message);
         this.code = code;     // SYNTAX | UNKNOWN_REF | NOT_NUMERIC | CIRCULAR | REF_ERROR
-        this.detail = detail; // e.g. { row: 100, col: 20 } or { code: 'PY' }
+        this.detail = detail; // e.g. { row: 100, col: 20 } or { code: 'PY' } or { row_code: 'REV_TOTAL' }
     }
 }
 
@@ -80,7 +82,7 @@ const tokenize = (text) => {
 //   expr  := term (('+'|'-') term)*
 //   term  := unary (('*'|'/') unary)*
 //   unary := ('+'|'-') unary | primary
-//   primary := NUM | REF | COL | IDENT '(' args ')' | '(' expr ')'
+//   primary := NUM | REF | COL | IDENT '(' args ')' | IDENT [COL] | '(' expr ')'
 const parse = (text) => {
     if (text == null || String(text).trim() === '') {
         throw new FormulaError('SYNTAX', 'Formula is empty');
@@ -131,6 +133,11 @@ const parse = (text) => {
             expect(')');
             return node;
         }
+        if (t.type === 'IDENT' && peek().type !== '(') {
+            // รหัสบรรทัด (row_code) — ตามด้วย [COL] ได้เพื่อระบุคอลัมน์
+            if (peek().type === 'COL') return { type: 'ROW', code: t.value, col: next().code };
+            return { type: 'ROW', code: t.value, col: null };
+        }
         if (t.type === 'IDENT') {
             const fn = FUNCTIONS[t.value];
             if (!fn) throw new FormulaError('SYNTAX', `Unknown function '${t.value}'`, { pos: t.pos + 1 });
@@ -157,8 +164,9 @@ const parse = (text) => {
     return ast;
 };
 
-// Evaluate an AST. resolveRef(row, col) / resolveCol(code) must return a number or null (or throw FormulaError).
-const evaluate = (ast, resolveRef, resolveCol) => {
+// Evaluate an AST. resolveRef(row, col) / resolveCol(code) / resolveRow(rowCode, colCode|null)
+// must return a number or null (or throw FormulaError).
+const evaluate = (ast, resolveRef, resolveCol, resolveRow) => {
     const ev = (n) => {
         switch (n.type) {
             case 'NUM': return n.value;
@@ -166,6 +174,9 @@ const evaluate = (ast, resolveRef, resolveCol) => {
             case 'COL':
                 if (!resolveCol) throw new FormulaError('UNKNOWN_REF', `Column [${n.code}] cannot be used here`, { code: n.code });
                 return resolveCol(n.code);
+            case 'ROW':
+                if (!resolveRow) throw new FormulaError('UNKNOWN_REF', `Row ${n.code} cannot be used here`, { row_code: n.code });
+                return resolveRow(n.code, n.col);
             case 'NEG': { const v = ev(n.arg); return v == null ? null : -v; }
             case 'BIN': {
                 const l = ev(n.left);
@@ -195,14 +206,27 @@ const evaluate = (ast, resolveRef, resolveCol) => {
     return ev(ast);
 };
 
-// รายการ col_code ที่สูตรอ้างถึง (ใช้ตรวจตอนบันทึก)
+const walk = (ast, visit) => {
+    if (!ast) return;
+    visit(ast);
+    if (ast.type === 'NEG') walk(ast.arg, visit);
+    if (ast.type === 'BIN') { walk(ast.left, visit); walk(ast.right, visit); }
+    if (ast.type === 'FN') ast.args.forEach(a => walk(a, visit));
+};
+
+// รายการ col_code ที่สูตรอ้างถึง (ใช้ตรวจตอนบันทึก) — รวม [COL] ที่ต่อท้ายรหัสบรรทัดด้วย
 const collectColRefs = (ast, out = new Set()) => {
-    if (!ast) return out;
-    if (ast.type === 'COL') out.add(ast.code);
-    if (ast.type === 'NEG') collectColRefs(ast.arg, out);
-    if (ast.type === 'BIN') { collectColRefs(ast.left, out); collectColRefs(ast.right, out); }
-    if (ast.type === 'FN') ast.args.forEach(a => collectColRefs(a, out));
+    walk(ast, n => {
+        if (n.type === 'COL') out.add(n.code);
+        if (n.type === 'ROW' && n.col) out.add(n.col);
+    });
     return out;
 };
 
-module.exports = { parse, evaluate, collectColRefs, FormulaError };
+// รายการ row_code ที่สูตรอ้างถึง
+const collectRowRefs = (ast, out = new Set()) => {
+    walk(ast, n => { if (n.type === 'ROW') out.add(n.code); });
+    return out;
+};
+
+module.exports = { parse, evaluate, collectColRefs, collectRowRefs, FUNCTIONS, FormulaError };

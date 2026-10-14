@@ -223,21 +223,31 @@ const generateFinancialReport = async (req, res) => {
         // ====================================================================
         // STEP 5: ประกอบร่างข้อมูล (Pass 1 - หยอดค่า TEXT, คำนวณ MTD, YTD)
         // ====================================================================
+        // ชนิดบรรทัด (row_kind): ACCOUNTS = ยอดจากช่วงบัญชี, TOTAL = รวมบรรทัดลูก (parent_row_code),
+        // FORMULA = row_formula ทุกคอลัมน์ตัวเลข, HEADING/BLANK = ไม่มียอด
+        const labelCol = reportCols.find(rc => rc.col_kind === 'LABEL');
+        const rowLabel = (row) => (isEnglish && row.label_eng) ? row.label_eng : (row.label_thai || row.label_eng || '');
+
         let reportData = rows.map(row => {
             const myCols = cols.filter(c => c.row_id === row.id);
-            
+            const kind = row.row_kind || 'ACCOUNTS';
+            // ช่องตัวเลขของบรรทัด TOTAL/FORMULA คำนวณทีหลังใน STEP 6 (calc)
+            const derivedCalc = kind === 'TOTAL' ? 'TOTAL' : kind === 'FORMULA' ? 'ROWF' : null;
+            const hasAccounts = kind === 'ACCOUNTS' && !!(row.account_from && row.account_to);
+
             let processedColumns = myCols.map(col => {
                 let cellValue = null;
+                let calc;
 
                 if (col.column_type === 'TEXT') {
-                    cellValue = col.description_thai; 
-                } 
+                    cellValue = (isEnglish && col.description_eng) ? col.description_eng : col.description_thai;
+                }
                 else if (col.column_type === 'DIVIDER') {
                     cellValue = '---';
                 }
                 else if (col.column_type === 'MTD' || col.column_type === 'YTD') {
-                    // คำนวณเฉพาะบรรทัดที่มีการระบุ Account (ปกติจะเป็น BODY)
-                    cellValue = sumRow(row, col.target_period_ids || [], null, true);
+                    if (derivedCalc) calc = derivedCalc;
+                    else cellValue = hasAccounts ? sumRow(row, col.target_period_ids || [], null, true) : 0;
                 }
 
                 return {
@@ -252,14 +262,15 @@ const generateFinancialReport = async (req, res) => {
                         fontSize: col.font_size,
                         fontWeight: col.font_weight,
                         textAlign: col.text_align
-                    }
+                    },
+                    ...(calc ? { calc } : {}),
                 };
             });
 
             // เติมคอลัมน์ระดับรายงาน (ข้ามช่องที่บรรทัดนี้ override ด้วยคอลัมน์รายบรรทัด)
             const overrideSeqs = new Set(myCols.map(c => c.column_seq_no));
-            const hasAccounts = !!(row.account_from && row.account_to);
-            const hasOverride = reportCols.some(rc => overrideSeqs.has(rc.col_seq_no));
+            const hasOverride = reportCols.some(rc => rc.col_kind !== 'LABEL' && overrideSeqs.has(rc.col_seq_no));
+            const hasAmounts = hasAccounts || !!derivedCalc;
             reportCols.forEach(rc => {
                 if (overrideSeqs.has(rc.col_seq_no)) return;
                 const cell = {
@@ -271,9 +282,15 @@ const generateFinancialReport = async (req, res) => {
                     report_col: true,
                     hidden: rc.is_hidden,
                 };
-                if (rc.col_kind === 'AMOUNT' && hasAccounts) {
+                if (rc.col_kind === 'LABEL') {
+                    // บรรทัดว่างใส่ช่องว่าง 1 ตัวเพื่อให้บรรทัดมีความสูง
+                    const text = kind === 'BLANK' ? ' ' : rowLabel(row);
+                    processedColumns.push({ ...cell, type: 'TEXT', value: text, indent_level: row.indent_level || 0, label: true });
+                } else if (rc.col_kind === 'AMOUNT' && hasAccounts) {
                     processedColumns.push({ ...cell, type: 'AMOUNT', value: sumRow(row, rc.target_period_ids, rc, rc.exclude_closing_entries) });
-                } else if (rc.col_kind === 'CALC' && (hasAccounts || hasOverride)) {
+                } else if (rc.col_kind === 'AMOUNT' && derivedCalc) {
+                    processedColumns.push({ ...cell, type: 'AMOUNT', value: null, calc: derivedCalc });
+                } else if (rc.col_kind === 'CALC' && (hasAmounts || hasOverride)) {
                     processedColumns.push({ ...cell, type: 'CALC', value: null, formula_text: rc.formula_text });
                 } else {
                     // บรรทัดหัวข้อ/บรรทัดว่าง: ช่องว่าง (ไม่ใช่ 0) เพื่อไม่ให้แสดง '-'
@@ -281,13 +298,34 @@ const generateFinancialReport = async (req, res) => {
                 }
             });
 
+            // ไม่มีคอลัมน์ LABEL ในรายงาน แต่บรรทัดมีชื่อ → วางไว้หน้าสุด (seq 0)
+            const label = rowLabel(row);
+            if (!labelCol && label && !overrideSeqs.has(0)) {
+                processedColumns.push({
+                    seq_no: 0, type: 'TEXT', value: label, data_type: null, flex: 3,
+                    indent_level: row.indent_level || 0,
+                    style: { fontSize: 10, fontWeight: 'NORMAL', textAlign: 'LEFT' }, label: true,
+                });
+            }
+
+            if (row.is_bold) {
+                processedColumns.forEach(c => { c.style = { ...c.style, fontWeight: 'BOLD' }; });
+            }
+
             processedColumns.sort((a, b) => a.seq_no - b.seq_no);
 
             return {
                 seq_no: row.row_seq_no,
+                row_code: row.row_code || null,
+                row_kind: kind,
                 row_type: row.row_type,
                 print_control: row.print_control,
                 has_accounts: hasAccounts,
+                parent_row_code: row.parent_row_code || null,
+                row_formula: row.row_formula || null,
+                hide_if_zero: !!row.hide_if_zero,
+                line_above: row.line_above || 'NONE',
+                line_below: row.line_below || 'NONE',
                 columns: processedColumns
             };
         });
@@ -301,44 +339,87 @@ const generateFinancialReport = async (req, res) => {
         const evalState = new Map(); // col object → 'visiting' | 'done'
 
         const findRow = (rSeq) => reportData.find(r => r.seq_no === rSeq);
+        const rowByCode = new Map(reportData.filter(r => r.row_code).map(r => [r.row_code, r]));
+        const childrenOf = (code) => reportData.filter(r => r.parent_row_code === code);
+        // ช่องที่ต้องคำนวณใน STEP นี้: สูตรรายบรรทัด, CALC, ยอดรวม/สูตรของบรรทัด TOTAL/FORMULA
+        const isComputed = (c) => c.type === 'FORMULA' || c.type === 'CALC' || !!c.calc;
+        const cellLabel = (row, col) => `${row.row_code || 'R' + row.seq_no}, C${col.seq_no}`;
+
+        // อ่านค่าช่องเป้าหมาย (คำนวณก่อนถ้ายังไม่ได้คำนวณ)
+        const readCell = (targetRow, target, where) => {
+            if (isComputed(target)) {
+                computeCell(targetRow, target);
+                if (target.error) {
+                    throw new FormulaError('REF_ERROR', `Referenced cell (${where}) has an error`, { row: targetRow.seq_no, col: target.seq_no });
+                }
+            }
+            // ช่องว่างของคอลัมน์ระดับรายงาน (บรรทัดที่ไม่มียอด) = ไม่มีค่า ไม่ใช่ error
+            if (target.report_col && target.type === 'TEXT') return null;
+            if (target.type === 'TEXT' || target.type === 'DIVIDER') {
+                throw new FormulaError('NOT_NUMERIC', `Cell (${where}) is not a number`, { row: targetRow.seq_no, col: target.seq_no });
+            }
+            return target.value == null ? null : Number(target.value);
+        };
+
+        // คำนวณค่าของช่องตามชนิด (สูตร / TOTAL / FORMULA ของบรรทัด)
+        const evaluateCell = (row, col) => {
+            if (col.calc === 'TOTAL') {
+                // รวมช่องเดียวกันของบรรทัดลูก (ค่าลูกกลับเครื่องหมายตาม normal_sign มาแล้ว)
+                let total = 0;
+                for (const child of childrenOf(row.row_code)) {
+                    const target = child.columns.find(c => c.seq_no === col.seq_no);
+                    if (!target) continue;
+                    if (!isComputed(target) && (target.type === 'TEXT' || target.type === 'DIVIDER')) continue;
+                    const v = readCell(child, target, cellLabel(child, target));
+                    if (v != null) total += v;
+                }
+                return total;
+            }
+            const formulaText = col.calc === 'ROWF' ? row.row_formula : col.formula_text;
+            const ast = parseFormula(formulaText);
+            const resolveRef = (rSeq, cSeq) => {
+                const targetRow = findRow(rSeq);
+                const target = targetRow ? targetRow.columns.find(c => c.seq_no === cSeq) : undefined;
+                if (!target) {
+                    throw new FormulaError('UNKNOWN_REF', `Cell (R${rSeq}, C${cSeq}) not found`, { row: rSeq, col: cSeq });
+                }
+                return readCell(targetRow, target, `R${rSeq}, C${cSeq}`);
+            };
+            // [CODE] = คอลัมน์ระดับรายงานในบรรทัดเดียวกัน
+            const resolveCol = (code) => {
+                const rc = reportColByCode.get(code);
+                if (!rc) throw new FormulaError('UNKNOWN_REF', `Column [${code}] not found`, { code });
+                return resolveRef(row.seq_no, rc.col_seq_no);
+            };
+            // ROW_CODE = บรรทัดนั้นในคอลัมน์เดียวกับช่องนี้, ROW_CODE[COL] = ระบุคอลัมน์
+            const resolveRow = (rowCode, colCode) => {
+                const targetRow = rowByCode.get(rowCode);
+                if (!targetRow) throw new FormulaError('UNKNOWN_REF', `Row ${rowCode} not found`, { row_code: rowCode });
+                let seq = col.seq_no;
+                if (colCode) {
+                    const rc = reportColByCode.get(colCode);
+                    if (!rc) throw new FormulaError('UNKNOWN_REF', `Column [${colCode}] not found`, { code: colCode });
+                    seq = rc.col_seq_no;
+                }
+                const target = targetRow.columns.find(c => c.seq_no === seq);
+                // บรรทัดเป้าหมายไม่มีช่องนี้ (เช่น หัวข้อ) = ไม่มีค่า
+                if (!target) return null;
+                return readCell(targetRow, target, cellLabel(targetRow, target));
+            };
+            return evaluateFormula(ast, resolveRef, resolveCol, resolveRow);
+        };
 
         // throws เฉพาะ CIRCULAR (เพื่อให้ทุกช่องในวงจรถูกบันทึก error) — error อื่นเก็บไว้ที่ col.error
-        const computeFormulaCell = (row, col) => {
+        function computeCell(row, col) {
             const state = evalState.get(col);
             if (state === 'done') return;
             if (state === 'visiting') {
-                throw new FormulaError('CIRCULAR', `Circular reference at (R${row.seq_no}, C${col.seq_no})`,
+                throw new FormulaError('CIRCULAR', `Circular reference at (${cellLabel(row, col)})`,
                     { row: row.seq_no, col: col.seq_no });
             }
             evalState.set(col, 'visiting');
             try {
-                const ast = parseFormula(col.formula_text);
-                const resolveRef = (rSeq, cSeq) => {
-                    const targetRow = findRow(rSeq);
-                    const target = targetRow ? targetRow.columns.find(c => c.seq_no === cSeq) : undefined;
-                    if (!target) {
-                        throw new FormulaError('UNKNOWN_REF', `Cell (R${rSeq}, C${cSeq}) not found`, { row: rSeq, col: cSeq });
-                    }
-                    if (target.type === 'FORMULA' || target.type === 'CALC') {
-                        computeFormulaCell(targetRow, target);
-                        if (target.error) {
-                            throw new FormulaError('REF_ERROR', `Referenced cell (R${rSeq}, C${cSeq}) has an error`, { row: rSeq, col: cSeq });
-                        }
-                    }
-                    // ช่องว่างของคอลัมน์ระดับรายงาน (บรรทัดที่ไม่มียอด) = ไม่มีค่า ไม่ใช่ error
-                    if (target.report_col && target.type === 'TEXT') return null;
-                    if (target.type === 'TEXT' || target.type === 'DIVIDER') {
-                        throw new FormulaError('NOT_NUMERIC', `Cell (R${rSeq}, C${cSeq}) is not a number`, { row: rSeq, col: cSeq });
-                    }
-                    return target.value == null ? null : Number(target.value);
-                };
-                // [CODE] = คอลัมน์ระดับรายงานในบรรทัดเดียวกัน
-                const resolveCol = (code) => {
-                    const rc = reportColByCode.get(code);
-                    if (!rc) throw new FormulaError('UNKNOWN_REF', `Column [${code}] not found`, { code });
-                    return resolveRef(row.seq_no, rc.col_seq_no);
-                };
-                col.value = evaluateFormula(ast, resolveRef, resolveCol);
+                col.value = evaluateCell(row, col);
                 evalState.set(col, 'done');
             } catch (err) {
                 evalState.set(col, 'done');
@@ -346,29 +427,52 @@ const generateFinancialReport = async (req, res) => {
                 col.error = err.code || 'SYNTAX';
                 formulaErrors.push({
                     row_seq_no: row.seq_no,
+                    row_code: row.row_code,
                     column_seq_no: col.seq_no,
-                    formula_text: col.formula_text,
+                    formula_text: col.calc === 'ROWF' ? row.row_formula : col.calc === 'TOTAL' ? `SUM(${row.row_code})` : col.formula_text,
                     code: col.error,
                     message: err.message,
                     detail: err.detail || {},
                 });
                 if (err.code === 'CIRCULAR') throw err;
             }
-        };
+        }
 
         reportData.forEach(row => {
             row.columns.forEach(col => {
-                if (col.type !== 'FORMULA' && col.type !== 'CALC') return;
-                if (!col.formula_text) { col.value = null; return; }
-                try { computeFormulaCell(row, col); } catch (_) { /* recorded in formulaErrors */ }
+                if (!isComputed(col)) return;
+                if (!col.calc && !col.formula_text) { col.value = null; return; }
+                try { computeCell(row, col); } catch (_) { /* recorded in formulaErrors */ }
             });
         });
 
         // คอลัมน์ช่วยคำนวณ (is_hidden) คำนวณแล้วแต่ไม่ส่งออกไปแสดงผล
         reportData.forEach(row => { row.columns = row.columns.filter(c => !c.hidden); });
 
-        let finalData = reportData.filter(r => r.print_control === 'SHOW');
+        // ซ่อนบรรทัดที่ทุกช่องตัวเลขเป็นศูนย์/ว่าง (ถ้าตั้ง hide_if_zero และไม่มี error)
+        const isZeroRow = (row) => {
+            const nums = row.columns.filter(c => c.type !== 'TEXT' && c.type !== 'DIVIDER');
+            return nums.length > 0 && nums.every(c => !c.error && (c.value == null || Number(c.value) === 0));
+        };
+
+        let finalData = reportData.filter(r => r.print_control === 'SHOW' && !(r.hide_if_zero && isZeroRow(r)));
         finalData.sort((a, b) => a.seq_no - b.seq_no);
+
+        // เส้นบน/เส้นใต้ยอดเงิน → แทรกบรรทัดเส้น (DIVIDER เฉพาะช่องตัวเลข, '=' = เส้นคู่)
+        const lineRow = (row, style) => ({
+            seq_no: row.seq_no,
+            row_type: row.row_type,
+            print_control: 'SHOW',
+            line_row: true,
+            columns: row.columns.map(c => (c.type === 'TEXT' || c.type === 'DIVIDER')
+                ? { seq_no: c.seq_no, type: 'TEXT', value: '', flex: c.flex, indent_level: 0, style: {} }
+                : { seq_no: c.seq_no, type: 'DIVIDER', data_type: style === 'DOUBLE' ? '=' : '-', value: '---', flex: c.flex, indent_level: 0, style: {} }),
+        });
+        finalData = finalData.flatMap(r => [
+            ...(r.line_above !== 'NONE' ? [lineRow(r, r.line_above)] : []),
+            r,
+            ...(r.line_below !== 'NONE' ? [lineRow(r, r.line_below)] : []),
+        ]);
 
         // ====================================================================
         // STEP 7: หัวคอลัมน์อัตโนมัติจากคอลัมน์ระดับรายงาน (เป็น HEADER จึงพิมพ์ซ้ำทุกหน้า)
@@ -408,7 +512,7 @@ const generateFinancialReport = async (req, res) => {
         // ส่งข้อมูลกลับไปที่ Frontend (กรองเฉพาะ Print Control ที่ให้แสดงผล)
         res.status(200).json({
             report_code: master.report_code,
-            report_name: master.report_name_thai,
+            report_name: (isEnglish && master.report_name_eng) ? master.report_name_eng : master.report_name_thai,
             parenthesis_for_minus: master.parenthesis_for_minus,
             page_config: {
                 orientation: master.page_orientation,
