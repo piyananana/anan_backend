@@ -1,4 +1,5 @@
 // File: controllers/gl/glFinancialReportEngineController.js
+const { parse: parseFormula, evaluate: evaluateFormula, FormulaError } = require('../../utils/finReportFormula');
 
 const getReportMasterList = async (req, res) => {
     const client = await req.dbPool.connect();
@@ -133,6 +134,32 @@ const generateFinancialReport = async (req, res) => {
                   AND ($7::int IS NULL OR c.dim5_id = $7)
             `, [reqPeriodArr, branchId, d1, d2, d3, d4, d5]);
             glData = glDataRes.rows;
+
+            // ตัดผลของรายการปิดบัญชีสิ้นปี (Step 3 ปิดรายได้/ค่าใช้จ่าย, Step 4 โอนเข้ากำไรสะสม) ออก
+            // รายการเหล่านี้ลงในงวดสุดท้ายของปี ถ้าไม่ตัดออก งบกำไรขาดทุน YTD งวดสุดท้ายจะเป็นศูนย์
+            // (Step 5 ยอดยกมาในงวด 1 ของปีใหม่ ยังคงไว้ เพราะเป็นยอดตั้งต้นของงบแสดงฐานะการเงิน)
+            // combo ของรายการปิดบัญชีสร้างจาก detail row (ดู glYearEndClosingController.updateBalanceAccum)
+            const closingRes = await client.query(`
+                SELECT a.account_code, h.period_id,
+                       COALESCE(d.branch_id, 0) AS branch_id,
+                       COALESCE(d.dim1_id, 0) AS dim1_id, COALESCE(d.dim2_id, 0) AS dim2_id,
+                       COALESCE(d.dim3_id, 0) AS dim3_id, COALESCE(d.dim4_id, 0) AS dim4_id,
+                       COALESCE(d.dim5_id, 0) AS dim5_id,
+                       SUM(COALESCE(d.debit_lc, 0) - COALESCE(d.credit_lc, 0)) AS net_amount
+                FROM gl_year_end_closing yc
+                JOIN gl_entry_header h ON h.id IN (yc.step3_entry_id, yc.step4_entry_id) AND h.status = 'Posted'
+                JOIN gl_entry_detail d ON d.header_id = h.id
+                JOIN gl_account a ON a.id = d.account_id
+                WHERE h.period_id = ANY($1::int[])
+                  AND ($2::int IS NULL OR COALESCE(d.branch_id, 0) = $2)
+                  AND ($3::int IS NULL OR COALESCE(d.dim1_id, 0) = $3)
+                  AND ($4::int IS NULL OR COALESCE(d.dim2_id, 0) = $4)
+                  AND ($5::int IS NULL OR COALESCE(d.dim3_id, 0) = $5)
+                  AND ($6::int IS NULL OR COALESCE(d.dim4_id, 0) = $6)
+                  AND ($7::int IS NULL OR COALESCE(d.dim5_id, 0) = $7)
+                GROUP BY a.account_code, h.period_id, 3, 4, 5, 6, 7, 8
+            `, [reqPeriodArr, branchId, d1, d2, d3, d4, d5]);
+            closingRes.rows.forEach(c => glData.push({ ...c, end_balance: -Number(c.net_amount) }));
         }
 
         // ====================================================================
@@ -163,8 +190,10 @@ const generateFinancialReport = async (req, res) => {
                         // 2. กรองข้อมูลเอาเฉพาะเงื่อนไขที่กำหนดไว้ใน Row
                         const matchedGL = targetGL.filter(g => {
                             let isMatch = true;
-                            // กรองช่วงรหัสบัญชี
-                            if (g.account_code < row.account_from || g.account_code > row.account_to) {
+                            // กรองช่วงรหัสบัญชี — account_to รวมบัญชีลูกที่ขึ้นต้นด้วยรหัสนั้นด้วย
+                            // (เช่น ถึง '1199' ต้องรวม '11991' ซึ่งเทียบแบบข้อความแล้วมากกว่า '1199')
+                            if (g.account_code < row.account_from ||
+                                (g.account_code > row.account_to && !g.account_code.startsWith(row.account_to))) {
                                 isMatch = false;
                             }
                             // กรองตาม Dimension ถ้ามีระบุไว้ในบรรทัดนั้น
@@ -215,31 +244,63 @@ const generateFinancialReport = async (req, res) => {
         // ====================================================================
         // STEP 6: ประมวลผลสูตรคำนวณ (Pass 2 - FORMULA)
         // ====================================================================
-        // ฟังก์ชันอ่านค่าเซลล์อ้างอิง เช่น (R100, C20)
-        const getCellValue = (rSeq, cSeq) => {
-            const targetRow = reportData.find(r => r.seq_no === parseInt(rSeq));
-            if (!targetRow) return 0;
-            const targetCol = targetRow.columns.find(c => c.seq_no === parseInt(cSeq));
-            return targetCol && !isNaN(targetCol.value) ? Number(targetCol.value) : 0;
+        // คำนวณแบบ recursive ตามการอ้างอิง (สูตรที่อ้างสูตรบรรทัดหลังจะได้ค่าที่ถูกต้อง)
+        // สูตรผิด/อ้างอิงไม่พบ/อ้างวน → value = null + error แทนการให้ค่า 0 เงียบ ๆ
+        const formulaErrors = [];
+        const evalState = new Map(); // col object → 'visiting' | 'done'
+
+        const findRow = (rSeq) => reportData.find(r => r.seq_no === rSeq);
+
+        // throws เฉพาะ CIRCULAR (เพื่อให้ทุกช่องในวงจรถูกบันทึก error) — error อื่นเก็บไว้ที่ col.error
+        const computeFormulaCell = (row, col) => {
+            const state = evalState.get(col);
+            if (state === 'done') return;
+            if (state === 'visiting') {
+                throw new FormulaError('CIRCULAR', `Circular reference at (R${row.seq_no}, C${col.seq_no})`,
+                    { row: row.seq_no, col: col.seq_no });
+            }
+            evalState.set(col, 'visiting');
+            try {
+                const ast = parseFormula(col.formula_text);
+                col.value = evaluateFormula(ast, (rSeq, cSeq) => {
+                    const targetRow = findRow(rSeq);
+                    const target = targetRow ? targetRow.columns.find(c => c.seq_no === cSeq) : undefined;
+                    if (!target) {
+                        throw new FormulaError('UNKNOWN_REF', `Cell (R${rSeq}, C${cSeq}) not found`, { row: rSeq, col: cSeq });
+                    }
+                    if (target.type === 'FORMULA') {
+                        computeFormulaCell(targetRow, target);
+                        if (target.error) {
+                            throw new FormulaError('REF_ERROR', `Referenced cell (R${rSeq}, C${cSeq}) has an error`, { row: rSeq, col: cSeq });
+                        }
+                    }
+                    if (target.type === 'TEXT' || target.type === 'DIVIDER') {
+                        throw new FormulaError('NOT_NUMERIC', `Cell (R${rSeq}, C${cSeq}) is not a number`, { row: rSeq, col: cSeq });
+                    }
+                    return target.value == null ? null : Number(target.value);
+                });
+                evalState.set(col, 'done');
+            } catch (err) {
+                evalState.set(col, 'done');
+                col.value = null;
+                col.error = err.code || 'SYNTAX';
+                formulaErrors.push({
+                    row_seq_no: row.seq_no,
+                    column_seq_no: col.seq_no,
+                    formula_text: col.formula_text,
+                    code: col.error,
+                    message: err.message,
+                    detail: err.detail || {},
+                });
+                if (err.code === 'CIRCULAR') throw err;
+            }
         };
 
-        // วนลูปเฉพาะคอลัมน์ที่เป็น FORMULA
         reportData.forEach(row => {
             row.columns.forEach(col => {
-                if (col.type === 'FORMULA' && col.formula_text) {
-                    try {
-                        // Regex ค้นหารูปแบบ (R100, C20) 
-                        // รองรับกรณีเว้นวรรค เช่น (R100, C20) หรือ (R100,C20)
-                        let parsedFormula = col.formula_text.replace(/\(R(\d+),\s*C(\d+)\)/g, (match, rSeq, cSeq) => {
-                            return getCellValue(rSeq, cSeq);
-                        });
-                        
-                        // ประมวลผลสมการคณิตศาสตร์ที่แปลงค่าตัวเลขแล้ว
-                        col.value = new Function(`return ${parsedFormula}`)();
-                    } catch (err) {
-                        col.value = 0;
-                    }
-                }
+                if (col.type !== 'FORMULA') return;
+                if (!col.formula_text) { col.value = null; return; }
+                try { computeFormulaCell(row, col); } catch (_) { /* recorded in formulaErrors */ }
             });
         });
 
@@ -255,6 +316,7 @@ const generateFinancialReport = async (req, res) => {
                 orientation: master.page_orientation,
                 margins: [master.margin_top, master.margin_right, master.margin_bottom, master.margin_left],
             },
+            formula_errors: formulaErrors,
             data: finalData
         });
 

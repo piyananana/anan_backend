@@ -1,4 +1,16 @@
 // controllers/gl/glFinancialReportBuilderController.js
+const { parse: parseFormula } = require('../../utils/finReportFormula');
+
+// ตรวจ syntax สูตรตอนบันทึก — คืน null ถ้าผ่าน หรือ { error, code, detail } ถ้าไม่ผ่าน
+const validateFormulaColumn = (column_type, formula_text) => {
+    if (column_type !== 'FORMULA') return null;
+    try {
+        parseFormula(formula_text);
+        return null;
+    } catch (err) {
+        return { error: `Invalid formula: ${err.message}`, code: err.code || 'SYNTAX', detail: err.detail || {} };
+    }
+};
 
 // --- gl_fin_report (Master) ---
 
@@ -166,6 +178,8 @@ const deleteRow = async (req, res) => {
 
 const createColumn = async (req, res) => {
     const { row_id, column_seq_no, column_type, description_thai, data_type, column_flex, indent_level, font_size, font_weight, text_align, period_offset, formula_text } = req.body;
+    const invalid = validateFormulaColumn(column_type, formula_text);
+    if (invalid) return res.status(400).json(invalid);
     const client = await req.dbPool.connect();
     try {
         const result = await client.query(
@@ -186,6 +200,8 @@ const createColumn = async (req, res) => {
 const updateColumn = async (req, res) => {
     const { id } = req.params;
     const { column_seq_no, column_type, description_thai, data_type, column_flex, indent_level, font_size, font_weight, text_align, period_offset, formula_text } = req.body;
+    const invalid = validateFormulaColumn(column_type, formula_text);
+    if (invalid) return res.status(400).json(invalid);
     const client = await req.dbPool.connect();
     try {
         const result = await client.query(
