@@ -115,6 +115,11 @@ router.post('/gl_fin_report_column', glFinancialReportBuilderController.createCo
 router.put('/gl_fin_report_column/:id', glFinancialReportBuilderController.updateColumn);
 router.delete('/gl_fin_report_column/:id', glFinancialReportBuilderController.deleteColumn);
 
+router.get('/gl_fin_report_col/:report_id', glFinancialReportBuilderController.getReportCols);
+router.post('/gl_fin_report_col', glFinancialReportBuilderController.createReportCol);
+router.put('/gl_fin_report_col/:id', glFinancialReportBuilderController.updateReportCol);
+router.delete('/gl_fin_report_col/:id', glFinancialReportBuilderController.deleteReportCol);
+
 // Router สำหรับ GL Dimension Framework
 router.get('/gl_dimension_type/active', glDimensionTypeController.fetchActiveRows);
 router.get('/gl_dimension_type', glDimensionTypeController.fetchRows);

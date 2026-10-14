@@ -4,6 +4,7 @@
 //
 // Syntax:
 //   cell ref : (R100, C20)          → value of row_seq_no 100, column_seq_no 20
+//   col ref  : [CUR]                → report-level column (gl_fin_report_col.col_code) in the same row
 //   operators: + - * /  unary -  ( )
 //   functions: ABS(x)  ROUND(x[, digits])  MIN(a, b, ...)  MAX(a, b, ...)
 //   numbers  : 123  1.5  .5
@@ -13,7 +14,7 @@ class FormulaError extends Error {
     constructor(code, message, detail = {}) {
         super(message);
         this.code = code;     // SYNTAX | UNKNOWN_REF | NOT_NUMERIC | CIRCULAR | REF_ERROR
-        this.detail = detail; // e.g. { row: 100, col: 20 }
+        this.detail = detail; // e.g. { row: 100, col: 20 } or { code: 'PY' }
     }
 }
 
@@ -25,6 +26,7 @@ const FUNCTIONS = {
 };
 
 const REF_RE = /^\(\s*R(\d+)\s*,\s*C(\d+)\s*\)/i;
+const COL_RE = /^\[\s*([A-Za-z][A-Za-z0-9_]*)\s*\]/;
 
 const tokenize = (text) => {
     const tokens = [];
@@ -38,6 +40,13 @@ const tokenize = (text) => {
         if (ref) {
             tokens.push({ type: 'REF', row: parseInt(ref[1], 10), col: parseInt(ref[2], 10), pos: i });
             i += ref[0].length;
+            continue;
+        }
+
+        const colRef = COL_RE.exec(rest);
+        if (colRef) {
+            tokens.push({ type: 'COL', code: colRef[1].toUpperCase(), pos: i });
+            i += colRef[0].length;
             continue;
         }
 
@@ -71,7 +80,7 @@ const tokenize = (text) => {
 //   expr  := term (('+'|'-') term)*
 //   term  := unary (('*'|'/') unary)*
 //   unary := ('+'|'-') unary | primary
-//   primary := NUM | REF | IDENT '(' args ')' | '(' expr ')'
+//   primary := NUM | REF | COL | IDENT '(' args ')' | '(' expr ')'
 const parse = (text) => {
     if (text == null || String(text).trim() === '') {
         throw new FormulaError('SYNTAX', 'Formula is empty');
@@ -116,6 +125,7 @@ const parse = (text) => {
         const t = next();
         if (t.type === 'NUM') return { type: 'NUM', value: t.value };
         if (t.type === 'REF') return { type: 'REF', row: t.row, col: t.col };
+        if (t.type === 'COL') return { type: 'COL', code: t.code };
         if (t.type === '(') {
             const node = parseExpr();
             expect(')');
@@ -147,12 +157,15 @@ const parse = (text) => {
     return ast;
 };
 
-// Evaluate an AST. resolveRef(row, col) must return a number or null (or throw FormulaError).
-const evaluate = (ast, resolveRef) => {
+// Evaluate an AST. resolveRef(row, col) / resolveCol(code) must return a number or null (or throw FormulaError).
+const evaluate = (ast, resolveRef, resolveCol) => {
     const ev = (n) => {
         switch (n.type) {
             case 'NUM': return n.value;
             case 'REF': return resolveRef(n.row, n.col);
+            case 'COL':
+                if (!resolveCol) throw new FormulaError('UNKNOWN_REF', `Column [${n.code}] cannot be used here`, { code: n.code });
+                return resolveCol(n.code);
             case 'NEG': { const v = ev(n.arg); return v == null ? null : -v; }
             case 'BIN': {
                 const l = ev(n.left);
@@ -182,4 +195,14 @@ const evaluate = (ast, resolveRef) => {
     return ev(ast);
 };
 
-module.exports = { parse, evaluate, FormulaError };
+// รายการ col_code ที่สูตรอ้างถึง (ใช้ตรวจตอนบันทึก)
+const collectColRefs = (ast, out = new Set()) => {
+    if (!ast) return out;
+    if (ast.type === 'COL') out.add(ast.code);
+    if (ast.type === 'NEG') collectColRefs(ast.arg, out);
+    if (ast.type === 'BIN') { collectColRefs(ast.left, out); collectColRefs(ast.right, out); }
+    if (ast.type === 'FN') ast.args.forEach(a => collectColRefs(a, out));
+    return out;
+};
+
+module.exports = { parse, evaluate, collectColRefs, FormulaError };
