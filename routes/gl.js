@@ -10,6 +10,7 @@ const glGeneralLedgerReportController = require('../controllers/gl/glGeneralLedg
 const glPeriodController = require('../controllers/gl/glPeriodController');
 const glTrialBalanceReportController = require('../controllers/gl/glTrialBalanceReportController');
 const glFinancialReportBuilderController = require('../controllers/gl/glFinancialReportBuilderController');
+const glFinancialReportTransferController = require('../controllers/gl/glFinancialReportTransferController');
 const glClosingConfigController = require('../controllers/gl/glClosingConfigController');
 const glAdjustingTemplateController = require('../controllers/gl/glAdjustingTemplateController');
 const glYearEndClosingController = require('../controllers/gl/glYearEndClosingController');
@@ -106,6 +107,10 @@ router.post('/gl_fin_report', glFinancialReportBuilderController.createReport);
 router.put('/gl_fin_report/:id', glFinancialReportBuilderController.updateReport);
 router.delete('/gl_fin_report/:id', glFinancialReportBuilderController.deleteReport);
 router.get('/gl_fin_report/:id/account_mapping', glFinancialReportBuilderController.getAccountMapping);
+router.put('/gl_fin_report/:id/reorder_rows', glFinancialReportBuilderController.reorderRows);
+router.get('/gl_fin_report/:id/export', glFinancialReportTransferController.exportReport);
+router.post('/gl_fin_report_import', glFinancialReportTransferController.importReport);
+router.get('/gl_fin_report_templates', glFinancialReportTransferController.listTemplates);
 
 router.get('/gl_fin_report_row/:report_id', glFinancialReportBuilderController.getRows);
 router.post('/gl_fin_report_row', glFinancialReportBuilderController.createRow);

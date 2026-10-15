@@ -229,4 +229,14 @@ const collectRowRefs = (ast, out = new Set()) => {
     return out;
 };
 
-module.exports = { parse, evaluate, collectColRefs, collectRowRefs, FUNCTIONS, FormulaError };
+// เปลี่ยนเลขบรรทัดใน (Rn, Cm) ตาม seqMap (Map เลขเดิม → เลขใหม่) — ใช้ตอนเรียงบรรทัดใหม่
+// เลขที่ไม่อยู่ใน seqMap คงเดิม; คืนข้อความเดิมถ้าไม่มีอะไรเปลี่ยน
+const renumberRowRefs = (text, seqMap) => {
+    if (!text) return text;
+    return text.replace(/\(\s*R(\d+)\s*,\s*C(\d+)\s*\)/gi, (m, r, c) => {
+        const to = seqMap.get(parseInt(r, 10));
+        return to === undefined ? m : `(R${to}, C${c})`;
+    });
+};
+
+module.exports = { parse, evaluate, collectColRefs, collectRowRefs, renumberRowRefs, FUNCTIONS, FormulaError };

@@ -21,7 +21,8 @@ const getReportMasterList = async (req, res) => {
 };
 
 const generateFinancialReport = async (req, res) => {
-    const { report_id, base_period_id, branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, lang } = req.body;
+    // preview = เรียกจากหน้าออกแบบ — แสดงได้แม้รายงานยังไม่เปิดใช้งาน
+    const { report_id, base_period_id, branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, lang, preview } = req.body;
     const isEnglish = lang === 'en';
     const branchId = branch_id  ? parseInt(branch_id)  : null;
     const d1 = dim1_id ? parseInt(dim1_id) : null;
@@ -33,7 +34,8 @@ const generateFinancialReport = async (req, res) => {
 
     try {
         // 1. ดึงข้อมูล Master (gl_fin_report)
-        const masterRes = await client.query(`SELECT * FROM gl_fin_report WHERE id = $1 AND is_active = true`, [report_id]);
+        const masterRes = await client.query(
+            `SELECT * FROM gl_fin_report WHERE id = $1 AND (is_active = true OR $2::boolean)`, [report_id, preview === true]);
         if (masterRes.rows.length === 0) throw new Error('ไม่พบรายงานนี้ในระบบ');
         const master = masterRes.rows[0];
 

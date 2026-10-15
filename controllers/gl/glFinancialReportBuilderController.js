@@ -1,5 +1,5 @@
 // controllers/gl/glFinancialReportBuilderController.js
-const { parse: parseFormula, collectColRefs, collectRowRefs, FUNCTIONS } = require('../../utils/finReportFormula');
+const { parse: parseFormula, collectColRefs, collectRowRefs, renumberRowRefs, FUNCTIONS } = require('../../utils/finReportFormula');
 const { SEL_TYPES, ACCOUNT_TYPES, loadAccounts, buildAccountIndex, rowSelections, resolveRowAccounts } = require('../../utils/finReportAccounts');
 
 // ตรวจ syntax สูตรตอนบันทึก — คืน null ถ้าผ่าน หรือ { error, code, detail } ถ้าไม่ผ่าน
@@ -94,14 +94,15 @@ const getReports = async (req, res) => {
 };
 
 const createReport = async (req, res) => {
-    const { report_code, report_name_thai, is_active, parenthesis_for_minus, page_orientation, margin_top, margin_right, margin_bottom, margin_left } = req.body;
+    const { report_code, report_name_thai, report_name_eng, is_active, parenthesis_for_minus, page_orientation, margin_top, margin_right, margin_bottom, margin_left } = req.body;
     const client = await req.dbPool.connect();
     try {
         const result = await client.query(
-            `INSERT INTO gl_fin_report (report_code, report_name_thai, is_active, parenthesis_for_minus, page_orientation, margin_top, margin_right, margin_bottom, margin_left)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+            `INSERT INTO gl_fin_report (report_code, report_name_thai, is_active, parenthesis_for_minus, page_orientation, margin_top, margin_right, margin_bottom, margin_left, report_name_eng)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
             [report_code, report_name_thai, is_active ?? true, parenthesis_for_minus ?? true,
-             page_orientation ?? 'PORTRAIT', margin_top ?? 30, margin_right ?? 30, margin_bottom ?? 30, margin_left ?? 30]
+             page_orientation ?? 'PORTRAIT', margin_top ?? 30, margin_right ?? 30, margin_bottom ?? 30, margin_left ?? 30,
+             report_name_eng || null]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -113,15 +114,15 @@ const createReport = async (req, res) => {
 
 const updateReport = async (req, res) => {
     const { id } = req.params;
-    const { report_code, report_name_thai, is_active, parenthesis_for_minus, page_orientation, margin_top, margin_right, margin_bottom, margin_left } = req.body;
+    const { report_code, report_name_thai, report_name_eng, is_active, parenthesis_for_minus, page_orientation, margin_top, margin_right, margin_bottom, margin_left } = req.body;
     const client = await req.dbPool.connect();
     try {
         const result = await client.query(
             `UPDATE gl_fin_report SET report_code=$1, report_name_thai=$2, is_active=$3, parenthesis_for_minus=$4,
-             page_orientation=$5, margin_top=$6, margin_right=$7, margin_bottom=$8, margin_left=$9
+             page_orientation=$5, margin_top=$6, margin_right=$7, margin_bottom=$8, margin_left=$9, report_name_eng=$11
              WHERE id=$10 RETURNING *`,
             [report_code, report_name_thai, is_active, parenthesis_for_minus, page_orientation,
-             margin_top, margin_right, margin_bottom, margin_left, id]
+             margin_top, margin_right, margin_bottom, margin_left, id, report_name_eng || null]
         );
         res.status(200).json(result.rows[0]);
     } catch (err) {
@@ -440,6 +441,57 @@ const updateRow = async (req, res) => {
     }
 };
 
+// เรียงบรรทัดใหม่ (ลากวาง) — body.row_ids = id ทุกบรรทัดของรายงานตามลำดับใหม่ → เลขบรรทัด 10, 20, 30, ...
+// สูตรแบบเก่า (Rn, Cm) อ้างด้วยเลขบรรทัด จึงแก้เลขในสูตรทุกที่ให้ตรงกับเลขใหม่ในธุรกรรมเดียวกัน
+// (สูตรที่อ้างด้วย row_code ไม่กระทบ)
+const reorderRows = async (req, res) => {
+    const reportId = Number(req.params.id);
+    const ids = (req.body.row_ids || []).map(Number);
+    const client = await req.dbPool.connect();
+    try {
+        const cur = await client.query(`SELECT id, row_seq_no FROM gl_fin_report_row WHERE report_id = $1`, [reportId]);
+        const oldSeqById = new Map(cur.rows.map(r => [r.id, r.row_seq_no]));
+        if (ids.length !== oldSeqById.size || new Set(ids).size !== ids.length || ids.some(id => !oldSeqById.has(id))) {
+            return res.status(400).json({ error: 'row_ids must list every row of the report exactly once', code: 'INVALID_SEQ' });
+        }
+        const seqMap = new Map(ids.map((id, i) => [oldSeqById.get(id), (i + 1) * 10]));
+
+        await client.query('BEGIN');
+        // เลี่ยง unique (report_id, row_seq_no) ชนกันระหว่างย้าย: ติดลบก่อนแล้วค่อยใส่เลขจริง
+        await client.query(`UPDATE gl_fin_report_row SET row_seq_no = -row_seq_no WHERE report_id = $1`, [reportId]);
+        for (const [i, id] of ids.entries()) {
+            await client.query(`UPDATE gl_fin_report_row SET row_seq_no = $1 WHERE id = $2`, [(i + 1) * 10, id]);
+        }
+        const formulas = await client.query(`
+            SELECT 'CELL' AS src, c.id, c.formula_text AS f FROM gl_fin_report_column c
+              JOIN gl_fin_report_row r ON r.id = c.row_id
+             WHERE r.report_id = $1 AND c.formula_text IS NOT NULL
+            UNION ALL
+            SELECT 'ROW', id, row_formula FROM gl_fin_report_row WHERE report_id = $1 AND row_formula IS NOT NULL
+            UNION ALL
+            SELECT 'COL', id, formula_text FROM gl_fin_report_col WHERE report_id = $1 AND formula_text IS NOT NULL`, [reportId]);
+        const sql = {
+            CELL: `UPDATE gl_fin_report_column SET formula_text = $1 WHERE id = $2`,
+            ROW: `UPDATE gl_fin_report_row SET row_formula = $1 WHERE id = $2`,
+            COL: `UPDATE gl_fin_report_col SET formula_text = $1 WHERE id = $2`,
+        };
+        let formulasUpdated = 0;
+        for (const f of formulas.rows) {
+            const next = renumberRowRefs(f.f, seqMap);
+            if (next === f.f) continue;
+            await client.query(sql[f.src], [next, f.id]);
+            formulasUpdated++;
+        }
+        await client.query('COMMIT');
+        res.status(200).json({ rows: ids.length, formulas_updated: formulasUpdated });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
+    }
+};
+
 const deleteRow = async (req, res) => {
     const { id } = req.params;
     const client = await req.dbPool.connect();
@@ -710,7 +762,7 @@ const deleteReportCol = async (req, res) => {
 
 module.exports = {
     getReports, createReport, updateReport, deleteReport,
-    getRows, createRow, updateRow, deleteRow, getAccountMapping,
+    getRows, createRow, updateRow, deleteRow, reorderRows, getAccountMapping,
     createColumn, updateColumn, deleteColumn,
     getReportCols, createReportCol, updateReportCol, deleteReportCol,
 };
