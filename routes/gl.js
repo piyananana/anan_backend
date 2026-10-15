@@ -105,6 +105,7 @@ router.get('/gl_fin_report', glFinancialReportBuilderController.getReports);
 router.post('/gl_fin_report', glFinancialReportBuilderController.createReport);
 router.put('/gl_fin_report/:id', glFinancialReportBuilderController.updateReport);
 router.delete('/gl_fin_report/:id', glFinancialReportBuilderController.deleteReport);
+router.get('/gl_fin_report/:id/account_mapping', glFinancialReportBuilderController.getAccountMapping);
 
 router.get('/gl_fin_report_row/:report_id', glFinancialReportBuilderController.getRows);
 router.post('/gl_fin_report_row', glFinancialReportBuilderController.createRow);

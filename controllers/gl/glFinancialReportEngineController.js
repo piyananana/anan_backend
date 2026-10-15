@@ -1,4 +1,5 @@
 // File: controllers/gl/glFinancialReportEngineController.js
+const { loadAccounts, buildAccountIndex, rowSelections, resolveRowAccounts } = require('../../utils/finReportAccounts');
 const { parse: parseFormula, evaluate: evaluateFormula, FormulaError } = require('../../utils/finReportFormula');
 
 const getReportMasterList = async (req, res) => {
@@ -54,6 +55,17 @@ const generateFinancialReport = async (req, res) => {
             `SELECT * FROM gl_fin_report_col WHERE report_id = $1 ORDER BY col_seq_no ASC`, [report_id]);
         const reportCols = reportColRes.rows;
         const reportColByCode = new Map(reportCols.map(rc => [rc.col_code, rc]));
+
+        // 3.2 เงื่อนไขเลือกบัญชีของบรรทัด (gl_fin_report_row_acct) → row.acctSet = Set ของรหัสบัญชี
+        //     (null = บรรทัดไม่ได้เลือกบัญชี)
+        if (rows.some(r => (r.row_kind || 'ACCOUNTS') === 'ACCOUNTS')) {
+            const selRes = await client.query(
+                `SELECT * FROM gl_fin_report_row_acct WHERE row_id = ANY($1::int[]) ORDER BY row_id, seq_no, id`, [rowIds]);
+            const acctIndex = buildAccountIndex(await loadAccounts(client));
+            rows.forEach(r => {
+                r.acctSet = resolveRowAccounts(acctIndex, rowSelections(r, selRes.rows.filter(s => s.row_id === r.id)));
+            });
+        }
 
         // ====================================================================
         // STEP 2: โหลดข้อมูล Period ทั้งหมดเพื่อคำนวณ Offset อย่างรวดเร็ว
@@ -201,16 +213,13 @@ const generateFinancialReport = async (req, res) => {
         // excludeClosing=false → ไม่หักรายการปิดบัญชีออก (ได้ยอดหลังปิดบัญชี)
         const dimKeys = ['branch_id', 'dim1_id', 'dim2_id', 'dim3_id', 'dim4_id', 'dim5_id'];
         const sumRow = (row, targetIds, colFilter, excludeClosing) => {
-            if (targetIds.length === 0 || !row.account_from || !row.account_to) return 0;
+            if (targetIds.length === 0 || !row.acctSet) return 0;
             const periodSet = new Set(targetIds);
             let total = 0;
             for (const g of glData) {
                 if (!periodSet.has(g.period_id)) continue;
                 if (g.is_closing_adj && !excludeClosing) continue;
-                // กรองช่วงรหัสบัญชี — account_to รวมบัญชีลูกที่ขึ้นต้นด้วยรหัสนั้นด้วย
-                // (เช่น ถึง '1199' ต้องรวม '11991' ซึ่งเทียบแบบข้อความแล้วมากกว่า '1199')
-                if (g.account_code < row.account_from ||
-                    (g.account_code > row.account_to && !g.account_code.startsWith(row.account_to))) continue;
+                if (!row.acctSet.has(g.account_code)) continue;
                 // กรองตาม Dimension ที่ระบุไว้ในบรรทัด และในคอลัมน์
                 if (dimKeys.some(k => row[k] && g[k] !== row[k])) continue;
                 if (colFilter && dimKeys.some(k => colFilter[k] && g[k] !== colFilter[k])) continue;
@@ -233,7 +242,7 @@ const generateFinancialReport = async (req, res) => {
             const kind = row.row_kind || 'ACCOUNTS';
             // ช่องตัวเลขของบรรทัด TOTAL/FORMULA คำนวณทีหลังใน STEP 6 (calc)
             const derivedCalc = kind === 'TOTAL' ? 'TOTAL' : kind === 'FORMULA' ? 'ROWF' : null;
-            const hasAccounts = kind === 'ACCOUNTS' && !!(row.account_from && row.account_to);
+            const hasAccounts = kind === 'ACCOUNTS' && !!row.acctSet;
 
             let processedColumns = myCols.map(col => {
                 let cellValue = null;

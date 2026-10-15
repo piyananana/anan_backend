@@ -1,5 +1,6 @@
 // controllers/gl/glFinancialReportBuilderController.js
 const { parse: parseFormula, collectColRefs, collectRowRefs, FUNCTIONS } = require('../../utils/finReportFormula');
+const { SEL_TYPES, ACCOUNT_TYPES, loadAccounts, buildAccountIndex, rowSelections, resolveRowAccounts } = require('../../utils/finReportAccounts');
 
 // ตรวจ syntax สูตรตอนบันทึก — คืน null ถ้าผ่าน หรือ { error, code, detail } ถ้าไม่ผ่าน
 const validateFormulaColumn = (column_type, formula_text) => {
@@ -168,7 +169,12 @@ const getRows = async (req, res) => {
             );
             cols = colRes.rows;
         }
-        const result = rows.map(row => ({ ...row, columns: cols.filter(c => c.row_id === row.id) }));
+        const accts = await fetchRowAccts(client, rowIds);
+        const result = rows.map(row => ({
+            ...row,
+            columns: cols.filter(c => c.row_id === row.id),
+            accounts: accts.filter(a => a.row_id === row.id),
+        }));
         res.status(200).json(result);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -262,6 +268,102 @@ const validateRow = async (client, reportId, r, rowId = null) => {
     return null;
 };
 
+// --- gl_fin_report_row_acct (เงื่อนไขเลือกบัญชีของบรรทัด บันทึกพร้อมบรรทัด) ---
+
+const fetchRowAccts = async (client, rowIds) => {
+    if (rowIds.length === 0) return [];
+    const res = await client.query(
+        `SELECT * FROM gl_fin_report_row_acct WHERE row_id = ANY($1::int[]) ORDER BY row_id, seq_no, id`, [rowIds]);
+    return res.rows;
+};
+
+// body.accounts → รายการที่บันทึกได้ (undefined = ไม่ได้ส่งมา ไม่แตะของเดิม)
+const normalizeAccts = (list) => {
+    if (!Array.isArray(list)) return undefined;
+    const str = (v) => String(v ?? '').trim() || null;
+    return list.map((a, i) => {
+        const selType = a.sel_type || 'RANGE';
+        return {
+            seq_no: (i + 1) * 10,
+            sel_type: selType,
+            is_exclude: a.is_exclude === true,
+            account_from: selType === 'RANGE' ? str(a.account_from) : null,
+            account_to: selType === 'RANGE' ? str(a.account_to) : null,
+            header_account_code: selType === 'UNDER_HEADER' ? str(a.header_account_code) : null,
+            account_type: selType === 'ACCOUNT_TYPE' ? str(a.account_type) : null,
+        };
+    });
+};
+
+// ตรวจเงื่อนไขเลือกบัญชี — คืน null หรือ error object (detail.index = ลำดับเงื่อนไขที่ผิด เริ่ม 0)
+const validateAccts = async (client, accts) => {
+    for (const [index, a] of accts.entries()) {
+        if (!SEL_TYPES.includes(a.sel_type)) return { error: 'Invalid sel_type', code: 'INVALID_KIND', detail: { index } };
+        if (a.sel_type === 'RANGE' && (!a.account_from || !a.account_to || a.account_from > a.account_to)) {
+            return { error: 'Account range needs from <= to', code: 'INVALID_RANGE', detail: { index } };
+        }
+        if (a.sel_type === 'ACCOUNT_TYPE' && !ACCOUNT_TYPES.includes(a.account_type)) {
+            return { error: 'Invalid account_type', code: 'INVALID_KIND', detail: { index } };
+        }
+    }
+    const headers = accts.filter(a => a.sel_type === 'UNDER_HEADER').map(a => a.header_account_code);
+    if (headers.length > 0) {
+        const res = await client.query(`SELECT account_code FROM gl_account WHERE account_code = ANY($1::text[])`, [headers]);
+        const found = new Set(res.rows.map(r => r.account_code));
+        const index = accts.findIndex(a => a.sel_type === 'UNDER_HEADER' && !found.has(a.header_account_code));
+        if (index !== -1) {
+            const code = accts[index].header_account_code;
+            return { error: `Account ${code} not found`, code: 'UNKNOWN_ACCOUNT', detail: { index, account_code: code } };
+        }
+    }
+    return null;
+};
+
+const replaceRowAccts = async (client, rowId, accts) => {
+    await client.query(`DELETE FROM gl_fin_report_row_acct WHERE row_id = $1`, [rowId]);
+    for (const a of accts) {
+        await client.query(
+            `INSERT INTO gl_fin_report_row_acct (row_id, seq_no, sel_type, is_exclude, account_from, account_to, header_account_code, account_type)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+            [rowId, a.seq_no, a.sel_type, a.is_exclude, a.account_from, a.account_to, a.header_account_code, a.account_type]);
+    }
+};
+
+// ตรวจผังบัญชีกับรายงาน: บัญชีลงรายการ (active) แต่ละบัญชีอยู่ในบรรทัด ACCOUNTS ใดบ้าง
+// UI ใช้หาบัญชีที่ไม่อยู่ในบรรทัดใดเลย (ยอดหายจากงบ) และบัญชีที่อยู่หลายบรรทัด (ยอดนับซ้ำ)
+const getAccountMapping = async (req, res) => {
+    const { id } = req.params;
+    const client = await req.dbPool.connect();
+    try {
+        const rowRes = await client.query(
+            `SELECT * FROM gl_fin_report_row WHERE report_id = $1 AND row_kind = 'ACCOUNTS' ORDER BY row_seq_no`, [id]);
+        const rows = rowRes.rows;
+        const sels = await fetchRowAccts(client, rows.map(r => r.id));
+        const accounts = await loadAccounts(client);
+        const index = buildAccountIndex(accounts);
+        const dimKeys = ['branch_id', 'dim1_id', 'dim2_id', 'dim3_id', 'dim4_id', 'dim5_id'];
+        const resolved = rows.map(r => ({
+            ref: {
+                row_seq_no: r.row_seq_no, row_code: r.row_code, label_thai: r.label_thai, label_eng: r.label_eng,
+                has_dims: dimKeys.some(k => r[k]), // บรรทัดกรองมิติ — อยู่หลายบรรทัดอาจตั้งใจแยกตามมิติ
+            },
+            set: resolveRowAccounts(index, rowSelections(r, sels.filter(s => s.row_id === r.id))) || new Set(),
+        }));
+        const result = accounts.filter(a => a.is_normal_account && a.is_active).map(a => ({
+            account_code: a.account_code,
+            account_name_thai: a.account_name_thai,
+            account_name_eng: a.account_name_eng,
+            account_type: a.account_type,
+            rows: resolved.filter(x => x.set.has(a.account_code)).map(x => x.ref),
+        }));
+        res.status(200).json(result);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
+    }
+};
+
 const rowUniqueViolation = (err) => {
     if (err.code !== '23505') return null;
     return err.constraint === 'gl_fin_report_row_code_uq'
@@ -272,16 +374,23 @@ const rowUniqueViolation = (err) => {
 const createRow = async (req, res) => {
     const reportId = req.body.report_id;
     const r = normalizeRow(req.body);
+    const accts = normalizeAccts(req.body.accounts);
+    if (accts) { r.account_from = null; r.account_to = null; } // ใช้ตาราง row_acct แทนช่วงเดิม
     const client = await req.dbPool.connect();
     try {
-        const invalid = await validateRow(client, reportId, r);
+        const invalid = await validateRow(client, reportId, r) || (accts && await validateAccts(client, accts));
         if (invalid) return res.status(400).json(invalid);
+        await client.query('BEGIN');
         const result = await client.query(
             `INSERT INTO gl_fin_report_row (report_id, ${ROW_FIELDS.join(', ')})
              VALUES ($1, ${ROW_FIELDS.map((_, i) => `$${i + 2}`).join(', ')}) RETURNING *`,
             [reportId, ...ROW_FIELDS.map(f => r[f])]);
-        res.status(201).json(result.rows[0]);
+        const row = result.rows[0];
+        if (accts) await replaceRowAccts(client, row.id, accts);
+        await client.query('COMMIT');
+        res.status(201).json({ ...row, accounts: await fetchRowAccts(client, [row.id]) });
     } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
         const dup = rowUniqueViolation(err);
         if (dup) return res.status(409).json(dup);
         res.status(500).json({ error: err.message });
@@ -293,13 +402,15 @@ const createRow = async (req, res) => {
 const updateRow = async (req, res) => {
     const { id } = req.params;
     const r = normalizeRow(req.body);
+    const accts = normalizeAccts(req.body.accounts);
+    if (accts) { r.account_from = null; r.account_to = null; } // ใช้ตาราง row_acct แทนช่วงเดิม
     const client = await req.dbPool.connect();
     try {
         const cur = await client.query(`SELECT report_id, row_code, row_kind FROM gl_fin_report_row WHERE id=$1`, [id]);
         if (cur.rows.length === 0) return res.status(404).json({ error: 'Row not found' });
         const { report_id: reportId, row_code: oldCode, row_kind: oldKind } = cur.rows[0];
 
-        const invalid = await validateRow(client, reportId, r, Number(id));
+        const invalid = await validateRow(client, reportId, r, Number(id)) || (accts && await validateAccts(client, accts));
         if (invalid) return res.status(400).json(invalid);
         // เปลี่ยน/ลบรหัส หรือเลิกเป็นบรรทัด TOTAL ทั้งที่ยังถูกอ้างอยู่ → สูตร/ยอดรวมจะพัง
         const codeChanged = oldCode && oldCode !== r.row_code;
@@ -312,11 +423,15 @@ const updateRow = async (req, res) => {
             }
         }
         const sets = ROW_FIELDS.map((f, i) => `${f}=$${i + 1}`).join(', ');
+        await client.query('BEGIN');
         const result = await client.query(
             `UPDATE gl_fin_report_row SET ${sets} WHERE id=$${ROW_FIELDS.length + 1} RETURNING *`,
             [...ROW_FIELDS.map(f => r[f]), id]);
-        res.status(200).json(result.rows[0]);
+        if (accts) await replaceRowAccts(client, Number(id), accts);
+        await client.query('COMMIT');
+        res.status(200).json({ ...result.rows[0], accounts: await fetchRowAccts(client, [Number(id)]) });
     } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
         const dup = rowUniqueViolation(err);
         if (dup) return res.status(409).json(dup);
         res.status(500).json({ error: err.message });
@@ -595,7 +710,7 @@ const deleteReportCol = async (req, res) => {
 
 module.exports = {
     getReports, createReport, updateReport, deleteReport,
-    getRows, createRow, updateRow, deleteRow,
+    getRows, createRow, updateRow, deleteRow, getAccountMapping,
     createColumn, updateColumn, deleteColumn,
     getReportCols, createReportCol, updateReportCol, deleteReportCol,
 };
