@@ -108,6 +108,7 @@ router.put('/gl_fin_report/:id', glFinancialReportBuilderController.updateReport
 router.delete('/gl_fin_report/:id', glFinancialReportBuilderController.deleteReport);
 router.get('/gl_fin_report/:id/account_mapping', glFinancialReportBuilderController.getAccountMapping);
 router.put('/gl_fin_report/:id/reorder_rows', glFinancialReportBuilderController.reorderRows);
+router.put('/gl_fin_report/:id/reorder_cols', glFinancialReportBuilderController.reorderReportCols);
 router.get('/gl_fin_report/:id/export', glFinancialReportTransferController.exportReport);
 router.post('/gl_fin_report_import', glFinancialReportTransferController.importReport);
 router.get('/gl_fin_report_templates', glFinancialReportTransferController.listTemplates);

@@ -1,5 +1,5 @@
 // controllers/gl/glFinancialReportBuilderController.js
-const { parse: parseFormula, collectColRefs, collectRowRefs, renumberRowRefs, FUNCTIONS } = require('../../utils/finReportFormula');
+const { parse: parseFormula, collectColRefs, collectRowRefs, renumberRowRefs, renumberColRefs, FUNCTIONS } = require('../../utils/finReportFormula');
 const { SEL_TYPES, ACCOUNT_TYPES, loadAccounts, buildAccountIndex, rowSelections, resolveRowAccounts } = require('../../utils/finReportAccounts');
 
 // ตรวจ syntax สูตรตอนบันทึก — คืน null ถ้าผ่าน หรือ { error, code, detail } ถ้าไม่ผ่าน
@@ -93,16 +93,37 @@ const getReports = async (req, res) => {
     }
 };
 
+// หน่วยจำนวนเงิน (บาท/พันบาท/ล้านบาท) และจำนวนทศนิยม — undefined = ไม่ได้ส่งมา
+const AMOUNT_UNITS = [1, 1000, 1000000];
+const reportNumberFormat = (body) => {
+    const out = {};
+    if (body.amount_unit != null) {
+        out.amountUnit = Number(body.amount_unit);
+        if (!AMOUNT_UNITS.includes(out.amountUnit)) {
+            return { error: { error: `amount_unit must be one of ${AMOUNT_UNITS.join(', ')}`, code: 'INVALID_AMOUNT_UNIT' } };
+        }
+    }
+    if (body.decimal_places != null) {
+        out.decimalPlaces = Number(body.decimal_places);
+        if (!Number.isInteger(out.decimalPlaces) || out.decimalPlaces < 0 || out.decimalPlaces > 4) {
+            return { error: { error: 'decimal_places must be 0-4', code: 'INVALID_DECIMAL_PLACES' } };
+        }
+    }
+    return out;
+};
+
 const createReport = async (req, res) => {
     const { report_code, report_name_thai, report_name_eng, is_active, parenthesis_for_minus, page_orientation, margin_top, margin_right, margin_bottom, margin_left } = req.body;
+    const fmt = reportNumberFormat(req.body);
+    if (fmt.error) return res.status(400).json(fmt.error);
     const client = await req.dbPool.connect();
     try {
         const result = await client.query(
-            `INSERT INTO gl_fin_report (report_code, report_name_thai, is_active, parenthesis_for_minus, page_orientation, margin_top, margin_right, margin_bottom, margin_left, report_name_eng)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+            `INSERT INTO gl_fin_report (report_code, report_name_thai, is_active, parenthesis_for_minus, page_orientation, margin_top, margin_right, margin_bottom, margin_left, report_name_eng, amount_unit, decimal_places)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
             [report_code, report_name_thai, is_active ?? true, parenthesis_for_minus ?? true,
              page_orientation ?? 'PORTRAIT', margin_top ?? 30, margin_right ?? 30, margin_bottom ?? 30, margin_left ?? 30,
-             report_name_eng || null]
+             report_name_eng || null, fmt.amountUnit ?? 1, fmt.decimalPlaces ?? 2]
         );
         res.status(201).json(result.rows[0]);
     } catch (err) {
@@ -115,14 +136,19 @@ const createReport = async (req, res) => {
 const updateReport = async (req, res) => {
     const { id } = req.params;
     const { report_code, report_name_thai, report_name_eng, is_active, parenthesis_for_minus, page_orientation, margin_top, margin_right, margin_bottom, margin_left } = req.body;
+    const fmt = reportNumberFormat(req.body);
+    if (fmt.error) return res.status(400).json(fmt.error);
     const client = await req.dbPool.connect();
     try {
+        // amount_unit / decimal_places ไม่ส่งมา = คงค่าเดิม
         const result = await client.query(
             `UPDATE gl_fin_report SET report_code=$1, report_name_thai=$2, is_active=$3, parenthesis_for_minus=$4,
-             page_orientation=$5, margin_top=$6, margin_right=$7, margin_bottom=$8, margin_left=$9, report_name_eng=$11
+             page_orientation=$5, margin_top=$6, margin_right=$7, margin_bottom=$8, margin_left=$9, report_name_eng=$11,
+             amount_unit=COALESCE($12, amount_unit), decimal_places=COALESCE($13, decimal_places)
              WHERE id=$10 RETURNING *`,
             [report_code, report_name_thai, is_active, parenthesis_for_minus, page_orientation,
-             margin_top, margin_right, margin_bottom, margin_left, id, report_name_eng || null]
+             margin_top, margin_right, margin_bottom, margin_left, id, report_name_eng || null,
+             fmt.amountUnit ?? null, fmt.decimalPlaces ?? null]
         );
         res.status(200).json(result.rows[0]);
     } catch (err) {
@@ -193,8 +219,12 @@ const upperOrNull = (v) => {
     return t === '' ? null : t;
 };
 
+const TEXT_ALIGNS = ['LEFT', 'CENTER', 'RIGHT'];
+
 const normalizeRow = (body) => {
-    const rowKind = body.row_kind || 'ACCOUNTS';
+    // บรรทัดหัวงบ/ท้ายงบ = ข้อความบรรทัดเดียวเต็มความกว้าง ไม่มียอดเงิน/ไม่รวมเข้าบรรทัดยอดรวม
+    const isHeaderFooter = body.row_type === 'HEADER' || body.row_type === 'FOOTER';
+    const rowKind = isHeaderFooter ? 'HEADING' : (body.row_kind || 'ACCOUNTS');
     return {
         row_seq_no: parseInt(body.row_seq_no, 10),
         row_type: body.row_type || 'BODY',
@@ -213,19 +243,21 @@ const normalizeRow = (body) => {
         label_thai: body.label_thai || null,
         label_eng: body.label_eng || null,
         indent_level: Math.max(0, Math.min(10, parseInt(body.indent_level, 10) || 0)),
-        parent_row_code: upperOrNull(body.parent_row_code),
+        parent_row_code: isHeaderFooter ? null : upperOrNull(body.parent_row_code),
         row_formula: rowKind === 'FORMULA' ? (String(body.row_formula || '').trim() || null) : null,
         is_bold: body.is_bold ?? false,
         line_above: body.line_above || 'NONE',
         line_below: body.line_below || 'NONE',
         hide_if_zero: body.hide_if_zero ?? false,
+        font_size: Math.max(6, Math.min(36, parseInt(body.font_size, 10) || 10)),
+        text_align: TEXT_ALIGNS.includes(body.text_align) ? body.text_align : 'CENTER',
     };
 };
 
 const ROW_FIELDS = ['row_seq_no', 'row_type', 'print_control', 'account_from', 'account_to', 'normal_sign',
     'branch_id', 'dim1_id', 'dim2_id', 'dim3_id', 'dim4_id', 'dim5_id',
     'row_code', 'row_kind', 'label_thai', 'label_eng', 'indent_level', 'parent_row_code', 'row_formula',
-    'is_bold', 'line_above', 'line_below', 'hide_if_zero'];
+    'is_bold', 'line_above', 'line_below', 'hide_if_zero', 'font_size', 'text_align'];
 
 // ตรวจค่าบรรทัด — คืน null หรือ error object
 const validateRow = async (client, reportId, r, rowId = null) => {
@@ -740,6 +772,74 @@ const updateReportCol = async (req, res) => {
     }
 };
 
+// เรียงคอลัมน์ของรายงานใหม่ (ลากวาง) — body.col_ids = id ทุกคอลัมน์ตามลำดับใหม่
+// ใช้ชุดเลข C เดิมของคอลัมน์รายงาน (เรียงจากน้อยไปมาก) มาแจกใหม่ตามลำดับ เลขจึงไม่ชนกับคอลัมน์รายบรรทัด
+// ที่ไม่ใช่การแทนค่า; ช่องแทนค่า (คอลัมน์รายบรรทัดที่เลข C ตรงกับคอลัมน์รายงาน) ย้ายตามคอลัมน์ของมัน
+// และแก้ (Rn, Cm) ในสูตรแบบเก่าให้ตรงกับเลขใหม่ในธุรกรรมเดียวกัน (สูตรที่อ้าง [CODE] ไม่กระทบ)
+const reorderReportCols = async (req, res) => {
+    const reportId = Number(req.params.id);
+    const ids = (req.body.col_ids || []).map(Number);
+    const client = await req.dbPool.connect();
+    try {
+        const cur = await client.query(`SELECT id, col_seq_no FROM gl_fin_report_col WHERE report_id = $1`, [reportId]);
+        const oldSeqById = new Map(cur.rows.map(r => [r.id, r.col_seq_no]));
+        if (ids.length !== oldSeqById.size || new Set(ids).size !== ids.length || ids.some(id => !oldSeqById.has(id))) {
+            return res.status(400).json({ error: 'col_ids must list every column of the report exactly once', code: 'INVALID_SEQ' });
+        }
+        const slots = [...oldSeqById.values()].sort((a, b) => a - b);
+        const seqMap = new Map(ids.map((id, i) => [oldSeqById.get(id), slots[i]]));
+        const moved = [...seqMap].filter(([from, to]) => from !== to);
+        if (moved.length === 0) return res.status(200).json({ columns: ids.length, formulas_updated: 0 });
+
+        await client.query('BEGIN');
+        // เลี่ยง unique ชนกันระหว่างย้าย: ติดลบก่อนแล้วค่อยใส่เลขจริง (ทั้งคอลัมน์รายงานและช่องแทนค่า)
+        const fromSeqs = moved.map(([from]) => from);
+        await client.query(
+            `UPDATE gl_fin_report_col SET col_seq_no = -col_seq_no WHERE report_id = $1 AND col_seq_no = ANY($2::int[])`,
+            [reportId, fromSeqs]);
+        await client.query(`
+            UPDATE gl_fin_report_column c SET column_seq_no = -c.column_seq_no
+              FROM gl_fin_report_row r
+             WHERE r.id = c.row_id AND r.report_id = $1 AND c.column_seq_no = ANY($2::int[])`, [reportId, fromSeqs]);
+        for (const [from, to] of moved) {
+            await client.query(
+                `UPDATE gl_fin_report_col SET col_seq_no = $1, updated_at = NOW() WHERE report_id = $2 AND col_seq_no = $3`,
+                [to, reportId, -from]);
+            await client.query(`
+                UPDATE gl_fin_report_column c SET column_seq_no = $1
+                  FROM gl_fin_report_row r
+                 WHERE r.id = c.row_id AND r.report_id = $2 AND c.column_seq_no = $3`, [to, reportId, -from]);
+        }
+        const formulas = await client.query(`
+            SELECT 'CELL' AS src, c.id, c.formula_text AS f FROM gl_fin_report_column c
+              JOIN gl_fin_report_row r ON r.id = c.row_id
+             WHERE r.report_id = $1 AND c.formula_text IS NOT NULL
+            UNION ALL
+            SELECT 'ROW', id, row_formula FROM gl_fin_report_row WHERE report_id = $1 AND row_formula IS NOT NULL
+            UNION ALL
+            SELECT 'COL', id, formula_text FROM gl_fin_report_col WHERE report_id = $1 AND formula_text IS NOT NULL`, [reportId]);
+        const sql = {
+            CELL: `UPDATE gl_fin_report_column SET formula_text = $1 WHERE id = $2`,
+            ROW: `UPDATE gl_fin_report_row SET row_formula = $1 WHERE id = $2`,
+            COL: `UPDATE gl_fin_report_col SET formula_text = $1 WHERE id = $2`,
+        };
+        let formulasUpdated = 0;
+        for (const f of formulas.rows) {
+            const next = renumberColRefs(f.f, seqMap);
+            if (next === f.f) continue;
+            await client.query(sql[f.src], [next, f.id]);
+            formulasUpdated++;
+        }
+        await client.query('COMMIT');
+        res.status(200).json({ columns: ids.length, formulas_updated: formulasUpdated });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
+    }
+};
+
 const deleteReportCol = async (req, res) => {
     const { id } = req.params;
     const client = await req.dbPool.connect();
@@ -764,5 +864,5 @@ module.exports = {
     getReports, createReport, updateReport, deleteReport,
     getRows, createRow, updateRow, deleteRow, reorderRows, getAccountMapping,
     createColumn, updateColumn, deleteColumn,
-    getReportCols, createReportCol, updateReportCol, deleteReportCol,
+    getReportCols, createReportCol, updateReportCol, deleteReportCol, reorderReportCols,
 };

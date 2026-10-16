@@ -239,4 +239,13 @@ const renumberRowRefs = (text, seqMap) => {
     });
 };
 
-module.exports = { parse, evaluate, collectColRefs, collectRowRefs, renumberRowRefs, FUNCTIONS, FormulaError };
+// เปลี่ยนเลขคอลัมน์ใน (Rn, Cm) ตาม seqMap (Map เลข C เดิม → เลขใหม่) — ใช้ตอนเรียงคอลัมน์ของรายงานใหม่
+const renumberColRefs = (text, seqMap) => {
+    if (!text) return text;
+    return text.replace(/\(\s*R(\d+)\s*,\s*C(\d+)\s*\)/gi, (m, r, c) => {
+        const to = seqMap.get(parseInt(c, 10));
+        return to === undefined ? m : `(R${r}, C${to})`;
+    });
+};
+
+module.exports = { parse, evaluate, collectColRefs, collectRowRefs, renumberRowRefs, renumberColRefs, FUNCTIONS, FormulaError };

@@ -1,6 +1,7 @@
 // File: controllers/gl/glFinancialReportEngineController.js
 const { loadAccounts, buildAccountIndex, rowSelections, resolveRowAccounts } = require('../../utils/finReportAccounts');
 const { parse: parseFormula, evaluate: evaluateFormula, FormulaError } = require('../../utils/finReportFormula');
+const { drillDown } = require('../../utils/finReportDrill');
 
 const getReportMasterList = async (req, res) => {
     const client = await req.dbPool.connect();
@@ -20,9 +21,27 @@ const getReportMasterList = async (req, res) => {
     }
 };
 
+// วันที่แบบยาวสำหรับหัวงบ: '2026-12-31' → '31 ธันวาคม 2569' / '31 December 2026'
+const MONTHS_TH = ['มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน',
+    'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'];
+const MONTHS_EN = ['January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'];
+const longDate = (ymd, isEnglish) => {
+    if (!ymd) return '';
+    const [y, m, d] = ymd.split('-').map(Number);
+    return isEnglish ? `${d} ${MONTHS_EN[m - 1]} ${y}` : `${d} ${MONTHS_TH[m - 1]} ${y + 543}`;
+};
+const amountUnitLabel = (unit, isEnglish) => {
+    if (unit === 1000) return isEnglish ? 'Thousand Baht' : 'พันบาท';
+    if (unit === 1000000) return isEnglish ? 'Million Baht' : 'ล้านบาท';
+    return isEnglish ? 'Baht' : 'บาท';
+};
+
 const generateFinancialReport = async (req, res) => {
-    // preview = เรียกจากหน้าออกแบบ — แสดงได้แม้รายงานยังไม่เปิดใช้งาน
-    const { report_id, base_period_id, branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, lang, preview } = req.body;
+    // preview =เรียกจากหน้าออกแบบ — แสดงได้แม้รายงานยังไม่เปิดใช้งาน
+    // drill = { row_id, col_seq_no, account_code? } → แตกยอดของช่องนั้นเป็นรายบัญชี (หรือรายการบัญชีของ account_code)
+    //         แทนการคืนทั้งงบ (ดู drillDown ด้านล่าง)
+    const { report_id, base_period_id, branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, lang, preview, drill } = req.body;
     const isEnglish = lang === 'en';
     const branchId = branch_id  ? parseInt(branch_id)  : null;
     const d1 = dim1_id ? parseInt(dim1_id) : null;
@@ -80,12 +99,16 @@ const generateFinancialReport = async (req, res) => {
                 p.period_start_date,
                 p.period_name,
                 y.fy_code,
-                y.year_start_date
+                y.year_start_date,
+                to_char(p.period_start_date, 'YYYY-MM-DD') AS start_ymd,
+                to_char(p.period_end_date, 'YYYY-MM-DD') AS end_ymd,
+                to_char(y.year_start_date, 'YYYY-MM-DD') AS year_start_ymd
             FROM gl_posting_period p
             JOIN gl_fiscal_year y ON p.fiscal_year_id = y.id
             ORDER BY p.period_start_date ASC, p.period_end_date ASC
         `);
         const allPeriods = periodsRes.rows;
+        const periodById = new Map(allPeriods.map(p => [p.period_id, p]));
 
         const baseIndex = allPeriods.findIndex(p => p.period_id === base_period_id);
         if (baseIndex === -1) throw new Error('ไม่พบงวดบัญชีที่ระบุในระบบ');
@@ -155,9 +178,8 @@ const generateFinancialReport = async (req, res) => {
             }
             if (idx !== -1) idx += rc.offset_periods || 0;
             rc.target_period = idx >= 0 && idx < allPeriods.length ? allPeriods[idx] : null;
-            rc.target_period_ids = rc.target_period
-                ? periodsOfRange(rc.target_period, rc.period_range).map(p => p.period_id)
-                : [];
+            rc.range_periods = rc.target_period ? periodsOfRange(rc.target_period, rc.period_range) : [];
+            rc.target_period_ids = rc.range_periods.map(p => p.period_id);
             rc.target_period_ids.forEach(id => requiredPeriodIds.add(id));
         });
 
@@ -214,22 +236,36 @@ const generateFinancialReport = async (req, res) => {
         // รวมยอดของบรรทัดตามงวด + เงื่อนไขของบรรทัด + เงื่อนไขของคอลัมน์ (ถ้ามี) แล้วกลับเครื่องหมายตาม normal_sign
         // excludeClosing=false → ไม่หักรายการปิดบัญชีออก (ได้ยอดหลังปิดบัญชี)
         const dimKeys = ['branch_id', 'dim1_id', 'dim2_id', 'dim3_id', 'dim4_id', 'dim5_id'];
+        // ยอดบัญชีหารด้วยหน่วยของงบ (พันบาท/ล้านบาท) ก่อนคำนวณสูตร — สูตรอัตราส่วน/ร้อยละจึงไม่เพี้ยนตามหน่วย
+        const amountUnit = Number(master.amount_unit) || 1;
+        const glMatches = (g, row, periodSet, colFilter, excludeClosing) => {
+            if (!periodSet.has(g.period_id)) return false;
+            if (g.is_closing_adj && !excludeClosing) return false;
+            if (!row.acctSet.has(g.account_code)) return false;
+            // กรองตาม Dimension ที่ระบุไว้ในบรรทัด และในคอลัมน์
+            if (dimKeys.some(k => row[k] && g[k] !== row[k])) return false;
+            if (colFilter && dimKeys.some(k => colFilter[k] && g[k] !== colFilter[k])) return false;
+            return true;
+        };
         const sumRow = (row, targetIds, colFilter, excludeClosing) => {
             if (targetIds.length === 0 || !row.acctSet) return 0;
             const periodSet = new Set(targetIds);
             let total = 0;
             for (const g of glData) {
-                if (!periodSet.has(g.period_id)) continue;
-                if (g.is_closing_adj && !excludeClosing) continue;
-                if (!row.acctSet.has(g.account_code)) continue;
-                // กรองตาม Dimension ที่ระบุไว้ในบรรทัด และในคอลัมน์
-                if (dimKeys.some(k => row[k] && g[k] !== row[k])) continue;
-                if (colFilter && dimKeys.some(k => colFilter[k] && g[k] !== colFilter[k])) continue;
-                total += Number(g.end_balance || 0);
+                if (glMatches(g, row, periodSet, colFilter, excludeClosing)) total += Number(g.end_balance || 0);
             }
+            total /= amountUnit;
             // สลับเครื่องหมายตาม normal_sign (บัญชีปกติฝั่ง Credit เช่น หนี้สิน/ทุน/รายได้ แสดงเป็นบวก)
             return row.normal_sign === 'CREDIT' ? -total : total;
         };
+
+        if (drill) {
+            const result = await drillDown(client, {
+                drill, rows, cols, reportCols, glData, glMatches, periodById, isEnglish,
+                globalFilter: { branch_id: branchId, dim1_id: d1, dim2_id: d2, dim3_id: d3, dim4_id: d4, dim5_id: d5 },
+            });
+            return res.status(result.status).json(result.body);
+        }
 
         // ====================================================================
         // STEP 5: ประกอบร่างข้อมูล (Pass 1 - หยอดค่า TEXT, คำนวณ MTD, YTD)
@@ -245,6 +281,8 @@ const generateFinancialReport = async (req, res) => {
             // ช่องตัวเลขของบรรทัด TOTAL/FORMULA คำนวณทีหลังใน STEP 6 (calc)
             const derivedCalc = kind === 'TOTAL' ? 'TOTAL' : kind === 'FORMULA' ? 'ROWF' : null;
             const hasAccounts = kind === 'ACCOUNTS' && !!row.acctSet;
+            // บรรทัดหัวงบ/ท้ายงบ: ไม่ใช้คอลัมน์ของรายงาน
+            const isHeaderFooter = row.row_type === 'HEADER' || row.row_type === 'FOOTER';
 
             let processedColumns = myCols.map(col => {
                 let cellValue = null;
@@ -261,7 +299,7 @@ const generateFinancialReport = async (req, res) => {
                     else cellValue = hasAccounts ? sumRow(row, col.target_period_ids || [], null, true) : 0;
                 }
 
-                return {
+                const cell = {
                     seq_no: col.column_seq_no,
                     type: col.column_type,
                     data_type: col.data_type,
@@ -275,7 +313,20 @@ const generateFinancialReport = async (req, res) => {
                         textAlign: col.text_align
                     },
                     ...(calc ? { calc } : {}),
+                    ...((col.column_type === 'MTD' || col.column_type === 'YTD') && (hasAccounts || kind === 'TOTAL') ? { drill: true } : {}),
                 };
+                // แทนค่าเฉพาะช่องของคอลัมน์รายงาน: ใช้ความกว้าง/การจัดวาง/การซ่อนของคอลัมน์รายงาน เพื่อให้ตรงแนวกับบรรทัดอื่น
+                const rc = isHeaderFooter ? null : reportCols.find(c => c.col_seq_no === col.column_seq_no && c.col_kind !== 'LABEL');
+                if (rc) {
+                    Object.assign(cell, {
+                        flex: rc.column_flex,
+                        style: { fontSize: rc.font_size, fontWeight: rc.font_weight, textAlign: rc.text_align },
+                        report_col: true,
+                        override: true,
+                        hidden: rc.is_hidden,
+                    });
+                }
+                return cell;
             });
 
             // เติมคอลัมน์ระดับรายงาน (ข้ามช่องที่บรรทัดนี้ override ด้วยคอลัมน์รายบรรทัด)
@@ -283,7 +334,7 @@ const generateFinancialReport = async (req, res) => {
             const hasOverride = reportCols.some(rc => rc.col_kind !== 'LABEL' && overrideSeqs.has(rc.col_seq_no));
             const hasAmounts = hasAccounts || !!derivedCalc;
             reportCols.forEach(rc => {
-                if (overrideSeqs.has(rc.col_seq_no)) return;
+                if (isHeaderFooter || overrideSeqs.has(rc.col_seq_no)) return;
                 const cell = {
                     seq_no: rc.col_seq_no,
                     data_type: null,
@@ -298,9 +349,9 @@ const generateFinancialReport = async (req, res) => {
                     const text = kind === 'BLANK' ? ' ' : rowLabel(row);
                     processedColumns.push({ ...cell, type: 'TEXT', value: text, indent_level: row.indent_level || 0, label: true });
                 } else if (rc.col_kind === 'AMOUNT' && hasAccounts) {
-                    processedColumns.push({ ...cell, type: 'AMOUNT', value: sumRow(row, rc.target_period_ids, rc, rc.exclude_closing_entries) });
+                    processedColumns.push({ ...cell, type: 'AMOUNT', value: sumRow(row, rc.target_period_ids, rc, rc.exclude_closing_entries), drill: true });
                 } else if (rc.col_kind === 'AMOUNT' && derivedCalc) {
-                    processedColumns.push({ ...cell, type: 'AMOUNT', value: null, calc: derivedCalc });
+                    processedColumns.push({ ...cell, type: 'AMOUNT', value: null, calc: derivedCalc, ...(kind === 'TOTAL' ? { drill: true } : {}) });
                 } else if (rc.col_kind === 'CALC' && (hasAmounts || hasOverride)) {
                     processedColumns.push({ ...cell, type: 'CALC', value: null, formula_text: rc.formula_text });
                 } else {
@@ -311,7 +362,17 @@ const generateFinancialReport = async (req, res) => {
 
             // ไม่มีคอลัมน์ LABEL ในรายงาน แต่บรรทัดมีชื่อ → วางไว้หน้าสุด (seq 0)
             const label = rowLabel(row);
-            if (!labelCol && label && !overrideSeqs.has(0)) {
+            if (isHeaderFooter) {
+                // ข้อความเต็มความกว้างบรรทัดเดียว ขนาด/ตัวหนา/การจัดวางตามบรรทัด
+                // (บรรทัดหัวงบแบบเดิมที่มีคอลัมน์รายบรรทัด ใช้คอลัมน์ของบรรทัดตามเดิม)
+                if (myCols.length === 0) {
+                    processedColumns.push({
+                        seq_no: 0, type: 'TEXT', value: label, data_type: null, flex: 1, indent_level: 0,
+                        style: { fontSize: row.font_size || 10, fontWeight: row.is_bold ? 'BOLD' : 'NORMAL', textAlign: row.text_align || 'CENTER' },
+                        label: true,
+                    });
+                }
+            } else if (!labelCol && label && !overrideSeqs.has(0)) {
                 processedColumns.push({
                     seq_no: 0, type: 'TEXT', value: label, data_type: null, flex: 3,
                     indent_level: row.indent_level || 0,
@@ -326,6 +387,7 @@ const generateFinancialReport = async (req, res) => {
             processedColumns.sort((a, b) => a.seq_no - b.seq_no);
 
             return {
+                row_id: row.id,
                 seq_no: row.row_seq_no,
                 row_code: row.row_code || null,
                 row_kind: kind,
@@ -492,7 +554,10 @@ const generateFinancialReport = async (req, res) => {
         if (visibleReportCols.some(rc => rc.header_thai || rc.header_eng)) {
             const headerText = (rc) => {
                 const text = (isEnglish && rc.header_eng) ? rc.header_eng : (rc.header_thai || rc.header_eng || '');
+                const first = rc.range_periods?.[0];
                 return text
+                    .replaceAll('$colPeriodStartDate', first ? longDate(first.start_ymd, isEnglish) : '')
+                    .replaceAll('$colPeriodEndDate', rc.target_period ? longDate(rc.target_period.end_ymd, isEnglish) : '')
                     .replaceAll('$colPeriodName', rc.target_period?.period_name ?? '')
                     .replaceAll('$colFiscalYear', rc.target_period?.fy_code ?? '');
             };
@@ -520,11 +585,37 @@ const generateFinancialReport = async (req, res) => {
             });
         }
 
+        // ตัวแปรในข้อความ ($ชื่อ) ที่ engine รู้ค่า — หน้าจอแทนค่าในบรรทัดหัวงบ/ชื่อบรรทัด
+        let branchName = isEnglish ? 'All branches' : 'ทุกสาขา';
+        if (branchId) {
+            const br = await client.query(`SELECT branch_name_thai, branch_name_eng FROM cd_branch WHERE id = $1`, [branchId]);
+            const b = br.rows[0];
+            if (b) branchName = (isEnglish && b.branch_name_eng) ? b.branch_name_eng : (b.branch_name_thai || '');
+        }
+        const co = await client.query(`SELECT thai_name, english_name FROM sa_company WHERE is_active = TRUE LIMIT 1`);
+        const company = co.rows[0] || {};
+        let userName = req.headers?.username || '';
+        try { userName = decodeURIComponent(userName); } catch (_) { /* ใช้ค่าเดิม */ }
+        const variables = {
+            companyName: (isEnglish && company.english_name) ? company.english_name : (company.thai_name || ''),
+            userName,
+            periodName: basePeriodInfo.period_name ?? '',
+            fiscalYear: basePeriodInfo.fy_code ?? '',
+            periodStartDate: longDate(basePeriodInfo.start_ymd, isEnglish),
+            periodEndDate: longDate(basePeriodInfo.end_ymd, isEnglish),
+            yearStartDate: longDate(basePeriodInfo.year_start_ymd, isEnglish),
+            amountUnit: amountUnitLabel(amountUnit, isEnglish),
+            branchName,
+        };
+
         // ส่งข้อมูลกลับไปที่ Frontend (กรองเฉพาะ Print Control ที่ให้แสดงผล)
         res.status(200).json({
             report_code: master.report_code,
             report_name: (isEnglish && master.report_name_eng) ? master.report_name_eng : master.report_name_thai,
             parenthesis_for_minus: master.parenthesis_for_minus,
+            amount_unit: amountUnit,
+            decimal_places: master.decimal_places ?? 2,
+            variables,
             page_config: {
                 orientation: master.page_orientation,
                 margins: [master.margin_top, master.margin_right, master.margin_bottom, master.margin_left],
