@@ -1,4 +1,5 @@
 // controllers/ap/apFxRevaluationController.js
+const { today: todayYmd, ymd } = require('../../utils/dateUtil');
 // FX Revaluation สำหรับเจ้าหนี้สกุลเงินต่างประเทศ ณ วันปิดปี
 //
 // ทิศทาง GL ตรงข้ามกับ AR:
@@ -378,7 +379,7 @@ const postReval = async (req, res) => {
         )).rows;
 
         const isUnrealized = reval.method === 'reversing';
-        const docNo = `AP-FXR-${reval.reval_date.toISOString().slice(0, 10).replace(/-/g, '')}`;
+        const docNo = `AP-FXR-${ymd(reval.reval_date).replace(/-/g, '')}`;
 
         const glEntryId = await postRevalGlEntry(
             client, setup, details, reval.reval_date, isUnrealized, docNo, updatedBy
@@ -396,7 +397,7 @@ const postReval = async (req, res) => {
                 );
             }
         } else {
-            const revDocNo = `AP-FXR-REV-${reval.reversal_date.toISOString().slice(0, 10).replace(/-/g, '')}`;
+            const revDocNo = `AP-FXR-REV-${ymd(reval.reversal_date).replace(/-/g, '')}`;
             const revPeriodRes = await client.query(
                 `SELECT id FROM gl_posting_period
                  WHERE $1::date BETWEEN period_start_date AND period_end_date
@@ -469,7 +470,7 @@ const voidReval = async (req, res) => {
         const reval = hdr.rows[0];
         if (reval.status !== 'Posted') { await client.query('ROLLBACK'); return res.status(422).json({ error: 'Only Posted can be voided' }); }
 
-        const today = new Date().toISOString().slice(0, 10);
+        const today = todayYmd();
         const todayPeriod = await client.query(
             `SELECT id FROM gl_posting_period
              WHERE $1::date BETWEEN period_start_date AND period_end_date

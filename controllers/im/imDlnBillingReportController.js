@@ -1,4 +1,5 @@
 // controllers/im/imDlnBillingReportController.js
+const { today } = require('../../utils/dateUtil');
 // รายงานตรวจสอบ DLN รอ/ผ่านการโพสต์ AR-GL (sys_doc_type='32') — ต้นทุนขาย (COGS) Post ไปแล้วตั้งแต่ตอน Post IM
 // (สถานะ Delivered) เสมอ ต่างจาก GRN '12' ที่ยังไม่มี GL ใดๆ เลย — ช่องว่างที่รายงานนี้เฝ้าดูคือรายได้/ลูกหนี้ที่ยังไม่
 // รับรู้ (ต้นทุนตัดไปแล้วแต่รายได้ยังไม่ตั้ง ผิดหลัก matching ชั่วคราวจนกว่าจะ Post AR/GL) ไม่ใช่ variance ราคาแบบ GRN —
@@ -14,7 +15,7 @@ const getDlnBillingReport = async (req, res) => {
         status, // 'Delivered' | 'Posted' | undefined(=both)
     } = req.query;
 
-    const asOf = as_of_date || new Date().toISOString().slice(0, 10);
+    const asOf = as_of_date || today();
     const client = await req.dbPool.connect();
     try {
         const params = [asOf];

@@ -1,4 +1,5 @@
 // controllers/cm/cmBankFxRevaluationController.js
+const { today: todayYmd } = require('../../utils/dateUtil');
 'use strict';
 
 const ensureTables = async (client) => {
@@ -513,7 +514,7 @@ const voidRow = async (req, res) => {
             const origLines = await client.query(
                 `SELECT * FROM gl_entry_detail WHERE header_id = $1`, [reval.gl_entry_id]);
 
-            const today = new Date().toISOString().substring(0, 10);
+            const today = todayYmd();
 
             const periodRes = await client.query(`
                 SELECT id FROM gl_posting_period

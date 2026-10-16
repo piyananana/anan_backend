@@ -1,4 +1,5 @@
 // controllers/ar/arFxGainLossReportController.js
+const { today } = require('../../utils/dateUtil');
 // รายงานกำไร/ขาดทุนจากอัตราแลกเปลี่ยน (AR FX Gain/Loss Report)
 // คำนวณจาก: applied_amount_fc × (receipt.exchange_rate − invoice.exchange_rate)
 
@@ -14,8 +15,8 @@ const getFxGainLossReport = async (req, res) => {
         sort_by,                // 'customer' | 'net_desc' | 'net_asc'
     } = req.query;
 
-    const dateFrom = date_from || new Date().toISOString().slice(0, 10);
-    const dateTo   = date_to   || new Date().toISOString().slice(0, 10);
+    const dateFrom = date_from || today();
+    const dateTo   = date_to   || today();
 
     const client = await req.dbPool.connect();
     try {

@@ -1,4 +1,5 @@
 // controllers/ap/apAgingReportController.js
+const { today } = require('../../utils/dateUtil');
 // รายงานเจ้าหนี้คงค้างตามอายุหนี้ (AP Aging Report)
 
 const getAgingReport = async (req, res) => {
@@ -10,7 +11,7 @@ const getAgingReport = async (req, res) => {
         vendor_code_to,
     } = req.query;
 
-    const asOf   = as_of_date || new Date().toISOString().slice(0, 10);
+    const asOf   = as_of_date || today();
     const client = await req.dbPool.connect();
     try {
         // idempotent migration

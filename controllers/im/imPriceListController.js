@@ -4,6 +4,7 @@
 const { ensureImItemTable } = require('./imItemController');
 const { ensureImUomTable } = require('./imUomController');
 const { ensureImPriceGroupTable } = require('./imPriceGroupController');
+const { today } = require('../../utils/dateUtil');
 
 const LIST_TYPES = ['SALES', 'PURCHASE'];
 
@@ -229,7 +230,7 @@ const fetchByItem = async (req, res) => {
 const resolveItemPrice = async (client, { itemId, listType, vendorId, customerId, uomId, qty, docDate }) => {
     const partyTable = listType === 'PURCHASE' ? 'ap_vendor' : 'ar_customer';
     const partyId = listType === 'PURCHASE' ? vendorId : customerId;
-    const date = docDate || new Date().toISOString().slice(0, 10);
+    const date = docDate || today();
     const q = Number(qty) || 0;
 
     let priceListId = null;

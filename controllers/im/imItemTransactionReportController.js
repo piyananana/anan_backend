@@ -1,4 +1,5 @@
 // controllers/im/imItemTransactionReportController.js
+const { today } = require('../../utils/dateUtil');
 // รายงานสินค้าในธุรกรรม — flat list ระดับ "บรรทัดสินค้า" (ไม่ใช่ระดับเอกสารเหมือน imTransactionReportController)
 // ทุก sys_doc_type ของ IM รวมกันในรายงานเดียว จัดกลุ่ม+ยอดรวมย่อยตามฟีลด์ที่เลือกเรียง (Flutter ฝั่ง frontend
 // เป็นคนจัดกลุ่ม/แสดงยอดรวมย่อยตอน render — backend แค่ query แถวดิบมาเรียงลำดับให้ถูกต้องพอ)
@@ -7,8 +8,8 @@
 const getItemTransactionReport = async (req, res) => {
     const { date_from, date_to, sys_doc_types, category_ids, item_code_from, item_code_to, sort } = req.query;
 
-    const dateFrom = date_from || new Date().toISOString().slice(0, 10);
-    const dateTo   = date_to   || new Date().toISOString().slice(0, 10);
+    const dateFrom = date_from || today();
+    const dateTo   = date_to   || today();
 
     const client = await req.dbPool.connect();
     try {

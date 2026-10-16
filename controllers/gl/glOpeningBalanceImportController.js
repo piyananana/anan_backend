@@ -4,7 +4,46 @@ const multer = require('multer');
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-const BF_DOC_ID = 42; // sa_module_document.id ของเอกสาร "ยอดยกมา" (BF)
+// เอกสารยอดยกมา = sys_doc_type '10' ของโมดูล GL ('01') — id/doc_code ต่างกันได้ในแต่ละฐานข้อมูล
+const GL_MODULE = '01';
+const BF_SYS_DOC_TYPE = '10';
+const BF_DOC_SQL = `SELECT id FROM sa_module_document
+                     WHERE sys_module = '${GL_MODULE}' AND sys_doc_type = '${BF_SYS_DOC_TYPE}' AND is_active = TRUE
+                     ORDER BY id LIMIT 1`;
+
+// เอกสารยอดยกมาที่ผ่านรายการแล้วในงวดที่จะนำเข้า — ใช้เตือน/กันการนำเข้าซ้ำ (ยอดจะเข้าสองเท่า)
+const findExistingOpening = async (db, periodIds) => {
+  if (periodIds.length === 0) return [];
+  const r = await db.query(`
+    SELECT h.id, h.doc_no, to_char(h.doc_date, 'YYYY-MM-DD') AS doc_date, p.period_name,
+           h.total_debit_lc::float8 AS total_debit_lc
+      FROM gl_entry_header h
+      JOIN sa_module_document d ON d.id = h.doc_id
+      JOIN gl_posting_period p ON p.id = h.period_id
+     WHERE d.sys_module = $1 AND d.sys_doc_type = $2 AND h.status = 'Posted'
+       AND h.period_id = ANY($3::int[])
+     ORDER BY h.doc_date, h.doc_no`, [GL_MODULE, BF_SYS_DOC_TYPE, periodIds]);
+  return r.rows;
+};
+
+// ยอดสกุลเงินบาทของบรรทัด = ยอดสกุลเงินเอกสาร x อัตราแลกเปลี่ยน ปัดทีละบรรทัด (ตรงกับที่บันทึกจริง)
+// เดบิต/เครดิตต้องเท่ากันพอดีทั้งสกุลเงินเอกสารและสกุลเงินบาท — คืนข้อความผิดพลาด หรือ null
+const balanceError = (lines, exchangeRate) => {
+  let dFc = 0, cFc = 0, dLc = 0, cLc = 0;
+  for (const l of lines) {
+    const d = round2(l.debit_fc), c = round2(l.credit_fc);
+    dFc += d; cFc += c;
+    dLc += round2(d * exchangeRate); cLc += round2(c * exchangeRate);
+  }
+  [dFc, cFc, dLc, cLc] = [dFc, cFc, dLc, cLc].map(round2);
+  if (dFc !== cFc) return `ยอดเดบิต/เครดิตไม่เท่ากัน (รวม Dr=${dFc.toFixed(2)} Cr=${cFc.toFixed(2)})`;
+  if (dLc !== cLc) {
+    return `ยอดเดบิต/เครดิตเป็นเงินบาทไม่เท่ากันหลังคูณอัตราแลกเปลี่ยน ${exchangeRate} `
+      + `(Dr=${dLc.toFixed(2)} Cr=${cLc.toFixed(2)} ต่างกัน ${Math.abs(dLc - cLc).toFixed(2)} จากการปัดเศษรายบรรทัด) `
+      + `กรุณาปรับยอดบรรทัดใดบรรทัดหนึ่งให้ลงตัว`;
+  }
+  return null;
+};
 
 // ---------------------------------------------------------------------------
 // Template definition — 2 sheets: header / detail
@@ -88,22 +127,8 @@ const parseAmount = (val) => {
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
 // parse date cell -> 'YYYY-MM-DD' string หรือ null
-const parseDateCell = (val) => {
-  if (val instanceof Date) {
-    if (isNaN(val.getTime())) return null;
-    const y = val.getFullYear();
-    const m = String(val.getMonth() + 1).padStart(2, '0');
-    const d = String(val.getDate()).padStart(2, '0');
-    return `${y}-${m}-${d}`;
-  }
-  const s = String(val ?? '').trim();
-  if (!s) return null;
-  let m = s.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})$/);
-  if (m) return `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
-  m = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/);
-  if (m) return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
-  return null;
-};
+// Excel date cell -> 'YYYY-MM-DD' (handles SheetJS's off-by-seconds dates and serial numbers)
+const { excelDate: parseDateCell, ymd } = require('../../utils/dateUtil');
 
 // ---------------------------------------------------------------------------
 // Local replicas of gl_entry helpers (glEntryController.js does not export them)
@@ -346,15 +371,10 @@ const validateFile = [
         req.dbPool.query(`SELECT doc_no FROM gl_entry_header`),
       ]);
 
-      const fmtDate = (d) => {
-        if (!d) return null;
-        if (typeof d === 'string') return d.slice(0, 10);
-        return d.toISOString().slice(0, 10);
-      };
-      const periods = periodsR.rows.map(p => ({
+            const periods = periodsR.rows.map(p => ({
         id: p.id,
-        start: fmtDate(p.period_start_date),
-        end: fmtDate(p.period_end_date),
+        start: ymd(p.period_start_date),
+        end: ymd(p.period_end_date),
         status: p.gl_status,
       }));
 
@@ -603,13 +623,8 @@ const validateFile = [
         if (h.totalLineCount === 0) {
           h.__rowErrors.push({ column: 'header_ref', message: 'ไม่มีรายการรายละเอียด (detail)' });
         } else if (!h.__hasDetailErrors) {
-          const diff = Math.abs(h.totalDebitFc - h.totalCreditFc);
-          if (diff > 0.01) {
-            h.__rowErrors.push({
-              column: 'header_ref',
-              message: `ยอดเดบิต/เครดิตไม่เท่ากัน (รวม Dr=${h.totalDebitFc.toFixed(2)} Cr=${h.totalCreditFc.toFixed(2)})`,
-            });
-          }
+          const msg = balanceError(h.details, h.exchange_rate);
+          if (msg) h.__rowErrors.push({ column: 'header_ref', message: msg });
         }
       }
 
@@ -663,7 +678,12 @@ const validateFile = [
         }))),
       };
 
+      // เอกสารยอดยกมาที่มีอยู่แล้วในงวดเดียวกัน — หน้าจอเตือนก่อนยืนยัน
+      const periodIds = [...new Set(validHeaderEntries.map(h => h.period_id).filter(Boolean))];
+      const existingOpening = await findExistingOpening(req.dbPool, periodIds);
+
       res.json({
+        existingOpening,
         totalHeaders: headerRows.length,
         validHeaders: validHeaderEntries.length,
         errorHeaders,
@@ -692,12 +712,45 @@ const confirmImport = async (req, res) => {
   }
   const detailsList = Array.isArray(details) ? details : [];
   const createdBy = parseInt(req.headers.userid, 10) || null;
+  const allowExisting = req.body.allow_existing === true;
 
   const client = await req.dbPool.connect();
   let imported = 0, skipped = 0;
   const importErrors = [];
   try {
     await client.query('BEGIN');
+
+    const bfRes = await client.query(BF_DOC_SQL);
+    if (bfRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        code: 'BF_DOC_NOT_FOUND',
+        message: 'ไม่พบประเภทเอกสารยอดยกมา (GL sys_doc_type 10) ที่ใช้งานอยู่ กรุณาตั้งค่าเอกสารก่อน',
+      });
+    }
+    const bfDocId = bfRes.rows[0].id;
+
+    // กันนำเข้าซ้ำ: มียอดยกมาในงวดเดียวกันอยู่แล้ว ต้องยืนยันจากหน้าจอ (allow_existing) ก่อน
+    const periodsRes = await client.query(`
+      SELECT DISTINCT p.id FROM gl_posting_period p
+       WHERE p.gl_status = 'OPEN'
+         AND EXISTS (SELECT 1 FROM unnest($1::date[]) dt WHERE dt BETWEEN p.period_start_date AND p.period_end_date)`,
+      [headers.map(h => h.doc_date)]);
+    const existing = await findExistingOpening(client, periodsRes.rows.map(r => r.id));
+    if (existing.length > 0 && !allowExisting) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        code: 'OPENING_EXISTS',
+        message: `มีเอกสารยอดยกมาในงวดเดียวกันอยู่แล้ว ${existing.length} เอกสาร — นำเข้าอีกครั้งยอดจะเพิ่มซ้ำ`,
+        existingOpening: existing,
+      });
+    }
+
+    // บัญชีที่ใช้ได้ (ตรวจซ้ำฝั่ง server — ไม่เชื่อข้อมูลที่หน้าจอส่งมา)
+    const acctRes = await client.query(
+      `SELECT id FROM gl_account WHERE id = ANY($1::int[]) AND is_active = TRUE AND is_normal_account = TRUE`,
+      [[...new Set(detailsList.map(d => parseInt(d.account_id, 10)).filter(Number.isInteger))]]);
+    const validAccountIds = new Set(acctRes.rows.map(r => r.id));
 
     for (let idx = 0; idx < headers.length; idx++) {
       const h = headers[idx];
@@ -716,26 +769,40 @@ const confirmImport = async (req, res) => {
         }
         const periodId = periodRes.rows[0].id;
 
-        // Resolve doc_no (auto-generate if not provided)
-        let docNo = h.doc_no;
-        if (!docNo) {
-          docNo = await generateDocNo(client, BF_DOC_ID, h.doc_date, h.branch_id || null);
-          if (!docNo) throw new Error('ไม่สามารถออกเลขที่เอกสารอัตโนมัติได้');
-        }
-
         const myDetails = detailsList.filter(d => d.header_ref === h.header_ref);
         if (myDetails.length === 0) {
           throw new Error('ไม่มีรายการรายละเอียด (detail)');
         }
-
         const exchangeRate = Number(h.exchange_rate) || 1;
-        let totalDebitFc = 0, totalCreditFc = 0;
-        for (const d of myDetails) {
-          totalDebitFc = round2(totalDebitFc + (Number(d.debit_fc) || 0));
-          totalCreditFc = round2(totalCreditFc + (Number(d.credit_fc) || 0));
+        if (!(exchangeRate > 0)) throw new Error('อัตราแลกเปลี่ยนต้องมากกว่า 0');
+        myDetails.forEach((d, i) => {
+          const dr = Number(d.debit_fc) || 0, cr = Number(d.credit_fc) || 0;
+          if (!validAccountIds.has(parseInt(d.account_id, 10))) {
+            throw new Error(`บรรทัดที่ ${i + 1}: บัญชี ${d.account_code || d.account_id} ต้องเป็นบัญชีปฏิบัติการที่ใช้งานอยู่`);
+          }
+          if (dr < 0 || cr < 0 || (dr > 0) === (cr > 0)) {
+            throw new Error(`บรรทัดที่ ${i + 1}: ระบุเดบิตหรือเครดิตอย่างใดอย่างหนึ่ง และต้องไม่ติดลบ`);
+          }
+        });
+        const balanceMsg = balanceError(myDetails, exchangeRate);
+        if (balanceMsg) throw new Error(balanceMsg);
+
+        // Resolve doc_no (auto-generate if not provided)
+        let docNo = h.doc_no;
+        if (!docNo) {
+          docNo = await generateDocNo(client, bfDocId, h.doc_date, h.branch_id || null);
+          if (!docNo) throw new Error('ไม่สามารถออกเลขที่เอกสารอัตโนมัติได้');
         }
-        const totalDebitLc = round2(totalDebitFc * exchangeRate);
-        const totalCreditLc = round2(totalCreditFc * exchangeRate);
+
+        // ยอดรวมหัวเอกสาร = ผลรวมยอดบรรทัดที่ปัดแล้ว (ให้ตรงกับบรรทัดที่บันทึกจริง)
+        let totalDebitFc = 0, totalCreditFc = 0, totalDebitLc = 0, totalCreditLc = 0;
+        for (const d of myDetails) {
+          const dr = round2(d.debit_fc), cr = round2(d.credit_fc);
+          totalDebitFc = round2(totalDebitFc + dr);
+          totalCreditFc = round2(totalCreditFc + cr);
+          totalDebitLc = round2(totalDebitLc + round2(dr * exchangeRate));
+          totalCreditLc = round2(totalCreditLc + round2(cr * exchangeRate));
+        }
 
         const headerRes = await client.query(
           `INSERT INTO gl_entry_header
@@ -746,7 +813,7 @@ const confirmImport = async (req, res) => {
            VALUES ($1,$2,$3,$3,$4,$5,$6,$7,$8,'Posted',$9,$10,$11,$12,$13,$14)
            RETURNING id`,
           [
-            BF_DOC_ID, docNo, h.doc_date, periodId, h.ref_no || null, h.description || null,
+            bfDocId, docNo, h.doc_date, periodId, h.ref_no || null, h.description || null,
             h.currency_id, exchangeRate,
             totalDebitFc, totalCreditFc, totalDebitLc, totalCreditLc,
             createdBy, h.branch_id || null,

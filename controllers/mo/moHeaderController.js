@@ -18,6 +18,7 @@ const { ensureImUomTable } = require('../im/imUomController');
 const { ensureImWarehouseTable } = require('../im/imWarehouseController');
 const { ensureImLocationTable } = require('../im/imLocationController');
 const { ensureMoBomTable } = require('./moBomController');
+const { today } = require('../../utils/dateUtil');
 
 const ensureMoHeaderTable = async (client) => {
     await ensureImItemTable(client);
@@ -690,7 +691,7 @@ const closeTransaction = async (req, res) => {
         }
 
         const residual = Number(mo.wip_balance_lc) || 0;
-        const closeDate = close_date || new Date().toISOString().slice(0, 10);
+        const closeDate = close_date || today();
         let glEntryId = null;
 
         if (Math.abs(residual) > 0.0001) {
@@ -879,7 +880,7 @@ const explodeSubAssembly = async (req, res) => {
         const bomQty = Number(bom.bom_qty) || 1;
         const scale = remainingQty / bomQty;
 
-        const docDate = due_date || new Date().toISOString().slice(0, 10);
+        const docDate = due_date || today();
         let docNo = await generateDocNo(client, parentMo.doc_id, docDate, parentMo.branch_id || null);
         if (!docNo) throw new Error('สร้างเลขที่เอกสารอัตโนมัติไม่สำเร็จ');
 

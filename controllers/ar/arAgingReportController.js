@@ -1,4 +1,5 @@
 // controllers/ar/arAgingReportController.js
+const { today } = require('../../utils/dateUtil');
 // รายงานลูกหนี้คงค้างตามอายุ (AR Aging Report)
 
 const getAgingReport = async (req, res) => {
@@ -11,7 +12,7 @@ const getAgingReport = async (req, res) => {
         customer_code_to,
     } = req.query;
 
-    const asOf = as_of_date || new Date().toISOString().slice(0, 10);
+    const asOf = as_of_date || today();
     const client = await req.dbPool.connect();
     try {
         const params = [asOf];

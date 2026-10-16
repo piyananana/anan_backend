@@ -1,4 +1,5 @@
 // controllers/im/imStockBalanceByItemReportController.js
+const { today } = require('../../utils/dateUtil');
 // รายงานสินค้าคงเหลือตามตำแหน่งที่เก็บ — ยอดคงเหลือ ณ วันที่สิ้นสุดที่เลือก แยกตาม item/warehouse/location/lot/serial
 //
 // จุดสำคัญ: ไม่ได้อ่านจาก im_stock_balance/im_stock_layer ตรงๆ (ตารางนั้นมีแค่ยอด "ปัจจุบัน" เท่านั้น ไม่รองรับ
@@ -27,7 +28,7 @@ const getStockBalanceByItemReport = async (req, res) => {
         warehouse_ids, location_code_from, location_code_to, balance_filter,
         sort, sort_dir,
     } = req.query;
-    const dateTo = date_to || new Date().toISOString().slice(0, 10);
+    const dateTo = date_to || today();
 
     const client = await req.dbPool.connect();
     try {

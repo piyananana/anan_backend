@@ -1,4 +1,5 @@
 // controllers/im/imTransactionReportController.js
+const { today } = require('../../utils/dateUtil');
 // รายงานธุรกรรมสินค้าคงคลัง — มิเรอร์รูปแบบ arTransactionReportController.js แต่ปรับให้เป็นรายการเอกสารเรียงตาม
 // วันที่ (ไม่จัดกลุ่มตาม entity เหมือน AR ที่จัดกลุ่มตามลูกค้า) เพราะ IM ไม่มีฟีลด์ที่ทุก sys_doc_type มีร่วมกัน
 // แบบ customer_id ของ AR (AJS/ISS/TRF ไม่มีผู้ขาย/ลูกค้า) — ยืนยันรูปแบบนี้กับผู้ใช้แล้วก่อนสร้าง
@@ -7,8 +8,8 @@
 const getTransactionReport = async (req, res) => {
     const { date_from, date_to, sys_doc_types, sort } = req.query;
 
-    const dateFrom = date_from || new Date().toISOString().slice(0, 10);
-    const dateTo   = date_to   || new Date().toISOString().slice(0, 10);
+    const dateFrom = date_from || today();
+    const dateTo   = date_to   || today();
     const order    = sort === 'desc' ? 'DESC' : 'ASC';
 
     const client = await req.dbPool.connect();

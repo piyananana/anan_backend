@@ -1,4 +1,5 @@
 // controllers/cm/cmBankStatementImportController.js
+const { today } = require('../../utils/dateUtil');
 'use strict';
 
 // POST: import parsed lines into a new bank statement
@@ -52,7 +53,7 @@ const importStatement = async (req, res) => {
 
         // Compute date range from lines if not provided
         const lineDates = lines.map(l => l.line_date).filter(Boolean).sort();
-        const dateFrom = statement_date_from || (lineDates.length ? lineDates[0]    : new Date().toISOString().substring(0,10));
+        const dateFrom = statement_date_from || (lineDates.length ? lineDates[0]    : today());
         const dateTo   = statement_date_to   || (lineDates.length ? lineDates[lineDates.length-1] : dateFrom);
 
         // Opening balance = balance of first line minus its net movement

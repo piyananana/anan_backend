@@ -1,4 +1,5 @@
 // controllers/vt/vatReportController.js
+const { today } = require('../../utils/dateUtil');
 // รายงานภาษีซื้อ / ภาษีขาย (สำหรับยื่นสรรพากร ภ.พ.30)
 // ดึงข้อมูลจาก vt_transaction (ตารางกลาง VAT ของทุก module)
 
@@ -9,8 +10,8 @@ const getVatReport = async (req, res) => {
         return res.status(400).json({ error: 'vat_type is required (OUTPUT_VAT | INPUT_VAT)' });
     }
 
-    const dateFrom = date_from || new Date().toISOString().slice(0, 10);
-    const dateTo   = date_to   || new Date().toISOString().slice(0, 10);
+    const dateFrom = date_from || today();
+    const dateTo   = date_to   || today();
 
     const vatTypes = vat_type === 'OUTPUT_VAT'
         ? ['OUTPUT_VAT']

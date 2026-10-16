@@ -1,4 +1,5 @@
 // controllers/cm/cmCashFlowStatementController.js
+const { addDays, ymd } = require('../../utils/dateUtil');
 'use strict';
 
 const tableExists = async (client, name) => {
@@ -21,9 +22,7 @@ const calcBalance = async (client, accId, asOfDate, tables) => {
             [accId, asOfDate]);
         if (ob.rows.length > 0) {
             balance = parseFloat(ob.rows[0].opening_balance);
-            const obDate = ob.rows[0].as_of_date.toISOString
-                ? ob.rows[0].as_of_date.toISOString().substring(0, 10)
-                : ob.rows[0].as_of_date.toString().substring(0, 10);
+            const obDate = ymd(ob.rows[0].as_of_date);
 
             if (tables.receipt) {
                 const r = await client.query(
@@ -109,9 +108,7 @@ const getStatement = async (req, res) => {
     }
 
     // date before period = opening balance date
-    const d = new Date(date_from);
-    d.setDate(d.getDate() - 1);
-    const openingDate = d.toISOString().substring(0, 10);
+    const openingDate = addDays(date_from, -1);
 
     const client = await req.dbPool.connect();
     try {

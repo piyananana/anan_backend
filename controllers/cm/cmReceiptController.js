@@ -1,4 +1,5 @@
 // controllers/cm/cmReceiptController.js
+const { today } = require('../../utils/dateUtil');
 'use strict';
 
 const ensureCmReceiptTable = async (client) => {
@@ -96,7 +97,7 @@ const clearReceipt = async (req, res) => {
                 updated_at    = NOW()
             WHERE id = $3 AND status = 'Pending'
             RETURNING *`,
-            [clearing_date || new Date().toISOString().substring(0, 10), clearing_note || null, id]);
+            [clearing_date || today(), clearing_note || null, id]);
         if (result.rows.length === 0)
             return res.status(400).json({ error: 'ไม่สามารถเคลียร์ได้ หรือสถานะไม่ใช่ Pending' });
         res.json(result.rows[0]);

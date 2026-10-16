@@ -1,4 +1,5 @@
 // controllers/cm/cmBankGlReconcileController.js
+const { ymd } = require('../../utils/dateUtil');
 'use strict';
 
 const tableExists = async (client, name) => {
@@ -20,9 +21,7 @@ const getCmBalance = async (client, bankAccountId, asOfDate, flags) => {
             [bankAccountId, asOfDate]);
         if (ob.rows.length > 0) {
             balance  = parseFloat(ob.rows[0].opening_balance);
-            fromDate = ob.rows[0].as_of_date.toISOString
-                ? ob.rows[0].as_of_date.toISOString().substring(0, 10)
-                : ob.rows[0].as_of_date.toString().substring(0, 10);
+            fromDate = ymd(ob.rows[0].as_of_date);
         }
     }
 

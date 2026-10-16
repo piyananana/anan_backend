@@ -8,6 +8,7 @@
 //   2. ไม่มี VAT (มิเรอร์ '10' GRN ธรรมดาที่ไม่มี VAT ตอน Post — ถ้าใบกำกับจริงจากผู้ฝากขายมี VAT ผู้ใช้ปรับเพิ่มเองใน AP ภายหลัง)
 //   3. มาจากการตัด im_stock_layer หลายใบของหลายเอกสารขายมารวมเป็นบิลเดียว ไม่ใช่ 1:1 กับเอกสารรับเหมือน '11'/'12'
 const { generateDocNo, voidLinkedApTransaction } = require('./imTransactionController');
+const { today } = require('../../utils/dateUtil');
 
 // หา consumption ที่มาจาก layer ของเอกสารรับฝากขาย (sys_doc_type='13') และยังไม่ถูก settle
 const PENDING_SELECT = `
@@ -61,7 +62,7 @@ const postSettlement = async (req, res) => {
         if (!Array.isArray(consumption_ids) || consumption_ids.length === 0) {
             return res.status(400).json({ message: 'กรุณาเลือกรายการที่จะตั้งหนี้อย่างน้อย 1 รายการ' });
         }
-        const settleDate = doc_date || new Date().toISOString().slice(0, 10);
+        const settleDate = doc_date || today();
 
         await client.query('BEGIN');
 

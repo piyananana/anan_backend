@@ -1,4 +1,5 @@
 // controllers/cm/cmBankFileExportController.js
+const { ymd } = require('../../utils/dateUtil');
 'use strict';
 
 // GET: payments available to export for a bank account
@@ -81,11 +82,11 @@ const generateFile = async (req, res) => {
 
                 // Map field names to payment columns
                 switch (field) {
-                    case 'payment_date':     val = p.payment_date ? p.payment_date.toISOString().substring(0,10) : ''; break;
+                    case 'payment_date':     val = p.payment_date ? ymd(p.payment_date) : ''; break;
                     case 'payee_name_th':    val = p.payee_name_th || ''; break;
                     case 'amount_lc':        val = parseFloat(p.amount_lc || 0).toFixed(2); break;
                     case 'check_no':         val = p.check_no || ''; break;
-                    case 'check_date':       val = p.check_date ? p.check_date.toISOString().substring(0,10) : ''; break;
+                    case 'check_date':       val = p.check_date ? ymd(p.check_date) : ''; break;
                     // cm_payment has no payee bank account number column — not captured anywhere upstream yet
                     case 'payee_bank_account_no': val = ''; break;
                     case 'ap_doc_no':        val = p.ap_doc_no || ''; break;

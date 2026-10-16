@@ -11,6 +11,7 @@ const { ensureImItemCategoryTable } = require('./imItemCategoryController');
 // running number แยกของตัวเอง ผู้ใช้เลือก "ประเภทเอกสาร" (doc_id, sys_doc_type='85') ตอนสร้างธุรกรรม แล้วเลขที่/การ
 // ตั้งค่าเลขที่อัตโนมัติมาจาก config ของ doc_id นั้นโดยตรง (จัดการผ่านหน้าจอ sa_module_document ของ SA เหมือน GRN/DLN)
 const { generateDocNo } = require('./imTransactionController');
+const { addDays } = require('../../utils/dateUtil');
 
 const CHANGE_TYPES = ['REVISE', 'PROMOTION'];
 const ADJUSTMENT_MODES = ['PERCENT', 'AMOUNT', 'SET_PRICE'];
@@ -442,11 +443,9 @@ const approveChange = async (req, res) => {
                     await client.query('ROLLBACK');
                     return res.status(400).json({ message: `สินค้ารหัส item_id=${line.item_id}: วันที่มีผลใหม่ต้องมากกว่าวันที่เริ่มราคาเดิม` });
                 }
-                const closeTo = new Date(header.effective_from);
-                closeTo.setDate(closeTo.getDate() - 1);
-                await client.query(
+                                await client.query(
                     `UPDATE im_price_list_detail SET effective_to = $1, updated_by = $2, updated_at = NOW() WHERE id = $3`,
-                    [closeTo.toISOString().slice(0, 10), userName, line.source_detail_id]
+                    [addDays(header.effective_from, -1), userName, line.source_detail_id]
                 );
             }
 

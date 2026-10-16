@@ -1,4 +1,5 @@
 // controllers/ar/arAllowanceRunController.js
+const { today: todayYmd, ymd } = require('../../utils/dateUtil');
 // Allowance for Doubtful Accounts — คำนวณค่าเผื่อหนี้สงสัยจะสูญ
 
 // ── Helper: คำนวณ allowance details ─────────────────────────────────────────
@@ -215,7 +216,7 @@ const postRun = async (req, res) => {
         const isInc  = adj > 0;   // เพิ่มค่าเผื่อ: DR expense, CR contra
         const absAdj = Math.abs(adj);
 
-        const docNo = `ALLOW-${run.run_date.toISOString().slice(0, 10).replace(/-/g, '')}`;
+        const docNo = `ALLOW-${ymd(run.run_date).replace(/-/g, '')}`;
 
         const glRes = await client.query(`
             INSERT INTO gl_entry_header
@@ -276,7 +277,7 @@ const voidRun = async (req, res) => {
         if (hdr.rows[0].status !== 'Posted') { await client.query('ROLLBACK'); return res.status(422).json({ error: 'Only Posted can be voided' }); }
 
         const run   = hdr.rows[0];
-        const today = new Date().toISOString().slice(0, 10);
+        const today = todayYmd();
 
         const todayPeriod = await client.query(
             `SELECT id FROM gl_posting_period

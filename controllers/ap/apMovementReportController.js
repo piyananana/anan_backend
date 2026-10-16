@@ -1,4 +1,5 @@
 // controllers/ap/apMovementReportController.js
+const { today } = require('../../utils/dateUtil');
 // รายงานการเคลื่อนไหวเจ้าหนี้ (AP Movement Report)
 
 // DR_TYPES: PI(10), DN(50) → เพิ่มยอดเจ้าหนี้
@@ -17,8 +18,8 @@ const getMovementReport = async (req, res) => {
         vendor_code_to,
     } = req.query;
 
-    const dateFrom = date_from || new Date().toISOString().slice(0, 10);
-    const dateTo   = date_to   || new Date().toISOString().slice(0, 10);
+    const dateFrom = date_from || today();
+    const dateTo   = date_to   || today();
 
     const client = await req.dbPool.connect();
     try {

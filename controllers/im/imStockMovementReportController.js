@@ -1,4 +1,5 @@
 // controllers/im/imStockMovementReportController.js
+const { today } = require('../../utils/dateUtil');
 // รายงานสินค้าคงเหลือและการเคลื่อนไหว — จัดกลุ่ม คลัง > หมวดหมู่ > สินค้า (1 "การ์ด" ต่อ สินค้า+คลัง) พร้อมยอดสะสม
 // (running balance) ต่อบรรทัด
 //
@@ -29,8 +30,8 @@ const bucketOf = (sysDocType) => {
 
 const getStockMovementReport = async (req, res) => {
     const { warehouse_ids, category_ids, item_code_from, item_code_to, date_from, date_to } = req.query;
-    const dateFrom = date_from || new Date().toISOString().slice(0, 10);
-    const dateTo   = date_to   || new Date().toISOString().slice(0, 10);
+    const dateFrom = date_from || today();
+    const dateTo   = date_to   || today();
 
     const client = await req.dbPool.connect();
     try {

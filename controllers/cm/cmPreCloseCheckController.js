@@ -1,4 +1,5 @@
 // controllers/cm/cmPreCloseCheckController.js
+const { ymd } = require('../../utils/dateUtil');
 'use strict';
 
 const tableExists = async (client, name) => {
@@ -20,9 +21,7 @@ const getCmBalance = async (client, bankAccountId, asOfDate, flags) => {
             [bankAccountId, asOfDate]);
         if (ob.rows.length > 0) {
             balance  = parseFloat(ob.rows[0].opening_balance);
-            fromDate = ob.rows[0].as_of_date.toISOString
-                ? ob.rows[0].as_of_date.toISOString().substring(0, 10)
-                : ob.rows[0].as_of_date.toString().substring(0, 10);
+            fromDate = ymd(ob.rows[0].as_of_date);
         }
     }
 
@@ -97,7 +96,7 @@ const runChecks = async (req, res) => {
                     LEFT JOIN cm_bank_account ba ON ba.id = s.bank_account_id
                     WHERE s.status='Draft' AND s.statement_date_to<=$1
                     ORDER BY s.statement_date_to LIMIT 5`, [period_date]);
-                docs = r.rows.map(x => ({ doc_no: `${x.account_code || ''} ${x.statement_date_to ? x.statement_date_to.toISOString().substring(0, 10) : ''}`.trim() }));
+                docs = r.rows.map(x => ({ doc_no: `${x.account_code || ''} ${x.statement_date_to ? ymd(x.statement_date_to) : ''}`.trim() }));
             }
             checks.push({ check_key: 'UNCONFIRMED_STATEMENTS', severity: 'WARNING', count: cnt, docs,
                 title: 'Bank Statement ที่ยังไม่ยืนยัน', title_en: 'Unconfirmed bank statements' });
@@ -117,7 +116,7 @@ const runChecks = async (req, res) => {
                     JOIN cm_bank_statement s ON s.id = l.statement_id
                     WHERE s.status='Confirmed' AND l.is_reconciled=FALSE AND s.statement_date_to<=$1
                     ORDER BY l.line_date LIMIT 5`, [period_date]);
-                docs2 = r.rows.map(x => ({ doc_no: (x.reference && x.reference.trim()) ? x.reference : (x.line_date ? x.line_date.toISOString().substring(0, 10) : '') }));
+                docs2 = r.rows.map(x => ({ doc_no: (x.reference && x.reference.trim()) ? x.reference : (x.line_date ? ymd(x.line_date) : '') }));
             }
             checks.push({ check_key: 'UNRECONCILED_LINES', severity: 'WARNING', count: cnt2, docs: docs2,
                 title: 'รายการที่ยังไม่ได้ Reconcile', title_en: 'Unreconciled statement lines' });

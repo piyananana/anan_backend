@@ -1,4 +1,5 @@
 // controllers/ap/apFxGainLossReportController.js
+const { today } = require('../../utils/dateUtil');
 // รายงานกำไร/ขาดทุนจากอัตราแลกเปลี่ยน (AP FX Gain/Loss Report)
 // คำนวณจาก: applied_amount_fc × (payment.exchange_rate − invoice.exchange_rate)
 // หมายเหตุ: AP → จ่ายอัตราสูงกว่าตั้งหนี้ = ขาดทุน, จ่ายต่ำกว่า = กำไร
@@ -14,8 +15,8 @@ const getFxGainLossReport = async (req, res) => {
         sort_by,   // 'vendor' | 'net_desc' | 'net_asc'
     } = req.query;
 
-    const dateFrom = date_from || new Date().toISOString().slice(0, 10);
-    const dateTo   = date_to   || new Date().toISOString().slice(0, 10);
+    const dateFrom = date_from || today();
+    const dateTo   = date_to   || today();
 
     const client = await req.dbPool.connect();
     try {

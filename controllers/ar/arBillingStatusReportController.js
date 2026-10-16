@@ -1,4 +1,5 @@
 // controllers/ar/arBillingStatusReportController.js
+const { today } = require('../../utils/dateUtil');
 // รายงานสถานะใบวางบิล — ตรวจดูว่าได้ชำระแล้วหรือไม่
 
 const getBillingStatusReport = async (req, res) => {
@@ -10,8 +11,8 @@ const getBillingStatusReport = async (req, res) => {
         sort_by,        // 'doc_type' | 'customer'
     } = req.query;
 
-    const dateFrom = date_from || new Date().toISOString().slice(0, 10);
-    const dateTo   = date_to   || new Date().toISOString().slice(0, 10);
+    const dateFrom = date_from || today();
+    const dateTo   = date_to   || today();
 
     const client = await req.dbPool.connect();
     try {

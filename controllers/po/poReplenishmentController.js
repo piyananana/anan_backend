@@ -1,4 +1,5 @@
 // controllers/po/poReplenishmentController.js — ใบแนะนำสั่งซื้อเพื่อเติมสต็อก (Purchase Replenishment Suggestion)
+const { today } = require('../../utils/dateUtil');
 // อ่านอย่างเดียว ไม่เขียนอะไรเลย — ใช้ min_stock_qty/max_stock_qty/reorder_point ที่มีอยู่แล้วใน im_item/
 // im_item_warehouse (เดิมไม่เคยถูกใช้คำนวณอะไรเลย) ผสมกับยอดขายจริงจาก DLN ('30'/'31'/'32') ในช่วงย้อนหลังที่เลือก
 // เพื่อประมาณจำนวนที่ต้องสั่งให้พอสำหรับช่วงเวลาข้างหน้าที่เลือก — สูตรและเหตุผลแต่ละขั้นดู plan ตอนออกแบบ
@@ -13,7 +14,7 @@ const fetchSuggestions = async (req, res) => {
     const warehouseIds = (warehouse_ids || '').split(',').map(s => parseInt(s, 10)).filter(n => !isNaN(n));
     if (warehouseIds.length === 0) return res.status(400).json({ message: 'กรุณาระบุคลังสินค้าอย่างน้อย 1 คลัง' });
 
-    const asOf = as_of || new Date().toISOString().slice(0, 10);
+    const asOf = as_of || today();
     const lookbackDays = Math.max(parseInt(lookback_days, 10) || 90, 1);
     const coverageDays = Math.max(parseInt(coverage_days, 10) || 30, 1);
     const categoryIds = (category_ids || '').split(',').map(s => parseInt(s, 10)).filter(n => !isNaN(n));

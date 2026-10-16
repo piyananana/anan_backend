@@ -1,4 +1,5 @@
 // controllers/ar/arMovementReportController.js
+const { today } = require('../../utils/dateUtil');
 // รายงานการเคลื่อนไหวลูกหนี้ (AR Movement Report)
 
 const DR_TYPES  = ['10', '30', '35'];
@@ -17,8 +18,8 @@ const getMovementReport = async (req, res) => {
         customer_code_to,
     } = req.query;
 
-    const dateFrom = date_from || new Date().toISOString().slice(0, 10);
-    const dateTo   = date_to   || new Date().toISOString().slice(0, 10);
+    const dateFrom = date_from || today();
+    const dateTo   = date_to   || today();
 
     const client = await req.dbPool.connect();
     try {

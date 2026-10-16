@@ -1,4 +1,5 @@
 // controllers/cm/cmBankReconcileController.js
+const { today } = require('../../utils/dateUtil');
 'use strict';
 
 // Add reconciliation columns to cm_receipt and cm_payment if not present
@@ -115,7 +116,7 @@ const reconcilePair = async (req, res) => {
 
     const table = cm_record_type === 'RECEIPT' ? 'cm_receipt' : 'cm_payment';
     const dateCol = cm_record_type === 'RECEIPT' ? 'receipt_date' : 'payment_date';
-    const rDate = reconcile_date || new Date().toISOString().substring(0, 10);
+    const rDate = reconcile_date || today();
 
     const client = await req.dbPool.connect();
     try {

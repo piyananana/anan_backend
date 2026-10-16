@@ -1,4 +1,5 @@
 // File: controllers/gl/glPeriodController.js
+const { ymd } = require('../../utils/dateUtil');
 // const { Pool } = require('pg');
 
 // // *** ตัวอย่าง Pool Connection (คุณอาจต้องแก้ไขให้ถูกต้องตาม config ของคุณ) ***
@@ -107,9 +108,6 @@ const addHeaderRow = async (req, res) => {
     const userId = req.headers.userid;
     const userName = req.headers.username;
     
-    // แปลงวันที่ให้อยู่ในรูปแบบ Date Object
-    const startDate = new Date(year_start_date);
-    const endDate = new Date(year_end_date);
     
     try {
         await client.query('BEGIN');
@@ -121,7 +119,7 @@ const addHeaderRow = async (req, res) => {
             ) VALUES ($1, $2, $3, $4, $5, $6, $6) RETURNING id, year_start_date, year_end_date, num_of_periods`;
             
         const yearValues = [
-            fy_code, description, startDate.toISOString().split('T')[0], endDate.toISOString().split('T')[0], 
+            fy_code, description, ymd(year_start_date), ymd(year_end_date), 
             num_of_periods || 12, userId
         ];
         

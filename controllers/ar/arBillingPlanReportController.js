@@ -1,4 +1,5 @@
 // controllers/ar/arBillingPlanReportController.js
+const { today } = require('../../utils/dateUtil');
 // รายงานวันวางบิล (Billing Plan Report)
 // ใช้วางแผนมอบหมายงานให้ผู้วางบิลไปติดต่อลูกหนี้ตามกำหนด
 // ดึงเฉพาะ Invoice/DN ที่ยังค้างชำระ (balance > 0) และมี billing_date กำหนดไว้
@@ -15,8 +16,8 @@ const getBillingPlanReport = async (req, res) => {
         customer_code_to,
     } = req.query;
 
-    const dateFrom = date_from || new Date().toISOString().slice(0, 10);
-    const dateTo   = date_to   || new Date().toISOString().slice(0, 10);
+    const dateFrom = date_from || today();
+    const dateTo   = date_to   || today();
 
     const client = await req.dbPool.connect();
     try {

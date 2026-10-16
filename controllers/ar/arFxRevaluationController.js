@@ -1,4 +1,5 @@
 // controllers/ar/arFxRevaluationController.js
+const { today: todayYmd, ymd } = require('../../utils/dateUtil');
 // FX Revaluation สำหรับลูกหนี้สกุลเงินต่างประเทศ ณ วันปิดปี
 
 // ── Helper: คำนวณ revaluation details สำหรับ outstanding FC invoices ──────────
@@ -324,7 +325,7 @@ const postReval = async (req, res) => {
         )).rows;
 
         const isUnrealized = reval.method === 'reversing';
-        const docNo = `FXR-${reval.reval_date.toISOString().slice(0, 10).replace(/-/g, '')}`;
+        const docNo = `FXR-${ymd(reval.reval_date).replace(/-/g, '')}`;
 
         // สร้าง GL revaluation entry
         const glEntryId = await postRevalGlEntry(
@@ -346,7 +347,7 @@ const postReval = async (req, res) => {
             }
         } else {
             // reversing: สร้าง Reversing GL entry (สลับ DR/CR) ด้วยวันที่ reversal_date
-            const revDocNo = `FXR-REV-${reval.reversal_date.toISOString().slice(0, 10).replace(/-/g, '')}`;
+            const revDocNo = `FXR-REV-${ymd(reval.reversal_date).replace(/-/g, '')}`;
 
             // ตรวจว่างวด reversal_date เปิดอยู่หรือไม่ (ถ้าเปิดแล้ว post ทันที)
             const revPeriodRes = await client.query(
@@ -423,7 +424,7 @@ const voidReval = async (req, res) => {
         const reval = hdr.rows[0];
         if (reval.status !== 'Posted') { await client.query('ROLLBACK'); return res.status(422).json({ error: 'Only Posted can be voided' }); }
 
-        const today = new Date().toISOString().slice(0, 10);
+        const today = todayYmd();
 
         // ตรวจสอบงวดวันนี้เปิดอยู่
         const todayPeriod = await client.query(

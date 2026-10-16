@@ -1,4 +1,5 @@
 // controllers/im/imGrBillingReportController.js
+const { today } = require('../../utils/dateUtil');
 // รายงานตรวจสอบ GR รอ/ผ่านการโพสต์ AP-GL (sys_doc_type='12') — ยอดสินค้าที่ยังไม่มี GL รองรับ (สถานะ Received)
 // และส่วนต่างราคาระหว่างต้นทุนที่ตีมูลค่าสต็อก (unit_cost) กับต้นทุนที่โพสต์ AP/GL จริง (billed_unit_cost, สถานะ Posted)
 
@@ -12,7 +13,7 @@ const getGrBillingReport = async (req, res) => {
         status, // 'Received' | 'Posted' | undefined(=both)
     } = req.query;
 
-    const asOf = as_of_date || new Date().toISOString().slice(0, 10);
+    const asOf = as_of_date || today();
     const client = await req.dbPool.connect();
     try {
         const params = [asOf];

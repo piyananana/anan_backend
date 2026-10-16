@@ -1,4 +1,5 @@
 // controllers/ar/arReceiptPaymentReportController.js
+const { today } = require('../../utils/dateUtil');
 // รายงานการรับชำระ — ยอดสรุปตามประเภทการชำระเงิน
 
 const getReceiptPaymentReport = async (req, res) => {
@@ -9,8 +10,8 @@ const getReceiptPaymentReport = async (req, res) => {
         sort_by, // 'customer' | 'amount_desc' | 'amount_asc'
     } = req.query;
 
-    const dateFrom = date_from || new Date().toISOString().slice(0, 10);
-    const dateTo   = date_to   || new Date().toISOString().slice(0, 10);
+    const dateFrom = date_from || today();
+    const dateTo   = date_to   || today();
 
     const client = await req.dbPool.connect();
     try {

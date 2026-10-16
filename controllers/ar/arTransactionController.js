@@ -1,4 +1,5 @@
 // controllers/ar/arTransactionController.js
+const { today: todayYmd } = require('../../utils/dateUtil');
 
 // --- Helper: Generate Document Number (supports per-branch counter) ---
 const generateDocNo = async (client, docId, date, branchId = null) => {
@@ -1399,7 +1400,7 @@ const voidTransaction = async (req, res) => {
         const voidSysDocType  = checkRes.rows[0].sys_doc_type || '';
         const isBcVoid        = voidSysDocType === '70'; // BC ไม่มี GL ให้ reverse
         const isReceiptVoid   = voidSysDocType === '80';
-        const today           = new Date().toISOString().slice(0, 10);
+        const today           = todayYmd();
 
         // 2. สร้าง Reversing GL Entry จาก GL entry ต้นทาง (ข้ามสำหรับ BC)
         let reversingGlId = null;

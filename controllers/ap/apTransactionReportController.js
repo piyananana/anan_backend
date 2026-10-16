@@ -1,4 +1,5 @@
 // controllers/ap/apTransactionReportController.js
+const { today } = require('../../utils/dateUtil');
 // รายงานธุรกรรมเจ้าหนี้ — ยอดสรุปและรายละเอียดตามประเภทเอกสาร
 
 // AP doc types: PI(10) CN(30) DN(50) จ่ายมัดจำ(60) คืนมัดจำ(65) ชำระ(80)
@@ -12,8 +13,8 @@ const getTransactionReport = async (req, res) => {
         sort_by,  // 'vendor' | 'doc_type'
     } = req.query;
 
-    const dateFrom = date_from || new Date().toISOString().slice(0, 10);
-    const dateTo   = date_to   || new Date().toISOString().slice(0, 10);
+    const dateFrom = date_from || today();
+    const dateTo   = date_to   || today();
 
     const client = await req.dbPool.connect();
     try {

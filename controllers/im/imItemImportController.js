@@ -194,22 +194,8 @@ const buildCodeMap = (rows, codeField) => {
 };
 
 // แปลงเซลล์วันที่ (Date object จาก cellDates:true หรือ string 'YYYY-MM-DD'/'DD/MM/YYYY') -> 'YYYY-MM-DD' หรือ null
-const parseDateCell = (val) => {
-  if (val instanceof Date) {
-    if (isNaN(val.getTime())) return null;
-    const y = val.getFullYear();
-    const m = String(val.getMonth() + 1).padStart(2, '0');
-    const d = String(val.getDate()).padStart(2, '0');
-    return `${y}-${m}-${d}`;
-  }
-  const s = String(val ?? '').trim();
-  if (!s) return null;
-  let m = s.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})$/);
-  if (m) return `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
-  m = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/);
-  if (m) return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
-  return null;
-};
+// Excel date cell -> 'YYYY-MM-DD' (handles SheetJS's off-by-seconds dates and serial numbers)
+const { excelDate: parseDateCell } = require('../../utils/dateUtil');
 
 // ---------------------------------------------------------------------------
 // POST /im_item/import/validate  (multipart file)

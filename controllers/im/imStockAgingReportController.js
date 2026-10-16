@@ -1,4 +1,5 @@
 // controllers/im/imStockAgingReportController.js
+const { today } = require('../../utils/dateUtil');
 // รายงานอายุสินค้าคงคลัง (Stock Aging Report) — แยกวิธีคำนวณอายุตาม costing_method ของสินค้า เพราะข้อมูลที่มีอยู่
 // จริงต่างกันโดยพื้นฐาน:
 //   - FIFO/SPECIFIC: มี im_stock_layer เก็บเป็นล็อตแยกทุก batch (layer_date, remaining_qty) จึงรู้ "อายุจริง"
@@ -34,7 +35,7 @@ const getStockAgingReport = async (req, res) => {
         warehouse_ids, location_code_from, location_code_to,
         sort, sort_dir,
     } = req.query;
-    const asOf = as_of_date || new Date().toISOString().slice(0, 10);
+    const asOf = as_of_date || today();
 
     const client = await req.dbPool.connect();
     try {
