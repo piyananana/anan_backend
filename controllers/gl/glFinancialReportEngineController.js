@@ -209,10 +209,10 @@ const generateFinancialReport = async (req, res) => {
             // ตัดผลของรายการปิดบัญชีสิ้นปี (Step 3 ปิดรายได้/ค่าใช้จ่าย, Step 4 โอนเข้ากำไรสะสม) ออก
             // รายการเหล่านี้ลงในงวดสุดท้ายของปี ถ้าไม่ตัดออก งบกำไรขาดทุน YTD งวดสุดท้ายจะเป็นศูนย์
             // (Step 5 ยอดยกมาในงวด 1 ของปีใหม่ ยังคงไว้ เพราะเป็นยอดตั้งต้นของงบแสดงฐานะการเงิน)
-            // combo ของรายการปิดบัญชีสร้างจาก detail row (ดู glYearEndClosingController.updateBalanceAccum)
+            // combo ของยอดสะสม: สาขาจากหัวรายการ + มิติ 1-5 จากบรรทัด (ตาม trigger ใน sql/gl_balance_accum_trigger.sql)
             const closingRes = await client.query(`
                 SELECT a.account_code, h.period_id,
-                       COALESCE(d.branch_id, 0) AS branch_id,
+                       COALESCE(h.branch_id, 0) AS branch_id,
                        COALESCE(d.dim1_id, 0) AS dim1_id, COALESCE(d.dim2_id, 0) AS dim2_id,
                        COALESCE(d.dim3_id, 0) AS dim3_id, COALESCE(d.dim4_id, 0) AS dim4_id,
                        COALESCE(d.dim5_id, 0) AS dim5_id,
@@ -222,7 +222,7 @@ const generateFinancialReport = async (req, res) => {
                 JOIN gl_entry_detail d ON d.header_id = h.id
                 JOIN gl_account a ON a.id = d.account_id
                 WHERE h.period_id = ANY($1::int[])
-                  AND ($2::int IS NULL OR COALESCE(d.branch_id, 0) = $2)
+                  AND ($2::int IS NULL OR COALESCE(h.branch_id, 0) = $2)
                   AND ($3::int IS NULL OR COALESCE(d.dim1_id, 0) = $3)
                   AND ($4::int IS NULL OR COALESCE(d.dim2_id, 0) = $4)
                   AND ($5::int IS NULL OR COALESCE(d.dim3_id, 0) = $5)

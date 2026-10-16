@@ -123,7 +123,11 @@ const accountLines = async (client, { drill, target, src, glData, glMatches, isE
     let lines = [];
     if (!conflict && account && src.periodIds.length > 0) {
         const params = [src.periodIds, account.id];
-        const where = Object.entries(filters).map(([k, v]) => { params.push(v); return `COALESCE(d.${k}, 0) = $${params.length}`; });
+        // สาขาของยอดสะสมมาจากหัวรายการ (มิติ 1-5 มาจากบรรทัด) — กรองให้ตรงกับ gl_balance_accum
+        const where = Object.entries(filters).map(([k, v]) => {
+            params.push(v);
+            return `COALESCE(${k === 'branch_id' ? 'h' : 'd'}.${k}, 0) = $${params.length}`;
+        });
         // รายการปิดบัญชีสิ้นปี (Step 3/4) ไม่นับ ถ้าคอลัมน์ตัดออก — ให้ตรงกับยอดในงบ
         if (src.excludeClosing) {
             where.push(`h.id NOT IN (SELECT step3_entry_id FROM gl_year_end_closing WHERE step3_entry_id IS NOT NULL

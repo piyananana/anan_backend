@@ -31,52 +31,6 @@ const validateDimRules = async (client, details) => {
     }
 };
 
-// --- Helper: Get or create gl_dim_combination id ---
-const getOrCreateComboId = async (client, { branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id }) => {
-    const res = await client.query(`
-        INSERT INTO gl_dim_combination (branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
-        VALUES ($1,$2,$3,$4,$5,$6)
-        ON CONFLICT (combo_key) DO UPDATE SET id = gl_dim_combination.id
-        RETURNING id
-    `, [branch_id || 0, dim1_id || 0, dim2_id || 0, dim3_id || 0, dim4_id || 0, dim5_id || 0]);
-    return res.rows[0].id;
-};
-
-// --- Helper: Update Accumulators (Post/Reverse) ---
-const updateBalanceAccum = async (client, headerId, isReverse = false) => {
-    const detailsRes = await client.query(`SELECT * FROM gl_entry_detail WHERE header_id = $1`, [headerId]);
-    const headerRes  = await client.query(`SELECT * FROM gl_entry_header WHERE id = $1`, [headerId]);
-    const header  = headerRes.rows[0];
-    const details = detailsRes.rows;
-    const multiplier = isReverse ? -1 : 1;
-
-    for (const row of details) {
-        // branch_id comes from header (document level), not detail line
-        const comboId  = await getOrCreateComboId(client, {
-            branch_id: header.branch_id,
-            dim1_id: row.dim1_id, dim2_id: row.dim2_id,
-            dim3_id: row.dim3_id, dim4_id: row.dim4_id, dim5_id: row.dim5_id,
-        });
-        const debit    = (Number(row.debit_lc)  || 0) * multiplier;
-        const credit   = (Number(row.credit_lc) || 0) * multiplier;
-        const netChange = debit - credit;
-
-        await client.query(`
-            INSERT INTO gl_balance_accum
-                (period_id, account_id, combo_id, currency_id,
-                 debit_amount, credit_amount, end_balance, updated_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-            ON CONFLICT (period_id, account_id, combo_id, currency_id)
-            DO UPDATE SET
-                debit_amount  = gl_balance_accum.debit_amount  + EXCLUDED.debit_amount,
-                credit_amount = gl_balance_accum.credit_amount + EXCLUDED.credit_amount,
-                end_balance   = gl_balance_accum.end_balance   + (EXCLUDED.debit_amount - EXCLUDED.credit_amount),
-                updated_at    = NOW()
-        `, [header.period_id, row.account_id, comboId, header.currency_id || 1,
-            debit, credit, netChange]);
-    }
-};
-
 // --- Helper: Generate Document Number (supports per-branch counter) ---
 const generateDocNo = async (client, docId, date, branchId = null) => {
     let config = null;
@@ -235,10 +189,9 @@ const createTransaction = async (req, res) => {
             ]);
         }
 
-        // D. Validate dim rules + Update Accumulators if Post
+        // D. Validate dim rules if Post (gl_balance_accum is maintained by DB triggers)
         if (action === 'Post') {
             await validateDimRules(client, details);
-            await updateBalanceAccum(client, newHeaderId, false);
         }
 
         await client.query('COMMIT');
@@ -324,10 +277,9 @@ const updateTransaction = async (req, res) => {
             ]);
         }
 
-        // Validate dim rules + Update Accumulators if Post
+        // Validate dim rules if Post (gl_balance_accum is maintained by DB triggers)
         if (action === 'Post') {
             await validateDimRules(client, details);
-            await updateBalanceAccum(client, id, false);
         }
 
         await client.query('COMMIT');
@@ -377,10 +329,7 @@ const reverseTransaction = async (req, res) => {
 
         if (checkRes.rows[0].status !== 'Posted') throw new Error('Only Posted can be reversed');
 
-        // Reverse Accumulators
-        await updateBalanceAccum(client, id, true); // true = reverse
-
-        // Update Status back to Draft
+        // Update Status back to Draft (DB trigger removes it from gl_balance_accum)
         await client.query(`UPDATE gl_entry_header SET status = 'Draft' WHERE id = $1`, [id]);
 
         await client.query('COMMIT');
