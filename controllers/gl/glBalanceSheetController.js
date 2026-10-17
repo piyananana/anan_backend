@@ -175,16 +175,9 @@ const getBalanceSheet = async (req, res) => {
       if (incomeSummaryId && accMap[incomeSummaryId]) {
         const acc = accMap[incomeSummaryId];
         acc.beg_dr = 0; acc.beg_cr = 0; acc.mvmt_dr = 0; acc.mvmt_cr = 0;
-        // Set raw Dr/Cr so that end_balance = netIncome after normal_balance transform
-        // CREDIT normal: end_balance = -(beg_dr - beg_cr) → set beg_cr = netIncome (profit) or beg_dr = -netIncome (loss)
-        // DEBIT normal:  end_balance =  (beg_dr - beg_cr) → set beg_dr = netIncome (profit) or beg_cr = -netIncome (loss)
-        if (acc.normal_balance === 'DEBIT') {
-          if (netIncome >= 0) acc.beg_dr = netIncome;
-          else                acc.beg_cr = -netIncome;
-        } else {
-          if (netIncome >= 0) acc.beg_cr = netIncome;
-          else                acc.beg_dr = -netIncome;
-        }
+        // Profit is a credit balance, loss a debit balance (EQUITY end_balance = cr − dr)
+        if (netIncome >= 0) acc.beg_cr = netIncome;
+        else                acc.beg_dr = -netIncome;
       }
 
       // 9. Roll-up header accounts (now includes overridden net income)
@@ -214,13 +207,19 @@ const getBalanceSheet = async (req, res) => {
       const resultList = allAccounts.map(a => {
         const d = accMap[a.id];
         const netEnd    = (d.beg_dr - d.beg_cr) + (d.mvmt_dr - d.mvmt_cr);
-        const endBalance = d.normal_balance === 'DEBIT' ? netEnd : -netEnd;
+        // Sign by section, not by each account's normal_balance (stored as 'DR'/'CR'):
+        // ASSET = dr − cr, LIABILITY/EQUITY = cr − dr. Contra accounts (e.g. accumulated
+        // depreciation, ASSET with CR normal) then show negative and reduce the section total.
+        const endBalance = d.account_type === 'ASSET' ? netEnd : -netEnd;
+        // The income summary row holds revenue − expense (step 8), so label it as net profit
+        const isNetIncome = incomeSummaryId != null && d.id === incomeSummaryId;
 
         return {
           account_id:        d.id,
           account_code:      d.account_code,
-          account_name_thai: d.account_name_thai,
-          account_name_eng:  d.account_name_eng,
+          account_name_thai: isNetIncome ? 'กำไร(ขาดทุน)สุทธิ' : d.account_name_thai,
+          account_name_eng:  isNetIncome ? 'Net profit (loss)' : d.account_name_eng,
+          is_net_income:     isNetIncome,
           parent_id:         d.parent_id,
           is_header:         !d.is_normal_account,
           account_type:      d.account_type,

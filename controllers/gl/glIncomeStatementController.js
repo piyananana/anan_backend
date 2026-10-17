@@ -104,7 +104,10 @@ const getIncomeStatement = async (req, res) => {
       const resultList = allAccounts.map(a => {
         const d = accMap[a.id];
         const netEnd    = d.total_dr - d.total_cr;
-        const endBalance = d.normal_balance === 'DEBIT' ? netEnd : -netEnd;
+        // Sign by section, not by each account's normal_balance (stored as 'DR'/'CR'):
+        // REVENUE = cr − dr, EXPENSE = dr − cr. Contra accounts (e.g. sales returns, REVENUE
+        // with DR normal) then show negative and reduce the section total.
+        const endBalance = d.account_type === 'REVENUE' ? -netEnd : netEnd;
 
         return {
           account_id:        d.id,
