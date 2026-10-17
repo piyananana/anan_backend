@@ -51,23 +51,25 @@ const drillDown = async (client, ctx) => {
     // บรรทัดบัญชีที่ประกอบเป็นยอด + บรรทัดที่รวมอยู่แต่แตกไม่ได้ (สูตร / ช่องที่ถูกแทนค่า)
     const parts = [];
     const skipped = [];
-    const visit = (row, depth) => {
+    // mult = เครื่องหมายสะสมตามทางลงมา: บรรทัดที่ "หักจาก" บรรทัดยอดรวม (parent_op SUBTRACT) กลับเครื่องหมาย
+    const visit = (row, depth, mult) => {
         const kind = kindOf(row);
         if (kind === 'HEADING' || kind === 'BLANK' || depth > 50) return;
         const src = cellSource(row);
         if (kind === 'ACCOUNTS') {
             if (!src) skipped.push(row);
-            else if (row.acctSet) parts.push({ row, src });
+            else if (row.acctSet) parts.push({ row, src, mult });
             return;
         }
         if (kind !== 'TOTAL' || (ownCol(row) && !src)) { skipped.push(row); return; }
-        rows.filter(r => r.parent_row_code && r.parent_row_code === row.row_code).forEach(r => visit(r, depth + 1));
+        rows.filter(r => r.parent_row_code && r.parent_row_code === row.row_code)
+            .forEach(r => visit(r, depth + 1, r.parent_op === 'SUBTRACT' ? -mult : mult));
     };
-    visit(target, 0);
+    visit(target, 0, 1);
 
     const order = new Map(rows.map((r, i) => [r.id, i]));
     const accounts = [];
-    for (const { row, src } of parts) {
+    for (const { row, src, mult } of parts) {
         const periodSet = new Set(src.periodIds);
         const byCode = new Map();
         for (const g of glData) {
@@ -76,7 +78,7 @@ const drillDown = async (client, ctx) => {
         }
         for (const [code, amt] of byCode) {
             if (Math.abs(amt) < 0.005) continue;
-            accounts.push({ row_id: row.id, row_code: row.row_code, row_label: label(row), account_code: code, amount: sign(row) * amt });
+            accounts.push({ row_id: row.id, row_code: row.row_code, row_label: label(row), account_code: code, amount: mult * sign(row) * amt, ...(mult < 0 ? { subtracted: true } : {}) });
         }
     }
     if (accounts.length > 0) {
@@ -136,12 +138,14 @@ const accountLines = async (client, { drill, target, src, glData, glMatches, isE
         params.push(LINE_LIMIT + 1);
         const res = await client.query(`
             SELECT h.id AS header_id, to_char(h.doc_date, 'YYYY-MM-DD') AS doc_date, h.doc_no, doc.doc_code, p.period_name,
+                   ref_doc.doc_code AS ref_doc_code, h.ref_doc_no, to_char(h.ref_doc_date, 'YYYY-MM-DD') AS ref_doc_date,
                    COALESCE(NULLIF(d.description, ''), h.description) AS description,
                    COALESCE(d.debit_lc, 0)::float8 AS debit, COALESCE(d.credit_lc, 0)::float8 AS credit
               FROM gl_entry_detail d
               JOIN gl_entry_header h ON h.id = d.header_id AND h.status = 'Posted'
               JOIN gl_posting_period p ON p.id = h.period_id
               LEFT JOIN sa_module_document doc ON doc.id = h.doc_id
+              LEFT JOIN sa_module_document ref_doc ON ref_doc.id = h.ref_doc_id
              WHERE h.period_id = ANY($1::int[]) AND d.account_id = $2
                ${where.map(w => `AND ${w}`).join(' ')}
              ORDER BY h.doc_date, h.doc_no, d.line_no

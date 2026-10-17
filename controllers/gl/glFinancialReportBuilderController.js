@@ -212,6 +212,8 @@ const getRows = async (req, res) => {
 
 const ROW_KINDS = ['ACCOUNTS', 'HEADING', 'TOTAL', 'FORMULA', 'BLANK'];
 const LINE_STYLES = ['NONE', 'SINGLE', 'DOUBLE'];
+// พิมพ์บรรทัดบัญชีแบบแตกเป็นรายบัญชี (sql/gl_fin_report_row_expand.sql)
+const EXPAND_MODES = ['NONE', 'DETAIL', 'DETAIL_TOTAL'];
 const ROW_CODE_RE = /^[A-Z][A-Z0-9_]{0,29}$/;
 
 const upperOrNull = (v) => {
@@ -244,6 +246,8 @@ const normalizeRow = (body) => {
         label_eng: body.label_eng || null,
         indent_level: Math.max(0, Math.min(10, parseInt(body.indent_level, 10) || 0)),
         parent_row_code: isHeaderFooter ? null : upperOrNull(body.parent_row_code),
+        // รวมเข้า (ADD) หรือหักจาก (SUBTRACT) บรรทัดยอดรวม (sql/gl_fin_report_row_parent_op.sql)
+        parent_op: !isHeaderFooter && upperOrNull(body.parent_row_code) && body.parent_op === 'SUBTRACT' ? 'SUBTRACT' : 'ADD',
         row_formula: rowKind === 'FORMULA' ? (String(body.row_formula || '').trim() || null) : null,
         is_bold: body.is_bold ?? false,
         line_above: body.line_above || 'NONE',
@@ -251,13 +255,16 @@ const normalizeRow = (body) => {
         hide_if_zero: body.hide_if_zero ?? false,
         font_size: Math.max(6, Math.min(36, parseInt(body.font_size, 10) || 10)),
         text_align: TEXT_ALIGNS.includes(body.text_align) ? body.text_align : 'CENTER',
+        expand_mode: rowKind === 'ACCOUNTS' && EXPAND_MODES.includes(body.expand_mode) ? body.expand_mode : 'NONE',
+        // ขึ้นหน้าใหม่ก่อนพิมพ์บรรทัดนี้ (sql/gl_fin_report_row_page_break.sql) — เฉพาะบรรทัดเนื้อหา
+        page_break_before: !isHeaderFooter && body.page_break_before === true,
     };
 };
 
 const ROW_FIELDS = ['row_seq_no', 'row_type', 'print_control', 'account_from', 'account_to', 'normal_sign',
     'branch_id', 'dim1_id', 'dim2_id', 'dim3_id', 'dim4_id', 'dim5_id',
     'row_code', 'row_kind', 'label_thai', 'label_eng', 'indent_level', 'parent_row_code', 'row_formula',
-    'is_bold', 'line_above', 'line_below', 'hide_if_zero', 'font_size', 'text_align'];
+    'is_bold', 'line_above', 'line_below', 'hide_if_zero', 'font_size', 'text_align', 'expand_mode', 'parent_op', 'page_break_before'];
 
 // ตรวจค่าบรรทัด — คืน null หรือ error object
 const validateRow = async (client, reportId, r, rowId = null) => {

@@ -79,10 +79,11 @@ const generateFinancialReport = async (req, res) => {
 
         // 3.2 เงื่อนไขเลือกบัญชีของบรรทัด (gl_fin_report_row_acct) → row.acctSet = Set ของรหัสบัญชี
         //     (null = บรรทัดไม่ได้เลือกบัญชี)
+        let acctIndex = null;
         if (rows.some(r => (r.row_kind || 'ACCOUNTS') === 'ACCOUNTS')) {
             const selRes = await client.query(
                 `SELECT * FROM gl_fin_report_row_acct WHERE row_id = ANY($1::int[]) ORDER BY row_id, seq_no, id`, [rowIds]);
-            const acctIndex = buildAccountIndex(await loadAccounts(client));
+            acctIndex = buildAccountIndex(await loadAccounts(client));
             rows.forEach(r => {
                 r.acctSet = resolveRowAccounts(acctIndex, rowSelections(r, selRes.rows.filter(s => s.row_id === r.id)));
             });
@@ -274,6 +275,8 @@ const generateFinancialReport = async (req, res) => {
         // FORMULA = row_formula ทุกคอลัมน์ตัวเลข, HEADING/BLANK = ไม่มียอด
         const labelCol = reportCols.find(rc => rc.col_kind === 'LABEL');
         const rowLabel = (row) => (isEnglish && row.label_eng) ? row.label_eng : (row.label_thai || row.label_eng || '');
+        // ช่องยอดบัญชี → ที่มาของยอด (งวด/ตัวกรองคอลัมน์) ใช้คำนวณซ้ำรายบัญชีตอนแตกบรรทัด (expand_mode)
+        const cellSrc = new Map();
 
         let reportData = rows.map(row => {
             const myCols = cols.filter(c => c.row_id === row.id);
@@ -315,6 +318,9 @@ const generateFinancialReport = async (req, res) => {
                     ...(calc ? { calc } : {}),
                     ...((col.column_type === 'MTD' || col.column_type === 'YTD') && (hasAccounts || kind === 'TOTAL') ? { drill: true } : {}),
                 };
+                if ((col.column_type === 'MTD' || col.column_type === 'YTD') && hasAccounts) {
+                    cellSrc.set(cell, { periodIds: col.target_period_ids || [], colFilter: null, excludeClosing: true });
+                }
                 // แทนค่าเฉพาะช่องของคอลัมน์รายงาน: ใช้ความกว้าง/การจัดวาง/การซ่อนของคอลัมน์รายงาน เพื่อให้ตรงแนวกับบรรทัดอื่น
                 const rc = isHeaderFooter ? null : reportCols.find(c => c.col_seq_no === col.column_seq_no && c.col_kind !== 'LABEL');
                 if (rc) {
@@ -349,7 +355,10 @@ const generateFinancialReport = async (req, res) => {
                     const text = kind === 'BLANK' ? ' ' : rowLabel(row);
                     processedColumns.push({ ...cell, type: 'TEXT', value: text, indent_level: row.indent_level || 0, label: true });
                 } else if (rc.col_kind === 'AMOUNT' && hasAccounts) {
-                    processedColumns.push({ ...cell, type: 'AMOUNT', value: sumRow(row, rc.target_period_ids, rc, rc.exclude_closing_entries), drill: true });
+                    const src = { periodIds: rc.target_period_ids, colFilter: rc, excludeClosing: rc.exclude_closing_entries };
+                    const amountCell = { ...cell, type: 'AMOUNT', value: sumRow(row, src.periodIds, src.colFilter, src.excludeClosing), drill: true };
+                    cellSrc.set(amountCell, src);
+                    processedColumns.push(amountCell);
                 } else if (rc.col_kind === 'AMOUNT' && derivedCalc) {
                     processedColumns.push({ ...cell, type: 'AMOUNT', value: null, calc: derivedCalc, ...(kind === 'TOTAL' ? { drill: true } : {}) });
                 } else if (rc.col_kind === 'CALC' && (hasAmounts || hasOverride)) {
@@ -395,12 +404,56 @@ const generateFinancialReport = async (req, res) => {
                 print_control: row.print_control,
                 has_accounts: hasAccounts,
                 parent_row_code: row.parent_row_code || null,
+                parent_op: row.parent_op || 'ADD',
                 row_formula: row.row_formula || null,
                 hide_if_zero: !!row.hide_if_zero,
+                page_break_before: row.row_type === 'BODY' && !!row.page_break_before,
                 line_above: row.line_above || 'NONE',
                 line_below: row.line_below || 'NONE',
                 columns: processedColumns
             };
+        });
+
+        // 5.1 บรรทัดบัญชีที่ตั้งให้แตกเป็นรายบัญชี (expand_mode DETAIL/DETAIL_TOTAL):
+        //     สร้างบรรทัดย่อยต่อบัญชีลงรายการ (ยอดคำนวณใหม่เฉพาะบัญชีนั้น) เก็บไว้ใน detail_rows
+        //     ไม่ใส่ใน reportData — สูตร/บรรทัดยอดรวมยังอ้างยอดของบรรทัดเดิมเหมือนเดิม
+        const rowById = new Map(rows.map(r => [r.id, r]));
+        reportData.forEach(rd => {
+            const row = rowById.get(rd.row_id);
+            const mode = row.expand_mode || 'NONE';
+            if (mode === 'NONE' || !rd.has_accounts) return;
+            rd.expand_mode = mode;
+            const codes = [...row.acctSet]
+                .filter(code => acctIndex.byCode.get(code)?.is_normal_account)
+                .sort();
+            rd.detail_rows = codes.map(code => {
+                const acct = acctIndex.byCode.get(code);
+                const acctRow = { ...row, acctSet: new Set([code]) };
+                const name = (isEnglish && acct.account_name_eng) ? acct.account_name_eng : (acct.account_name_thai || acct.account_name_eng || code);
+                return {
+                    row_id: row.id,
+                    seq_no: row.row_seq_no,
+                    row_code: null,
+                    row_kind: 'ACCOUNT_LINE',
+                    row_type: row.row_type,
+                    print_control: 'SHOW',
+                    account_code: code,
+                    has_accounts: false,
+                    columns: rd.columns.map(c => {
+                        const base = {
+                            seq_no: c.seq_no, data_type: c.data_type, flex: c.flex, indent_level: 0,
+                            style: { ...c.style, fontWeight: 'NORMAL' },
+                            ...(c.report_col ? { report_col: true } : {}),
+                            ...(c.hidden ? { hidden: true } : {}),
+                        };
+                        if (c.label) return { ...base, type: 'TEXT', value: name, indent_level: (row.indent_level || 0) + 1, label: true };
+                        const src = cellSrc.get(c);
+                        if (src) return { ...base, type: c.type, value: sumRow(acctRow, src.periodIds, src.colFilter, src.excludeClosing), drill: true };
+                        if (c.type === 'CALC') return { ...base, type: 'CALC', value: null, formula_text: c.formula_text };
+                        return { ...base, type: 'TEXT', value: '' };
+                    }),
+                };
+            });
         });
 
         // ====================================================================
@@ -438,13 +491,14 @@ const generateFinancialReport = async (req, res) => {
         const evaluateCell = (row, col) => {
             if (col.calc === 'TOTAL') {
                 // รวมช่องเดียวกันของบรรทัดลูก (ค่าลูกกลับเครื่องหมายตาม normal_sign มาแล้ว)
+                // บรรทัดลูกที่ตั้ง "หักจาก" (parent_op SUBTRACT) ลบออกแทนการบวก
                 let total = 0;
                 for (const child of childrenOf(row.row_code)) {
                     const target = child.columns.find(c => c.seq_no === col.seq_no);
                     if (!target) continue;
                     if (!isComputed(target) && (target.type === 'TEXT' || target.type === 'DIVIDER')) continue;
                     const v = readCell(child, target, cellLabel(child, target));
-                    if (v != null) total += v;
+                    if (v != null) total += child.parent_op === 'SUBTRACT' ? -v : v;
                 }
                 return total;
             }
@@ -458,11 +512,15 @@ const generateFinancialReport = async (req, res) => {
                 }
                 return readCell(targetRow, target, `R${rSeq}, C${cSeq}`);
             };
-            // [CODE] = คอลัมน์ระดับรายงานในบรรทัดเดียวกัน
+            // [CODE] = คอลัมน์ระดับรายงานในบรรทัดเดียวกัน (อ่านจากบรรทัดนี้ตรงๆ — บรรทัดรายบัญชีที่แตกย่อยมี seq_no ซ้ำกับบรรทัดเดิม)
             const resolveCol = (code) => {
                 const rc = reportColByCode.get(code);
                 if (!rc) throw new FormulaError('UNKNOWN_REF', `Column [${code}] not found`, { code });
-                return resolveRef(row.seq_no, rc.col_seq_no);
+                const target = row.columns.find(c => c.seq_no === rc.col_seq_no);
+                if (!target) {
+                    throw new FormulaError('UNKNOWN_REF', `Cell (R${row.seq_no}, C${rc.col_seq_no}) not found`, { row: row.seq_no, col: rc.col_seq_no });
+                }
+                return readCell(row, target, `R${row.seq_no}, C${rc.col_seq_no}`);
             };
             // ROW_CODE = บรรทัดนั้นในคอลัมน์เดียวกับช่องนี้, ROW_CODE[COL] = ระบุคอลัมน์
             const resolveRow = (rowCode, colCode) => {
@@ -519,8 +577,18 @@ const generateFinancialReport = async (req, res) => {
             });
         });
 
+        // บรรทัดรายบัญชี: คำนวณสูตรของคอลัมน์รายงาน (CALC) ในบรรทัดนั้น
+        reportData.forEach(rd => (rd.detail_rows || []).forEach(dr => dr.columns.forEach(col => {
+            if (col.type !== 'CALC') return;
+            if (!col.formula_text) { col.value = null; return; }
+            try { computeCell(dr, col); } catch (_) { /* recorded in formulaErrors */ }
+        })));
+
         // คอลัมน์ช่วยคำนวณ (is_hidden) คำนวณแล้วแต่ไม่ส่งออกไปแสดงผล
-        reportData.forEach(row => { row.columns = row.columns.filter(c => !c.hidden); });
+        reportData.forEach(row => {
+            row.columns = row.columns.filter(c => !c.hidden);
+            (row.detail_rows || []).forEach(dr => { dr.columns = dr.columns.filter(c => !c.hidden); });
+        });
 
         // ซ่อนบรรทัดที่ทุกช่องตัวเลขเป็นศูนย์/ว่าง (ถ้าตั้ง hide_if_zero และไม่มี error)
         const isZeroRow = (row) => {
@@ -528,8 +596,16 @@ const generateFinancialReport = async (req, res) => {
             return nums.length > 0 && nums.every(c => !c.error && (c.value == null || Number(c.value) === 0));
         };
 
-        let finalData = reportData.filter(r => r.print_control === 'SHOW' && !(r.hide_if_zero && isZeroRow(r)));
-        finalData.sort((a, b) => a.seq_no - b.seq_no);
+        const sortedData = [...reportData].sort((a, b) => a.seq_no - b.seq_no);
+        let finalData = [];
+        // บรรทัดที่ตั้งขึ้นหน้าใหม่แต่ถูกซ่อน → ส่งต่อการขึ้นหน้าใหม่ให้บรรทัดเนื้อหาถัดไปที่แสดง
+        let pendingBreak = false;
+        for (const r of sortedData) {
+            const visible = r.print_control === 'SHOW' && !(r.hide_if_zero && isZeroRow(r));
+            if (!visible) { if (r.page_break_before) pendingBreak = true; continue; }
+            if (pendingBreak && r.row_type === 'BODY') { finalData.push({ ...r, page_break_before: true }); pendingBreak = false; }
+            else finalData.push(r);
+        }
 
         // เส้นบน/เส้นใต้ยอดเงิน → แทรกบรรทัดเส้น (DIVIDER เฉพาะช่องตัวเลข, '=' = เส้นคู่)
         const lineRow = (row, style) => ({
@@ -541,11 +617,35 @@ const generateFinancialReport = async (req, res) => {
                 ? { seq_no: c.seq_no, type: 'TEXT', value: '', flex: c.flex, indent_level: 0, style: {} }
                 : { seq_no: c.seq_no, type: 'DIVIDER', data_type: style === 'DOUBLE' ? '=' : '-', value: '---', flex: c.flex, indent_level: 0, style: {} }),
         });
-        finalData = finalData.flatMap(r => [
-            ...(r.line_above !== 'NONE' ? [lineRow(r, r.line_above)] : []),
-            r,
-            ...(r.line_below !== 'NONE' ? [lineRow(r, r.line_below)] : []),
-        ]);
+        // บรรทัดที่แตกเป็นรายบัญชี: ชื่อบรรทัดเป็นหัวข้อ (ไม่มียอด) + รายบัญชีที่มียอด
+        //   DETAIL_TOTAL ปิดท้ายด้วยบรรทัด "รวม..." (ยอดของบรรทัดเดิม) — เส้นเหนือ/ใต้ยอดเงินอยู่ที่บรรทัดรวม
+        //   DETAIL       เส้นเหนือ/ใต้ยอดเงินครอบกลุ่มรายบัญชี
+        const headingOf = (r) => ({
+            ...r,
+            columns: r.columns.map(c => (c.type === 'TEXT' || c.type === 'DIVIDER') ? c
+                : { seq_no: c.seq_no, type: 'TEXT', value: '', flex: c.flex, indent_level: 0, style: c.style, ...(c.report_col ? { report_col: true } : {}) }),
+        });
+        const totalOf = (r) => ({
+            ...r,
+            columns: r.columns.map(c => c.label && c.value
+                ? { ...c, value: isEnglish ? `Total ${c.value}` : `รวม${c.value}` } : c),
+        });
+        finalData = finalData.flatMap(r => {
+            const above = r.line_above !== 'NONE' ? [lineRow(r, r.line_above)] : [];
+            const below = r.line_below !== 'NONE' ? [lineRow(r, r.line_below)] : [];
+            const { detail_rows: detailRows, expand_mode: expandMode, page_break_before: pageBreak, ...out } = r;
+            let group;
+            if (!detailRows) group = [...above, out, ...below];
+            else {
+                const details = detailRows.filter(d => !isZeroRow(d));
+                group = expandMode === 'DETAIL_TOTAL'
+                    ? [headingOf(out), ...details, ...above, totalOf(out), ...below]
+                    : [headingOf(out), ...above, ...details, ...below];
+            }
+            // ขึ้นหน้าใหม่ก่อนแถวแรกของกลุ่ม (รวมเส้นเหนือยอดเงิน / บรรทัดรายบัญชี)
+            if (pageBreak) group[0] = { ...group[0], page_break_before: true };
+            return group;
+        });
 
         // ====================================================================
         // STEP 7: หัวคอลัมน์อัตโนมัติจากคอลัมน์ระดับรายงาน (เป็น HEADER จึงพิมพ์ซ้ำทุกหน้า)
