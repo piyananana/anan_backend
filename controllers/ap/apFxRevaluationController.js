@@ -418,13 +418,13 @@ const postReval = async (req, res) => {
                     (doc_id, doc_no, doc_date, posting_date, period_id, description,
                      currency_id, exchange_rate, status,
                      total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-                     created_by, ref_doc_id, ref_doc_no)
-                    VALUES ($1,$2,$3::date,$3::date,$4,$5,$6,1,'Posted',$7,$8,$7,$8,$9,$10,$11)
+                     created_by, ref_doc_id, ref_doc_no, ref_doc_date)
+                    VALUES ($1,$2,$3::date,$3::date,$4,$5,$6,1,'Posted',$7,$8,$7,$8,$9,$10,$11,$12)
                     RETURNING id
                 `, [origHdr.doc_id, revDocNo, reval.reversal_date, revPeriodId,
                     `[กลับรายการ] ${docNo}`,
                     origHdr.currency_id, origHdr.total_credit_lc, origHdr.total_debit_lc,
-                    updatedBy, glEntryId, docNo]);
+                    updatedBy, glEntryId, docNo, origHdr.doc_date]);
                 reversalGlEntryId = revHdrRes.rows[0].id;
 
                 for (const d of origDtl.rows) {
@@ -508,13 +508,13 @@ const voidReval = async (req, res) => {
                 (doc_id, doc_no, doc_date, posting_date, period_id, description,
                  currency_id, exchange_rate, status,
                  total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-                 created_by, ref_doc_id, ref_doc_no)
-                VALUES ($1,$2,$3::date,$3::date,$4,$5,$6,1,'Posted',$7,$8,$7,$8,$9,$10,$11)
+                 created_by, ref_doc_id, ref_doc_no, ref_doc_date)
+                VALUES ($1,$2,$3::date,$3::date,$4,$5,$6,1,'Posted',$7,$8,$7,$8,$9,$10,$11,$12)
                 RETURNING id
             `, [origHdr.doc_id, revDocNo, today, todayPeriodId,
                 `[ยกเลิก AP FX Revaluation] ${origHdr.doc_no}`,
                 origHdr.currency_id, origHdr.total_credit_lc, origHdr.total_debit_lc,
-                updatedBy, reval.gl_entry_id, origHdr.doc_no]);
+                updatedBy, reval.gl_entry_id, origHdr.doc_no, origHdr.doc_date]);
             const voidGlId = revHdrRes.rows[0].id;
 
             for (const d of origDtl) {

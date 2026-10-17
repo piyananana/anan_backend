@@ -737,8 +737,8 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
         INSERT INTO gl_entry_header
         (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
          currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-         created_by, ref_doc_id, ref_doc_no, external_source_id)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'Posted',$9,$10,0,0,$11,$12,$13,$14)
+         created_by, ref_doc_id, ref_doc_no, external_source_id, ref_doc_date)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'Posted',$9,$10,0,0,$11,$12,$13,$14,$3)
         RETURNING id
     `, [
         setup.gl_doc_id, glDocNo, header.doc_date, header.doc_date, periodId,
@@ -936,8 +936,8 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
             INSERT INTO gl_entry_header
             (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
              currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-             created_by, ref_doc_id, ref_doc_no, external_source_id)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'Posted',$9,$10,0,0,$11,$12,$13,$14)
+             created_by, ref_doc_id, ref_doc_no, external_source_id, ref_doc_date)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'Posted',$9,$10,0,0,$11,$12,$13,$14,$3)
             RETURNING id
         `, [
             apSetup.gl_doc_id, `GL-${apDocNo}`, header.doc_date, header.doc_date, periodId,
@@ -1092,8 +1092,8 @@ const postArBillFromDln = async (client, { header, details, docNo }) => {
             INSERT INTO gl_entry_header
             (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
              currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-             created_by, ref_doc_id, ref_doc_no, external_source_id)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'Posted',$9,$10,0,0,$11,$12,$13,$14)
+             created_by, ref_doc_id, ref_doc_no, external_source_id, ref_doc_date)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'Posted',$9,$10,0,0,$11,$12,$13,$14,$3)
             RETURNING id
         `, [
             arSetup.gl_doc_id, `GL-${arDocNo}`, header.doc_date, header.doc_date, periodId,
@@ -1280,8 +1280,8 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, mod
             INSERT INTO gl_entry_header
             (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
              currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-             created_by, ref_doc_id, ref_doc_no, external_source_id)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'Posted',$9,$10,0,0,$11,$12,$13,$14)
+             created_by, ref_doc_id, ref_doc_no, external_source_id, ref_doc_date)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'Posted',$9,$10,0,0,$11,$12,$13,$14,$3)
             RETURNING id
         `, [
             apSetup.gl_doc_id, `GL-${apDocNo}`, header.doc_date, header.doc_date, periodId,
@@ -1448,8 +1448,8 @@ const postArCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
             INSERT INTO gl_entry_header
             (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
              currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-             created_by, ref_doc_id, ref_doc_no, external_source_id)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'Posted',$9,$10,0,0,$11,$12,$13,$14)
+             created_by, ref_doc_id, ref_doc_no, external_source_id, ref_doc_date)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'Posted',$9,$10,0,0,$11,$12,$13,$14,$3)
             RETURNING id
         `, [
             arSetup.gl_doc_id, `GL-${arDocNo}`, header.doc_date, header.doc_date, periodId,

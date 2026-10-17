@@ -247,8 +247,8 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
         (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
          currency_id, exchange_rate, status,
          total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-         created_by, ref_doc_id, ref_doc_no, external_source_id)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'Posted',$10,$11,$12,$13,$14,$15,$16,$17)
+         created_by, ref_doc_id, ref_doc_no, external_source_id, ref_doc_date)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'Posted',$10,$11,$12,$13,$14,$15,$16,$17,$3)
         RETURNING id
     `, [
         glDocId, glDocNo, header.doc_date, header.doc_date, periodId,

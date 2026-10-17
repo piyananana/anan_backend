@@ -184,8 +184,8 @@ const postSettlement = async (req, res) => {
                 INSERT INTO gl_entry_header
                 (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
                  currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-                 created_by, ref_doc_id, ref_doc_no, external_source_id)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'Posted',$9,$10,0,0,$11,$12,$13,$14)
+                 created_by, ref_doc_id, ref_doc_no, external_source_id, ref_doc_date)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'Posted',$9,$10,0,0,$11,$12,$13,$14,$3)
                 RETURNING id
             `, [
                 apSetup.gl_doc_id, `GL-${apDocNo}`, settleDate, settleDate, periodId,

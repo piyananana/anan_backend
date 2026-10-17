@@ -302,13 +302,13 @@ const voidRun = async (req, res) => {
                 (doc_id, doc_no, doc_date, posting_date, period_id, description,
                  currency_id, exchange_rate, status,
                  total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-                 created_by, ref_doc_id, ref_doc_no)
-                VALUES ($1,$2,$3::date,$3::date,$4,$5,$6,1,'Posted',$7,$8,$7,$8,$9,$10,$11)
+                 created_by, ref_doc_id, ref_doc_no, ref_doc_date)
+                VALUES ($1,$2,$3::date,$3::date,$4,$5,$6,1,'Posted',$7,$8,$7,$8,$9,$10,$11,$12)
                 RETURNING id
             `, [origHdr.doc_id, revDocNo, today, todayPeriodId,
                 `[ยกเลิก] ${origHdr.doc_no}`, origHdr.currency_id,
                 origHdr.total_credit_lc, origHdr.total_debit_lc,
-                updatedBy, run.gl_entry_id, origHdr.doc_no]);
+                updatedBy, run.gl_entry_id, origHdr.doc_no, origHdr.doc_date]);
             const voidGlId = revRes.rows[0].id;
 
             for (const d of origDtl) {

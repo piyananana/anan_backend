@@ -297,8 +297,9 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
         INSERT INTO gl_entry_header
         (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
          currency_id, exchange_rate, status,
-         total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc, created_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'Posted',$10,$11,$12,$13,$14)
+         total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc, created_by,
+         ref_doc_id, ref_doc_no, ref_doc_date)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'Posted',$10,$11,$12,$13,$14,$15,$16,$3)
         RETURNING id
     `, [
         setup.gl_doc_id, glDocNo, header.doc_date, header.doc_date, periodId,
@@ -306,6 +307,7 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
         header.currency_id || null, exchangeRate,
         totalDebitLc, totalCreditLc, totalDebitFc, totalCreditFc,
         header.created_by || null,
+        header.doc_id, docNo,
     ]);
     const glHeaderId = glHeaderRes.rows[0].id;
 

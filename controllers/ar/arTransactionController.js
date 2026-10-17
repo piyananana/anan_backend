@@ -409,8 +409,8 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
         (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
          currency_id, exchange_rate, status,
          total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-         created_by, ref_doc_id, ref_doc_no, external_source_id)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'Posted',$10,$11,$12,$13,$14,$15,$16,$17)
+         created_by, ref_doc_id, ref_doc_no, external_source_id, ref_doc_date)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'Posted',$10,$11,$12,$13,$14,$15,$16,$17,$3)
         RETURNING id
     `;
     const totalDebit = Number(header.total_amount_lc) || 0;
@@ -1435,9 +1435,9 @@ const voidTransaction = async (req, res) => {
                 (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
                  currency_id, exchange_rate, status,
                  total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-                 created_by, ref_doc_id, ref_doc_no, external_source_id)
+                 created_by, ref_doc_id, ref_doc_no, external_source_id, ref_doc_date)
                 VALUES ($1,$2,$3,$3,$4,$5,$6,$7,$8,'Posted',
-                        $9,$10,$11,$12,$13,$14,$15,$16)
+                        $9,$10,$11,$12,$13,$14,$15,$16,$17)
                 RETURNING id
             `, [
                 origHdr.doc_id, reverseDocNo, today, reversePeriodId,
@@ -1448,7 +1448,8 @@ const voidTransaction = async (req, res) => {
                 origHdr.total_credit_fc, origHdr.total_debit_fc,
                 null,           // created_by (ไม่ resolve user_id ตอนนี้)
                 origHdr.doc_id, arDocNo,
-                id              // external_source_id = ar_transaction.id → ป้องกัน GL ถอยเอง
+                id,             // external_source_id = ar_transaction.id → ป้องกัน GL ถอยเอง
+                origHdr.ref_doc_date || origHdr.doc_date,
             ]);
             reversingGlId = revHdrRes.rows[0].id;
 

@@ -729,12 +729,12 @@ const closeTransaction = async (req, res) => {
                 INSERT INTO gl_entry_header
                 (doc_id, doc_no, doc_date, posting_date, period_id, description,
                  currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-                 created_by, ref_doc_id, ref_doc_no)
-                VALUES ($1,$2,$3,$3,$4,$5,1,1,'Posted',$6,$6,0,0,$7,$8,$9)
+                 created_by, ref_doc_id, ref_doc_no, ref_doc_date)
+                VALUES ($1,$2,$3,$3,$4,$5,1,1,'Posted',$6,$6,0,0,$7,$8,$9,$10)
                 RETURNING id
             `, [
                 setup.gl_doc_id, glDocNo, closeDate, periodId, description,
-                amount, createdByUserId, mo.doc_id, mo.doc_no,
+                amount, createdByUserId, mo.doc_id, mo.doc_no, mo.doc_date,
             ]);
             glEntryId = glHeaderRes.rows[0].id;
 
