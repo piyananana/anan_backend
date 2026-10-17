@@ -494,7 +494,10 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
 
         // DR: AP account (amount at invoice exchange rate)
         const apDebitLc = totalInvoiceAtInvRate > 0 ? totalInvoiceAtInvRate : (cashPaid + totalWhtLc);
-        const apDebitFc = totalInvoiceAppliedFc;
+        // ไม่ได้อ้างอิงใบกำกับ → FC ต้องใช้ fallback คู่กับ LC (ยอดจ่าย + WHT) ไม่งั้นเดบิต FC เป็น 0 แต่บรรทัดธนาคารมีเครดิต FC
+        const apDebitFc = totalInvoiceAtInvRate > 0
+            ? totalInvoiceAppliedFc
+            : (Number(header.total_amount_fc) || 0) + totalWhtLc / exchangeRate;
         if (apAccountId && apDebitLc > 0) {
             glDetails.push({
                 account_id: apAccountId,

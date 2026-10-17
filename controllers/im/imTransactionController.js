@@ -12,6 +12,14 @@ const { ensureImStockLayerTable } = require('./imStockLayerController');
 const { fetchSetupByDocCode } = require('./imGlAccountSetupController');
 const { fetchMode, fetchSettingRow } = require('./imAccountingSettingController');
 
+// ปัดเป็น 2 ตำแหน่ง (ปัดครึ่งหนีศูนย์แบบเดียวกับ numeric ของ PostgreSQL) — ทุกยอดที่ลง GL/AP/AR ต้องปัดทีละบรรทัด
+// ก่อนรวม ไม่งั้นฐานข้อมูลปัดแต่ละช่องแยกกันแล้วเดบิต/เครดิตต่างกัน 0.01 (เช่น 40.3333 + VAT 2.8233 = 43.1566:
+// ปัดแยกได้ 40.33 + 2.82 = 43.15 แต่ยอดรวมปัดได้ 43.16)
+const round2 = (n) => {
+    const r = Math.round(Math.abs(Number(n) || 0) * 100 + 1e-7) / 100;
+    return n < 0 ? -r : r;
+};
+
 // --- Schema ---
 const ensureImTransactionTable = async (client) => {
     await ensureImItemTable(client);
@@ -600,7 +608,7 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
         // เหมือนกัน) วันนี้ im_warehouse ยังไม่มีบัญชีแยกตามคลัง ทั้งสองฝั่งจึง resolve ไปที่บัญชีเดียวกันเสมอ หักล้างเป็น 0
         // และจะไม่มีการโพสต์ GL เลยจนกว่าจะตั้งค่าบัญชีแยกตามคลัง (ดู resolveInventoryAccount)
         for (const d of details) {
-            const value = Number(d.qty) * Number(d.unit_cost); // ติดลบเสมอ — มูลค่าที่ออกจากต้นทาง (qty ของ TRF คือฝั่งต้นทาง)
+            const value = round2(Number(d.qty) * Number(d.unit_cost)); // ติดลบเสมอ — มูลค่าที่ออกจากต้นทาง (qty ของ TRF คือฝั่งต้นทาง)
             const srcAcc = await resolveInventoryAccount(client, d.item_id, header.warehouse_id, setup.inventory_account_id);
             const dstAcc = await resolveInventoryAccount(client, d.item_id, header.to_warehouse_id, setup.inventory_account_id);
             invDebitByAccount[srcAcc] = (invDebitByAccount[srcAcc] || 0) + value;
@@ -610,7 +618,7 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
             if (amt === 0) continue;
             glDetails.push({
                 account_id: Number(accId), description: `โอนสินค้า ${docNo}`,
-                debit_lc: amt > 0 ? amt : 0, credit_lc: amt < 0 ? -amt : 0, debit_fc: 0, credit_fc: 0,
+                debit_lc: amt > 0 ? round2(amt) : 0, credit_lc: amt < 0 ? round2(-amt) : 0, debit_fc: 0, credit_fc: 0,
             });
         }
     } else if (sysDocType === '10' || sysDocType === '13') {
@@ -629,7 +637,7 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
         let totalValue = 0;
         for (const d of details) {
             const invAcc = purchasesAccountId || await resolveInventoryAccount(client, d.item_id, header.warehouse_id, setup.inventory_account_id);
-            const value = Number(d.qty) * Number(d.unit_cost);
+            const value = round2(Number(d.qty) * Number(d.unit_cost));
             invDebitByAccount[invAcc] = (invDebitByAccount[invAcc] || 0) + value;
             totalValue += value;
         }
@@ -637,13 +645,13 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
             if (amt === 0) continue;
             glDetails.push({
                 account_id: Number(accId), description: `${counterLabel} ${docNo}`,
-                debit_lc: amt > 0 ? amt : 0, credit_lc: amt < 0 ? -amt : 0, debit_fc: 0, credit_fc: 0,
+                debit_lc: amt > 0 ? round2(amt) : 0, credit_lc: amt < 0 ? round2(-amt) : 0, debit_fc: 0, credit_fc: 0,
             });
         }
         if (totalValue !== 0) {
             glDetails.push({
                 account_id: counterAccountId, description: `${counterLabel} ${docNo}`,
-                debit_lc: totalValue < 0 ? -totalValue : 0, credit_lc: totalValue > 0 ? totalValue : 0, debit_fc: 0, credit_fc: 0,
+                debit_lc: totalValue < 0 ? round2(-totalValue) : 0, credit_lc: totalValue > 0 ? round2(totalValue) : 0, debit_fc: 0, credit_fc: 0,
             });
         }
     } else if (sysDocType === '95') {
@@ -660,25 +668,25 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
             const qty = Number(d.qty);
             const unitCost = Number(d.unit_cost);
             const actualUnitCost = d.mo_actual_unit_cost != null ? Number(d.mo_actual_unit_cost) : unitCost;
-            const invValue = qty * unitCost;
+            const invValue = round2(qty * unitCost);
             invDebitByAccount[invAcc] = (invDebitByAccount[invAcc] || 0) + invValue;
             totalInvValue += invValue;
-            totalWipValue += qty * actualUnitCost;
+            totalWipValue += round2(qty * actualUnitCost);
         }
         for (const [accId, amt] of Object.entries(invDebitByAccount)) {
             if (amt === 0) continue;
             glDetails.push({
                 account_id: Number(accId), description: `${wipLabel} ${docNo}`,
-                debit_lc: amt > 0 ? amt : 0, credit_lc: amt < 0 ? -amt : 0, debit_fc: 0, credit_fc: 0,
+                debit_lc: amt > 0 ? round2(amt) : 0, credit_lc: amt < 0 ? round2(-amt) : 0, debit_fc: 0, credit_fc: 0,
             });
         }
         if (totalWipValue !== 0) {
             glDetails.push({
                 account_id: wipAccountId, description: `${wipLabel} ${docNo}`,
-                debit_lc: totalWipValue < 0 ? -totalWipValue : 0, credit_lc: totalWipValue > 0 ? totalWipValue : 0, debit_fc: 0, credit_fc: 0,
+                debit_lc: totalWipValue < 0 ? round2(-totalWipValue) : 0, credit_lc: totalWipValue > 0 ? round2(totalWipValue) : 0, debit_fc: 0, credit_fc: 0,
             });
         }
-        const standardVsActual = totalInvValue - totalWipValue;
+        const standardVsActual = round2(totalInvValue - totalWipValue);
         if (Math.abs(standardVsActual) > 0.0001) {
             if (!setup.variance_account_id) {
                 throw new Error('ยังไม่ได้ตั้งค่าบัญชีผลต่างต้นทุนการผลิต (variance_account_id) ใน im_gl_account_setup สำหรับประเภทเอกสารนี้');
@@ -693,7 +701,7 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
         let totalValue = 0;
         for (const d of details) {
             const invAcc = await resolveInventoryAccount(client, d.item_id, header.warehouse_id, setup.inventory_account_id);
-            const value = Number(d.qty) * Number(d.unit_cost);
+            const value = round2(Number(d.qty) * Number(d.unit_cost));
             invDebitByAccount[invAcc] = (invDebitByAccount[invAcc] || 0) + value;
             totalValue += value;
         }
@@ -701,13 +709,13 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
             if (amt === 0) continue;
             glDetails.push({
                 account_id: Number(accId), description: `${counterLabel} ${docNo}`,
-                debit_lc: amt > 0 ? amt : 0, credit_lc: amt < 0 ? -amt : 0, debit_fc: 0, credit_fc: 0,
+                debit_lc: amt > 0 ? round2(amt) : 0, credit_lc: amt < 0 ? round2(-amt) : 0, debit_fc: 0, credit_fc: 0,
             });
         }
         if (totalValue !== 0) {
             glDetails.push({
                 account_id: counterAccountId, description: `${counterLabel} ${docNo}`,
-                debit_lc: totalValue < 0 ? -totalValue : 0, credit_lc: totalValue > 0 ? totalValue : 0, debit_fc: 0, credit_fc: 0,
+                debit_lc: totalValue < 0 ? round2(-totalValue) : 0, credit_lc: totalValue > 0 ? round2(totalValue) : 0, debit_fc: 0, credit_fc: 0,
             });
         }
     }
@@ -722,8 +730,8 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
         if (userRes.rows.length > 0) createdByUserId = userRes.rows[0].id;
     }
 
-    const totalDebit = glDetails.reduce((s, l) => s + l.debit_lc, 0);
-    const totalCredit = glDetails.reduce((s, l) => s + l.credit_lc, 0);
+    const totalDebit = round2(glDetails.reduce((s, l) => s + l.debit_lc, 0));
+    const totalCredit = round2(glDetails.reduce((s, l) => s + l.credit_lc, 0));
 
     const glHeaderRes = await client.query(`
         INSERT INTO gl_entry_header
@@ -853,18 +861,20 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
         const qty = Number(d.qty);
         const unitCostLc = Number(d.unit_cost);
         const unitCostFc = d.unit_cost_fc != null ? Number(d.unit_cost_fc) : unitCostLc;
-        const amountLc = qty * unitCostLc;
-        const amountFc = qty * unitCostFc;
+        const amountLc = round2(qty * unitCostLc);
+        const amountFc = round2(qty * unitCostFc);
         const vatType = d.vat_type || 'NOVAT';
         const vatRate = vatType === 'NOVAT' ? 0 : (Number(d.vat_rate) || 0);
-        const vatAmountLc = amountLc * vatRate / 100;
-        const vatAmountFc = amountFc * vatRate / 100;
+        const vatAmountLc = round2(amountLc * vatRate / 100);
+        const vatAmountFc = round2(amountFc * vatRate / 100);
         lineRows.push({ itemCode: d.item_code, itemName: d.item_name, quantity: qty, unitPriceFc: unitCostFc, amountLc, amountFc, expenseAccountId, vatType, vatRate, vatAmountLc, vatAmountFc });
         totalAmountLc += amountLc; totalVatLc += vatAmountLc;
         totalAmountFc += amountFc; totalVatFc += vatAmountFc;
     }
-    const grandTotalLc = totalAmountLc + totalVatLc;
-    const grandTotalFc = totalAmountFc + totalVatFc;
+    totalAmountLc = round2(totalAmountLc); totalVatLc = round2(totalVatLc);
+    totalAmountFc = round2(totalAmountFc); totalVatFc = round2(totalVatFc);
+    const grandTotalLc = round2(totalAmountLc + totalVatLc);
+    const grandTotalFc = round2(totalAmountFc + totalVatFc);
 
     const apHeaderRes = await client.query(`
         INSERT INTO ap_transaction
@@ -909,7 +919,7 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
     const apGlDetails = [];
     for (const [accId, amt] of Object.entries(expDebitByAccount)) {
         if (amt === 0) continue;
-        apGlDetails.push({ account_id: Number(accId), description: `ใบกำกับสินค้า ${apDocNo}`, debit_lc: amt, credit_lc: 0 });
+        apGlDetails.push({ account_id: Number(accId), description: `ใบกำกับสินค้า ${apDocNo}`, debit_lc: round2(amt), credit_lc: 0 });
     }
     if (totalVatLc !== 0) {
         if (!vatAccountId) throw new Error('ยังไม่ได้ตั้งค่าบัญชี VAT ซื้อ (vat_input_account_id) ใน im_gl_account_setup หรือ ap_gl_account_setup');
@@ -920,8 +930,8 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
     }
 
     if (apGlDetails.length > 0) {
-        const totalDebit = apGlDetails.reduce((s, l) => s + l.debit_lc, 0);
-        const totalCredit = apGlDetails.reduce((s, l) => s + l.credit_lc, 0);
+        const totalDebit = round2(apGlDetails.reduce((s, l) => s + l.debit_lc, 0));
+        const totalCredit = round2(apGlDetails.reduce((s, l) => s + l.credit_lc, 0));
         const apGlHeaderRes = await client.query(`
             INSERT INTO gl_entry_header
             (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
@@ -1011,18 +1021,19 @@ const postArBillFromDln = async (client, { header, details, docNo }) => {
         const revenueAccountId = await resolveRevenueAccount(client, d.item_id, arSetup.revenue_account_id);
         const qty = Math.abs(Number(d.qty) || 0); // qty ของ DLN ติดลบเสมอ (สต็อกลด) — ใบแจ้งหนี้ต้องเป็นจำนวนบวก
         const unitPrice = Number(d.unit_price) || 0;
-        const subtotal = qty * unitPrice;
+        const subtotal = round2(qty * unitPrice);
         const vatType = d.vat_type || 'NOVAT';
         const vatRate = vatType === 'NOVAT' ? 0 : (Number(d.vat_rate) || 0);
-        const vatAmount = subtotal * vatRate / 100;
+        const vatAmount = round2(subtotal * vatRate / 100);
         lineRows.push({
             itemCode: d.item_code, itemName: d.item_name, quantity: qty, unitPriceFc: unitPrice,
-            subtotal, vatType, vatRate, vatAmount, total: subtotal + vatAmount, revenueAccountId,
+            subtotal, vatType, vatRate, vatAmount, total: round2(subtotal + vatAmount), revenueAccountId,
         });
         totalSubtotal += subtotal;
         totalVat += vatAmount;
     }
-    const totalAmount = totalSubtotal + totalVat;
+    totalSubtotal = round2(totalSubtotal); totalVat = round2(totalVat);
+    const totalAmount = round2(totalSubtotal + totalVat);
 
     const arHeaderRes = await client.query(`
         INSERT INTO ar_transaction
@@ -1064,7 +1075,7 @@ const postArBillFromDln = async (client, { header, details, docNo }) => {
     const arGlDetails = [];
     for (const [accId, amt] of Object.entries(revCreditByAccount)) {
         if (amt === 0) continue;
-        arGlDetails.push({ account_id: Number(accId), description: `ใบแจ้งหนี้ ${arDocNo}`, debit_lc: 0, credit_lc: amt });
+        arGlDetails.push({ account_id: Number(accId), description: `ใบแจ้งหนี้ ${arDocNo}`, debit_lc: 0, credit_lc: round2(amt) });
     }
     if (totalVat !== 0) {
         if (!vatAccountId) throw new Error('ยังไม่ได้ตั้งค่าบัญชีภาษีขาย (vat_output_account_id) ใน im_gl_account_setup หรือ ar_gl_account_setup');
@@ -1075,8 +1086,8 @@ const postArBillFromDln = async (client, { header, details, docNo }) => {
     }
 
     if (arGlDetails.length > 0) {
-        const totalDebit = arGlDetails.reduce((s, l) => s + l.debit_lc, 0);
-        const totalCredit = arGlDetails.reduce((s, l) => s + l.credit_lc, 0);
+        const totalDebit = round2(arGlDetails.reduce((s, l) => s + l.debit_lc, 0));
+        const totalCredit = round2(arGlDetails.reduce((s, l) => s + l.credit_lc, 0));
         const arGlHeaderRes = await client.query(`
             INSERT INTO gl_entry_header
             (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
@@ -1183,18 +1194,20 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, mod
         const qty = Math.abs(Number(d.qty) || 0); // qty ติดลบสำหรับ CN (สต็อกลด) บวกสำหรับ DN — เอกสาร AP ต้องเป็นจำนวนบวกเสมอ
         const unitCostLc = Number(d.unit_cost);
         const unitCostFc = d.unit_cost_fc != null ? Number(d.unit_cost_fc) : unitCostLc;
-        const amountLc = qty * unitCostLc;
-        const amountFc = qty * unitCostFc;
+        const amountLc = round2(qty * unitCostLc);
+        const amountFc = round2(qty * unitCostFc);
         const vatType = d.vat_type || 'NOVAT';
         const vatRate = vatType === 'NOVAT' ? 0 : (Number(d.vat_rate) || 0);
-        const vatAmountLc = amountLc * vatRate / 100;
-        const vatAmountFc = amountFc * vatRate / 100;
+        const vatAmountLc = round2(amountLc * vatRate / 100);
+        const vatAmountFc = round2(amountFc * vatRate / 100);
         lineRows.push({ itemCode: d.item_code, itemName: d.item_name, quantity: qty, unitPriceFc: unitCostFc, amountLc, amountFc, expenseAccountId, vatType, vatRate, vatAmountLc, vatAmountFc });
         totalAmountLc += amountLc; totalVatLc += vatAmountLc;
         totalAmountFc += amountFc; totalVatFc += vatAmountFc;
     }
-    const grandTotalLc = totalAmountLc + totalVatLc;
-    const grandTotalFc = totalAmountFc + totalVatFc;
+    totalAmountLc = round2(totalAmountLc); totalVatLc = round2(totalVatLc);
+    totalAmountFc = round2(totalAmountFc); totalVatFc = round2(totalVatFc);
+    const grandTotalLc = round2(totalAmountLc + totalVatLc);
+    const grandTotalFc = round2(totalAmountFc + totalVatFc);
 
     const label = isCredit ? 'ใบลดหนี้จากผู้ขาย' : 'ใบเพิ่มหนี้จากผู้ขาย';
     const apHeaderRes = await client.query(`
@@ -1242,7 +1255,7 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, mod
         // CN: Dr AP / Cr คลัง — DN: Dr คลัง / Cr AP (มิเรอร์ postApBillFromGrn โดยกลับทิศทางเมื่อ isCredit)
         apGlDetails.push({
             account_id: Number(accId), description: `${label} ${apDocNo}`,
-            debit_lc: isCredit ? 0 : amt, credit_lc: isCredit ? amt : 0,
+            debit_lc: isCredit ? 0 : round2(amt), credit_lc: isCredit ? round2(amt) : 0,
         });
     }
     if (totalVatLc !== 0) {
@@ -1261,8 +1274,8 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, mod
     }
 
     if (apGlDetails.length > 0) {
-        const totalDebit = apGlDetails.reduce((s, l) => s + l.debit_lc, 0);
-        const totalCredit = apGlDetails.reduce((s, l) => s + l.credit_lc, 0);
+        const totalDebit = round2(apGlDetails.reduce((s, l) => s + l.debit_lc, 0));
+        const totalCredit = round2(apGlDetails.reduce((s, l) => s + l.credit_lc, 0));
         const apGlHeaderRes = await client.query(`
             INSERT INTO gl_entry_header
             (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
@@ -1352,18 +1365,19 @@ const postArCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
         const revenueAccountId = await resolveRevenueAccount(client, d.item_id, arSetup.revenue_account_id);
         const qty = Math.abs(Number(d.qty) || 0); // qty ติดลบสำหรับ DN (สต็อกลด) บวกสำหรับ CN — ใบแจ้งหนี้ต้องเป็นจำนวนบวก
         const unitPrice = Number(d.unit_price) || 0;
-        const subtotal = qty * unitPrice;
+        const subtotal = round2(qty * unitPrice);
         const vatType = d.vat_type || 'NOVAT';
         const vatRate = vatType === 'NOVAT' ? 0 : (Number(d.vat_rate) || 0);
-        const vatAmount = subtotal * vatRate / 100;
+        const vatAmount = round2(subtotal * vatRate / 100);
         lineRows.push({
             itemCode: d.item_code, itemName: d.item_name, quantity: qty, unitPriceFc: unitPrice,
-            subtotal, vatType, vatRate, vatAmount, total: subtotal + vatAmount, revenueAccountId,
+            subtotal, vatType, vatRate, vatAmount, total: round2(subtotal + vatAmount), revenueAccountId,
         });
         totalSubtotal += subtotal;
         totalVat += vatAmount;
     }
-    const totalAmount = totalSubtotal + totalVat;
+    totalSubtotal = round2(totalSubtotal); totalVat = round2(totalVat);
+    const totalAmount = round2(totalSubtotal + totalVat);
 
     const label = isCredit ? 'ใบลดหนี้ลูกค้า' : 'ใบเพิ่มหนี้ลูกค้า';
     const arHeaderRes = await client.query(`
@@ -1410,7 +1424,7 @@ const postArCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
         // DN: Cr รายได้ (เหมือน postArBillFromDln) — CN: Dr รายได้ (กลับรายการ)
         arGlDetails.push({
             account_id: Number(accId), description: `${label} ${arDocNo}`,
-            debit_lc: isCredit ? amt : 0, credit_lc: isCredit ? 0 : amt,
+            debit_lc: isCredit ? round2(amt) : 0, credit_lc: isCredit ? 0 : round2(amt),
         });
     }
     if (totalVat !== 0) {
@@ -1428,8 +1442,8 @@ const postArCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
     }
 
     if (arGlDetails.length > 0) {
-        const totalDebit = arGlDetails.reduce((s, l) => s + l.debit_lc, 0);
-        const totalCredit = arGlDetails.reduce((s, l) => s + l.credit_lc, 0);
+        const totalDebit = round2(arGlDetails.reduce((s, l) => s + l.debit_lc, 0));
+        const totalCredit = round2(arGlDetails.reduce((s, l) => s + l.credit_lc, 0));
         const arGlHeaderRes = await client.query(`
             INSERT INTO gl_entry_header
             (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
