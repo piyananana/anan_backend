@@ -194,10 +194,21 @@ const getTrialBalance = async (req, res) => {
         }
       });
 
-      // Recursive Roll-up Function (รวมยอดลูกสู่แม่)
+      // ยอดที่ลงบัญชีคุมโดยตรง (ไม่ควรเกิด — trigger ใน sql/gl_normal_account_guard.sql กันไว้แล้ว แต่ข้อมูลเก่าอาจมี)
+      // ต้องไม่ทิ้ง: เก็บไว้รวมเข้ายอดบัญชีคุม และแสดงเป็นแถวแยก (is_header=false) ให้ยอดรวมของหน้าจอดุล
+      const directOnHeader = {};
+      allAccounts.forEach(acc => {
+        const d = accMap[acc.id];
+        if (!acc.is_normal_account && (d.beg_dr || d.beg_cr || d.mvmt_dr || d.mvmt_cr)) {
+          directOnHeader[acc.id] = { beg_dr: d.beg_dr, beg_cr: d.beg_cr, mvmt_dr: d.mvmt_dr, mvmt_cr: d.mvmt_cr };
+        }
+      });
+
+      // Recursive Roll-up Function (รวมยอดลูกสู่แม่ + ยอดที่ลงบัญชีคุมเองโดยตรง)
       const calculateRollup = (node) => {
         if (!node.is_normal_account) {
-           let h_beg_dr = 0, h_beg_cr = 0, h_mvmt_dr = 0, h_mvmt_cr = 0;
+           const own = directOnHeader[node.id] || { beg_dr: 0, beg_cr: 0, mvmt_dr: 0, mvmt_cr: 0 };
+           let h_beg_dr = own.beg_dr, h_beg_cr = own.beg_cr, h_mvmt_dr = own.mvmt_dr, h_mvmt_cr = own.mvmt_cr;
            
            node.children.forEach(child => {
              calculateRollup(child);
@@ -219,8 +230,7 @@ const getTrialBalance = async (req, res) => {
       rootAccounts.forEach(root => calculateRollup(root));
 
       // 5. Flatten Result
-      let resultList = allAccounts.map(a => {
-        const d = accMap[a.id];
+      const toRow = (d) => {
         // Net Beginning Balance (แสดงในฝั่งเดียวเหมือนยอดยกไป)
         const netBeg = d.beg_dr - d.beg_cr;
         const beg_dr_net = netBeg > 0 ? netBeg : 0;
@@ -251,6 +261,18 @@ const getTrialBalance = async (req, res) => {
             };
           })
         };
+      };
+      let resultList = allAccounts.flatMap(a => {
+        const row = toRow(accMap[a.id]);
+        const own = directOnHeader[a.id];
+        if (!own) return [row];
+        // แถวแยกของยอดที่ลงบัญชีคุมโดยตรง — นับเป็นบัญชีลงรายการได้ (is_header=false) เพื่อให้ยอดรวมดุล
+        return [row, {
+          ...toRow({ ...accMap[a.id], ...own, is_normal_account: true, parent_id: a.id, dimension_rows: [] }),
+          account_name_thai: `${a.account_name_thai} (ยอดที่ลงบัญชีคุมโดยตรง - ตรวจการตั้งค่าบัญชี)`,
+          account_name_eng: `${a.account_name_eng || a.account_name_thai} (posted directly to header account - check account setup)`,
+          direct_on_header: true,
+        }];
       });
 
       // 6. Filter Hide Zero

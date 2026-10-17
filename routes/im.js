@@ -1,5 +1,6 @@
 // routes/im.js — Inventory Management
 const express = require('express');
+const { rejectHeaderAccounts } = require('../utils/glAccountGuard');
 const router = express.Router();
 const imItemCategoryController = require('../controllers/im/imItemCategoryController');
 const imItemController         = require('../controllers/im/imItemController');
@@ -35,7 +36,7 @@ const imConsignmentSettlementController = require('../controllers/im/imConsignme
 // im_gl_account_setup (per doc-type GL fallback, for the future im_transaction module)
 router.get('/im_gl_account_setup',           imGlAccountSetupController.fetchRows);
 router.get('/im_gl_account_setup/:doc_code', imGlAccountSetupController.fetchRow);
-router.post('/im_gl_account_setup/:doc_code', imGlAccountSetupController.upsertRow);
+router.post('/im_gl_account_setup/:doc_code', rejectHeaderAccounts, imGlAccountSetupController.upsertRow);
 
 // im_price_list (im_price_list + im_price_list_detail)
 router.get('/im_price_list',                     imPriceListController.fetchRows);
@@ -117,7 +118,7 @@ router.delete('/im_transaction/:id',     imTransactionController.deleteTransacti
 
 // im_accounting_setting (โหมดบัญชีสินค้า PERPETUAL/PERIODIC ระดับบริษัท)
 router.get('/im_accounting_setting',  imAccountingSettingController.getSetting);
-router.put('/im_accounting_setting',  imAccountingSettingController.upsertSetting);
+router.put('/im_accounting_setting',  rejectHeaderAccounts, imAccountingSettingController.upsertSetting);
 
 // im_period_closing (ปิดงวดสต็อกสินค้าสำหรับโหมด PERIODIC — คำนวณ+โพสต์ COGS ครั้งเดียวต่องวด)
 router.get('/im_period_closing/:periodId/preview', imPeriodClosingController.calculatePreview);

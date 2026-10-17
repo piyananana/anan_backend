@@ -1,5 +1,6 @@
 // routes/ar.js
 const express = require('express');
+const { rejectHeaderAccounts } = require('../utils/glAccountGuard');
 const router = express.Router();
 const arCustomerController = require('../controllers/ar/arCustomerController');
 const arCustomerGroupController = require('../controllers/ar/arCustomerGroupController');
@@ -94,12 +95,12 @@ router.post('/ar_bulk_billing',        arBulkBillingController.createBulkBilling
 // Router สำหรับตั้งค่ารหัสบัญชี GL ต่อ doc_code ของ AR
 router.get('/ar_gl_account_setup', arGlAccountSetupController.fetchRows);
 router.get('/ar_gl_account_setup/:doc_code', arGlAccountSetupController.fetchRow);
-router.post('/ar_gl_account_setup/:doc_code', arGlAccountSetupController.upsertRow);
+router.post('/ar_gl_account_setup/:doc_code', rejectHeaderAccounts, arGlAccountSetupController.upsertRow);
 
 // ── AR Year-End Closing ────────────────────────────────────────────────────────
 // Setup & Allowance Rules
 router.get('/ar_year_end_setup',    arYearEndSetupController.fetchSetup);
-router.put('/ar_year_end_setup',    arYearEndSetupController.upsertSetup);
+router.put('/ar_year_end_setup',    rejectHeaderAccounts, arYearEndSetupController.upsertSetup);
 router.get('/ar_allowance_rule',    arYearEndSetupController.fetchAllowanceRules);
 router.put('/ar_allowance_rule',    arYearEndSetupController.saveAllowanceRules);
 

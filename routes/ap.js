@@ -1,5 +1,6 @@
 // routes/ap.js
 const express = require('express');
+const { rejectHeaderAccounts } = require('../utils/glAccountGuard');
 const router  = express.Router();
 
 const apVendorRunningController  = require('../controllers/ap/apVendorRunningController');
@@ -84,7 +85,7 @@ router.delete('/ap_vendor/:id', apVendorController.deleteRow);
 // ── GL Account Setup ───────────────────────────────────────────────────────
 router.get('/ap_gl_account_setup',            apGlAccountSetupController.fetchRows);
 router.get('/ap_gl_account_setup/:doc_code',  apGlAccountSetupController.fetchRow);
-router.post('/ap_gl_account_setup/:doc_code', apGlAccountSetupController.upsertRow);
+router.post('/ap_gl_account_setup/:doc_code', rejectHeaderAccounts, apGlAccountSetupController.upsertRow);
 
 // ── AP Payment Run ─────────────────────────────────────────────────────────
 router.get('/ap_payment_run/my_pending',        apPaymentRunController.fetchMyPending);
@@ -120,7 +121,7 @@ router.delete('/ap_transaction/:id',                 apTransactionController.del
 
 // ── Year-End Setup ─────────────────────────────────────────────────────────────
 router.get('/ap_year_end_setup', apYearEndSetupController.fetchSetup);
-router.put('/ap_year_end_setup', apYearEndSetupController.upsertSetup);
+router.put('/ap_year_end_setup', rejectHeaderAccounts, apYearEndSetupController.upsertSetup);
 
 // ── Year-End Pre-Close Check ───────────────────────────────────────────────────
 router.get('/year_end/pre_close_check', apPreCloseCheckController.preCloseCheck);
