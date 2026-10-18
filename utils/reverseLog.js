@@ -1,5 +1,5 @@
 // utils/reverseLog.js
-// ประวัติการถอยเอกสารกลับเป็นร่าง และการลบเอกสาร (to_status = 'Deleted')
+// ประวัติการถอยเอกสารกลับเป็นร่าง การลบเอกสาร (to_status = 'Deleted') และการยกเลิก (to_status = 'Void')
 // ตาราง sa_document_reverse_log, sql/sa_document_reverse_log.sql
 // ใช้ร่วมทุกโมดูล: บันทึกทุกครั้งที่ถอยเอกสาร และดึงไปแสดงที่หน้าจอเอกสาร
 

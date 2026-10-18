@@ -1,4 +1,5 @@
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
+const { today: todayYmd } = require('../../utils/dateUtil');
 // controllers/ap/apTransactionController.js
 
 // --- Helper: Generate Document Number ---
@@ -736,6 +737,22 @@ const AP_REVERSE_BLOCK_MESSAGES = {
     FX_REVAL:       'เอกสารนี้อยู่ในการปรับมูลค่าอัตราแลกเปลี่ยน',
     CM_CLEARED:     'การจ่ายเงินผ่านธนาคารของเอกสารนี้เคลียร์/กระทบยอดแล้ว',
 };
+// --- ยกเลิก (Void): ใช้เมื่อถอยเป็นร่างไม่ได้ (เช่น งวดเดิมปิดแล้ว) ---
+// ยกเลิกได้เฉพาะ Posted ที่ไม่มีเอกสารอื่นอ้างอิง  ไม่ดูงวดของเอกสารเดิม เพราะลงรายการกลับในงวดของวันที่ยกเลิก
+const getApVoidBlock = (r) => {
+    if (r.status !== 'Posted') return { code: 'NOT_POSTED' };
+    if (r.from_im) return { code: 'IM_SOURCE' };
+    if (r.from_consignment) return { code: 'CONSIGNMENT' };
+    if (r.applied_by) return { code: 'APPLIED', ref: r.applied_by };
+    if (Number(r.paid_amount_lc) > 0.005) return { code: 'PAID' };
+    if (r.ra_paid_by) return { code: 'RA_PAID', ref: r.ra_paid_by };
+    if (r.in_payment_run) return { code: 'PAYMENT_RUN', ref: r.in_payment_run };
+    if (r.in_fx_reval) return { code: 'FX_REVAL', ref: r.in_fx_reval };
+    if (r.cm_cleared) return { code: 'CM_CLEARED', ref: r.cm_cleared };
+    return null;
+};
+AP_REVERSE_BLOCK_MESSAGES.NOT_POSTED = 'ยกเลิกได้เฉพาะเอกสารที่โพสต์แล้ว (เอกสารร่างให้ลบแทน)';
+
 const apReverseBlockMessage = (b) => AP_REVERSE_BLOCK_MESSAGES[b.code] + (b.ref ? ` (${b.ref})` : '');
 
 // --- Ensure payment table exists ---
@@ -892,11 +909,14 @@ const fetchRowById = async (pool, id) => {
     if (hRes.rows.length === 0) return null;
     const infoRes = await pool.query(AP_REVERSE_INFO_SQL, [id]);
     const block = infoRes.rows[0] ? getApReverseBlock(infoRes.rows[0]) : null;
+    const vBlock = infoRes.rows[0] ? getApVoidBlock(infoRes.rows[0]) : null;
     return {
         ...hRes.rows[0], details: dRes.rows, applies: aRes.rows, payments: pRes.rows, whts: whtRes.rows,
         approvals: apprRes.rows,
         reverse_block: block ? block.code : null,
         reverse_block_ref: block ? (block.ref || null) : null,
+        void_block: vBlock ? vBlock.code : null,
+        void_block_ref: vBlock ? (vBlock.ref || null) : null,
         reverse_history: await getReverseHistory(pool, 'ap_transaction', id),
     };
 };
@@ -1691,87 +1711,116 @@ const postTransaction = async (req, res) => {
     }
 };
 
-// --- 3. Void Transaction ---
+// --- 3. Void Transaction (Posted → Void) ---
+// เก็บรายการบัญชีเดิมไว้ครบ แล้วลงรายการกลับ (สลับเดบิต/เครดิต) ลงวันที่ยกเลิก ในงวดที่เปิดอยู่
+// (เดิมเปลี่ยนรายการบัญชีเดิมเป็น Void ซึ่งแก้ยอดในงวดเดิมย้อนหลัง แม้งวดนั้นปิดแล้ว)
+// ภาษีซื้อ: ยกเลิกในเดือนเดียวกับเอกสาร → ตัดรายการออก (is_voided), ข้ามเดือน → ลงรายการกลับในเดือนที่ยกเลิก
+//   เพื่อไม่ให้รายงานภาษีของเดือนที่ยื่นไปแล้วเปลี่ยน
+// คืนยอดคงค้างให้ใบตั้งหนี้ที่จับคู่ไว้ และยกเลิกรายการจ่ายผ่านธนาคารที่ยังรอเคลียร์
 const voidTransaction = async (req, res) => {
     const { id } = req.params;
+    const voidReason = (req.body?.void_reason || '').trim();
+    const userId = req.body?.user_id || req.headers['userid'] || null;
+    const userName = req.headers['username'] || null;
+    if (!voidReason) return res.status(400).json({ message: 'กรุณาระบุเหตุผลการยกเลิก' });
+
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
-        const existing = await client.query(`
-            SELECT t.*, d.sys_doc_type
-            FROM ap_transaction t
-            JOIN sa_module_document d ON d.id = t.doc_id
-            WHERE t.id=$1`, [id]
-        );
-        if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
-        const tx = existing.rows[0];
-        if (tx.status === 'Void') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'เอกสารถูก Void แล้ว' }); }
-
-        // Reverse invoice balances
-        const applies = (await client.query(
-            `SELECT * FROM ap_transaction_apply WHERE transaction_id=$1 AND apply_type='invoice'`, [id]
-        )).rows;
-        for (const a of applies) {
-            await client.query(`
-                UPDATE ap_transaction t SET
-                    paid_amount_lc = GREATEST(0, t.paid_amount_lc - (SELECT SUM(a2.applied_amount_fc * t.exchange_rate)
-                        FROM ap_transaction_apply a2 WHERE a2.transaction_id=$1 AND a2.applied_to_id=t.id AND a2.apply_type='invoice')),
-                    balance_amount_lc = t.total_amount_lc -
-                        GREATEST(0, t.paid_amount_lc - (SELECT SUM(a2.applied_amount_fc * t.exchange_rate)
-                        FROM ap_transaction_apply a2 WHERE a2.transaction_id=$1 AND a2.applied_to_id=t.id AND a2.apply_type='invoice')),
-                    updated_at = NOW()
-                WHERE id = $2
-            `, [id, a.applied_to_id]);
+        const lock = await client.query(`SELECT * FROM ap_transaction WHERE id=$1 FOR UPDATE`, [id]);
+        if (lock.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
+        const tx = lock.rows[0];
+        const info = (await client.query(AP_REVERSE_INFO_SQL, [id])).rows[0];
+        const block = getApVoidBlock(info);
+        if (block) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ message: apReverseBlockMessage(block), code: block.code, ref: block.ref || null });
         }
 
-        // Void GL entry
+        const voidDate = todayYmd();
+        let reversingGlId = null;
         if (tx.gl_entry_id) {
-            await client.query(
-                `UPDATE gl_entry_header SET status='Void', updated_at=NOW() WHERE id=$1`, [tx.gl_entry_id]
-            );
+            const perRes = await client.query(`
+                SELECT id FROM gl_posting_period
+                 WHERE $1::date BETWEEN period_start_date AND period_end_date
+                   AND gl_status = 'OPEN' AND ap_status = 'OPEN' LIMIT 1`, [voidDate]);
+            if (perRes.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ message: `ไม่พบงวดบัญชี (GL/AP) ที่เปิดอยู่ สำหรับวันที่ยกเลิก ${voidDate}` });
+            }
+            const orig = (await client.query(`SELECT * FROM gl_entry_header WHERE id=$1`, [tx.gl_entry_id])).rows[0];
+            let revDocNo = await generateDocNo(client, orig.doc_id, voidDate, tx.branch_id);
+            if (!revDocNo) revDocNo = `RV-${orig.doc_no}`;
+
+            const revRes = await client.query(`
+                INSERT INTO gl_entry_header
+                (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
+                 currency_id, exchange_rate, status,
+                 total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
+                 created_by, branch_id, ref_doc_id, ref_doc_no, ref_doc_date, external_source_id)
+                VALUES ($1,$2,$3,$3,$4,$5,$6,$7,$8,'Posted',$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+                RETURNING id`, [
+                orig.doc_id, revDocNo, voidDate, perRes.rows[0].id,
+                orig.ref_no, `[ยกเลิก ${tx.doc_no}] ${voidReason}`,
+                orig.currency_id, orig.exchange_rate,
+                orig.total_credit_lc, orig.total_debit_lc, orig.total_credit_fc, orig.total_debit_fc,
+                orig.created_by, orig.branch_id,
+                tx.doc_id, tx.doc_no, tx.doc_date, tx.id,
+            ]);
+            reversingGlId = revRes.rows[0].id;
+            await client.query(`
+                INSERT INTO gl_entry_detail
+                (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc,
+                 branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+                SELECT $1, line_no, account_id, '[ยกเลิก] ' || COALESCE(description, ''),
+                       credit_lc, debit_lc, credit_fc, debit_fc,
+                       branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id
+                  FROM gl_entry_detail WHERE header_id = $2 ORDER BY line_no`,
+                [reversingGlId, tx.gl_entry_id]);
         }
 
-        // Void the linked cm_payment record, if any (direct AP payment docs, sys_doc_type=80)
-        if (tx.sys_doc_type === '80') {
+        // ภาษีซื้อ
+        const sameMonth = String(todayYmd()).slice(0, 7) === (tx.doc_date instanceof Date
+            ? `${tx.doc_date.getFullYear()}-${String(tx.doc_date.getMonth() + 1).padStart(2, '0')}`
+            : String(tx.doc_date).slice(0, 7));
+        if (sameMonth) {
+            await client.query(
+                `UPDATE vt_transaction SET is_voided=TRUE WHERE module_code='AP' AND source_header_id=$1`, [id]);
+        } else {
             await client.query(`
-                CREATE TABLE IF NOT EXISTS cm_payment (
-                    id                  SERIAL PRIMARY KEY,
-                    payment_date        DATE          NOT NULL,
-                    bank_account_id     INTEGER       REFERENCES cm_bank_account(id),
-                    payment_method_id   INTEGER,
-                    payment_method_type VARCHAR(30)   NOT NULL DEFAULT 'TRANSFER',
-                    ap_payment_run_id   INTEGER,
-                    ap_doc_no           VARCHAR(50),
-                    payee_type          VARCHAR(10)   DEFAULT 'VENDOR',
-                    payee_id            INTEGER,
-                    payee_code          VARCHAR(50),
-                    payee_name_th       VARCHAR(200),
-                    amount_lc           NUMERIC(18,4) NOT NULL DEFAULT 0,
-                    amount_fc           NUMERIC(18,4) NOT NULL DEFAULT 0,
-                    currency_code       VARCHAR(10)   NOT NULL DEFAULT 'THB',
-                    exchange_rate       NUMERIC(15,6) NOT NULL DEFAULT 1,
-                    check_no            VARCHAR(50),
-                    check_date          DATE,
-                    checkbook_id        INTEGER       REFERENCES cm_checkbook(id),
-                    status              VARCHAR(20)   NOT NULL DEFAULT 'Pending',
-                    clearing_date       DATE,
-                    clearing_note       TEXT,
-                    gl_entry_id         INTEGER,
-                    remark              TEXT,
-                    created_by          INTEGER,
-                    created_at          TIMESTAMP DEFAULT NOW(),
-                    updated_at          TIMESTAMP DEFAULT NOW()
-                )`);
-            await client.query(`ALTER TABLE cm_payment ADD COLUMN IF NOT EXISTS ap_transaction_id INTEGER`).catch(() => {});
+                INSERT INTO vt_transaction
+                (module_code, vat_type, doc_id, source_header_id, source_detail_id, doc_no, doc_date,
+                 tax_invoice_no, tax_invoice_date, vat_rate,
+                 base_amount_lc, vat_amount_lc, base_amount_fc, vat_amount_fc, currency_id, exchange_rate,
+                 customer_id, supplier_id, vendor_id, entity_name, entity_tax_id, entity_branch_code, created_by)
+                SELECT module_code, vat_type, doc_id, source_header_id, source_detail_id, doc_no, $2::date,
+                       COALESCE(tax_invoice_no, doc_no), COALESCE(tax_invoice_date, doc_date), vat_rate,
+                       -base_amount_lc, -vat_amount_lc, -base_amount_fc, -vat_amount_fc, currency_id, exchange_rate,
+                       customer_id, supplier_id, vendor_id, entity_name, entity_tax_id, entity_branch_code, $3
+                  FROM vt_transaction
+                 WHERE module_code='AP' AND source_header_id=$1 AND is_voided = FALSE`,
+                [id, voidDate, userName]);
+        }
+
+        // คืนยอดคงค้างให้ใบตั้งหนี้ที่จับคู่ไว้
+        await adjustInvoiceBalances(client, id, -1);
+
+        // รายการจ่ายผ่านธนาคาร (ใบจ่ายเงิน 80) — ที่ยังรอเคลียร์ (ที่เคลียร์แล้วถูกกันไว้ข้างบน)
+        if (info.sys_doc_type === '80') {
             await client.query(`
                 UPDATE cm_payment SET status='Voided', updated_at=NOW()
-                WHERE ap_transaction_id=$1 AND status != 'Voided'
-            `, [id]);
+                 WHERE ap_transaction_id=$1 AND status <> 'Voided'`, [id]);
         }
 
-        await client.query(
-            `UPDATE ap_transaction SET status='Void', updated_at=NOW() WHERE id=$1`, [id]
-        );
+        await client.query(`
+            UPDATE ap_transaction SET status='Void', void_reason=$1, voided_by=$2, voided_at=NOW(),
+                   void_gl_entry_id=$3, updated_by=$2, updated_at=NOW()
+             WHERE id=$4`, [voidReason, userName, reversingGlId, id]);
+        await logReverse(client, {
+            sysModule: '21', tableName: 'ap_transaction', recordId: Number(id),
+            docNo: tx.doc_no, fromStatus: 'Posted', toStatus: 'Void', reason: voidReason, userId,
+        });
+
         await client.query('COMMIT');
         const full = await fetchRowById(req.dbPool, id);
         res.status(200).json(full);
