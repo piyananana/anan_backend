@@ -1,12 +1,13 @@
 // controllers/im/imTransactionReportController.js
 const { today } = require('../../utils/dateUtil');
+const { parseStatuses, IM_LINE_QTY, IM_LINE_VALUE } = require('./imEffectiveTxSql');
 // รายงานธุรกรรมสินค้าคงคลัง — มิเรอร์รูปแบบ arTransactionReportController.js แต่ปรับให้เป็นรายการเอกสารเรียงตาม
 // วันที่ (ไม่จัดกลุ่มตาม entity เหมือน AR ที่จัดกลุ่มตามลูกค้า) เพราะ IM ไม่มีฟีลด์ที่ทุก sys_doc_type มีร่วมกัน
 // แบบ customer_id ของ AR (AJS/ISS/TRF ไม่มีผู้ขาย/ลูกค้า) — ยืนยันรูปแบบนี้กับผู้ใช้แล้วก่อนสร้าง
 'use strict';
 
 const getTransactionReport = async (req, res) => {
-    const { date_from, date_to, sys_doc_types, sort } = req.query;
+    const { date_from, date_to, sys_doc_types, statuses, sort } = req.query;
 
     const dateFrom = date_from || today();
     const dateTo   = date_to   || today();
@@ -14,7 +15,10 @@ const getTransactionReport = async (req, res) => {
 
     const client = await req.dbPool.connect();
     try {
-        const params = [dateFrom, dateTo];
+        // ค่าเริ่มต้น: ธุรกรรมที่มีผลจริง — Posted รวมถึง Received/Delivered ('12'/'32' ที่ Post IM แล้วแต่ยังไม่
+        // Post AP/AR-GL) เลือกสถานะอื่น (ร่าง / ยกเลิก / ลบแล้ว) เพิ่มได้จากหน้าจอ
+        const statusList = parseStatuses(statuses, ['Posted', 'Received', 'Delivered']);
+        const params = [dateFrom, dateTo, statusList];
         let sdtFilter = '';
         if (sys_doc_types) {
             const types = String(sys_doc_types).split(',').map(s => s.trim()).filter(Boolean);
@@ -24,8 +28,6 @@ const getTransactionReport = async (req, res) => {
             }
         }
 
-        // สถานะที่นับเป็น "ธุรกรรมจริง" — Posted ทั่วไป รวมถึง Received/Delivered ('12'/'32' ที่ Post IM แล้วแต่ยัง
-        // ไม่ Post AP/AR-GL) เพราะสต็อกเคลื่อนไหวจริงไปแล้ว ไม่นับ Draft (ยังไม่เกิดผลจริง) และ Void (ถูกยกเลิกแล้ว)
         const headerRes = await client.query(`
             SELECT
                 t.id                AS txn_id,
@@ -33,7 +35,7 @@ const getTransactionReport = async (req, res) => {
                 t.ref_no, t.ref_doc_no,
                 t.vendor_code, t.vendor_name_th,
                 t.customer_code, t.customer_name_th,
-                t.total_qty, t.total_value_lc,
+                t.total_qty, t.total_value_lc, t.void_date, t.void_reason,
                 w.warehouse_code, w.warehouse_name_th,
                 tw.warehouse_code  AS to_warehouse_code, tw.warehouse_name_th AS to_warehouse_name_th,
                 d.doc_code, d.doc_name_thai, d.doc_name_eng, d.sys_doc_type
@@ -41,7 +43,7 @@ const getTransactionReport = async (req, res) => {
             JOIN sa_module_document d  ON d.id = t.doc_id
             LEFT JOIN im_warehouse w   ON w.id = t.warehouse_id
             LEFT JOIN im_warehouse tw  ON tw.id = t.to_warehouse_id
-            WHERE t.status IN ('Posted', 'Received', 'Delivered')
+            WHERE t.status = ANY($3::text[])
               AND t.doc_date >= $1::date
               AND t.doc_date <= $2::date
               ${sdtFilter}
@@ -58,10 +60,11 @@ const getTransactionReport = async (req, res) => {
                     dt.header_id, dt.line_no,
                     COALESCE(dt.item_code, it.item_code) AS item_code,
                     it.item_name_th, it.item_name_en,
-                    dt.qty, dt.unit_cost, dt.unit_price, dt.billed_unit_cost, dt.is_free,
-                    dt.vat_type, dt.vat_rate, dt.lot_no, dt.serial_no, dt.total_value_lc,
+                    ${IM_LINE_QTY} AS qty, dt.unit_cost, dt.unit_price, dt.billed_unit_cost, dt.is_free,
+                    dt.vat_type, dt.vat_rate, dt.lot_no, dt.serial_no, ${IM_LINE_VALUE} AS total_value_lc,
                     u.uom_code, u.uom_name_th, u.uom_name_en, l.location_code, tl.location_code AS to_location_code
                 FROM im_transaction_detail dt
+                JOIN im_transaction t    ON t.id = dt.header_id
                 LEFT JOIN im_item it     ON it.id = dt.item_id
                 LEFT JOIN im_uom u       ON u.id  = dt.uom_id
                 LEFT JOIN im_location l  ON l.id  = dt.location_id
@@ -75,10 +78,13 @@ const getTransactionReport = async (req, res) => {
             }
         }
 
-        const rows = headerRes.rows.map(h => ({
-            ...h,
-            lines: linesByHeader.get(h.txn_id) || [],
-        }));
+        // ร่าง/ลบแล้ว: ยอดรวมหัวเอกสารยังเป็น 0 (คำนวณตอนโพสต์) — รวมจากบรรทัดแทน
+        const rows = headerRes.rows.map(h => {
+            const lines = linesByHeader.get(h.txn_id) || [];
+            if (h.status !== 'Draft' && h.status !== 'Deleted') return { ...h, lines };
+            const sum = (k) => lines.reduce((a, l) => a + Number(l[k] || 0), 0);
+            return { ...h, total_qty: sum('qty'), total_value_lc: sum('total_value_lc'), lines };
+        });
 
         res.json(rows);
     } catch (err) {

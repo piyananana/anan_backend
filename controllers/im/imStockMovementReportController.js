@@ -1,5 +1,6 @@
 // controllers/im/imStockMovementReportController.js
 const { today } = require('../../utils/dateUtil');
+const { IM_EFFECTIVE_TX, IM_EFFECTIVE_DOC_NO } = require('./imEffectiveTxSql');
 // รายงานสินค้าคงเหลือและการเคลื่อนไหว — จัดกลุ่ม คลัง > หมวดหมู่ > สินค้า (1 "การ์ด" ต่อ สินค้า+คลัง) พร้อมยอดสะสม
 // (running balance) ต่อบรรทัด
 //
@@ -67,28 +68,28 @@ const getStockMovementReport = async (req, res) => {
             WITH movement AS (
                 -- ทุก sys_doc_type ยกเว้นฝั่งปลายทางของ TRF — ใช้ warehouse_id (ต้นทาง/คลังเดียว) ตรงๆ
                 SELECT
-                    t.id AS txn_id, t.doc_no, t.doc_date, d.doc_code, d.doc_name_thai, d.doc_name_eng,
+                    t.id AS txn_id, ${IM_EFFECTIVE_DOC_NO} AS doc_no, t.eff_date AS doc_date, d.doc_code, d.doc_name_thai, d.doc_name_eng,
                     d.sys_doc_type, t.warehouse_id AS effective_warehouse_id,
-                    dt.item_id, dt.qty, dt.total_value_lc, dt.lot_no, dt.serial_no, dt.line_no, dt.is_free
-                FROM im_transaction t
+                    dt.item_id, dt.qty * t.sign AS qty, dt.total_value_lc * t.sign AS total_value_lc,
+                    dt.lot_no, dt.serial_no, dt.line_no, dt.is_free
+                FROM ${IM_EFFECTIVE_TX} t
                 JOIN sa_module_document d ON d.id = t.doc_id
                 JOIN im_transaction_detail dt ON dt.header_id = t.id
-                WHERE t.status IN ('Posted', 'Received', 'Delivered')
-                  AND t.doc_date <= $2::date
+                WHERE t.eff_date <= $2::date
 
                 UNION ALL
 
                 -- ฝั่งปลายทางของ TRF (โอนเข้า) — ไม่มีแถวจริงใน im_transaction_detail จึงสร้างขึ้นเองโดย flip
                 -- sign ของ qty/total_value_lc แล้วใช้ to_warehouse_id เป็นคลังที่มีผล
                 SELECT
-                    t.id, t.doc_no, t.doc_date, d.doc_code, d.doc_name_thai, d.doc_name_eng,
+                    t.id, ${IM_EFFECTIVE_DOC_NO}, t.eff_date, d.doc_code, d.doc_name_thai, d.doc_name_eng,
                     d.sys_doc_type, t.to_warehouse_id AS effective_warehouse_id,
-                    dt.item_id, -dt.qty AS qty, -dt.total_value_lc AS total_value_lc, dt.lot_no, dt.serial_no, dt.line_no, dt.is_free
-                FROM im_transaction t
+                    dt.item_id, -dt.qty * t.sign AS qty, -dt.total_value_lc * t.sign AS total_value_lc,
+                    dt.lot_no, dt.serial_no, dt.line_no, dt.is_free
+                FROM ${IM_EFFECTIVE_TX} t
                 JOIN sa_module_document d ON d.id = t.doc_id
                 JOIN im_transaction_detail dt ON dt.header_id = t.id
-                WHERE t.status IN ('Posted', 'Received', 'Delivered')
-                  AND t.doc_date <= $2::date
+                WHERE t.eff_date <= $2::date
                   AND d.sys_doc_type = '${TRANSFER_TYPE}'
                   AND t.to_warehouse_id IS NOT NULL
             ),

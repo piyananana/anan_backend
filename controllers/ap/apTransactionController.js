@@ -755,6 +755,18 @@ AP_REVERSE_BLOCK_MESSAGES.NOT_POSTED = 'ยกเลิกได้เฉพา�
 
 const apReverseBlockMessage = (b) => AP_REVERSE_BLOCK_MESSAGES[b.code] + (b.ref ? ` (${b.ref})` : '');
 
+// ใช้จาก IM: ใบตั้งหนี้ที่เอกสาร IM สร้างให้ — สถานะ, เหตุที่ถอย/ยกเลิกไม่ได้ (ไม่นับ IM_SOURCE), งวดยังเปิดหรือไม่
+const getApLinkedState = async (db, id) => {
+    const info = (await db.query(AP_REVERSE_INFO_SQL, [id])).rows[0];
+    if (!info) return null;
+    const b = info.status === 'Posted' ? getApVoidBlock({ ...info, from_im: false }) : null;
+    return {
+        status: info.status, doc_no: info.doc_no, gl_entry_id: info.gl_entry_id,
+        block: b ? { ...b, message: apReverseBlockMessage(b) } : null,
+        periodOpen: info.ap_status === 'OPEN' && (!info.gl_period_status || info.gl_period_status === 'OPEN'),
+    };
+};
+
 // --- Ensure payment table exists ---
 const ensurePaymentTable = async (client) => {
     await client.query(`
@@ -1717,25 +1729,16 @@ const postTransaction = async (req, res) => {
 // ภาษีซื้อ: ยกเลิกในเดือนเดียวกับเอกสาร → ตัดรายการออก (is_voided), ข้ามเดือน → ลงรายการกลับในเดือนที่ยกเลิก
 //   เพื่อไม่ให้รายงานภาษีของเดือนที่ยื่นไปแล้วเปลี่ยน
 // คืนยอดคงค้างให้ใบตั้งหนี้ที่จับคู่ไว้ และยกเลิกรายการจ่ายผ่านธนาคารที่ยังรอเคลียร์
-const voidTransaction = async (req, res) => {
-    const { id } = req.params;
-    const voidReason = (req.body?.void_reason || '').trim();
-    const userId = req.body?.user_id || req.headers['userid'] || null;
-    const userName = req.headers['username'] || null;
-    if (!voidReason) return res.status(400).json({ message: 'กรุณาระบุเหตุผลการยกเลิก' });
-
-    const client = await req.dbPool.connect();
-    try {
-        await client.query('BEGIN');
+// แกนกลางของการยกเลิก ทำงานใน transaction ของผู้เรียก (ใช้ร่วมกับ IM ที่ยกเลิกใบตั้งหนี้ที่สร้างให้)
+// fromIm = เรียกจากเอกสาร IM ต้นทาง → ข้ามเงื่อนไข IM_SOURCE
+// คืน { message, code, ref, httpStatus } เมื่อทำไม่ได้ หรือ { reversingGlId } เมื่อสำเร็จ
+const voidApDocument = async (client, id, { voidReason, userId, userName, fromIm = false }) => {
         const lock = await client.query(`SELECT * FROM ap_transaction WHERE id=$1 FOR UPDATE`, [id]);
-        if (lock.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
+        if (lock.rows.length === 0) return { message: 'Not found', httpStatus: 404 };
         const tx = lock.rows[0];
         const info = (await client.query(AP_REVERSE_INFO_SQL, [id])).rows[0];
-        const block = getApVoidBlock(info);
-        if (block) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: apReverseBlockMessage(block), code: block.code, ref: block.ref || null });
-        }
+        const block = getApVoidBlock(fromIm ? { ...info, from_im: false } : info);
+        if (block) return { message: apReverseBlockMessage(block), code: block.code, ref: block.ref || null };
 
         const voidDate = todayYmd();
         let reversingGlId = null;
@@ -1745,8 +1748,7 @@ const voidTransaction = async (req, res) => {
                  WHERE $1::date BETWEEN period_start_date AND period_end_date
                    AND gl_status = 'OPEN' AND ap_status = 'OPEN' LIMIT 1`, [voidDate]);
             if (perRes.rows.length === 0) {
-                await client.query('ROLLBACK');
-                return res.status(400).json({ message: `ไม่พบงวดบัญชี (GL/AP) ที่เปิดอยู่ สำหรับวันที่ยกเลิก ${voidDate}` });
+                return { message: `ไม่พบงวดบัญชี (GL/AP) ที่เปิดอยู่ สำหรับวันที่ยกเลิก ${voidDate}` };
             }
             const orig = (await client.query(`SELECT * FROM gl_entry_header WHERE id=$1`, [tx.gl_entry_id])).rows[0];
             let revDocNo = await generateDocNo(client, orig.doc_id, voidDate, tx.branch_id);
@@ -1820,7 +1822,24 @@ const voidTransaction = async (req, res) => {
             sysModule: '21', tableName: 'ap_transaction', recordId: Number(id),
             docNo: tx.doc_no, fromStatus: 'Posted', toStatus: 'Void', reason: voidReason, userId,
         });
+        return { reversingGlId };
+};
 
+const voidTransaction = async (req, res) => {
+    const { id } = req.params;
+    const voidReason = (req.body?.void_reason || '').trim();
+    const userId = req.body?.user_id || req.headers['userid'] || null;
+    const userName = req.headers['username'] || null;
+    if (!voidReason) return res.status(400).json({ message: 'กรุณาระบุเหตุผลการยกเลิก' });
+
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        const r = await voidApDocument(client, id, { voidReason, userId, userName });
+        if (r.message) {
+            await client.query('ROLLBACK');
+            return res.status(r.httpStatus || 400).json({ message: r.message, code: r.code, ref: r.ref ?? null });
+        }
         await client.query('COMMIT');
         const full = await fetchRowById(req.dbPool, id);
         res.status(200).json(full);
@@ -1945,5 +1964,6 @@ module.exports = {
     fetchOpenRemittanceAdvices, fetchRaInvoices,
     fetchRemittanceAdviceByDocNo,
     createTransaction, updateTransaction, voidTransaction, deleteTransaction, reverseTransaction,
+    voidApDocument, getApLinkedState,
     submitTransaction, approveTransaction, rejectTransaction, postTransaction,
 };

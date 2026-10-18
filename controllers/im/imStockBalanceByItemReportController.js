@@ -1,5 +1,6 @@
 // controllers/im/imStockBalanceByItemReportController.js
 const { today } = require('../../utils/dateUtil');
+const { IM_EFFECTIVE_TX } = require('./imEffectiveTxSql');
 // รายงานสินค้าคงเหลือตามตำแหน่งที่เก็บ — ยอดคงเหลือ ณ วันที่สิ้นสุดที่เลือก แยกตาม item/warehouse/location/lot/serial
 //
 // จุดสำคัญ: ไม่ได้อ่านจาก im_stock_balance/im_stock_layer ตรงๆ (ตารางนั้นมีแค่ยอด "ปัจจุบัน" เท่านั้น ไม่รองรับ
@@ -89,12 +90,11 @@ const getStockBalanceByItemReport = async (req, res) => {
             WITH movement AS (
                 SELECT
                     t.warehouse_id AS effective_warehouse_id, dt.location_id AS effective_location_id,
-                    dt.item_id, dt.qty, dt.total_value_lc, dt.lot_no, dt.serial_no
-                FROM im_transaction t
+                    dt.item_id, dt.qty * t.sign AS qty, dt.total_value_lc * t.sign AS total_value_lc, dt.lot_no, dt.serial_no
+                FROM ${IM_EFFECTIVE_TX} t
                 JOIN sa_module_document d ON d.id = t.doc_id
                 JOIN im_transaction_detail dt ON dt.header_id = t.id
-                WHERE t.status IN ('Posted', 'Received', 'Delivered')
-                  AND t.doc_date <= $1::date
+                WHERE t.eff_date <= $1::date
 
                 UNION ALL
 
@@ -102,12 +102,11 @@ const getStockBalanceByItemReport = async (req, res) => {
                 -- sign ของ qty/total_value_lc แล้วใช้ to_warehouse_id/to_location_id เป็นคลัง/ตำแหน่งที่มีผล
                 SELECT
                     t.to_warehouse_id AS effective_warehouse_id, dt.to_location_id AS effective_location_id,
-                    dt.item_id, -dt.qty AS qty, -dt.total_value_lc AS total_value_lc, dt.lot_no, dt.serial_no
-                FROM im_transaction t
+                    dt.item_id, -dt.qty * t.sign AS qty, -dt.total_value_lc * t.sign AS total_value_lc, dt.lot_no, dt.serial_no
+                FROM ${IM_EFFECTIVE_TX} t
                 JOIN sa_module_document d ON d.id = t.doc_id
                 JOIN im_transaction_detail dt ON dt.header_id = t.id
-                WHERE t.status IN ('Posted', 'Received', 'Delivered')
-                  AND t.doc_date <= $1::date
+                WHERE t.eff_date <= $1::date
                   AND d.sys_doc_type = '70'
                   AND t.to_warehouse_id IS NOT NULL
             ),

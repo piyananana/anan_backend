@@ -1000,6 +1000,18 @@ const getArVoidBlockById = async (db, id) => {
     return b ? { ...b, message: arBlockMessage(b) } : null;
 };
 
+// ใช้จาก IM: ใบแจ้งหนี้/ลดหนี้ที่เอกสาร IM สร้างให้ — สถานะ, เหตุที่ถอย/ยกเลิกไม่ได้ (ไม่นับ IM_SOURCE), งวดยังเปิดหรือไม่
+const getArLinkedState = async (db, id) => {
+    const info = (await db.query(AR_REVERSE_INFO_SQL, [id])).rows[0];
+    if (!info) return null;
+    const b = info.status === 'Posted' ? getArDependentBlock({ ...info, from_im: false }) : null;
+    return {
+        status: info.status, doc_no: info.doc_no, gl_entry_id: info.gl_entry_id,
+        block: b ? { ...b, message: arBlockMessage(b) } : null,
+        periodOpen: info.ar_status === 'OPEN' && (!info.gl_period_status || info.gl_period_status === 'OPEN'),
+    };
+};
+
 // ใบเสร็จที่อ้างเลขที่ใบวางบิลใน ref_no: โพสต์แล้วเคลียร์ยอดวางบิล → ถอย/ยกเลิกต้องคืนยอดวางบิล
 const restoreBillCollection = async (client, refNo) => {
     if (!refNo) return;
@@ -1440,12 +1452,13 @@ const updateTransaction = async (req, res) => {
 // คืนยอดคงค้างให้เอกสารที่จับคู่ไว้ ยกเลิกรายการรับเงินผ่านธนาคารที่ยังรอเคลียร์ และคืนยอดวางบิล
 // ตัวงานแยกเป็น voidArDocument ให้ CM เรียกใช้ตอนบันทึกเช็คคืนได้ (ทำใน transaction ของผู้เรียก)
 // คืนค่า { error, code, ref, httpStatus } เมื่อทำไม่ได้ หรือ { reversingGlId } เมื่อสำเร็จ
-const voidArDocument = async (client, id, { voidReason, userId, userName }) => {
+const voidArDocument = async (client, id, { voidReason, userId, userName, fromIm = false }) => {
         const lock = await client.query(`SELECT * FROM ar_transaction WHERE id=$1 FOR UPDATE`, [id]);
         if (lock.rows.length === 0) return { error: 'Not found', httpStatus: 404 };
         const tx = lock.rows[0];
         const info = (await client.query(AR_REVERSE_INFO_SQL, [id])).rows[0];
-        const block = getArVoidBlock(info);
+        // fromIm = เรียกจากเอกสาร IM ต้นทาง → ข้ามเงื่อนไข IM_SOURCE
+        const block = getArVoidBlock(fromIm ? { ...info, from_im: false } : info);
         if (block) return { error: arBlockMessage(block), code: block.code, ref: block.ref || null };
 
         const voidDate = todayYmd();
@@ -1999,6 +2012,7 @@ module.exports = {
     voidTransaction,
     voidArDocument,
     getArVoidBlockById,
+    getArLinkedState,
     reverseTransaction,
     deleteTransaction,
     fetchRows,

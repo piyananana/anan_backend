@@ -701,7 +701,7 @@ const closeTransaction = async (req, res) => {
             }
 
             const periodRes = await client.query(
-                `SELECT id FROM gl_posting_period WHERE $1::date BETWEEN period_start_date AND period_end_date AND gl_status = 'OPEN' AND im_status != 'CLOSED' LIMIT 1`,
+                `SELECT id FROM gl_posting_period WHERE $1::date BETWEEN period_start_date AND period_end_date AND gl_status = 'OPEN' AND im_status = 'OPEN' LIMIT 1`,
                 [closeDate]
             );
             if (periodRes.rows.length === 0) throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่ปิด ${closeDate}`);
