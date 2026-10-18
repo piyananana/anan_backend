@@ -8,6 +8,9 @@
 // AR/AP ตอน Post เท่านั้น (ดู postCmReceiptsHelper ใน arTransactionController.js และ
 // postCmPaymentHelper ใน apTransactionController.js) จึงไม่ผ่าน createTransaction/postGlEntry เลย
 
+const { today: todayYmd } = require('../../utils/dateUtil');
+const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
+
 // --- Helper: Generate Document Number (คัดลอกจาก apTransactionController.js) ---
 const generateDocNo = async (client, docId, date, branchId = null) => {
     let config = null;
@@ -191,7 +194,8 @@ const resolvePaymentGlAccount = async (client, payment) => {
 };
 
 // --- Post GL entry — branches by sys_doc_type, mirrors apTransactionController.js's postGlEntry ---
-const postGlEntry = async (client, headerId, header, details, applies, payments, docNo) => {
+// reservedGlDocNo: เลขที่รายการบัญชีเดิมของเอกสารที่ถอยเป็นร่าง (cm_transaction.gl_doc_no) — โพสต์ใหม่ใช้เลขเดิม
+const postGlEntry = async (client, headerId, header, details, applies, payments, docNo, reservedGlDocNo = null) => {
     const periodRes = await client.query(
         `SELECT id FROM gl_posting_period
          WHERE $1::date BETWEEN period_start_date AND period_end_date
@@ -216,7 +220,7 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
     if (!setup) throw new Error('ยังไม่ได้ตั้งค่าบัญชีสำหรับประเภทเอกสารนี้ กรุณาตั้งค่าใน CM GL Account Setup');
     if (!setup.gl_doc_id) throw new Error('ยังไม่ได้ตั้งค่า GL Document Type ใน CM GL Account Setup สำหรับประเภทเอกสารนี้');
 
-    let glDocNo = await generateDocNo(client, setup.gl_doc_id, header.doc_date, header.branch_id);
+    let glDocNo = reservedGlDocNo || await generateDocNo(client, setup.gl_doc_id, header.doc_date, header.branch_id);
     if (!glDocNo) glDocNo = `GL-${docNo}`;
 
     const totalAmountLc = Number(header.total_amount_lc) || 0;
@@ -293,6 +297,13 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
     const totalDebitFc  = glDetails.reduce((s, l) => s + l.debit_fc, 0);
     const totalCreditFc = glDetails.reduce((s, l) => s + l.credit_fc, 0);
 
+    // gl_entry_header.created_by เป็นรหัสผู้ใช้ (INT) แต่หน้าจอส่งชื่อผู้ใช้มา → แปลงก่อน (เดิมส่งชื่อตรงๆ ทำให้โพสต์ไม่ได้)
+    let createdByUserId = null;
+    if (header.created_by) {
+        const uRes = await client.query(`SELECT id FROM sa_user WHERE user_name = $1 LIMIT 1`, [String(header.created_by)]);
+        createdByUserId = uRes.rows[0]?.id || null;
+    }
+
     const glHeaderRes = await client.query(`
         INSERT INTO gl_entry_header
         (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
@@ -306,10 +317,11 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
         header.ref_no || docNo, header.description || docNo,
         header.currency_id || null, exchangeRate,
         totalDebitLc, totalCreditLc, totalDebitFc, totalCreditFc,
-        header.created_by || null,
+        createdByUserId,
         header.doc_id, docNo,
     ]);
     const glHeaderId = glHeaderRes.rows[0].id;
+    await client.query(`UPDATE cm_transaction SET gl_doc_no=$1 WHERE id=$2`, [glDocNo, headerId]);
 
     // Dimension validation — เหมือน apTransactionController.js/arTransactionController.js:
     // ใช้ dim ระดับหัวเอกสารแปะลงทุก GL line ที่สร้าง แล้วตรวจสอบว่าครบตาม gl_account_dim_rule ของแต่ละบัญชีหรือไม่
@@ -364,15 +376,78 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
     return glHeaderId;
 };
 
+// --- Helper: คำนวณยอดเติมเงินแล้ว/คงค้างของใบเบิกเงินสดย่อย (40) จาก apply ของใบเติมเงิน (30) ---
+// นับเฉพาะใบเติมเงินที่ยังไม่ยกเลิก/ลบ (ร่างนับด้วย เพื่อกันเติมซ้ำระหว่างทำร่าง)
+const recalcVoucherBalances = async (client, voucherIds) => {
+    const ids = [...new Set((voucherIds || []).map(Number).filter(Boolean))];
+    if (ids.length === 0) return;
+    await client.query(`
+        UPDATE cm_transaction t SET
+            paid_amount_lc    = x.paid,
+            balance_amount_lc = t.total_amount_lc - x.paid,
+            updated_at = NOW()
+          FROM (SELECT v.id, COALESCE(SUM(a.applied_amount_lc), 0) AS paid
+                  FROM cm_transaction v
+                  LEFT JOIN cm_transaction_apply a ON a.applied_to_id = v.id
+                       AND EXISTS (SELECT 1 FROM cm_transaction s
+                                    WHERE s.id = a.transaction_id AND s.status NOT IN ('Void', 'Deleted'))
+                 WHERE v.id = ANY($1::int[])
+                 GROUP BY v.id) x
+         WHERE t.id = x.id`, [ids]);
+};
+
+const appliedVoucherIds = async (client, transactionId) => (await client.query(
+    `SELECT DISTINCT applied_to_id FROM cm_transaction_apply WHERE transaction_id = $1`, [transactionId]
+)).rows.map(r => r.applied_to_id);
+
+// --- ถอยเป็นร่าง / ยกเลิก: ตรวจว่าทำได้หรือไม่ ---
+// คืน null = ทำได้ หรือ { code, ref } = ทำไม่ได้ (หน้าจอใช้ code แสดงเหตุผล 2 ภาษา, ref = เลขที่เอกสารที่อ้างอิง)
+const CM_REVERSE_INFO_SQL = `
+    SELECT t.id, t.doc_no, t.status, t.gl_entry_id, d.sys_doc_type,
+           p.cm_status, gp.gl_status AS gl_period_status,
+           (SELECT string_agg(DISTINCT s.doc_no, ', ')
+              FROM cm_transaction_apply a JOIN cm_transaction s ON s.id = a.transaction_id
+             WHERE a.applied_to_id = t.id AND a.transaction_id <> t.id
+               AND s.status NOT IN ('Void', 'Deleted')) AS applied_by
+      FROM cm_transaction t
+      JOIN sa_module_document d ON d.id = t.doc_id
+      LEFT JOIN gl_posting_period p  ON p.id = t.period_id
+      LEFT JOIN gl_entry_header   g  ON g.id = t.gl_entry_id
+      LEFT JOIN gl_posting_period gp ON gp.id = g.period_id
+     WHERE t.id = $1`;
+
+// ถอยเป็นร่าง (Posted → Draft): งวด CM ของเอกสารและงวด GL ของรายการบัญชียังเปิด และไม่มีใบเติมเงินอ้างอิง
+const getCmReverseBlock = (r) => {
+    if (r.status !== 'Posted') return { code: 'NOT_REVERSIBLE' };
+    if (r.cm_status !== 'OPEN' || (r.gl_period_status && r.gl_period_status !== 'OPEN')) return { code: 'PERIOD_CLOSED' };
+    if (r.applied_by) return { code: 'APPLIED', ref: r.applied_by };
+    return null;
+};
+
+// ยกเลิก (Posted → Void): ใช้เมื่อถอยเป็นร่างไม่ได้ ไม่ดูงวดของเอกสารเดิม เพราะลงรายการกลับในงวดของวันที่ยกเลิก
+const getCmVoidBlock = (r) => {
+    if (r.status !== 'Posted') return { code: 'NOT_POSTED' };
+    if (r.applied_by) return { code: 'APPLIED', ref: r.applied_by };
+    return null;
+};
+
+const CM_BLOCK_MESSAGES = {
+    NOT_REVERSIBLE: 'ถอยได้เฉพาะเอกสารที่โพสต์แล้ว',
+    NOT_POSTED:     'ยกเลิกได้เฉพาะเอกสารที่โพสต์แล้ว (เอกสารร่างให้ลบแทน)',
+    PERIOD_CLOSED:  'งวดบัญชีของเอกสารนี้ปิดแล้ว ถอยเป็นร่างไม่ได้',
+    APPLIED:        'ใบเบิกนี้ถูกนำไปเติมเงินสดย่อยแล้ว',
+};
+const cmBlockMessage = (b) => CM_BLOCK_MESSAGES[b.code] + (b.ref ? ` (${b.ref})` : '');
+
 // --- Fetch helper ---
 const fetchRowById = async (pool, id) => {
     const [hRes, dRes, aRes, pRes] = await Promise.all([
         pool.query(`
             SELECT t.*,
                    d.doc_code, d.doc_name_thai, d.doc_name_eng, d.sys_doc_type, d.is_auto_numbering,
-                   fb.bank_name_th AS from_bank_name, fb.account_number AS from_account_number,
-                   tb.bank_name_th AS to_bank_name, tb.account_number AS to_account_number,
-                   bb.bank_name_th AS bank_name, bb.account_number AS bank_account_number,
+                   COALESCE(fcb.bank_name_thai, fb.account_name_th) AS from_bank_name, fb.account_number AS from_account_number,
+                   COALESCE(tcb.bank_name_thai, tb.account_name_th) AS to_bank_name, tb.account_number AS to_account_number,
+                   COALESCE(bcb.bank_name_thai, bb.account_name_th) AS bank_name, bb.account_number AS bank_account_number,
                    b.branch_code, b.branch_name_thai,
                    dim1.value_name_thai AS dim1_name, dim2.value_name_thai AS dim2_name,
                    dim3.value_name_thai AS dim3_name, dim4.value_name_thai AS dim4_name, dim5.value_name_thai AS dim5_name
@@ -381,6 +456,9 @@ const fetchRowById = async (pool, id) => {
             LEFT JOIN cm_bank_account fb ON fb.id = t.from_bank_account_id
             LEFT JOIN cm_bank_account tb ON tb.id = t.to_bank_account_id
             LEFT JOIN cm_bank_account bb ON bb.id = t.bank_account_id
+            LEFT JOIN cd_bank fcb ON fcb.id = fb.bank_id
+            LEFT JOIN cd_bank tcb ON tcb.id = tb.bank_id
+            LEFT JOIN cd_bank bcb ON bcb.id = bb.bank_id
             LEFT JOIN cd_branch b ON b.id = t.branch_id
             LEFT JOIN gl_dimension_value dim1 ON dim1.id = t.dim1_id
             LEFT JOIN gl_dimension_value dim2 ON dim2.id = t.dim2_id
@@ -402,7 +480,17 @@ const fetchRowById = async (pool, id) => {
             .catch(() => ({ rows: [] })),
     ]);
     if (hRes.rows.length === 0) return null;
-    return { ...hRes.rows[0], details: dRes.rows, applies: aRes.rows, payments: pRes.rows };
+    const info = (await pool.query(CM_REVERSE_INFO_SQL, [id])).rows[0];
+    const rBlock = info ? getCmReverseBlock(info) : null;
+    const vBlock = info ? getCmVoidBlock(info) : null;
+    return {
+        ...hRes.rows[0], details: dRes.rows, applies: aRes.rows, payments: pRes.rows,
+        reverse_block: rBlock ? rBlock.code : null,
+        reverse_block_ref: rBlock ? (rBlock.ref || null) : null,
+        void_block: vBlock ? vBlock.code : null,
+        void_block_ref: vBlock ? (vBlock.ref || null) : null,
+        reverse_history: await getReverseHistory(pool, 'cm_transaction', Number(id)),
+    };
 };
 
 // --- GET list ---
@@ -454,6 +542,7 @@ const fetchRows = async (req, res) => {
             JOIN sa_module_document d ON d.id = t.doc_id
             WHERE 1=1`;
         const params = []; let pi = 1;
+        if (status !== 'Deleted') query += ` AND t.status <> 'Deleted'`;
         if (doc_type)  { params.push(doc_type);  query += ` AND d.sys_doc_type = $${pi++}`; }
         if (status)    { params.push(status);    query += ` AND t.status = $${pi++}`; }
         if (date_from) { params.push(date_from); query += ` AND t.doc_date >= $${pi++}`; }
@@ -603,17 +692,7 @@ const createTransaction = async (req, res) => {
                 VALUES ($1,$2,$3,$4,$5,$6)
             `, [newHeaderId, a.applied_to_id, a.applied_amount_lc || 0, a.applied_amount_fc || 0, header.doc_date, header.created_by || null]);
         }
-        const affectedVoucherIds = [...new Set((applies || []).map(a => a.applied_to_id).filter(Boolean))];
-        for (const voucherId of affectedVoucherIds) {
-            await client.query(`
-                UPDATE cm_transaction t SET
-                    paid_amount_lc = (SELECT COALESCE(SUM(a.applied_amount_lc),0) FROM cm_transaction_apply a WHERE a.applied_to_id = t.id),
-                    balance_amount_lc = t.total_amount_lc -
-                        (SELECT COALESCE(SUM(a.applied_amount_lc),0) FROM cm_transaction_apply a WHERE a.applied_to_id = t.id),
-                    updated_at = NOW()
-                WHERE id = $1
-            `, [voucherId]);
-        }
+        await recalcVoucherBalances(client, (applies || []).map(a => a.applied_to_id));
 
         let pmLineNo = 1;
         for (const p of (payments || [])) {
@@ -665,10 +744,11 @@ const updateTransaction = async (req, res) => {
         await client.query('BEGIN');
         await ensureTables(req.dbPool);
 
-        const existing = await client.query(`SELECT status, doc_no FROM cm_transaction WHERE id=$1`, [id]);
+        const existing = await client.query(`SELECT status, doc_no, gl_doc_no FROM cm_transaction WHERE id=$1 FOR UPDATE`, [id]);
         if (existing.rows.length === 0) throw new Error('Not found');
         if (existing.rows[0].status !== 'Draft') throw new Error('แก้ไขได้เฉพาะเอกสาร Draft เท่านั้น');
         const existingDocNo = existing.rows[0].doc_no;
+        const oldVoucherIds = await appliedVoucherIds(client, id);
 
         const periodRes = await client.query(
             `SELECT id FROM gl_posting_period
@@ -720,17 +800,7 @@ const updateTransaction = async (req, res) => {
                 VALUES ($1,$2,$3,$4,$5,$6)
             `, [id, a.applied_to_id, a.applied_amount_lc || 0, a.applied_amount_fc || 0, header.doc_date, header.updated_by || null]);
         }
-        const affectedVoucherIds = [...new Set((applies || []).map(a => a.applied_to_id).filter(Boolean))];
-        for (const voucherId of affectedVoucherIds) {
-            await client.query(`
-                UPDATE cm_transaction t SET
-                    paid_amount_lc = (SELECT COALESCE(SUM(a.applied_amount_lc),0) FROM cm_transaction_apply a WHERE a.applied_to_id = t.id),
-                    balance_amount_lc = t.total_amount_lc -
-                        (SELECT COALESCE(SUM(a.applied_amount_lc),0) FROM cm_transaction_apply a WHERE a.applied_to_id = t.id),
-                    updated_at = NOW()
-                WHERE id = $1
-            `, [voucherId]);
-        }
+        await recalcVoucherBalances(client, [...oldVoucherIds, ...(applies || []).map(a => a.applied_to_id)]);
         let pmLineNo = 1;
         for (const p of (payments || [])) {
             await client.query(`
@@ -752,7 +822,7 @@ const updateTransaction = async (req, res) => {
         if (action === 'Post') {
             const glEntryId = await postGlEntry(
                 client, id, { ...header, doc_no: existingDocNo, created_by: header.updated_by },
-                details || [], applies || [], payments || [], existingDocNo
+                details || [], applies || [], payments || [], existingDocNo, existing.rows[0].gl_doc_no
             );
             await client.query(
                 `UPDATE cm_transaction SET status='Posted', gl_entry_id=$1 WHERE id=$2`,
@@ -772,33 +842,83 @@ const updateTransaction = async (req, res) => {
     }
 };
 
-// --- Void ---
+// --- Void (Posted → Void) ---
+// เก็บรายการบัญชีเดิมไว้ครบ แล้วลงรายการกลับ (สลับเดบิต/เครดิต) ลงวันที่ยกเลิก ในงวดที่เปิดอยู่
+// (เดิมเปลี่ยนรายการบัญชีเดิมเป็น Void ซึ่งแก้ยอดในงวดเดิมย้อนหลัง แม้งวดนั้นปิดแล้ว)
+// ใบเติมเงินสดย่อย (30): คืนยอดคงค้างให้ใบเบิกที่เติมไว้
 const voidTransaction = async (req, res) => {
     const { id } = req.params;
+    const voidReason = (req.body?.void_reason || '').trim();
+    const userId = req.body?.user_id || req.headers['userid'] || null;
+    const userName = req.headers['username'] || null;
+    if (!voidReason) return res.status(400).json({ message: 'กรุณาระบุเหตุผลการยกเลิก' });
+
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
-        const existing = await client.query(`SELECT * FROM cm_transaction WHERE id=$1`, [id]);
-        if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
-        const tx = existing.rows[0];
-        if (tx.status === 'Void') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'เอกสารถูก Void แล้ว' }); }
-
-        const applies = (await client.query(`SELECT * FROM cm_transaction_apply WHERE transaction_id=$1`, [id])).rows;
-        for (const a of applies) {
-            await client.query(`
-                UPDATE cm_transaction t SET
-                    paid_amount_lc = GREATEST(0, t.paid_amount_lc - $1),
-                    balance_amount_lc = t.total_amount_lc - GREATEST(0, t.paid_amount_lc - $1),
-                    updated_at = NOW()
-                WHERE id = $2
-            `, [a.applied_amount_lc, a.applied_to_id]);
+        const lock = await client.query(`SELECT * FROM cm_transaction WHERE id=$1 FOR UPDATE`, [id]);
+        if (lock.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
+        const tx = lock.rows[0];
+        const info = (await client.query(CM_REVERSE_INFO_SQL, [id])).rows[0];
+        const block = getCmVoidBlock(info);
+        if (block) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ message: cmBlockMessage(block), code: block.code, ref: block.ref || null });
         }
 
+        const voidDate = todayYmd();
+        let reversingGlId = null;
         if (tx.gl_entry_id) {
-            await client.query(`UPDATE gl_entry_header SET status='Void', updated_at=NOW() WHERE id=$1`, [tx.gl_entry_id]);
+            const perRes = await client.query(`
+                SELECT id FROM gl_posting_period
+                 WHERE $1::date BETWEEN period_start_date AND period_end_date
+                   AND gl_status = 'OPEN' AND cm_status = 'OPEN' LIMIT 1`, [voidDate]);
+            if (perRes.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ message: `ไม่พบงวดบัญชี (GL/CM) ที่เปิดอยู่ สำหรับวันที่ยกเลิก ${voidDate}` });
+            }
+            const orig = (await client.query(`SELECT * FROM gl_entry_header WHERE id=$1`, [tx.gl_entry_id])).rows[0];
+            let revDocNo = await generateDocNo(client, orig.doc_id, voidDate, tx.branch_id);
+            if (!revDocNo) revDocNo = `RV-${orig.doc_no}`;
+
+            const revRes = await client.query(`
+                INSERT INTO gl_entry_header
+                (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
+                 currency_id, exchange_rate, status,
+                 total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
+                 created_by, branch_id, ref_doc_id, ref_doc_no, ref_doc_date)
+                VALUES ($1,$2,$3,$3,$4,$5,$6,$7,$8,'Posted',$9,$10,$11,$12,$13,$14,$15,$16,$17)
+                RETURNING id`, [
+                orig.doc_id, revDocNo, voidDate, perRes.rows[0].id,
+                orig.ref_no, `[ยกเลิก ${tx.doc_no}] ${voidReason}`,
+                orig.currency_id, orig.exchange_rate,
+                orig.total_credit_lc, orig.total_debit_lc, orig.total_credit_fc, orig.total_debit_fc,
+                orig.created_by, orig.branch_id,
+                tx.doc_id, tx.doc_no, tx.doc_date,
+            ]);
+            reversingGlId = revRes.rows[0].id;
+            await client.query(`
+                INSERT INTO gl_entry_detail
+                (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc,
+                 branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+                SELECT $1, line_no, account_id, '[ยกเลิก] ' || COALESCE(description, ''),
+                       credit_lc, debit_lc, credit_fc, debit_fc,
+                       branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id
+                  FROM gl_entry_detail WHERE header_id = $2 ORDER BY line_no`,
+                [reversingGlId, tx.gl_entry_id]);
         }
 
-        await client.query(`UPDATE cm_transaction SET status='Void', updated_at=NOW() WHERE id=$1`, [id]);
+        await client.query(`
+            UPDATE cm_transaction SET status='Void', void_reason=$1, voided_by=$2, voided_at=NOW(),
+                   void_gl_entry_id=$3, updated_by=$2, updated_at=NOW()
+             WHERE id=$4`, [voidReason, userName, reversingGlId, id]);
+        // คำนวณหลังเปลี่ยนสถานะ จึงไม่นับใบเติมเงินนี้แล้ว
+        await recalcVoucherBalances(client, await appliedVoucherIds(client, id));
+        await logReverse(client, {
+            sysModule: '81', tableName: 'cm_transaction', recordId: Number(id),
+            docNo: tx.doc_no, fromStatus: 'Posted', toStatus: 'Void', reason: voidReason, userId,
+        });
+
         await client.query('COMMIT');
         const full = await fetchRowById(req.dbPool, id);
         res.status(200).json(full);
@@ -811,22 +931,91 @@ const voidTransaction = async (req, res) => {
     }
 };
 
-// --- Delete (Draft only) ---
-const deleteTransaction = async (req, res) => {
+// --- Reverse to Draft (Posted → Draft) ---
+// ลบรายการบัญชีที่ระบบสร้าง แต่เก็บเลขที่ไว้ที่ cm_transaction.gl_doc_no — โพสต์ใหม่ใช้เลขเดิม
+// apply ของใบเติมเงินยังอยู่กับร่าง (ร่างนับยอดอยู่แล้ว ตามที่ create/update ทำ) จึงไม่ต้องปรับยอด
+// เลขที่เอกสาร CM คงเดิม และบันทึกประวัติการถอยที่ sa_document_reverse_log
+const reverseTransaction = async (req, res) => {
     const { id } = req.params;
+    const reason = (req.body?.reason || '').trim();
+    const userId = req.body?.user_id || req.headers['userid'] || null;
+    const userName = req.headers['username'] || null;
+    if (!reason) return res.status(400).json({ message: 'กรุณาระบุเหตุผลการถอยเอกสาร' });
+
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
-        const existing = await client.query(`SELECT status FROM cm_transaction WHERE id=$1`, [id]);
-        if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
-        if (existing.rows[0].status !== 'Draft') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'ลบได้เฉพาะเอกสาร Draft เท่านั้น' }); }
-        await client.query(`DELETE FROM cm_transaction WHERE id=$1`, [id]);
+        const lock = await client.query(`SELECT id FROM cm_transaction WHERE id=$1 FOR UPDATE`, [id]);
+        if (lock.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
+        const info = (await client.query(CM_REVERSE_INFO_SQL, [id])).rows[0];
+        const block = getCmReverseBlock(info);
+        if (block) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ message: cmBlockMessage(block), code: block.code, ref: block.ref || null });
+        }
+
+        if (info.gl_entry_id) {
+            // ตัดการอ้างอิงก่อนลบรายการบัญชี
+            await client.query(`UPDATE cm_transaction SET gl_entry_id=NULL WHERE id=$1`, [id]);
+            await client.query(`DELETE FROM gl_entry_header WHERE id=$1`, [info.gl_entry_id]);
+        }
+        await client.query(`
+            UPDATE cm_transaction SET status='Draft', gl_entry_id=NULL, updated_at=NOW(), updated_by=$1 WHERE id=$2`,
+            [userName, id]);
+        await logReverse(client, {
+            sysModule: '81', tableName: 'cm_transaction', recordId: Number(id),
+            docNo: info.doc_no, fromStatus: info.status, reason, userId,
+        });
+
         await client.query('COMMIT');
-        res.status(204).send();
+        const full = await fetchRowById(req.dbPool, id);
+        res.status(200).json(full);
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error reversing cm_transaction:', error);
+        res.status(500).json({ message: error.message || 'Internal server error' });
+    } finally {
+        client.release();
+    }
+};
+
+// --- Delete (Draft only) ---
+// เอกสารที่โพสต์แล้วต้องถอยเป็นร่างก่อนจึงลบได้ (กันลบโดยไม่ตั้งใจ)
+// ลบแล้วยังเก็บแถวไว้ด้วยสถานะ 'Deleted' เพื่อตรวจสอบ แต่นำกลับมาใช้ไม่ได้ และคืนยอดคงค้างให้ใบเบิกที่เติมไว้
+// (เดิมลบแถวจริง ทำให้ apply หายไปด้วย แต่ยอดของใบเบิกไม่ถูกคืน)
+const deleteTransaction = async (req, res) => {
+    const { id } = req.params;
+    const reason = (req.body?.reason || '').trim();
+    const userId = req.body?.user_id || req.headers['userid'] || null;
+    const userName = req.headers['username'] || null;
+    if (!reason) return res.status(400).json({ message: 'กรุณาระบุเหตุผลการลบเอกสาร' });
+
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        const existing = await client.query(`SELECT id, doc_no, status FROM cm_transaction WHERE id=$1 FOR UPDATE`, [id]);
+        if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
+        const tx = existing.rows[0];
+        if (tx.status !== 'Draft') {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                message: tx.status === 'Posted'
+                    ? 'เอกสารที่โพสต์แล้วลบไม่ได้ กรุณาถอยเป็นร่างก่อน'
+                    : 'ลบได้เฉพาะเอกสาร Draft เท่านั้น',
+            });
+        }
+        await client.query(`UPDATE cm_transaction SET status='Deleted', updated_at=NOW(), updated_by=$1 WHERE id=$2`, [userName, id]);
+        await recalcVoucherBalances(client, await appliedVoucherIds(client, id));
+        await logReverse(client, {
+            sysModule: '81', tableName: 'cm_transaction', recordId: Number(id),
+            docNo: tx.doc_no, fromStatus: tx.status, toStatus: 'Deleted', reason, userId,
+        });
+        await client.query('COMMIT');
+        res.status(200).json({ message: 'Deleted' });
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error deleting cm_transaction:', error);
-        res.status(500).json({ message: 'Internal server error' });
+        res.status(500).json({ message: error.message || 'Internal server error' });
     } finally {
         client.release();
     }
@@ -834,5 +1023,5 @@ const deleteTransaction = async (req, res) => {
 
 module.exports = {
     fetchRows, fetchRow, fetchReceiptView, fetchPaymentView, fetchOpenVouchers,
-    createTransaction, updateTransaction, voidTransaction, deleteTransaction,
+    createTransaction, updateTransaction, voidTransaction, reverseTransaction, deleteTransaction,
 };

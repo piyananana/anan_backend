@@ -88,6 +88,7 @@ router.get('/cm_transaction/:id',             cmTransactionController.fetchRow);
 router.post('/cm_transaction',                cmTransactionController.createTransaction);
 router.put('/cm_transaction/:id',             cmTransactionController.updateTransaction);
 router.put('/cm_transaction/:id/void',        cmTransactionController.voidTransaction);
+router.put('/cm_transaction/:id/reverse',     cmTransactionController.reverseTransaction);
 router.delete('/cm_transaction/:id',          cmTransactionController.deleteTransaction);
 
 // cm_transaction_gl_setup — ตั้งค่าบัญชี GL ต่อประเภทเอกสาร (คู่กับ cm_transaction ด้านบน)
