@@ -1,4 +1,5 @@
 // File: controllers/gl/glEntriesController.js
+const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 
 // --- Helper: Validate required dimensions per detail line before Post ---
 const validateDimRules = async (client, details) => {
@@ -198,6 +199,10 @@ const createTransaction = async (req, res) => {
         res.status(201).json({ message: 'Success', id: newHeaderId, doc_no: finalDocNo });
     } catch (err) {
         await client.query('ROLLBACK');
+        // เลขที่เอกสารซ้ำ (รวมเลขของรายการที่ลบแล้ว ซึ่งนำกลับมาใช้ไม่ได้)
+        if (err.code === '23505' && err.constraint === 'gl_entry_header_doc_no_key') {
+            return res.status(400).json({ error: 'เลขที่เอกสารนี้ถูกใช้แล้ว (รวมถึงรายการที่ลบแล้ว) กรุณาใช้เลขที่อื่น' });
+        }
         res.status(500).json({ error: err.message });
     } finally {
         client.release();
@@ -293,44 +298,119 @@ const updateTransaction = async (req, res) => {
 };
 
 // --- 3. Soft Delete (Change Status) ---
+// ลบได้เฉพาะร่าง (รายการที่โพสต์แล้วต้องถอยเป็นร่างก่อน กันลบโดยไม่ตั้งใจ)
+// ลบแล้วยังเก็บแถวไว้ด้วยสถานะ 'Deleted' เพื่อตรวจสอบ แต่แก้ไข/โพสต์/นำกลับมาใช้ไม่ได้
+// และเลขที่เอกสาร (unique) ไม่ถูกนำไปใช้ซ้ำ
 const deleteTransaction = async (req, res) => {
     const { id } = req.params;
+    const reason = (req.body?.reason || '').trim();
+    const userId = req.body?.user_id || req.headers['userid'] || null;
+    if (!reason) return res.status(400).json({ error: 'กรุณาระบุเหตุผลการลบรายการ' });
+
+    const client = await req.dbPool.connect();
     try {
-        const result = await req.dbPool.query(
-            `UPDATE gl_entry_header SET status = 'Deleted' WHERE id = $1 AND status = 'Draft' RETURNING id`, 
-            [id]
+        await client.query('BEGIN');
+        const r = await client.query('SELECT id, doc_no, status FROM gl_entry_header WHERE id = $1 FOR UPDATE', [id]);
+        const row = r.rows[0];
+        if (!row) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Not found' });
+        }
+        if (row.status !== 'Draft') {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                error: row.status === 'Posted'
+                    ? 'รายการที่โพสต์แล้วลบไม่ได้ กรุณาถอยเป็นร่างก่อน'
+                    : `รายการสถานะ ${row.status} ลบไม่ได้`,
+            });
+        }
+
+        await client.query(
+            `UPDATE gl_entry_header SET status = 'Deleted', updated_by = $2, updated_at = NOW() WHERE id = $1`,
+            [id, userId]
         );
-        if (result.rowCount === 0) return res.status(400).json({ error: 'Cannot delete: Not found or not Draft' });
+        await logReverse(client, {
+            sysModule: '01', tableName: 'gl_entry_header', recordId: row.id,
+            docNo: row.doc_no, fromStatus: row.status, toStatus: 'Deleted', reason, userId,
+        });
+
+        await client.query('COMMIT');
         res.json({ message: 'Deleted' });
     } catch (err) {
+        await client.query('ROLLBACK');
         res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
     }
 };
 
-// --- 4. Reverse Transaction ---
+// --- 4. Reverse Transaction (Posted -> Draft) ---
+// ถอยกลับเป็นร่างเพื่อแก้ไขแล้วโพสต์ใหม่ด้วยเลขที่เดิม (ไม่เกิดเอกสารยกเลิก)
+// ถอยได้เฉพาะรายการที่บันทึกใน GL เอง และงวดบัญชีของรายการยังเปิดอยู่
+// คืนค่า null ถ้าถอยได้ หรือรหัสเหตุผลที่ถอยไม่ได้ (หน้าจอใช้ล็อกปุ่มถอย)
+const getReverseBlock = (row) => {
+    if (row.status !== 'Posted') return 'NOT_POSTED';
+    // สร้างจากโมดูลอื่น (AR/AP/CM/IM/MO) ต้องถอย/ยกเลิกจากเอกสารต้นทาง
+    if (row.external_source_id || (row.sys_doc_type && row.sys_doc_type >= '80')) return 'MODULE';
+    // รายการปิดบัญชี / โอนกำไรสะสม / ยกยอดไปปีใหม่ จากหน้าจอปิดบัญชีสิ้นปี
+    if (row.sys_doc_type === '70' || row.is_year_end_entry) return 'CLOSING';
+    if (row.period_gl_status !== 'OPEN') return 'PERIOD_CLOSED';
+    return null;
+};
+
+const REVERSE_BLOCK_MESSAGES = {
+    NOT_POSTED:    'ถอยได้เฉพาะรายการที่โพสต์แล้ว',
+    MODULE:        'รายการนี้สร้างจากโมดูลอื่น ไม่สามารถถอยจาก GL ได้ กรุณาถอย/ยกเลิกจากเอกสารต้นทาง',
+    CLOSING:       'รายการปิดบัญชีสิ้นปี ไม่สามารถถอยจากหน้าจอบันทึกรายการบัญชีได้',
+    PERIOD_CLOSED: 'งวดบัญชีของรายการนี้ปิดแล้ว ไม่สามารถถอยเป็นร่างได้',
+};
+
+// ข้อมูลที่ใช้ตัดสินว่าถอยได้หรือไม่ (ใช้ทั้งตอนถอยและตอนเปิดดูรายการ)
+const REVERSE_INFO_SQL = `
+    SELECT h.id, h.doc_no, h.status, h.external_source_id,
+           d.sys_doc_type, p.gl_status AS period_gl_status,
+           EXISTS (SELECT 1 FROM gl_year_end_closing y
+                    WHERE h.id IN (y.step3_entry_id, y.step4_entry_id, y.step5_entry_id)) AS is_year_end_entry
+      FROM gl_entry_header h
+      LEFT JOIN sa_module_document d ON d.id = h.doc_id
+      LEFT JOIN gl_posting_period p ON p.id = h.period_id
+     WHERE h.id = $1`;
+
 const reverseTransaction = async (req, res) => {
     const { id } = req.params;
+    const reason = (req.body?.reason || '').trim();
+    const userId = req.body?.user_id || req.headers['userid'] || null;
+    if (!reason) return res.status(400).json({ error: 'กรุณาระบุเหตุผลการถอยรายการ' });
+
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
 
-        // Check Status and source
-        const checkRes = await client.query(
-            'SELECT status, external_source_id FROM gl_entry_header WHERE id = $1', [id]
-        );
-        if (!checkRes.rows[0]) return res.status(404).json({ error: 'Not found' });
-
-        // ถ้าสร้างมาจากโมดูลอื่น (AR, AP ฯลฯ) → ห้ามถอยจาก GL โดยตรง
-        if (checkRes.rows[0].external_source_id) {
-            return res.status(403).json({
-                error: 'รายการนี้สร้างจากโมดูลอื่น ไม่สามารถถอยจาก GL ได้ กรุณายกเลิกจากโมดูลต้นทาง'
-            });
+        // ล็อกหัวเอกสารกันถอย/แก้ไขพร้อมกัน
+        await client.query('SELECT id FROM gl_entry_header WHERE id = $1 FOR UPDATE', [id]);
+        const infoRes = await client.query(REVERSE_INFO_SQL, [id]);
+        const row = infoRes.rows[0];
+        if (!row) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Not found' });
         }
 
-        if (checkRes.rows[0].status !== 'Posted') throw new Error('Only Posted can be reversed');
+        const block = getReverseBlock(row);
+        if (block) {
+            await client.query('ROLLBACK');
+            return res.status(block === 'MODULE' ? 403 : 400).json({ error: REVERSE_BLOCK_MESSAGES[block], code: block });
+        }
 
-        // Update Status back to Draft (DB trigger removes it from gl_balance_accum)
-        await client.query(`UPDATE gl_entry_header SET status = 'Draft' WHERE id = $1`, [id]);
+        // กลับเป็นร่าง (DB trigger ตัดยอดออกจาก gl_balance_accum)  เลขที่เอกสารเดิมยังอยู่
+        await client.query(
+            `UPDATE gl_entry_header SET status = 'Draft', posted_by = NULL, posted_at = NULL,
+                    updated_by = $2, updated_at = NOW() WHERE id = $1`,
+            [id, userId]
+        );
+        await logReverse(client, {
+            sysModule: '01', tableName: 'gl_entry_header', recordId: row.id,
+            docNo: row.doc_no, fromStatus: row.status, reason, userId,
+        });
 
         await client.query('COMMIT');
         res.json({ message: 'Reversed to Draft' });
@@ -354,7 +434,7 @@ const getTransactions = async (req, res) => {
     let sql = `SELECT h.*, d.doc_code, d.doc_name_thai
                FROM gl_entry_header h
                JOIN sa_module_document d ON h.doc_id = d.id
-               WHERE h.status != 'Deleted' `;
+               WHERE 1 = 1 `;
     const params = [];
 
     if (period_id) {
@@ -386,8 +466,8 @@ const getTransactions = async (req, res) => {
         )`;
     }
 
-    // Sort: Draft First, then Doc No DESC (Latest)
-    sql += ` ORDER BY CASE WHEN h.status = 'Draft' THEN 0 ELSE 1 END, h.doc_no DESC LIMIT 100`;
+    // Sort: Draft First, Deleted last, then Doc No DESC (Latest)
+    sql += ` ORDER BY CASE h.status WHEN 'Draft' THEN 0 WHEN 'Deleted' THEN 2 ELSE 1 END, h.doc_no DESC LIMIT 100`;
 
     try {
         const result = await req.dbPool.query(sql, params);
@@ -437,9 +517,17 @@ const getTransactionById = async (req, res) => {
             ORDER BY d.line_no ASC
         `, [id]);
 
+        // สถานะการถอยเป็นร่าง (หน้าจอใช้ล็อกปุ่มถอยพร้อมเหตุผล) + ประวัติการถอย
+        const infoRes = await req.dbPool.query(REVERSE_INFO_SQL, [id]);
+        const header = {
+            ...headerRes.rows[0],
+            reverse_block: infoRes.rows[0] ? getReverseBlock(infoRes.rows[0]) : null,
+            reverse_history: await getReverseHistory(req.dbPool, 'gl_entry_header', id),
+        };
+
         // ส่งกลับในรูปแบบที่ Frontend (Service) รอรับ คือมี key "header" และ "details"
         res.json({
-            header: headerRes.rows[0],
+            header,
             details: detailsRes.rows
         });
 
