@@ -992,6 +992,14 @@ const AR_BLOCK_MESSAGES = {
 };
 const arBlockMessage = (b) => AR_BLOCK_MESSAGES[b.code] + (b.ref ? ` (${b.ref})` : '');
 
+// ใช้ภายนอกโมดูล (CM เช็คคืน): เหตุที่ยกเลิกเอกสาร AR ไม่ได้ พร้อมข้อความ หรือ null
+const getArVoidBlockById = async (db, id) => {
+    const info = (await db.query(AR_REVERSE_INFO_SQL, [id])).rows[0];
+    if (!info) return null;
+    const b = getArVoidBlock(info);
+    return b ? { ...b, message: arBlockMessage(b) } : null;
+};
+
 // ใบเสร็จที่อ้างเลขที่ใบวางบิลใน ref_no: โพสต์แล้วเคลียร์ยอดวางบิล → ถอย/ยกเลิกต้องคืนยอดวางบิล
 const restoreBillCollection = async (client, refNo) => {
     if (!refNo) return;
@@ -1430,25 +1438,15 @@ const updateTransaction = async (req, res) => {
 // ภาษีขาย: ยกเลิกในเดือนเดียวกับเอกสาร → ตัดรายการออก (is_voided), ข้ามเดือน → ลงรายการกลับในเดือนที่ยกเลิก
 //   เพื่อไม่ให้รายงานภาษีของเดือนที่ยื่นไปแล้วเปลี่ยน
 // คืนยอดคงค้างให้เอกสารที่จับคู่ไว้ ยกเลิกรายการรับเงินผ่านธนาคารที่ยังรอเคลียร์ และคืนยอดวางบิล
-const voidTransaction = async (req, res) => {
-    const { id } = req.params;
-    const voidReason = (req.body?.void_reason || '').trim();
-    const userId = req.body?.user_id || req.headers['userid'] || null;
-    const userName = req.body?.updated_by || req.headers['username'] || null;
-    if (!voidReason) return res.status(400).json({ error: 'กรุณาระบุเหตุผลการยกเลิก' });
-
-    const client = await req.dbPool.connect();
-    try {
-        await client.query('BEGIN');
+// ตัวงานแยกเป็น voidArDocument ให้ CM เรียกใช้ตอนบันทึกเช็คคืนได้ (ทำใน transaction ของผู้เรียก)
+// คืนค่า { error, code, ref, httpStatus } เมื่อทำไม่ได้ หรือ { reversingGlId } เมื่อสำเร็จ
+const voidArDocument = async (client, id, { voidReason, userId, userName }) => {
         const lock = await client.query(`SELECT * FROM ar_transaction WHERE id=$1 FOR UPDATE`, [id]);
-        if (lock.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
+        if (lock.rows.length === 0) return { error: 'Not found', httpStatus: 404 };
         const tx = lock.rows[0];
         const info = (await client.query(AR_REVERSE_INFO_SQL, [id])).rows[0];
         const block = getArVoidBlock(info);
-        if (block) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ error: arBlockMessage(block), code: block.code, ref: block.ref || null });
-        }
+        if (block) return { error: arBlockMessage(block), code: block.code, ref: block.ref || null };
 
         const voidDate = todayYmd();
         let reversingGlId = null;
@@ -1458,8 +1456,7 @@ const voidTransaction = async (req, res) => {
                  WHERE $1::date BETWEEN period_start_date AND period_end_date
                    AND gl_status = 'OPEN' AND ar_status = 'OPEN' LIMIT 1`, [voidDate]);
             if (perRes.rows.length === 0) {
-                await client.query('ROLLBACK');
-                return res.status(400).json({ error: `ไม่พบงวดบัญชี (GL/AR) ที่เปิดอยู่ สำหรับวันที่ยกเลิก ${voidDate}` });
+                return { error: `ไม่พบงวดบัญชี (GL/AR) ที่เปิดอยู่ สำหรับวันที่ยกเลิก ${voidDate}` };
             }
             const orig = (await client.query(`SELECT * FROM gl_entry_header WHERE id=$1`, [tx.gl_entry_id])).rows[0];
             let revDocNo = await generateDocNo(client, orig.doc_id, voidDate, tx.branch_id);
@@ -1535,9 +1532,26 @@ const voidTransaction = async (req, res) => {
             sysModule: '11', tableName: 'ar_transaction', recordId: Number(id),
             docNo: tx.doc_no, fromStatus: 'Posted', toStatus: 'Void', reason: voidReason, userId,
         });
+        return { reversingGlId };
+};
 
+const voidTransaction = async (req, res) => {
+    const { id } = req.params;
+    const voidReason = (req.body?.void_reason || '').trim();
+    const userId = req.body?.user_id || req.headers['userid'] || null;
+    const userName = req.body?.updated_by || req.headers['username'] || null;
+    if (!voidReason) return res.status(400).json({ error: 'กรุณาระบุเหตุผลการยกเลิก' });
+
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        const r = await voidArDocument(client, id, { voidReason, userId, userName });
+        if (r.error) {
+            await client.query('ROLLBACK');
+            return res.status(r.httpStatus || 400).json({ error: r.error, code: r.code, ref: r.ref });
+        }
         await client.query('COMMIT');
-        res.json({ message: 'Voided', reversing_gl_entry_id: reversingGlId });
+        res.json({ message: 'Voided', reversing_gl_entry_id: r.reversingGlId });
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('Error voiding ar_transaction:', err);
@@ -1983,6 +1997,8 @@ module.exports = {
     createTransaction,
     updateTransaction,
     voidTransaction,
+    voidArDocument,
+    getArVoidBlockById,
     reverseTransaction,
     deleteTransaction,
     fetchRows,

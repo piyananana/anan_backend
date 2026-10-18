@@ -68,6 +68,7 @@ router.delete('/cm_check_print_config/:id', cmCheckPrintConfigController.deleteR
 router.get('/cm_receipt',              cmReceiptController.fetchRows);
 router.get('/cm_receipt/:id',          cmReceiptController.fetchRow);
 router.put('/cm_receipt/:id/clear',    cmReceiptController.clearReceipt);
+router.put('/cm_receipt/:id/unclear',  cmReceiptController.unclearReceipt);
 router.put('/cm_receipt/:id/bounce',   cmReceiptController.bounceReceipt);
 router.put('/cm_receipt/:id/void',     cmReceiptController.voidReceipt);
 
@@ -76,6 +77,7 @@ router.get('/cm_payment',              cmPaymentController.fetchRows);
 router.get('/cm_payment/:id',          cmPaymentController.fetchRow);
 router.post('/cm_payment',             cmPaymentController.createPayment);
 router.put('/cm_payment/:id/clear',    cmPaymentController.clearPayment);
+router.put('/cm_payment/:id/unclear',  cmPaymentController.unclearPayment);
 router.put('/cm_payment/:id/void',     cmPaymentController.voidPayment);
 
 // cm_transaction — หน้าจอธุรกรรม CM รวม (10 รายรับ, 15 รายรับจาก AR, 20 รายจ่าย, 25 รายจ่ายจาก AP,

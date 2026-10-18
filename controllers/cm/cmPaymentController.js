@@ -1,5 +1,7 @@
 // controllers/cm/cmPaymentController.js
 const { today } = require('../../utils/dateUtil');
+const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
+const { checkCmPeriodOpen } = require('./cmPeriodCheckHelper');
 'use strict';
 
 const ensureCmPaymentTable = async (client) => {
@@ -47,7 +49,10 @@ const BASE_SELECT = `
            pm.method_name_th   AS payment_method_name,
            pm.method_name_en   AS payment_method_name_en,
            ck.checkbook_code   AS checkbook_code,
-           v.vendor_name_en    AS payee_name_en
+           v.vendor_name_en    AS payee_name_en,
+           (SELECT COALESCE(gp.cm_status, 'OPEN') FROM gl_posting_period gp
+             WHERE p.clearing_date BETWEEN gp.period_start_date AND gp.period_end_date
+             ORDER BY gp.period_start_date DESC LIMIT 1) AS clear_period_status
     FROM cm_payment p
     LEFT JOIN cm_bank_account   ba ON ba.id = p.bank_account_id
     LEFT JOIN cd_bank           cb ON cb.id = ba.bank_id
@@ -55,6 +60,55 @@ const BASE_SELECT = `
     LEFT JOIN cm_checkbook      ck ON ck.id = p.checkbook_id
     LEFT JOIN ap_vendor         v  ON v.id = p.payee_id AND p.payee_type = 'VENDOR'
 `;
+
+// รายการจ่ายเงินผ่านธนาคาร: ส่วนใหญ่สร้างโดยใบจ่ายเงิน AP / จ่ายชำระแบบกลุ่ม ตอนโพสต์ (ใช้รายการบัญชีของต้นทาง)
+// - เคลียร์ / ยกเลิกการเคลียร์: เปลี่ยนสถานะอย่างเดียว ไม่กระทบบัญชี — ยกเลิกการเคลียร์ไม่ได้เมื่อกระทบยอดแล้ว
+//   หรืองวด CM ของวันที่เคลียร์ปิดแล้ว
+// - ยกเลิก: รายการที่มาจาก AP ต้องยกเลิกที่เอกสารต้นทาง (ไม่เช่นนั้นยอด CM กับบัญชีจะไม่ตรงกัน)
+//   ยกเลิกในหน้านี้ได้เฉพาะรายการที่บันทึกเองในหน้านี้ (ไม่มีรายการบัญชี)
+const getUnclearBlock = (p) => {
+    if (p.status !== 'Cleared') return { code: 'NOT_CLEARED' };
+    if (p.is_reconciled === true) return { code: 'RECONCILED' };
+    if (p.clear_period_status && p.clear_period_status !== 'OPEN') return { code: 'PERIOD_CLOSED' };
+    return null;
+};
+
+const getVoidBlock = (p) => {
+    if (p.status !== 'Pending') return { code: 'NOT_PENDING' };
+    if (p.is_reconciled === true) return { code: 'RECONCILED' };
+    if (p.ap_transaction_id || p.gl_entry_id) return { code: 'SOURCE_DOC', ref: p.ap_doc_no };
+    return null;
+};
+
+const BLOCK_MESSAGES = {
+    NOT_CLEARED:   'ยกเลิกการเคลียร์ได้เฉพาะรายการที่เคลียร์แล้ว',
+    NOT_PENDING:   'ยกเลิกได้เฉพาะรายการที่รอเคลียร์',
+    RECONCILED:    'รายการนี้กระทบยอดกับ Bank Statement แล้ว กรุณายกเลิกการกระทบยอดก่อน',
+    PERIOD_CLOSED: 'งวด CM ของวันที่เคลียร์ปิดแล้ว',
+    SOURCE_DOC:    'รายการนี้มาจากเอกสาร AP กรุณายกเลิกที่เอกสารต้นทาง',
+};
+const blockMessage = (b) => BLOCK_MESSAGES[b.code] + (b.ref ? ` (${b.ref})` : '');
+const blockError = (res, b) => res.status(400).json({ error: blockMessage(b), code: b.code, ref: b.ref || null });
+
+const fetchById = async (db, id) => {
+    const p = (await db.query(`${BASE_SELECT} WHERE p.id = $1`, [id])).rows[0];
+    if (!p) return null;
+    const ub = getUnclearBlock(p), vb = getVoidBlock(p);
+    return {
+        ...p,
+        unclear_block: ub?.code || null,
+        void_block: vb?.code || null, void_block_ref: vb?.ref || null,
+        reverse_history: await getReverseHistory(db, 'cm_payment', p.id),
+    };
+};
+
+const lockById = async (client, id) => {
+    await client.query(`SELECT id FROM cm_payment WHERE id = $1 FOR UPDATE`, [id]);
+    return (await client.query(`${BASE_SELECT} WHERE p.id = $1`, [id])).rows[0];
+};
+
+const reasonOf = (req) => (req.body?.reason || req.body?.clearing_note || '').trim();
+const userIdOf = (req) => req.body?.user_id || req.headers['userid'] || null;
 
 // GET list
 const fetchRows = async (req, res) => {
@@ -83,9 +137,9 @@ const fetchRow = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await ensureCmPaymentTable(client);
-        const result = await client.query(`${BASE_SELECT} WHERE p.id = $1`, [req.params.id]);
-        if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
-        res.json(result.rows[0]);
+        const row = await fetchById(client, req.params.id);
+        if (!row) return res.status(404).json({ error: 'Not found' });
+        res.json(row);
     } catch (err) {
         res.status(500).json({ error: err.message });
     } finally { client.release(); }
@@ -99,6 +153,11 @@ const createPayment = async (req, res) => {
     try {
         await client.query('BEGIN');
         await ensureCmPaymentTable(client);
+
+        // created_by เป็นรหัสผู้ใช้ (ตัวเลข) แต่หน้าจอส่งชื่อผู้ใช้มา
+        const userRes = userName
+            ? await client.query(`SELECT id FROM sa_user WHERE user_name = $1 LIMIT 1`, [userName]) : { rows: [] };
+        const createdById = userRes.rows[0]?.id || null;
 
         let checkNo = body.check_no || null;
 
@@ -157,7 +216,7 @@ const createPayment = async (req, res) => {
                 body.check_date || null,
                 body.checkbook_id || null,
                 body.remark || null,
-                userName,
+                createdById,
             ]);
 
         await client.query('COMMIT');
@@ -172,9 +231,12 @@ const createPayment = async (req, res) => {
 const clearPayment = async (req, res) => {
     const { id } = req.params;
     const { clearing_date, clearing_note } = req.body;
+    const clearDate = clearing_date || today();
     const client = await req.dbPool.connect();
     try {
         await ensureCmPaymentTable(client);
+        const pc = await checkCmPeriodOpen(client, clearDate);
+        if (!pc.allowed) return res.status(400).json({ error: pc.message });
         const result = await client.query(`
             UPDATE cm_payment
             SET status        = 'Cleared',
@@ -183,36 +245,66 @@ const clearPayment = async (req, res) => {
                 updated_at    = NOW()
             WHERE id = $3 AND status = 'Pending'
             RETURNING *`,
-            [clearing_date || today(), clearing_note || null, id]);
+            [clearDate, clearing_note || null, id]);
         if (result.rows.length === 0)
             return res.status(400).json({ error: 'ไม่สามารถเคลียร์ได้ หรือสถานะไม่ใช่ Pending' });
-        res.json(result.rows[0]);
+        res.json(await fetchById(client, id));
     } catch (err) {
         res.status(500).json({ error: err.message });
     } finally { client.release(); }
 };
 
-// PUT /void
-const voidPayment = async (req, res) => {
+// PUT /unclear — ยกเลิกการเคลียร์ (Cleared → Pending)
+const unclearPayment = async (req, res) => {
     const { id } = req.params;
-    const { clearing_note } = req.body;
+    const reason = reasonOf(req);
+    if (!reason) return res.status(400).json({ error: 'กรุณาระบุเหตุผล' });
     const client = await req.dbPool.connect();
     try {
-        await ensureCmPaymentTable(client);
-        const result = await client.query(`
-            UPDATE cm_payment
-            SET status        = 'Voided',
-                clearing_note = $1,
-                updated_at    = NOW()
-            WHERE id = $2 AND status = 'Pending'
-            RETURNING *`,
-            [clearing_note || null, id]);
-        if (result.rows.length === 0)
-            return res.status(400).json({ error: 'ไม่สามารถ Void ได้ หรือสถานะไม่ใช่ Pending' });
-        res.json(result.rows[0]);
+        await client.query('BEGIN');
+        const p = await lockById(client, id);
+        if (!p) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
+        const b = getUnclearBlock(p);
+        if (b) { await client.query('ROLLBACK'); return blockError(res, b); }
+        await client.query(`
+            UPDATE cm_payment SET status = 'Pending', clearing_date = NULL, clearing_note = NULL, updated_at = NOW()
+             WHERE id = $1`, [id]);
+        await logReverse(client, {
+            sysModule: '81', tableName: 'cm_payment', recordId: Number(id), docNo: p.check_no || p.ap_doc_no,
+            fromStatus: 'Cleared', toStatus: 'Pending', reason, userId: userIdOf(req),
+        });
+        await client.query('COMMIT');
+        res.json(await fetchById(client, id));
     } catch (err) {
+        await client.query('ROLLBACK');
         res.status(500).json({ error: err.message });
     } finally { client.release(); }
 };
 
-module.exports = { fetchRows, fetchRow, createPayment, clearPayment, voidPayment, ensureCmPaymentTable };
+// PUT /void — เฉพาะรายการที่บันทึกเองในหน้านี้
+const voidPayment = async (req, res) => {
+    const { id } = req.params;
+    const reason = reasonOf(req);
+    if (!reason) return res.status(400).json({ error: 'กรุณาระบุเหตุผลการยกเลิก' });
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        const p = await lockById(client, id);
+        if (!p) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
+        const b = getVoidBlock(p);
+        if (b) { await client.query('ROLLBACK'); return blockError(res, b); }
+        await client.query(`
+            UPDATE cm_payment SET status = 'Voided', clearing_note = $1, updated_at = NOW() WHERE id = $2`, [reason, id]);
+        await logReverse(client, {
+            sysModule: '81', tableName: 'cm_payment', recordId: Number(id), docNo: p.check_no || p.ap_doc_no,
+            fromStatus: 'Pending', toStatus: 'Void', reason, userId: userIdOf(req),
+        });
+        await client.query('COMMIT');
+        res.json(await fetchById(client, id));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ error: err.message });
+    } finally { client.release(); }
+};
+
+module.exports = { fetchRows, fetchRow, createPayment, clearPayment, unclearPayment, voidPayment, ensureCmPaymentTable };

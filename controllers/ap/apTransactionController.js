@@ -700,7 +700,7 @@ const AP_REVERSE_INFO_SQL = `
            (SELECT string_agg(DISTINCT COALESCE(c.check_no, c.ap_doc_no, c.id::text), ', ')
               FROM cm_payment c
              WHERE c.ap_transaction_id = t.id
-               AND (c.status <> 'Pending' OR c.is_reconciled IS TRUE)) AS cm_cleared
+               AND (c.status NOT IN ('Pending', 'Voided') OR c.is_reconciled IS TRUE)) AS cm_cleared
       FROM ap_transaction t
       JOIN sa_module_document d ON d.id = t.doc_id
       LEFT JOIN gl_posting_period p  ON p.id = t.period_id
