@@ -1,6 +1,8 @@
 // controllers/cm/cmPostDatedCheckController.js
 'use strict';
 const { checkCmPeriodOpen } = require('./cmPeriodCheckHelper');
+const { ymd, today } = require('../../utils/dateUtil');
+const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 
 const ensureTable = async (client) => {
     await client.query(`
@@ -9,7 +11,7 @@ const ensureTable = async (client) => {
             direction            VARCHAR(10)  NOT NULL CHECK (direction IN ('RECEIVED','ISSUED')),
             check_no             VARCHAR(50)  NOT NULL,
             check_date           DATE         NOT NULL,
-            bank_id              INTEGER      REFERENCES cm_bank(id),
+            bank_id              INTEGER      REFERENCES cd_bank(id),
             payee_payer_name     VARCHAR(200),
             amount               NUMERIC(18,4) NOT NULL DEFAULT 0,
             currency_code        VARCHAR(3)   NOT NULL DEFAULT 'THB',
@@ -39,27 +41,110 @@ const fetchRows = async (req, res) => {
         const wheres = [];
         if (direction)        { params.push(direction);        wheres.push(`p.direction=$${params.length}`); }
         if (status && status !== 'All') { params.push(status); wheres.push(`p.status=$${params.length}`); }
+        else wheres.push(`p.status <> 'Deleted'`);
         if (bank_account_id)  { params.push(bank_account_id);  wheres.push(`p.our_bank_account_id=$${params.length}`); }
         if (date_from)        { params.push(date_from);        wheres.push(`p.check_date>=$${params.length}`); }
         if (date_to)          { params.push(date_to);          wheres.push(`p.check_date<=$${params.length}`); }
 
         const where = wheres.length ? 'WHERE ' + wheres.join(' AND ') : '';
-        const r = await client.query(`
-            SELECT p.*,
-                   b.bank_name_thai       AS bank_name,
-                   b.short_name          AS bank_short_name,
-                   ba.account_code       AS our_account_code,
-                   ba.account_name_th    AS our_account_name,
-                   cb.short_name         AS our_bank_name
-            FROM cm_post_dated_check p
-            LEFT JOIN cd_bank         b  ON b.id  = p.bank_id
-            LEFT JOIN cm_bank_account ba ON ba.id = p.our_bank_account_id
-            LEFT JOIN cd_bank         cb ON cb.id = ba.bank_id
-            ${where}
-            ORDER BY p.check_date, p.id`, params);
+        const r = await client.query(`${BASE_SELECT} ${where} ORDER BY p.check_date, p.id`, params);
         res.json(r.rows);
     } catch (err) { res.status(500).json({ error: err.message }); }
     finally { client.release(); }
+};
+
+const BASE_SELECT = `
+    SELECT p.*,
+           b.bank_name_thai       AS bank_name,
+           b.short_name          AS bank_short_name,
+           ba.account_code       AS our_account_code,
+           ba.account_name_th    AS our_account_name,
+           cb.short_name         AS our_bank_name
+    FROM cm_post_dated_check p
+    LEFT JOIN cd_bank         b  ON b.id  = p.bank_id
+    LEFT JOIN cm_bank_account ba ON ba.id = p.our_bank_account_id
+    LEFT JOIN cd_bank         cb ON cb.id = ba.bank_id`;
+
+// ทะเบียนเช็คลงวันที่ล่วงหน้า ไม่มีรายการบัญชี
+// - ถอยสถานะ: กลับไปสถานะก่อนหน้า (นำฝาก → ถือไว้, เคลียร์/คืน → นำฝาก หรือถือไว้, ยกเลิก → สถานะก่อนยกเลิก)
+//   ทำไม่ได้เมื่องวด CM ของวันที่ของสถานะที่จะถอยปิดแล้ว
+// - ยกเลิก / ลบ (เฉพาะถือไว้ เก็บไว้ด้วยสถานะ Deleted): ต้องมีเหตุผล
+// ทุกการกระทำบันทึกที่ sa_document_reverse_log
+const EVENT_DATE_COL = { Deposited: 'deposit_date', Cleared: 'cleared_date', Returned: 'returned_date', Cancelled: 'cancelled_date' };
+
+const previousStatus = (r) => {
+    if (r.status === 'Deposited') return 'Holding';
+    if (r.status === 'Cancelled' && r.returned_date) return 'Returned';
+    return r.deposit_date ? 'Deposited' : 'Holding';
+};
+
+const getRevertBlock = async (db, r) => {
+    const col = EVENT_DATE_COL[r.status];
+    if (!col) return { code: 'NOT_REVERTIBLE' };
+    if (r[col]) {
+        const pc = await checkCmPeriodOpen(db, ymd(r[col]));
+        if (!pc.allowed) return { code: 'PERIOD_CLOSED', message: pc.message };
+    }
+    return null;
+};
+
+const fetchById = async (db, id) => {
+    const r = (await db.query(`${BASE_SELECT} WHERE p.id = $1`, [id])).rows[0];
+    if (!r) return null;
+    const rb = await getRevertBlock(db, r);
+    return {
+        ...r,
+        revert_block: rb?.code || null,
+        revert_block_message: rb?.message || null,
+        revert_to: EVENT_DATE_COL[r.status] ? previousStatus(r) : null,
+        reverse_history: await getReverseHistory(db, 'cm_post_dated_check', Number(id)),
+    };
+};
+
+const fetchRow = async (req, res) => {
+    const client = await req.dbPool.connect();
+    try {
+        await ensureTable(client);
+        const row = await fetchById(client, req.params.id);
+        if (!row) return res.status(404).json({ error: 'Not found' });
+        res.json(row);
+    } catch (err) { res.status(500).json({ error: err.message }); }
+    finally { client.release(); }
+};
+
+const reasonOf = (req) => (req.body?.reason || '').trim();
+const userIdOf = (req) => req.body?.user_id || req.headers['userid'] || null;
+
+// PUT /:id/revert — ถอยสถานะ
+const revertCheck = async (req, res) => {
+    const { id } = req.params;
+    const reason = reasonOf(req);
+    if (!reason) return res.status(400).json({ error: 'กรุณาระบุเหตุผล' });
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        const r = (await client.query(`SELECT * FROM cm_post_dated_check WHERE id = $1 FOR UPDATE`, [id])).rows[0];
+        if (!r) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
+        const b = await getRevertBlock(client, r);
+        if (b) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                error: b.message || 'ถอยสถานะได้เฉพาะเช็คที่นำฝาก เคลียร์ คืน หรือยกเลิกแล้ว', code: b.code });
+        }
+        const to = previousStatus(r);
+        await client.query(`
+            UPDATE cm_post_dated_check SET status = $1, ${EVENT_DATE_COL[r.status]} = NULL, updated_at = NOW()
+             WHERE id = $2`, [to, id]);
+        await logReverse(client, {
+            sysModule: '81', tableName: 'cm_post_dated_check', recordId: Number(id), docNo: r.check_no,
+            fromStatus: r.status, toStatus: to, reason, userId: userIdOf(req),
+        });
+        await client.query('COMMIT');
+        res.json(await fetchById(client, id));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ error: err.message });
+    } finally { client.release(); }
 };
 
 const createRow = async (req, res) => {
@@ -120,12 +205,20 @@ const updateRow = async (req, res) => {
 };
 
 // PUT /:id/present  — Mark as Deposited/Presented
+// นำฝาก / เคลียร์ / คืน: วันที่ของสถานะต้องอยู่ในงวด CM ที่เปิดอยู่ (ไม่ระบุ = วันนี้)
+const periodBlock = async (db, date) => {
+    const pc = await checkCmPeriodOpen(db, date || today());
+    return pc.allowed ? null : pc.message;
+};
+
 const presentCheck = async (req, res) => {
     const { id } = req.params;
     const { deposit_date } = req.body;
     const client = await req.dbPool.connect();
     try {
         await ensureTable(client);
+        const pm = await periodBlock(client, deposit_date);
+        if (pm) return res.status(400).json({ error: pm, code: 'PERIOD_CLOSED' });
         const r = await client.query(`
             UPDATE cm_post_dated_check SET
                 status       = 'Deposited',
@@ -146,6 +239,8 @@ const clearCheck = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await ensureTable(client);
+        const pm = await periodBlock(client, cleared_date);
+        if (pm) return res.status(400).json({ error: pm, code: 'PERIOD_CLOSED' });
         const r = await client.query(`
             UPDATE cm_post_dated_check SET
                 status       = 'Cleared',
@@ -166,6 +261,8 @@ const returnCheck = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await ensureTable(client);
+        const pm = await periodBlock(client, returned_date);
+        if (pm) return res.status(400).json({ error: pm, code: 'PERIOD_CLOSED' });
         const r = await client.query(`
             UPDATE cm_post_dated_check SET
                 status        = 'Returned',
@@ -181,37 +278,43 @@ const returnCheck = async (req, res) => {
 };
 
 // PUT /:id/cancel  — Cancel the check
-const cancelCheck = async (req, res) => {
+// เปลี่ยนสถานะพร้อมเหตุผล + บันทึกประวัติ (ยกเลิก / ลบ)
+const changeStatus = async (req, res, { allowed, toStatus, logStatus, setDate, blockMessage }) => {
     const { id } = req.params;
-    const { notes } = req.body;
+    const reason = reasonOf(req);
+    if (!reason) return res.status(400).json({ error: 'กรุณาระบุเหตุผล' });
     const client = await req.dbPool.connect();
     try {
+        await client.query('BEGIN');
         await ensureTable(client);
-        const r = await client.query(`
-            UPDATE cm_post_dated_check SET
-                status          = 'Cancelled',
-                cancelled_date  = NOW()::date,
-                notes           = COALESCE($1, notes),
-                updated_at      = NOW()
-            WHERE id=$2 AND status NOT IN ('Cleared','Cancelled') RETURNING *`,
-            [notes || null, id]);
-        if (!r.rows.length) return res.status(400).json({ error: 'ไม่พบรายการ หรือไม่สามารถยกเลิกได้' });
-        res.json(r.rows[0]);
-    } catch (err) { res.status(500).json({ error: err.message }); }
-    finally { client.release(); }
+        const r = (await client.query(`SELECT * FROM cm_post_dated_check WHERE id = $1 FOR UPDATE`, [id])).rows[0];
+        if (!r) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
+        if (!allowed.includes(r.status)) { await client.query('ROLLBACK'); return res.status(400).json({ error: blockMessage }); }
+        await client.query(`
+            UPDATE cm_post_dated_check SET status = $1, updated_at = NOW()${setDate ? ', cancelled_date = CURRENT_DATE' : ''}
+             WHERE id = $2`, [toStatus, id]);
+        await logReverse(client, {
+            sysModule: '81', tableName: 'cm_post_dated_check', recordId: Number(id), docNo: r.check_no,
+            fromStatus: r.status, toStatus: logStatus, reason, userId: userIdOf(req),
+        });
+        await client.query('COMMIT');
+        res.json(await fetchById(client, id));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ error: err.message });
+    } finally { client.release(); }
 };
 
-const deleteRow = async (req, res) => {
-    const client = await req.dbPool.connect();
-    try {
-        const r = await client.query(
-            `DELETE FROM cm_post_dated_check WHERE id=$1 AND status='Holding' RETURNING id`,
-            [req.params.id]);
-        if (!r.rows.length) return res.status(400).json({ error: 'ลบได้เฉพาะ Holding เท่านั้น' });
-        res.json({ success: true });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-    finally { client.release(); }
-};
+const cancelCheck = (req, res) => changeStatus(req, res, {
+    allowed: ['Holding', 'Deposited', 'Returned'], toStatus: 'Cancelled', logStatus: 'Void', setDate: true,
+    blockMessage: 'ยกเลิกได้เฉพาะเช็คที่ถือไว้ นำฝาก หรือคืนแล้ว',
+});
+
+// ลบ: เฉพาะถือไว้ — เก็บไว้ด้วยสถานะ Deleted (ไม่แสดงในรายการ เว้นแต่เลือกสถานะ Deleted)
+const deleteRow = (req, res) => changeStatus(req, res, {
+    allowed: ['Holding'], toStatus: 'Deleted', logStatus: 'Deleted',
+    blockMessage: 'ลบได้เฉพาะเช็คที่ถือไว้',
+});
 
 // GET summary counts
 const getSummary = async (req, res) => {
@@ -221,6 +324,7 @@ const getSummary = async (req, res) => {
         const r = await client.query(`
             SELECT direction, status, COUNT(*) AS count, SUM(amount) AS total_amount
             FROM cm_post_dated_check
+            WHERE status <> 'Deleted'
             GROUP BY direction, status
             ORDER BY direction, status`);
         res.json(r.rows);
@@ -228,4 +332,4 @@ const getSummary = async (req, res) => {
     finally { client.release(); }
 };
 
-module.exports = { fetchRows, createRow, updateRow, presentCheck, clearCheck, returnCheck, cancelCheck, deleteRow, getSummary };
+module.exports = { fetchRows, fetchRow, createRow, updateRow, presentCheck, clearCheck, returnCheck, cancelCheck, revertCheck, deleteRow, getSummary };

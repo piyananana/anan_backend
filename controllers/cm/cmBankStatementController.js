@@ -1,5 +1,7 @@
 // controllers/cm/cmBankStatementController.js
 'use strict';
+const { ymd } = require('../../utils/dateUtil');
+const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 
 const ensureTables = async (client) => {
     await client.query(`
@@ -47,6 +49,84 @@ const BASE_SELECT = `
     LEFT JOIN cd_bank         cb ON cb.id = ba.bank_id
 `;
 
+// Bank Statement ไม่มีรายการบัญชี — ใช้จับคู่กระทบยอดกับรายการรับ/จ่ายผ่านธนาคาร (เฉพาะสถานะ Confirmed)
+// - ถอยเป็นร่าง (Confirmed → Draft) / ยกเลิก (Confirmed → Voided): ต้องไม่มีบรรทัดที่กระทบยอดแล้ว
+//   ไม่เช่นนั้นรายการรับ/จ่ายจะยังกระทบยอดอยู่กับ Statement ที่ใช้ไม่ได้แล้ว
+// - ลบ: เฉพาะร่าง เก็บไว้ด้วยสถานะ Deleted (ไม่แสดงในรายการ เว้นแต่เลือกสถานะ Deleted)
+// ทุกการกระทำต้องมีเหตุผล บันทึกที่ sa_document_reverse_log
+const STMT_INFO_SQL = `
+    SELECT s.id, s.status, s.statement_date_from, s.statement_date_to, ba.account_code,
+           (SELECT COUNT(*)::int FROM cm_bank_statement_line l
+             WHERE l.statement_id = s.id AND l.is_reconciled = TRUE) AS reconciled_count
+      FROM cm_bank_statement s
+      LEFT JOIN cm_bank_account ba ON ba.id = s.bank_account_id
+     WHERE s.id = $1`;
+
+const getReverseBlock = (r) => {
+    if (r.status !== 'Confirmed') return { code: 'NOT_CONFIRMED' };
+    if (r.reconciled_count > 0) return { code: 'RECONCILED', ref: String(r.reconciled_count) };
+    return null;
+};
+const getVoidBlock = getReverseBlock;
+const getDeleteBlock = (r) => {
+    if (r.status !== 'Draft') return { code: 'NOT_DRAFT' };
+    if (r.reconciled_count > 0) return { code: 'RECONCILED', ref: String(r.reconciled_count) };
+    return null;
+};
+
+const BLOCK_MESSAGES = {
+    NOT_CONFIRMED: 'ทำได้เฉพาะ Statement ที่ยืนยันแล้ว (ร่างให้ลบแทน)',
+    NOT_DRAFT:     'ลบได้เฉพาะร่าง (ที่ยืนยันแล้วให้ถอยเป็นร่างก่อน)',
+    RECONCILED:    'มีรายการที่กระทบยอดแล้ว กรุณายกเลิกการกระทบยอดก่อน',
+};
+const blockError = (res, b) => res.status(400).json({
+    error: BLOCK_MESSAGES[b.code] + (b.ref ? ` (${b.ref} รายการ)` : ''), code: b.code, ref: b.ref || null });
+
+const stmtDocNo = (r) => `${r.account_code || ''} ${ymd(r.statement_date_from)}~${ymd(r.statement_date_to)}`.trim();
+const reasonOf = (req) => (req.body?.reason || '').trim();
+const userIdOf = (req) => req.body?.user_id || req.headers['userid'] || null;
+
+// เปลี่ยนสถานะพร้อมตรวจเงื่อนไข + บันทึกประวัติ (ใช้ร่วม ถอย / ยกเลิก / ลบ)
+const changeStatus = async (req, res, { getBlock, toStatus, logStatus }) => {
+    const { id } = req.params;
+    const reason = reasonOf(req);
+    if (!reason) return res.status(400).json({ error: 'กรุณาระบุเหตุผล' });
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        await ensureTables(client);
+        await client.query(`SELECT id FROM cm_bank_statement WHERE id = $1 FOR UPDATE`, [id]);
+        const info = (await client.query(STMT_INFO_SQL, [id])).rows[0];
+        if (!info) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
+        const b = getBlock(info);
+        if (b) { await client.query('ROLLBACK'); return blockError(res, b); }
+        await client.query(`UPDATE cm_bank_statement SET status = $1, updated_at = NOW() WHERE id = $2`, [toStatus, id]);
+        await logReverse(client, {
+            sysModule: '81', tableName: 'cm_bank_statement', recordId: Number(id), docNo: stmtDocNo(info),
+            fromStatus: info.status, toStatus: logStatus, reason, userId: userIdOf(req),
+        });
+        await client.query('COMMIT');
+        res.json(await fetchById(client, id));
+    } catch (err) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ error: err.message });
+    } finally { client.release(); }
+};
+
+const fetchById = async (db, id) => {
+    const row = (await db.query(`${BASE_SELECT} WHERE s.id = $1`, [id])).rows[0];
+    if (!row) return null;
+    const info = (await db.query(STMT_INFO_SQL, [id])).rows[0];
+    return {
+        ...row,
+        reconciled_count: info.reconciled_count,
+        reverse_block: getReverseBlock(info)?.code || null,
+        void_block: getVoidBlock(info)?.code || null,
+        delete_block: getDeleteBlock(info)?.code || null,
+        reverse_history: await getReverseHistory(db, 'cm_bank_statement', Number(id)),
+    };
+};
+
 // GET list
 const fetchRows = async (req, res) => {
     const client = await req.dbPool.connect();
@@ -58,6 +138,7 @@ const fetchRows = async (req, res) => {
         let pi = 1;
         if (bank_account_id)             { where += ` AND s.bank_account_id = $${pi++}`;    params.push(bank_account_id); }
         if (status && status !== 'All')  { where += ` AND s.status = $${pi++}`;             params.push(status); }
+        else                             { where += ` AND s.status <> 'Deleted'`; }
         if (date_from)                   { where += ` AND s.statement_date_to >= $${pi++}`; params.push(date_from); }
         if (date_to)                     { where += ` AND s.statement_date_from <= $${pi++}`; params.push(date_to); }
         const result = await client.query(
@@ -72,9 +153,9 @@ const fetchRow = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await ensureTables(client);
-        const result = await client.query(`${BASE_SELECT} WHERE s.id = $1`, [req.params.id]);
-        if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
-        res.json(result.rows[0]);
+        const row = await fetchById(client, req.params.id);
+        if (!row) return res.status(404).json({ error: 'Not found' });
+        res.json(row);
     } catch (err) { res.status(500).json({ error: err.message }); }
     finally { client.release(); }
 };
@@ -165,41 +246,19 @@ const confirmRow = async (req, res) => {
             WHERE id = $1 AND status = 'Draft' RETURNING *`, [id]);
         if (result.rows.length === 0)
             return res.status(400).json({ error: 'ไม่สามารถยืนยันได้ หรือสถานะไม่ใช่ Draft' });
-        res.json(result.rows[0]);
+        res.json(await fetchById(client, id));
     } catch (err) { res.status(500).json({ error: err.message }); }
     finally { client.release(); }
 };
 
-// PUT void
-const voidRow = async (req, res) => {
-    const { id } = req.params;
-    const client = await req.dbPool.connect();
-    try {
-        await ensureTables(client);
-        const result = await client.query(`
-            UPDATE cm_bank_statement SET status = 'Voided', updated_at = NOW()
-            WHERE id = $1 AND status != 'Voided' RETURNING *`, [id]);
-        if (result.rows.length === 0)
-            return res.status(400).json({ error: 'ไม่สามารถ Void ได้' });
-        res.json(result.rows[0]);
-    } catch (err) { res.status(500).json({ error: err.message }); }
-    finally { client.release(); }
-};
+// PUT reverse: Confirmed → Draft
+const reverseRow = (req, res) => changeStatus(req, res, { getBlock: getReverseBlock, toStatus: 'Draft', logStatus: 'Draft' });
 
-// DELETE statement + cascade lines
-const deleteRow = async (req, res) => {
-    const { id } = req.params;
-    const client = await req.dbPool.connect();
-    try {
-        await ensureTables(client);
-        const result = await client.query(
-            `DELETE FROM cm_bank_statement WHERE id = $1 AND status = 'Draft' RETURNING id`, [id]);
-        if (result.rows.length === 0)
-            return res.status(400).json({ error: 'ลบได้เฉพาะ Draft เท่านั้น' });
-        res.json({ message: 'Deleted' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-    finally { client.release(); }
-};
+// PUT void: Confirmed → Voided
+const voidRow = (req, res) => changeStatus(req, res, { getBlock: getVoidBlock, toStatus: 'Voided', logStatus: 'Void' });
+
+// DELETE: ร่างเท่านั้น — เก็บไว้ด้วยสถานะ Deleted พร้อมบรรทัดรายการ
+const deleteRow = (req, res) => changeStatus(req, res, { getBlock: getDeleteBlock, toStatus: 'Deleted', logStatus: 'Deleted' });
 
 // POST add one line
 const addLine = async (req, res) => {
@@ -211,8 +270,8 @@ const addLine = async (req, res) => {
         // Only Draft/Confirmed statements can have lines added
         const sRes = await client.query(`SELECT status FROM cm_bank_statement WHERE id = $1`, [id]);
         if (sRes.rows.length === 0) return res.status(404).json({ error: 'Statement not found' });
-        if (sRes.rows[0].status === 'Voided')
-            return res.status(400).json({ error: 'ไม่สามารถเพิ่มรายการใน Statement ที่ Voided' });
+        if (['Voided', 'Deleted'].includes(sRes.rows[0].status))
+            return res.status(400).json({ error: 'ไม่สามารถเพิ่มรายการใน Statement ที่ยกเลิกหรือลบแล้ว' });
         const result = await client.query(`
             INSERT INTO cm_bank_statement_line
                 (statement_id, line_date, description, withdrawal_amount, deposit_amount, balance, reference)
@@ -245,7 +304,7 @@ const bulkInsertLines = async (req, res) => {
         const sRes = await client.query(
             `SELECT status FROM cm_bank_statement WHERE id = $1 FOR UPDATE`, [id]);
         if (sRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
-        if (sRes.rows[0].status === 'Voided') { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Statement ถูก Void แล้ว' }); }
+        if (['Voided', 'Deleted'].includes(sRes.rows[0].status)) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Statement ถูกยกเลิกหรือลบแล้ว' }); }
 
         // Optionally update file_name on the statement
         if (file_name) {
@@ -337,7 +396,7 @@ const deleteLine = async (req, res) => {
 
 module.exports = {
     fetchRows, fetchRow, fetchLines,
-    createRow, updateRow, confirmRow, voidRow, deleteRow,
+    createRow, updateRow, confirmRow, reverseRow, voidRow, deleteRow,
     addLine, bulkInsertLines, updateLine, deleteLine,
     ensureTables,
 };

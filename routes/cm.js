@@ -107,6 +107,7 @@ router.post('/cm_bank_statement/:id/lines',               cmBankStatementControl
 router.post('/cm_bank_statement/:id/lines/bulk',          cmBankStatementController.bulkInsertLines);
 router.put('/cm_bank_statement/:id',                      cmBankStatementController.updateRow);
 router.put('/cm_bank_statement/:id/confirm',              cmBankStatementController.confirmRow);
+router.put('/cm_bank_statement/:id/reverse',              cmBankStatementController.reverseRow);
 router.put('/cm_bank_statement/:id/void',                 cmBankStatementController.voidRow);
 router.put('/cm_bank_statement_line/:lineId',             cmBankStatementController.updateLine);
 router.delete('/cm_bank_statement/:id',                   cmBankStatementController.deleteRow);
@@ -179,12 +180,14 @@ router.post('/cm_bank_statement_import', cmBankStatementImportController.importS
 // cm_post_dated_check — summary BEFORE /:id
 router.get('/cm_post_dated_check/summary',         cmPostDatedCheckController.getSummary);
 router.get('/cm_post_dated_check',                  cmPostDatedCheckController.fetchRows);
+router.get('/cm_post_dated_check/:id',              cmPostDatedCheckController.fetchRow);
 router.post('/cm_post_dated_check',                 cmPostDatedCheckController.createRow);
 router.put('/cm_post_dated_check/:id',              cmPostDatedCheckController.updateRow);
 router.put('/cm_post_dated_check/:id/present',      cmPostDatedCheckController.presentCheck);
 router.put('/cm_post_dated_check/:id/clear',        cmPostDatedCheckController.clearCheck);
 router.put('/cm_post_dated_check/:id/return',       cmPostDatedCheckController.returnCheck);
 router.put('/cm_post_dated_check/:id/cancel',       cmPostDatedCheckController.cancelCheck);
+router.put('/cm_post_dated_check/:id/revert',       cmPostDatedCheckController.revertCheck);
 router.delete('/cm_post_dated_check/:id',           cmPostDatedCheckController.deleteRow);
 
 

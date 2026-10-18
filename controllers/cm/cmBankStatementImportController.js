@@ -1,5 +1,6 @@
 // controllers/cm/cmBankStatementImportController.js
 const { today } = require('../../utils/dateUtil');
+const { ensureTables } = require('./cmBankStatementController');
 'use strict';
 
 // POST: import parsed lines into a new bank statement
@@ -15,41 +16,17 @@ const importStatement = async (req, res) => {
     if (!Array.isArray(lines) || lines.length === 0)
         return res.status(400).json({ error: 'ต้องมีข้อมูล lines อย่างน้อย 1 รายการ' });
 
-    const createdBy = req.headers.username || 'system';
+    const userName = req.headers.username || null;
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
 
-        // Ensure bank_statement tables exist (delegate to the existing controller pattern)
-        await client.query(`
-            CREATE TABLE IF NOT EXISTS cm_bank_statement (
-                id                    SERIAL PRIMARY KEY,
-                bank_account_id       INTEGER NOT NULL REFERENCES cm_bank_account(id),
-                statement_date_from   DATE NOT NULL,
-                statement_date_to     DATE NOT NULL,
-                opening_balance       NUMERIC(18,4) NOT NULL DEFAULT 0,
-                closing_balance       NUMERIC(18,4) NOT NULL DEFAULT 0,
-                description           TEXT,
-                status                VARCHAR(20) NOT NULL DEFAULT 'Draft',
-                created_by            VARCHAR(100),
-                created_at            TIMESTAMPTZ DEFAULT NOW(),
-                updated_at            TIMESTAMPTZ DEFAULT NOW()
-            )
-        `);
-        await client.query(`
-            CREATE TABLE IF NOT EXISTS cm_bank_statement_line (
-                id              SERIAL PRIMARY KEY,
-                statement_id    INTEGER NOT NULL REFERENCES cm_bank_statement(id) ON DELETE CASCADE,
-                line_date       DATE    NOT NULL,
-                description     TEXT,
-                debit_amount    NUMERIC(18,4) NOT NULL DEFAULT 0,
-                credit_amount   NUMERIC(18,4) NOT NULL DEFAULT 0,
-                balance         NUMERIC(18,4),
-                is_reconciled   BOOLEAN NOT NULL DEFAULT FALSE,
-                reference_no    VARCHAR(100),
-                created_at      TIMESTAMPTZ DEFAULT NOW()
-            )
-        `);
+        // ตารางเดียวกับหน้าจอ Bank Statement (เดิมไฟล์นี้สร้างตารางเองด้วยชื่อคอลัมน์ที่ไม่ตรงกัน
+        // — description/debit_amount/credit_amount/reference_no ไม่มีอยู่จริง นำเข้าจึงไม่สำเร็จ)
+        await ensureTables(client);
+        const userRes = userName
+            ? await client.query(`SELECT id FROM sa_user WHERE user_name = $1 LIMIT 1`, [userName]) : { rows: [] };
+        const createdBy = userRes.rows[0]?.id || null;
 
         // Compute date range from lines if not provided
         const lineDates = lines.map(l => l.line_date).filter(Boolean).sort();
@@ -74,7 +51,7 @@ const importStatement = async (req, res) => {
         const stmtRes = await client.query(`
             INSERT INTO cm_bank_statement
                 (bank_account_id, statement_date_from, statement_date_to,
-                 opening_balance, closing_balance, description, status, created_by)
+                 opening_balance, closing_balance, notes, status, created_by)
             VALUES ($1,$2,$3,$4,$5,$6,'Draft',$7) RETURNING id`,
             [bank_account_id, dateFrom, dateTo,
              Math.round(openingBalance * 100) / 100,
@@ -88,20 +65,16 @@ const importStatement = async (req, res) => {
         for (let i = 0; i < lines.length; i++) {
             const l = lines[i];
             if (!l.line_date) { errors.push(`Row ${i+1}: ไม่มีวันที่`); continue; }
-            try {
-                await client.query(`
-                    INSERT INTO cm_bank_statement_line
-                        (statement_id, line_date, description, debit_amount, credit_amount, balance, reference_no)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-                    [stmtId, l.line_date, l.description || '',
-                     parseFloat(l.debit  || 0),
-                     parseFloat(l.credit || 0),
-                     l.balance !== undefined && l.balance !== null ? parseFloat(l.balance) : null,
-                     l.reference_no || null]);
-                imported++;
-            } catch (err) {
-                errors.push(`Row ${i+1}: ${err.message}`);
-            }
+            await client.query(`
+                INSERT INTO cm_bank_statement_line
+                    (statement_id, line_date, description, withdrawal_amount, deposit_amount, balance, reference)
+                VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+                [stmtId, l.line_date, l.description || '',
+                 parseFloat(l.debit  || 0),
+                 parseFloat(l.credit || 0),
+                 l.balance !== undefined && l.balance !== null ? parseFloat(l.balance) : 0,
+                 l.reference_no || null]);
+            imported++;
         }
 
         await client.query('COMMIT');
