@@ -134,7 +134,7 @@ const getMovementReport = async (req, res) => {
                 ) applied_by_info ON true
                 WHERE (
                           t.status = 'Posted'
-                          OR (d.sys_doc_type = ANY($6::text[]) AND t.status <> 'Void')
+                          OR (d.sys_doc_type = ANY($6::text[]) AND t.status NOT IN ('Void', 'Deleted'))
                       )
                   AND d.sys_doc_type = ANY($5::text[])
                   AND t.doc_date <= $2::date

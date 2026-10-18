@@ -116,6 +116,7 @@ router.put('/ap_transaction/:id/approve',            apTransactionController.app
 router.put('/ap_transaction/:id/reject',             apTransactionController.rejectTransaction);
 router.put('/ap_transaction/:id/post',               apTransactionController.postTransaction);
 router.put('/ap_transaction/:id/void',               apTransactionController.voidTransaction);
+router.put('/ap_transaction/:id/reverse',            apTransactionController.reverseTransaction);
 router.delete('/ap_transaction/:id',                 apTransactionController.deleteTransaction);
 
 

@@ -1,3 +1,4 @@
+const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 // controllers/ap/apTransactionController.js
 
 // --- Helper: Generate Document Number ---
@@ -144,7 +145,8 @@ const resolvePaymentGlAccount = async (client, payment, setup, fallbackCashAccou
 };
 
 // --- Helper: Post GL Entry for AP transaction ---
-const postGlEntry = async (client, headerId, header, details, docNo) => {
+// reservedGlDocNo: เลขที่รายการบัญชีเดิมของเอกสารที่ถอยเป็นร่าง (ap_transaction.gl_doc_no) — โพสต์ใหม่ใช้เลขเดิม
+const postGlEntry = async (client, headerId, header, details, docNo, reservedGlDocNo = null) => {
     const periodRes = await client.query(
         `SELECT id FROM gl_posting_period
          WHERE $1::date BETWEEN period_start_date AND period_end_date
@@ -217,7 +219,7 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
     const glDocId = setup.gl_doc_id;
     if (!glDocId) throw new Error('ยังไม่ได้ตั้งค่า GL Document Type ใน ap_gl_account_setup สำหรับประเภทเอกสารนี้');
 
-    let glDocNo = await generateDocNo(client, glDocId, header.doc_date, header.branch_id);
+    let glDocNo = reservedGlDocNo || await generateDocNo(client, glDocId, header.doc_date, header.branch_id);
     if (!glDocNo) glDocNo = `GL-${docNo}`;
 
     const vatAccountId        = Number(setup.vat_input_account_id)         || null;
@@ -653,6 +655,89 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
     return glEntryId;
 };
 
+// --- Helper: ปรับยอดจ่าย/คงค้างของใบตั้งหนี้ตาม apply ของเอกสารนี้ (sign +1 = เพิ่ม, -1 = คืน) ---
+// ปรับแบบเพิ่ม/ลดเฉพาะส่วนของเอกสารนี้ ไม่คำนวณใหม่ทั้งใบ เพราะการจ่ายแบบกลุ่ม (apBulkPayment) เพิ่ม paid_amount_lc
+// โดยไม่มีแถว apply ถ้าคำนวณใหม่จาก apply ยอดส่วนนั้นจะหาย
+const adjustInvoiceBalances = async (client, transactionId, sign) => {
+    await client.query(`
+        UPDATE ap_transaction t SET
+            paid_amount_lc    = GREATEST(0, COALESCE(t.paid_amount_lc, 0) + $2 * x.amt),
+            balance_amount_lc = t.total_amount_lc - GREATEST(0, COALESCE(t.paid_amount_lc, 0) + $2 * x.amt),
+            updated_at = NOW()
+          FROM (SELECT a.applied_to_id, SUM(a.applied_amount_fc * inv.exchange_rate) AS amt
+                  FROM ap_transaction_apply a
+                  JOIN ap_transaction inv ON inv.id = a.applied_to_id
+                 WHERE a.transaction_id = $1 AND a.apply_type = 'invoice'
+                 GROUP BY a.applied_to_id) x
+         WHERE t.id = x.applied_to_id`, [transactionId, sign]);
+};
+
+// --- ถอยเป็นร่าง: ตรวจว่าถอยได้หรือไม่ ---
+// Posted → Draft: งวดยังเปิด และไม่มีเอกสารอื่นอ้างอิง (ลบรายการบัญชีออก เก็บเลขที่ไว้ใช้ซ้ำ)
+// Submitted/Approved → Draft: ดึงกลับมาแก้ไข (ต้องขออนุมัติใหม่)
+// คืน null = ถอยได้ หรือ { code, ref } = ถอยไม่ได้ (หน้าจอใช้ code แสดงเหตุผล 2 ภาษา, ref = เลขที่เอกสารที่อ้างอิง)
+// หมายเหตุ: คำนำหน้าคำอธิบาย 'ตั้งหนี้สินค้าฝากขาย' = ใบตั้งหนี้จากการตั้งหนี้สินค้าฝากขาย (imConsignmentSettlementController)
+const AP_REVERSE_INFO_SQL = `
+    SELECT t.id, t.doc_no, t.status, t.gl_entry_id, t.paid_amount_lc, t.total_amount_lc, d.sys_doc_type,
+           p.ap_status, gp.gl_status AS gl_period_status,
+           EXISTS (SELECT 1 FROM im_transaction i WHERE i.linked_ap_transaction_id = t.id) AS from_im,
+           COALESCE(t.description, '') LIKE 'ตั้งหนี้สินค้าฝากขาย%' AS from_consignment,
+           (SELECT string_agg(DISTINCT p2.doc_no, ', ')
+              FROM ap_transaction_apply a JOIN ap_transaction p2 ON p2.id = a.transaction_id
+             WHERE a.applied_to_id = t.id AND a.transaction_id <> t.id
+               AND p2.status NOT IN ('Void', 'Deleted')) AS applied_by,
+           (SELECT string_agg(p3.doc_no, ', ')
+              FROM ap_transaction p3 JOIN sa_module_document d3 ON d3.id = p3.doc_id
+             WHERE d.sys_doc_type = '70' AND d3.sys_doc_type = '80' AND p3.ref_no = t.doc_no
+               AND p3.status NOT IN ('Void', 'Deleted')) AS ra_paid_by,
+           (SELECT string_agg(DISTINCT r.run_number, ', ')
+              FROM ap_payment_run_detail rd JOIN ap_payment_run r ON r.id = rd.run_id
+             WHERE rd.ap_transaction_id = t.id AND r.status IN ('Draft', 'Submitted', 'Approved')) AS in_payment_run,
+           (SELECT string_agg(DISTINCT to_char(fr.reval_date, 'DD/MM/YYYY'), ', ')
+              FROM ap_fx_revaluation_detail fd JOIN ap_fx_revaluation fr ON fr.id = fd.revaluation_id
+             WHERE fd.invoice_id = t.id AND fr.status <> 'Void') AS in_fx_reval,
+           (SELECT string_agg(DISTINCT COALESCE(c.check_no, c.ap_doc_no, c.id::text), ', ')
+              FROM cm_payment c
+             WHERE c.ap_transaction_id = t.id
+               AND (c.status <> 'Pending' OR c.is_reconciled IS TRUE)) AS cm_cleared
+      FROM ap_transaction t
+      JOIN sa_module_document d ON d.id = t.doc_id
+      LEFT JOIN gl_posting_period p  ON p.id = t.period_id
+      LEFT JOIN gl_entry_header   g  ON g.id = t.gl_entry_id
+      LEFT JOIN gl_posting_period gp ON gp.id = g.period_id
+     WHERE t.id = $1`;
+
+const getApReverseBlock = (r) => {
+    if (['Submitted', 'Approved'].includes(r.status)) return null;
+    if (r.status !== 'Posted') return { code: 'NOT_REVERSIBLE' };
+    if (r.from_im) return { code: 'IM_SOURCE' };
+    if (r.from_consignment) return { code: 'CONSIGNMENT' };
+    if (!r.gl_entry_id && r.sys_doc_type !== '70') return { code: 'IMPORTED' };
+    if (r.ap_status !== 'OPEN' || (r.gl_period_status && r.gl_period_status !== 'OPEN')) return { code: 'PERIOD_CLOSED' };
+    if (r.applied_by) return { code: 'APPLIED', ref: r.applied_by };
+    if (Number(r.paid_amount_lc) > 0.005) return { code: 'PAID' };
+    if (r.ra_paid_by) return { code: 'RA_PAID', ref: r.ra_paid_by };
+    if (r.in_payment_run) return { code: 'PAYMENT_RUN', ref: r.in_payment_run };
+    if (r.in_fx_reval) return { code: 'FX_REVAL', ref: r.in_fx_reval };
+    if (r.cm_cleared) return { code: 'CM_CLEARED', ref: r.cm_cleared };
+    return null;
+};
+
+const AP_REVERSE_BLOCK_MESSAGES = {
+    NOT_REVERSIBLE: 'ถอยได้เฉพาะเอกสารที่โพสต์แล้ว หรือรออนุมัติ/อนุมัติแล้ว',
+    IM_SOURCE:      'เอกสารนี้สร้างจากโมดูลสินค้าคงคลัง กรุณาถอยจากเอกสาร IM ต้นทาง',
+    CONSIGNMENT:    'เอกสารนี้สร้างจากการตั้งหนี้สินค้าฝากขาย กรุณายกเลิกจากหน้าจอตั้งหนี้สินค้าฝากขาย',
+    IMPORTED:       'เอกสารยอดยกมาที่นำเข้า ไม่มีรายการบัญชี ถอยเป็นร่างไม่ได้',
+    PERIOD_CLOSED:  'งวดบัญชีของเอกสารนี้ปิดแล้ว ถอยเป็นร่างไม่ได้',
+    APPLIED:        'มีเอกสารอ้างอิงเอกสารนี้อยู่',
+    PAID:           'เอกสารนี้มีการจ่ายชำระแล้ว (จ่ายแบบกลุ่ม)',
+    RA_PAID:        'ใบแจ้งชำระนี้ถูกนำไปจ่ายชำระแล้ว',
+    PAYMENT_RUN:    'เอกสารนี้อยู่ในชุดจ่ายเงินที่ยังไม่เสร็จ',
+    FX_REVAL:       'เอกสารนี้อยู่ในการปรับมูลค่าอัตราแลกเปลี่ยน',
+    CM_CLEARED:     'การจ่ายเงินผ่านธนาคารของเอกสารนี้เคลียร์/กระทบยอดแล้ว',
+};
+const apReverseBlockMessage = (b) => AP_REVERSE_BLOCK_MESSAGES[b.code] + (b.ref ? ` (${b.ref})` : '');
+
 // --- Ensure payment table exists ---
 const ensurePaymentTable = async (client) => {
     await client.query(`
@@ -805,9 +890,14 @@ const fetchRowById = async (pool, id) => {
             .catch(() => ({ rows: [] })),
     ]);
     if (hRes.rows.length === 0) return null;
+    const infoRes = await pool.query(AP_REVERSE_INFO_SQL, [id]);
+    const block = infoRes.rows[0] ? getApReverseBlock(infoRes.rows[0]) : null;
     return {
         ...hRes.rows[0], details: dRes.rows, applies: aRes.rows, payments: pRes.rows, whts: whtRes.rows,
         approvals: apprRes.rows,
+        reverse_block: block ? block.code : null,
+        reverse_block_ref: block ? (block.ref || null) : null,
+        reverse_history: await getReverseHistory(pool, 'ap_transaction', id),
     };
 };
 
@@ -833,6 +923,7 @@ const fetchRows = async (req, res) => {
         if (vendor_id)  { params.push(vendor_id);  query += ` AND t.vendor_id = $${pi++}`; }
         if (doc_code)   { params.push(doc_code);   query += ` AND d.doc_code = $${pi++}`; }
         if (status)     { params.push(status);     query += ` AND t.status = $${pi++}`; }
+        else            { query += ` AND t.status <> 'Deleted'`; }
         if (date_from)  { params.push(date_from);  query += ` AND t.doc_date >= $${pi++}`; }
         if (date_to)    { params.push(date_to);    query += ` AND t.doc_date <= $${pi++}`; }
         if (search) {
@@ -1145,26 +1236,7 @@ const createTransaction = async (req, res) => {
         }
 
         // Update invoice balances
-        const affectedIds = [...new Set(
-            (applies || []).filter(a => (a.apply_type || 'invoice') === 'invoice')
-                           .map(a => a.applied_to_id).filter(Boolean)
-        )];
-        for (const invoiceId of affectedIds) {
-            await client.query(`
-                UPDATE ap_transaction t SET
-                    paid_amount_lc = (
-                        SELECT COALESCE(SUM(a.applied_amount_fc * t.exchange_rate), 0)
-                        FROM ap_transaction_apply a
-                        WHERE a.applied_to_id = t.id AND a.apply_type = 'invoice'
-                    ),
-                    balance_amount_lc = t.total_amount_lc -
-                        COALESCE((SELECT SUM(a.applied_amount_fc * t.exchange_rate)
-                                  FROM ap_transaction_apply a
-                                  WHERE a.applied_to_id = t.id AND a.apply_type = 'invoice'), 0),
-                    updated_at = NOW()
-                WHERE id = $1
-            `, [invoiceId]);
-        }
+        await adjustInvoiceBalances(client, newHeaderId, +1);
 
         // Insert payment rows
         await ensurePaymentTable(client);
@@ -1231,7 +1303,7 @@ const createTransaction = async (req, res) => {
                 glEntryId = await postGlEntry(client, newHeaderId, headerWithDocNo, details || [], finalDocNo);
                 await insertVtRecords(client, newHeaderId, headerWithDocNo, details || [], sysDocType1);
                 if (glEntryId) {
-                    await client.query(`UPDATE ap_transaction SET gl_entry_id=$1 WHERE id=$2`, [glEntryId, newHeaderId]);
+                    await client.query(`UPDATE ap_transaction SET gl_entry_id=$1, gl_doc_no=(SELECT doc_no FROM gl_entry_header WHERE id=$1) WHERE id=$2`, [glEntryId, newHeaderId]);
                 }
                 if (['65'].includes(sysDocType1)) {
                     await client.query(`UPDATE ap_transaction SET balance_amount_lc=0 WHERE id=$1`, [newHeaderId]);
@@ -1263,7 +1335,7 @@ const updateTransaction = async (req, res) => {
         await client.query(`ALTER TABLE ap_transaction_detail ADD COLUMN IF NOT EXISTS item_code VARCHAR(50)`).catch(() => {});
         await client.query(`ALTER TABLE ap_transaction_detail ADD COLUMN IF NOT EXISTS item_name VARCHAR(200)`).catch(() => {});
 
-        const existing = await client.query(`SELECT status FROM ap_transaction WHERE id=$1`, [id]);
+        const existing = await client.query(`SELECT status FROM ap_transaction WHERE id=$1 FOR UPDATE`, [id]);
         if (existing.rows.length === 0) throw new Error('Not found');
         if (existing.rows[0].status !== 'Draft') throw new Error('แก้ไขได้เฉพาะเอกสาร Draft เท่านั้น');
 
@@ -1306,6 +1378,8 @@ const updateTransaction = async (req, res) => {
             header.branch_id || null, header.updated_by || null, id
         ]);
 
+        // คืนยอดคงค้างของใบตั้งหนี้ตาม apply เดิม (เดิมลบ apply โดยไม่คืนยอด ทำให้ยอดค้างของใบตั้งหนี้ผิด)
+        await adjustInvoiceBalances(client, id, -1);
         await client.query(`DELETE FROM ap_transaction_detail WHERE header_id=$1`, [id]);
         await client.query(`DELETE FROM ap_transaction_apply  WHERE transaction_id=$1`, [id]);
         await client.query(`DELETE FROM ap_transaction_wht    WHERE header_id=$1`, [id]);
@@ -1344,6 +1418,7 @@ const updateTransaction = async (req, res) => {
             `, [id, w.wht_type || null, w.wht_type_id || null, w.income_type || null,
                 w.wht_rate || 0, w.base_amount_lc || 0, w.wht_amount_lc || 0, w.description || null]);
         }
+        await adjustInvoiceBalances(client, id, +1);
         const totalWhtLc = (whts || []).reduce((s, w) => s + (Number(w.wht_amount_lc) || 0), 0);
         await client.query(`UPDATE ap_transaction SET wht_amount_lc=$1 WHERE id=$2`, [totalWhtLc, id]);
 
@@ -1592,10 +1667,10 @@ const postTransaction = async (req, res) => {
         let glEntryId = null;
         if (!isRaPost) {
             const headerWithDocNo = { ...tx, _applies: aRes.rows, _payments: pRes.rows, _whts: whtRes.rows };
-            glEntryId = await postGlEntry(client, id, headerWithDocNo, dRes.rows, tx.doc_no);
+            glEntryId = await postGlEntry(client, id, headerWithDocNo, dRes.rows, tx.doc_no, tx.gl_doc_no);
             await insertVtRecords(client, id, headerWithDocNo, dRes.rows, sysDocType1);
             if (glEntryId) {
-                await client.query(`UPDATE ap_transaction SET gl_entry_id=$1 WHERE id=$2`, [glEntryId, id]);
+                await client.query(`UPDATE ap_transaction SET gl_entry_id=$1, gl_doc_no=(SELECT doc_no FROM gl_entry_header WHERE id=$1) WHERE id=$2`, [glEntryId, id]);
             }
             if (sysDocType1 === '65') {
                 await client.query(`UPDATE ap_transaction SET balance_amount_lc=0 WHERE id=$1`, [id]);
@@ -1709,22 +1784,107 @@ const voidTransaction = async (req, res) => {
     }
 };
 
-// --- 4. Delete Transaction (Draft only) ---
-const deleteTransaction = async (req, res) => {
+// --- 3b. Reverse to Draft ---
+// Posted → Draft: ลบรายการบัญชี (trigger ตัดยอดสะสม) แต่เก็บเลขที่ไว้ที่ gl_doc_no, ลบรายการภาษีซื้อ (vt_transaction)
+//   และรายการจ่ายเงินผ่านธนาคาร (cm_payment ที่ยังรอเคลียร์ — โพสต์ใหม่จะสร้างใหม่)
+//   apply ที่จับคู่ใบตั้งหนี้ยังอยู่กับร่าง (ร่างนับยอดจ่ายอยู่แล้ว ตามที่ create/update ทำ) จึงไม่ต้องปรับยอด
+// Submitted/Approved → Draft: ล้างขั้นตอนอนุมัติ ต้องขออนุมัติใหม่
+// เลขที่เอกสาร AP คงเดิม และบันทึกประวัติการถอยที่ sa_document_reverse_log
+const reverseTransaction = async (req, res) => {
     const { id } = req.params;
+    const reason = (req.body?.reason || '').trim();
+    const userId = req.body?.user_id || req.headers['userid'] || null;
+    const userName = req.headers['username'] || null;
+    if (!reason) return res.status(400).json({ message: 'กรุณาระบุเหตุผลการถอยเอกสาร' });
+
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
-        const existing = await client.query(`SELECT status FROM ap_transaction WHERE id=$1`, [id]);
-        if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
-        if (existing.rows[0].status !== 'Draft') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'ลบได้เฉพาะเอกสาร Draft เท่านั้น' }); }
-        await client.query(`DELETE FROM ap_transaction WHERE id=$1`, [id]);
+        const lock = await client.query(`SELECT id FROM ap_transaction WHERE id=$1 FOR UPDATE`, [id]);
+        if (lock.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
+        const info = (await client.query(AP_REVERSE_INFO_SQL, [id])).rows[0];
+        const block = getApReverseBlock(info);
+        if (block) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ message: apReverseBlockMessage(block), code: block.code, ref: block.ref || null });
+        }
+
+        if (info.status === 'Posted') {
+            if (info.gl_entry_id) {
+                // ตัด FK ก่อน (ap_transaction.gl_entry_id ไม่มี ON DELETE SET NULL)
+                await client.query(`UPDATE ap_transaction SET gl_entry_id=NULL WHERE id=$1`, [id]);
+                await client.query(`DELETE FROM gl_entry_header WHERE id=$1`, [info.gl_entry_id]);
+            }
+            await client.query(`DELETE FROM vt_transaction WHERE module_code='AP' AND source_header_id=$1`, [id]);
+            if (info.sys_doc_type === '80') {
+                await client.query(`DELETE FROM cm_payment WHERE ap_transaction_id=$1`, [id]);
+            }
+            if (info.sys_doc_type === '65') {
+                // คืนเงินมัดจำ: ตอนโพสต์ตั้ง balance = 0 → คืนยอดเต็มให้ร่าง (ตามที่ create ตั้งไว้)
+                await client.query(`UPDATE ap_transaction SET balance_amount_lc = total_amount_lc WHERE id=$1`, [id]);
+            }
+        }
+
+        await client.query(`DELETE FROM ap_transaction_approval WHERE transaction_id=$1`, [id]).catch(() => {});
+        await client.query(`
+            UPDATE ap_transaction SET status='Draft', gl_entry_id=NULL, updated_at=NOW(), updated_by=$1 WHERE id=$2`,
+            [userName, id]);
+        await logReverse(client, {
+            sysModule: '21', tableName: 'ap_transaction', recordId: Number(id),
+            docNo: info.doc_no, fromStatus: info.status, reason, userId,
+        });
+
         await client.query('COMMIT');
-        res.status(204).send();
+        const full = await fetchRowById(req.dbPool, id);
+        res.status(200).json(full);
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error reversing ap_transaction:', error);
+        res.status(500).json({ message: error.message || 'Internal server error' });
+    } finally {
+        client.release();
+    }
+};
+
+// --- 4. Delete Transaction (Draft only) ---
+// เอกสารที่โพสต์แล้วต้องถอยเป็นร่างก่อนจึงลบได้ (กันลบโดยไม่ตั้งใจ)
+// ลบแล้วยังเก็บแถวไว้ด้วยสถานะ 'Deleted' เพื่อตรวจสอบ แต่นำกลับมาใช้ไม่ได้ และคืนยอดคงค้างให้ใบตั้งหนี้ที่จับคู่ไว้
+const deleteTransaction = async (req, res) => {
+    const { id } = req.params;
+    const reason = (req.body?.reason || '').trim();
+    const userId = req.body?.user_id || req.headers['userid'] || null;
+    const userName = req.headers['username'] || null;
+    if (!reason) return res.status(400).json({ message: 'กรุณาระบุเหตุผลการลบเอกสาร' });
+
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        const existing = await client.query(`SELECT id, doc_no, status FROM ap_transaction WHERE id=$1 FOR UPDATE`, [id]);
+        if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
+        const tx = existing.rows[0];
+        if (tx.status !== 'Draft') {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                message: tx.status === 'Posted'
+                    ? 'เอกสารที่โพสต์แล้วลบไม่ได้ กรุณาถอยเป็นร่างก่อน'
+                    : 'ลบได้เฉพาะเอกสาร Draft เท่านั้น',
+            });
+        }
+
+        await adjustInvoiceBalances(client, id, -1);
+        await client.query(`DELETE FROM ap_transaction_approval WHERE transaction_id=$1`, [id]).catch(() => {});
+        await client.query(`UPDATE ap_transaction SET status='Deleted', updated_at=NOW(), updated_by=$1 WHERE id=$2`, [userName, id]);
+        await logReverse(client, {
+            sysModule: '21', tableName: 'ap_transaction', recordId: Number(id),
+            docNo: tx.doc_no, fromStatus: tx.status, toStatus: 'Deleted', reason, userId,
+        });
+
+        await client.query('COMMIT');
+        res.status(200).json({ message: 'Deleted' });
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error deleting ap_transaction:', error);
-        res.status(500).json({ message: 'Internal server error' });
+        res.status(500).json({ message: error.message || 'Internal server error' });
     } finally {
         client.release();
     }
@@ -1735,6 +1895,6 @@ module.exports = {
     fetchOpenInvoices, fetchOpenAdvances,
     fetchOpenRemittanceAdvices, fetchRaInvoices,
     fetchRemittanceAdviceByDocNo,
-    createTransaction, updateTransaction, voidTransaction, deleteTransaction,
+    createTransaction, updateTransaction, voidTransaction, deleteTransaction, reverseTransaction,
     submitTransaction, approveTransaction, rejectTransaction, postTransaction,
 };
