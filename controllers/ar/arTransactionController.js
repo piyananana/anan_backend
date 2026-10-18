@@ -1,5 +1,6 @@
 // controllers/ar/arTransactionController.js
 const { today: todayYmd } = require('../../utils/dateUtil');
+const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 
 // --- Helper: Generate Document Number (supports per-branch counter) ---
 const generateDocNo = async (client, docId, date, branchId = null) => {
@@ -293,7 +294,8 @@ const postCmReceiptsHelper = async (client, arTransactionId, glEntryId) => {
 };
 
 // --- Helper: Post GL Entry for AR transaction ---
-const postGlEntry = async (client, headerId, header, details, docNo) => {
+// reservedGlDocNo: เลขที่รายการบัญชีเดิมของเอกสารที่ถอยเป็นร่าง (ar_transaction.gl_doc_no) — โพสต์ใหม่ใช้เลขเดิม
+const postGlEntry = async (client, headerId, header, details, docNo, reservedGlDocNo = null) => {
     // Find open period
     const periodRes = await client.query(
         `SELECT id FROM gl_posting_period
@@ -378,7 +380,7 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
     const glDocId = setup.gl_doc_id;
     if (!glDocId) throw new Error('ยังไม่ได้ตั้งค่า GL Document Type ใน ar_gl_account_setup สำหรับประเภทเอกสารนี้');
 
-    let glDocNo = await generateDocNo(client, glDocId, header.doc_date, header.branch_id);
+    let glDocNo = reservedGlDocNo || await generateDocNo(client, glDocId, header.doc_date, header.branch_id);
     if (!glDocNo) glDocNo = `GL-${docNo}`;
 
     // บัญชี VAT output, VAT รอตัดบัญชี, ส่วนลด, เงินสด, มัดจำรับ
@@ -424,6 +426,7 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
     ];
     const glHeaderRes = await client.query(glHeaderSql, glHeaderParams);
     const glEntryId = glHeaderRes.rows[0].id;
+    await client.query(`UPDATE ar_transaction SET gl_doc_no=$1 WHERE id=$2`, [glDocNo, headerId]);
 
     // Build GL detail lines
     const glDetails = [];
@@ -887,6 +890,119 @@ const postGlEntry = async (client, headerId, header, details, docNo) => {
     return glEntryId;
 };
 
+// --- Helper: คำนวณยอดรับชำระ/คงค้างของใบแจ้งหนี้ (และมัดจำ/ลดหนี้) จาก apply ทั้งหมดที่อ้างถึง ---
+// นับเฉพาะเอกสารที่ยังไม่ยกเลิก/ลบ (ร่างนับด้วย เพื่อกันยอดซ้ำระหว่างทำร่าง)
+// bc_* (ใบวางบิล) ไม่กระทบยอด, dn_ref (ใบเพิ่มหนี้อ้างใบแจ้งหนี้) เพิ่มยอดคงค้าง
+const recalcInvoiceBalances = async (client, invoiceIds) => {
+    const ids = [...new Set((invoiceIds || []).map(Number).filter(Boolean))];
+    if (ids.length === 0) return;
+    await client.query(`
+        UPDATE ar_transaction t SET
+            paid_amount_lc    = x.paid,
+            balance_amount_lc = t.total_amount_lc + x.dn - x.paid,
+            updated_at = NOW()
+          FROM (SELECT inv.id,
+                       COALESCE(SUM(a.applied_amount_fc * inv.exchange_rate)
+                                FILTER (WHERE a.apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')), 0) AS paid,
+                       COALESCE(SUM(a.applied_amount_fc * inv.exchange_rate)
+                                FILTER (WHERE a.apply_type = 'dn_ref'), 0) AS dn
+                  FROM ar_transaction inv
+                  LEFT JOIN ar_transaction_apply a ON a.applied_to_id = inv.id
+                       AND EXISTS (SELECT 1 FROM ar_transaction s
+                                    WHERE s.id = a.transaction_id AND s.status NOT IN ('Void', 'Deleted'))
+                 WHERE inv.id = ANY($1::int[])
+                 GROUP BY inv.id) x
+         WHERE t.id = x.id`, [ids]);
+};
+
+// เอกสารที่ apply ของเอกสารนี้อ้างถึง (ไม่รวมใบวางบิล bc_* เพราะไม่กระทบยอด)
+const appliedTargetIds = async (client, transactionId) => (await client.query(
+    `SELECT DISTINCT applied_to_id FROM ar_transaction_apply
+      WHERE transaction_id = $1 AND apply_type NOT IN ('bc_invoice','bc_advance','bc_cn')`,
+    [transactionId])).rows.map(r => r.applied_to_id);
+
+// --- ถอยเป็นร่าง / ยกเลิก: ตรวจว่าทำได้หรือไม่ ---
+// คืน null = ทำได้ หรือ { code, ref } = ทำไม่ได้ (หน้าจอใช้ code แสดงเหตุผล 2 ภาษา, ref = เลขที่เอกสารที่อ้างอิง)
+const AR_REVERSE_INFO_SQL = `
+    SELECT t.id, t.doc_no, t.status, t.gl_entry_id, d.sys_doc_type,
+           p.ar_status, gp.gl_status AS gl_period_status,
+           EXISTS (SELECT 1 FROM im_transaction i WHERE i.linked_ar_transaction_id = t.id) AS from_im,
+           (SELECT string_agg(DISTINCT s.doc_no, ', ')
+              FROM ar_transaction_apply a JOIN ar_transaction s ON s.id = a.transaction_id
+             WHERE a.applied_to_id = t.id AND a.transaction_id <> t.id
+               AND s.status NOT IN ('Void', 'Deleted')) AS applied_by,
+           (SELECT string_agg(r.doc_no, ', ')
+              FROM ar_transaction r JOIN sa_module_document rd ON rd.id = r.doc_id
+             WHERE d.sys_doc_type = '70' AND rd.sys_doc_type = '80' AND r.ref_no = t.doc_no
+               AND r.status NOT IN ('Void', 'Deleted')) AS bc_paid_by,
+           (SELECT string_agg(DISTINCT to_char(fr.reval_date, 'DD/MM/YYYY'), ', ')
+              FROM ar_fx_revaluation_detail fd JOIN ar_fx_revaluation fr ON fr.id = fd.revaluation_id
+             WHERE fd.invoice_id = t.id AND fr.status <> 'Void') AS in_fx_reval,
+           (SELECT string_agg(DISTINCT to_char(ar.run_date, 'DD/MM/YYYY'), ', ')
+              FROM ar_allowance_run_detail ad JOIN ar_allowance_run ar ON ar.id = ad.run_id
+             WHERE ad.invoice_id = t.id AND ar.status <> 'Void') AS in_allowance,
+           (SELECT string_agg(DISTINCT COALESCE(c.check_no, c.ar_doc_no, c.id::text), ', ')
+              FROM cm_receipt c
+             WHERE c.ar_transaction_id = t.id
+               AND (c.status NOT IN ('Pending', 'Voided') OR c.is_reconciled IS TRUE)) AS cm_cleared
+      FROM ar_transaction t
+      JOIN sa_module_document d ON d.id = t.doc_id
+      LEFT JOIN gl_posting_period p  ON p.id = t.period_id
+      LEFT JOIN gl_entry_header   g  ON g.id = t.gl_entry_id
+      LEFT JOIN gl_posting_period gp ON gp.id = g.period_id
+     WHERE t.id = $1`;
+
+// เงื่อนไขที่ใช้ร่วมกันระหว่างถอยกับยกเลิก: มีเอกสารอื่นอ้างอิงอยู่
+const getArDependentBlock = (r) => {
+    if (r.from_im) return { code: 'IM_SOURCE' };
+    if (r.applied_by) return { code: 'APPLIED', ref: r.applied_by };
+    if (r.bc_paid_by) return { code: 'BC_PAID', ref: r.bc_paid_by };
+    if (r.in_fx_reval) return { code: 'FX_REVAL', ref: r.in_fx_reval };
+    if (r.in_allowance) return { code: 'ALLOWANCE', ref: r.in_allowance };
+    if (r.cm_cleared) return { code: 'CM_CLEARED', ref: r.cm_cleared };
+    return null;
+};
+
+// ถอยเป็นร่าง (Posted → Draft): งวด AR ของเอกสารและงวด GL ของรายการบัญชียังเปิด และไม่มีเอกสารอื่นอ้างอิง
+// ใบวางบิล (70) ไม่มีรายการบัญชีอยู่แล้ว ส่วนเอกสารอื่นที่ไม่มีรายการบัญชี = ยอดยกมาที่นำเข้า
+const getArReverseBlock = (r) => {
+    if (r.status !== 'Posted') return { code: 'NOT_REVERSIBLE' };
+    if (!r.gl_entry_id && r.sys_doc_type !== '70') return { code: 'IMPORTED' };
+    if (r.ar_status !== 'OPEN' || (r.gl_period_status && r.gl_period_status !== 'OPEN')) return { code: 'PERIOD_CLOSED' };
+    return getArDependentBlock(r);
+};
+
+// ยกเลิก (Posted → Void): ใช้เมื่อถอยเป็นร่างไม่ได้ ไม่ดูงวดของเอกสารเดิม เพราะลงรายการกลับในงวดของวันที่ยกเลิก
+const getArVoidBlock = (r) => {
+    if (r.status !== 'Posted') return { code: 'NOT_POSTED' };
+    return getArDependentBlock(r);
+};
+
+const AR_BLOCK_MESSAGES = {
+    NOT_REVERSIBLE: 'ถอยได้เฉพาะเอกสารที่โพสต์แล้ว',
+    NOT_POSTED:     'ยกเลิกได้เฉพาะเอกสารที่โพสต์แล้ว (เอกสารร่างให้ลบแทน)',
+    IM_SOURCE:      'เอกสารนี้สร้างจากโมดูลสินค้าคงคลัง กรุณาทำจากเอกสาร IM ต้นทาง',
+    IMPORTED:       'เอกสารยอดยกมาที่นำเข้า ไม่มีรายการบัญชี ถอยเป็นร่างไม่ได้',
+    PERIOD_CLOSED:  'งวดบัญชีของเอกสารนี้ปิดแล้ว ถอยเป็นร่างไม่ได้',
+    APPLIED:        'มีเอกสารอ้างอิงเอกสารนี้อยู่',
+    BC_PAID:        'ใบวางบิลนี้ถูกนำไปรับชำระแล้ว',
+    FX_REVAL:       'เอกสารนี้อยู่ในการปรับมูลค่าอัตราแลกเปลี่ยน',
+    ALLOWANCE:      'เอกสารนี้อยู่ในการตั้งค่าเผื่อหนี้สงสัยจะสูญ',
+    CM_CLEARED:     'การรับเงินผ่านธนาคารของเอกสารนี้เคลียร์/กระทบยอดแล้ว',
+};
+const arBlockMessage = (b) => AR_BLOCK_MESSAGES[b.code] + (b.ref ? ` (${b.ref})` : '');
+
+// ใบเสร็จที่อ้างเลขที่ใบวางบิลใน ref_no: โพสต์แล้วเคลียร์ยอดวางบิล → ถอย/ยกเลิกต้องคืนยอดวางบิล
+const restoreBillCollection = async (client, refNo) => {
+    if (!refNo) return;
+    await client.query(`
+        UPDATE ar_transaction t SET balance_amount_lc = total_amount_lc, updated_at = NOW()
+        FROM sa_module_document d
+        WHERE t.doc_id = d.id AND d.sys_doc_type = '70'
+          AND t.doc_no = $1 AND t.status = 'Posted'
+    `, [refNo]);
+};
+
 // --- Helper: create ar_transaction_payment if it doesn't exist yet ---
 const ensurePaymentTable = async (client) => {
     await client.query(`
@@ -1061,27 +1177,7 @@ const createTransaction = async (req, res) => {
             (applies || []).filter(a => !['bc_invoice','bc_advance','bc_cn'].includes(a.apply_type || 'invoice'))
                            .map(a => a.applied_to_id).filter(Boolean)
         )];
-        for (const invoiceId of createdAffectedIds) {
-            await client.query(`
-                UPDATE ar_transaction t SET
-                    paid_amount_lc = (
-                        SELECT COALESCE(SUM(ata.applied_amount_fc * t.exchange_rate), 0)
-                        FROM ar_transaction_apply ata
-                        WHERE ata.applied_to_id = t.id
-                          AND ata.apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')
-                    ),
-                    balance_amount_lc = t.total_amount_lc
-                        + COALESCE((SELECT SUM(ata.applied_amount_fc * t.exchange_rate)
-                                    FROM ar_transaction_apply ata
-                                    WHERE ata.applied_to_id = t.id AND ata.apply_type = 'dn_ref'), 0)
-                        - COALESCE((SELECT SUM(ata.applied_amount_fc * t.exchange_rate)
-                                    FROM ar_transaction_apply ata
-                                    WHERE ata.applied_to_id = t.id
-                                      AND ata.apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')), 0),
-                    updated_at = NOW()
-                WHERE id = $1
-            `, [invoiceId]);
-        }
+        await recalcInvoiceBalances(client, createdAffectedIds);
 
         // Insert payment rows (ar_transaction_payment)
         await ensurePaymentTable(client);
@@ -1279,7 +1375,13 @@ const updateTransaction = async (req, res) => {
             ]);
         }
 
-        // If Post: recalculate balances on applied invoices/advances and create GL + VAT
+        // คำนวณยอดคงค้างของเอกสารที่ apply เดิม (ก่อนลบ) และ apply ใหม่อ้างถึง
+        await recalcInvoiceBalances(client, [
+            ...oldAppliesRes.rows.filter(a => !['bc_invoice','bc_advance','bc_cn'].includes(a.apply_type)).map(a => a.applied_to_id),
+            ...(applies || []).filter(a => !['bc_invoice','bc_advance','bc_cn'].includes(a.apply_type)).map(a => a.applied_to_id),
+        ]);
+
+        // If Post: create GL + VAT
         let glEntryId = null;
         if (action === 'Post') {
             const sysDocTypeRes2 = await client.query(
@@ -1288,42 +1390,11 @@ const updateTransaction = async (req, res) => {
             const sysDocType2 = sysDocTypeRes2.rows[0]?.sys_doc_type || '';
             const isBcUpdate = sysDocType2 === '70'; // BC ไม่ลงบัญชี GL
 
-            // Recalculate balances — รวม IDs จาก old applies (ก่อน delete) + new applies
-            const nonBcApplies = (applies || []).filter(a => !['bc_invoice','bc_advance','bc_cn'].includes(a.apply_type));
-            const oldNonBcIds = oldAppliesRes.rows
-                .filter(a => !['bc_invoice','bc_advance','bc_cn'].includes(a.apply_type))
-                .map(a => a.applied_to_id).filter(Boolean);
-            const affectedIds = [...new Set([
-                ...oldNonBcIds,
-                ...nonBcApplies.map(a => a.applied_to_id).filter(Boolean),
-            ])];
-            for (const invoiceId of affectedIds) {
-                await client.query(`
-                    UPDATE ar_transaction t SET
-                        paid_amount_lc = (
-                            SELECT COALESCE(SUM(ata.applied_amount_fc * t.exchange_rate), 0)
-                            FROM ar_transaction_apply ata
-                            WHERE ata.applied_to_id = t.id
-                              AND ata.apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')
-                        ),
-                        balance_amount_lc = t.total_amount_lc
-                            + COALESCE((SELECT SUM(ata.applied_amount_fc * t.exchange_rate)
-                                        FROM ar_transaction_apply ata
-                                        WHERE ata.applied_to_id = t.id AND ata.apply_type = 'dn_ref'), 0)
-                            - COALESCE((SELECT SUM(ata.applied_amount_fc * t.exchange_rate)
-                                        FROM ar_transaction_apply ata
-                                        WHERE ata.applied_to_id = t.id
-                                          AND ata.apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')), 0),
-                        updated_at = NOW()
-                    WHERE id = $1
-                `, [invoiceId]);
-            }
-
             if (!isBcUpdate) {
-                const docNoRes = await client.query('SELECT doc_no FROM ar_transaction WHERE id=$1', [id]);
+                const docNoRes = await client.query('SELECT doc_no, gl_doc_no FROM ar_transaction WHERE id=$1', [id]);
                 const docNo = docNoRes.rows[0].doc_no;
                 const headerWithDocNo = { ...header, doc_no: docNo, _applies: applies || [], _payments: payments || [] };
-                glEntryId = await postGlEntry(client, id, headerWithDocNo, details || [], docNo);
+                glEntryId = await postGlEntry(client, id, headerWithDocNo, details || [], docNo, docNoRes.rows[0].gl_doc_no);
                 await insertVtRecords(client, id, headerWithDocNo, details || [], sysDocType2);
                 await insertDeferredVtRecordsForReceipt(client, id, headerWithDocNo, applies || []);
                 await client.query(`UPDATE ar_transaction SET gl_entry_id=$1 WHERE id=$2`, [glEntryId, id]);
@@ -1354,226 +1425,180 @@ const updateTransaction = async (req, res) => {
     }
 };
 
-// --- 3. Void Transaction (Posted only) ---
-// --- Helper: เพิ่มคอลัมน์ void metadata ถ้ายังไม่มี ---
-const ensureVoidFields = async (client) => {
-    await client.query(`
-        DO $$ BEGIN
-            IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_name='ar_transaction' AND column_name='void_reason')
-            THEN
-                ALTER TABLE ar_transaction
-                    ADD COLUMN void_reason    VARCHAR(500),
-                    ADD COLUMN voided_by      VARCHAR(100),
-                    ADD COLUMN voided_at      TIMESTAMPTZ,
-                    ADD COLUMN void_gl_entry_id INT;
-            END IF;
-        END $$
-    `);
-};
-
-// --- 3b. Void Transaction (Posted → Void) ---
-// กลยุทธ์: เก็บ GL entry ต้นทางไว้ครบถ้วน + สร้าง Reversing GL entry ใหม่
-// เพื่อรักษา audit trail และให้ยอดสุทธิในGL = 0
+// --- 3. Void Transaction (Posted → Void) ---
+// เก็บรายการบัญชีเดิมไว้ครบ แล้วลงรายการกลับ (สลับเดบิต/เครดิต) ลงวันที่ยกเลิก ในงวดที่เปิดอยู่
+// ภาษีขาย: ยกเลิกในเดือนเดียวกับเอกสาร → ตัดรายการออก (is_voided), ข้ามเดือน → ลงรายการกลับในเดือนที่ยกเลิก
+//   เพื่อไม่ให้รายงานภาษีของเดือนที่ยื่นไปแล้วเปลี่ยน
+// คืนยอดคงค้างให้เอกสารที่จับคู่ไว้ ยกเลิกรายการรับเงินผ่านธนาคารที่ยังรอเคลียร์ และคืนยอดวางบิล
 const voidTransaction = async (req, res) => {
     const { id } = req.params;
-    const { void_reason, updated_by } = req.body;
-    if (!void_reason || !void_reason.trim()) {
-        return res.status(400).json({ error: 'กรุณาระบุเหตุผลการยกเลิก' });
-    }
+    const voidReason = (req.body?.void_reason || '').trim();
+    const userId = req.body?.user_id || req.headers['userid'] || null;
+    const userName = req.body?.updated_by || req.headers['username'] || null;
+    if (!voidReason) return res.status(400).json({ error: 'กรุณาระบุเหตุผลการยกเลิก' });
+
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
-        await ensureVoidFields(client);
+        const lock = await client.query(`SELECT * FROM ar_transaction WHERE id=$1 FOR UPDATE`, [id]);
+        if (lock.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
+        const tx = lock.rows[0];
+        const info = (await client.query(AR_REVERSE_INFO_SQL, [id])).rows[0];
+        const block = getArVoidBlock(info);
+        if (block) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: arBlockMessage(block), code: block.code, ref: block.ref || null });
+        }
 
-        // 1. ตรวจสอบ status
-        const checkRes = await client.query(
-            `SELECT t.status, t.gl_entry_id, t.doc_no, t.ref_no, d.sys_doc_type
-             FROM ar_transaction t JOIN sa_module_document d ON t.doc_id = d.id
-             WHERE t.id = $1`, [id]
-        );
-        if (!checkRes.rows[0]) return res.status(404).json({ error: 'Not found' });
-        if (checkRes.rows[0].status !== 'Posted') throw new Error('Only Posted can be voided');
-
-        const origGlId        = checkRes.rows[0].gl_entry_id;
-        const arDocNo         = checkRes.rows[0].doc_no;
-        const voidSysDocType  = checkRes.rows[0].sys_doc_type || '';
-        const isBcVoid        = voidSysDocType === '70'; // BC ไม่มี GL ให้ reverse
-        const isReceiptVoid   = voidSysDocType === '80';
-        const today           = todayYmd();
-
-        // 2. สร้าง Reversing GL Entry จาก GL entry ต้นทาง (ข้ามสำหรับ BC)
+        const voidDate = todayYmd();
         let reversingGlId = null;
-        if (origGlId && !isBcVoid) {
-            // ตรวจสอบว่างวดของวันยกเลิก (today) เปิดอยู่
-            const voidPeriodRes = await client.query(
-                `SELECT id FROM gl_posting_period
+        if (tx.gl_entry_id) {
+            const perRes = await client.query(`
+                SELECT id FROM gl_posting_period
                  WHERE $1::date BETWEEN period_start_date AND period_end_date
-                 AND gl_status = 'OPEN' LIMIT 1`, [today]
-            );
-            if (voidPeriodRes.rows.length === 0)
-                throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่ยกเลิก ${today}`);
-
-            // ดึง GL header ต้นทาง
-            const origHdrRes = await client.query(
-                `SELECT * FROM gl_entry_header WHERE id=$1`, [origGlId]
-            );
-            const origHdr = origHdrRes.rows[0];
-
-            const reversePeriodId = voidPeriodRes.rows[0].id;
-
-            // Generate doc_no ใหม่สำหรับ Reversing entry
-            let reverseDocNo = null;
-            if (origHdr.doc_id) {
-                reverseDocNo = await generateDocNo(client, origHdr.doc_id, today);
+                   AND gl_status = 'OPEN' AND ar_status = 'OPEN' LIMIT 1`, [voidDate]);
+            if (perRes.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: `ไม่พบงวดบัญชี (GL/AR) ที่เปิดอยู่ สำหรับวันที่ยกเลิก ${voidDate}` });
             }
-            if (!reverseDocNo) reverseDocNo = `RV-${arDocNo}`;
+            const orig = (await client.query(`SELECT * FROM gl_entry_header WHERE id=$1`, [tx.gl_entry_id])).rows[0];
+            let revDocNo = await generateDocNo(client, orig.doc_id, voidDate, tx.branch_id);
+            if (!revDocNo) revDocNo = `RV-${orig.doc_no}`;
 
-            // Insert Reversing GL header (DR/CR สลับกัน)
-            const revHdrRes = await client.query(`
+            const revRes = await client.query(`
                 INSERT INTO gl_entry_header
                 (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
                  currency_id, exchange_rate, status,
                  total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-                 created_by, ref_doc_id, ref_doc_no, external_source_id, ref_doc_date)
-                VALUES ($1,$2,$3,$3,$4,$5,$6,$7,$8,'Posted',
-                        $9,$10,$11,$12,$13,$14,$15,$16,$17)
-                RETURNING id
-            `, [
-                origHdr.doc_id, reverseDocNo, today, reversePeriodId,
-                origHdr.ref_no,
-                `[ยกเลิก ${arDocNo}] ${void_reason}`,
-                origHdr.currency_id, origHdr.exchange_rate,
-                origHdr.total_credit_lc, origHdr.total_debit_lc,   // สลับ debit↔credit
-                origHdr.total_credit_fc, origHdr.total_debit_fc,
-                null,           // created_by (ไม่ resolve user_id ตอนนี้)
-                origHdr.doc_id, arDocNo,
-                id,             // external_source_id = ar_transaction.id → ป้องกัน GL ถอยเอง
-                origHdr.ref_doc_date || origHdr.doc_date,
+                 created_by, branch_id, ref_doc_id, ref_doc_no, ref_doc_date, external_source_id)
+                VALUES ($1,$2,$3,$3,$4,$5,$6,$7,$8,'Posted',$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+                RETURNING id`, [
+                orig.doc_id, revDocNo, voidDate, perRes.rows[0].id,
+                orig.ref_no, `[ยกเลิก ${tx.doc_no}] ${voidReason}`,
+                orig.currency_id, orig.exchange_rate,
+                orig.total_credit_lc, orig.total_debit_lc, orig.total_credit_fc, orig.total_debit_fc,
+                orig.created_by, orig.branch_id,
+                tx.doc_id, tx.doc_no, tx.doc_date, tx.id,
             ]);
-            reversingGlId = revHdrRes.rows[0].id;
-
-            // ดึง GL detail ต้นทาง แล้ว insert สลับ DR/CR
-            const origDtlRes = await client.query(
-                `SELECT * FROM gl_entry_detail WHERE header_id=$1 ORDER BY line_no`, [origGlId]
-            );
-            let lineNo = 1;
-            for (const d of origDtlRes.rows) {
-                await client.query(`
-                    INSERT INTO gl_entry_detail
-                    (header_id, line_no, account_id, description,
-                     debit_lc, credit_lc, debit_fc, credit_fc,
-                     branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-                `, [
-                    reversingGlId, lineNo++, d.account_id,
-                    `[ยกเลิก] ${d.description || ''}`,
-                    d.credit_lc, d.debit_lc,
-                    d.credit_fc, d.debit_fc,
-                    d.branch_id, d.dim1_id, d.dim2_id, d.dim3_id, d.dim4_id, d.dim5_id,
-                ]);
-            }
+            reversingGlId = revRes.rows[0].id;
+            await client.query(`
+                INSERT INTO gl_entry_detail
+                (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc,
+                 branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+                SELECT $1, line_no, account_id, '[ยกเลิก] ' || COALESCE(description, ''),
+                       credit_lc, debit_lc, credit_fc, debit_fc,
+                       branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id
+                  FROM gl_entry_detail WHERE header_id = $2 ORDER BY line_no`,
+                [reversingGlId, tx.gl_entry_id]);
         }
 
-        // 3. อัปเดต ar_transaction
+        // ภาษีขาย (รวม VAT รอตัดบัญชีที่รับรู้ตอนรับชำระ)
+        const docMonth = tx.doc_date instanceof Date
+            ? `${tx.doc_date.getFullYear()}-${String(tx.doc_date.getMonth() + 1).padStart(2, '0')}`
+            : String(tx.doc_date).slice(0, 7);
+        if (String(voidDate).slice(0, 7) === docMonth) {
+            await client.query(
+                `UPDATE vt_transaction SET is_voided=TRUE WHERE module_code='AR' AND source_header_id=$1`, [id]);
+        } else {
+            await client.query(`
+                INSERT INTO vt_transaction
+                (module_code, vat_type, doc_id, source_header_id, source_detail_id, doc_no, doc_date,
+                 tax_invoice_no, tax_invoice_date, vat_rate,
+                 base_amount_lc, vat_amount_lc, base_amount_fc, vat_amount_fc, currency_id, exchange_rate,
+                 customer_id, supplier_id, vendor_id, entity_name, entity_tax_id, entity_branch_code, created_by)
+                SELECT module_code, vat_type, doc_id, source_header_id, source_detail_id, doc_no, $2::date,
+                       COALESCE(tax_invoice_no, doc_no), COALESCE(tax_invoice_date, doc_date), vat_rate,
+                       -base_amount_lc, -vat_amount_lc, -base_amount_fc, -vat_amount_fc, currency_id, exchange_rate,
+                       customer_id, supplier_id, vendor_id, entity_name, entity_tax_id, entity_branch_code, $3
+                  FROM vt_transaction
+                 WHERE module_code='AR' AND source_header_id=$1 AND is_voided = FALSE`,
+                [id, voidDate, userName]);
+        }
+
         await client.query(`
-            UPDATE ar_transaction SET
-                status     = 'Void',
-                void_reason     = $1,
-                voided_by       = $2,
-                voided_at       = NOW(),
-                void_gl_entry_id = $3,
-                updated_by      = $2,
-                updated_at      = NOW()
-            WHERE id = $4
-        `, [void_reason.trim(), updated_by || null, reversingGlId, id]);
+            UPDATE ar_transaction SET status='Void', void_reason=$1, voided_by=$2, voided_at=NOW(),
+                   void_gl_entry_id=$3, updated_by=$2, updated_at=NOW()
+             WHERE id=$4`, [voidReason, userName, reversingGlId, id]);
 
-        // 4. Mark vt_transaction as voided
-        await client.query(
-            `UPDATE vt_transaction SET is_voided=TRUE WHERE source_header_id=$1 AND module_code='AR'`,
-            [id]
-        );
+        // คืนยอดคงค้างให้เอกสารที่จับคู่ไว้ (คำนวณหลังเปลี่ยนสถานะ จึงไม่นับเอกสารนี้แล้ว)
+        await recalcInvoiceBalances(client, await appliedTargetIds(client, id));
 
-        // 5. Reverse applied amounts — คืนยอด outstanding ให้ Invoice/Advance ที่ถูก Apply ไว้
-        // ข้าม bc_* apply types เพราะไม่ได้กระทบ balance ของเอกสารที่อ้างถึง
-        const appliesRes = await client.query(
-            `SELECT * FROM ar_transaction_apply WHERE transaction_id=$1`, [id]
-        );
-        const regularApplies = appliesRes.rows.filter(a =>
-            !['bc_invoice','bc_advance','bc_cn'].includes(a.apply_type)
-        );
-        const affectedIds = [...new Set(regularApplies.map(a => a.applied_to_id).filter(Boolean))];
-        for (const invoiceId of affectedIds) {
-            await client.query(`
-                UPDATE ar_transaction t SET
-                    paid_amount_lc = (
-                        SELECT COALESCE(SUM(ata.applied_amount_fc * t.exchange_rate), 0)
-                        FROM ar_transaction_apply ata
-                        WHERE ata.applied_to_id = t.id AND ata.transaction_id != $1
-                          AND ata.apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')
-                    ),
-                    balance_amount_lc = t.total_amount_lc
-                        + COALESCE((SELECT SUM(ata.applied_amount_fc * t.exchange_rate)
-                                    FROM ar_transaction_apply ata
-                                    WHERE ata.applied_to_id = t.id AND ata.transaction_id != $1
-                                      AND ata.apply_type = 'dn_ref'), 0)
-                        - COALESCE((SELECT SUM(ata.applied_amount_fc * t.exchange_rate)
-                                    FROM ar_transaction_apply ata
-                                    WHERE ata.applied_to_id = t.id AND ata.transaction_id != $1
-                                      AND ata.apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')), 0),
-                    updated_at = NOW()
-                WHERE id = $2
-            `, [id, invoiceId]);
-        }
-        // Void the linked cm_receipt record, if any (AR receipt docs, sys_doc_type=80)
-        if (isReceiptVoid) {
-            await client.query(`
-                CREATE TABLE IF NOT EXISTS cm_receipt (
-                    id                  SERIAL PRIMARY KEY,
-                    receipt_date        DATE          NOT NULL,
-                    bank_account_id     INTEGER       REFERENCES cm_bank_account(id),
-                    payment_method_id   INTEGER,
-                    payment_method_type VARCHAR(30)   NOT NULL DEFAULT 'CASH',
-                    ar_transaction_id   INTEGER,
-                    ar_doc_no           VARCHAR(50),
-                    customer_id         INTEGER,
-                    customer_code       VARCHAR(50),
-                    customer_name_th    VARCHAR(200),
-                    amount_lc           NUMERIC(18,4) NOT NULL DEFAULT 0,
-                    amount_fc           NUMERIC(18,4) NOT NULL DEFAULT 0,
-                    currency_code       VARCHAR(10)   NOT NULL DEFAULT 'THB',
-                    exchange_rate       NUMERIC(15,6) NOT NULL DEFAULT 1,
-                    check_no            VARCHAR(50),
-                    check_date          DATE,
-                    drawer_bank         VARCHAR(200),
-                    status              VARCHAR(20)   NOT NULL DEFAULT 'Pending',
-                    clearing_date       DATE,
-                    clearing_note       TEXT,
-                    gl_entry_id         INTEGER,
-                    created_by          INTEGER,
-                    created_at          TIMESTAMP DEFAULT NOW(),
-                    updated_at          TIMESTAMP DEFAULT NOW()
-                )`);
+        if (info.sys_doc_type === '80') {
+            // รายการรับเงินผ่านธนาคารที่ยังรอเคลียร์ (ที่เคลียร์แล้วถูกกันไว้ข้างบน)
             await client.query(`
                 UPDATE cm_receipt SET status='Voided', updated_at=NOW()
-                WHERE ar_transaction_id=$1 AND status != 'Voided'
-            `, [id]);
+                 WHERE ar_transaction_id=$1 AND status <> 'Voided'`, [id]);
+            await restoreBillCollection(client, tx.ref_no);
         }
 
-        // Receipt ที่อ้าง BC ถูก Void → คืนยอดวางบิลให้ BC
-        if (isReceiptVoid && checkRes.rows[0].ref_no) {
-            await client.query(`
-                UPDATE ar_transaction t SET balance_amount_lc = total_amount_lc, updated_at = NOW()
-                FROM sa_module_document d
-                WHERE t.doc_id = d.id AND d.sys_doc_type = '70'
-                  AND t.doc_no = $1 AND t.status = 'Posted'
-            `, [checkRes.rows[0].ref_no]);
-        }
+        await logReverse(client, {
+            sysModule: '11', tableName: 'ar_transaction', recordId: Number(id),
+            docNo: tx.doc_no, fromStatus: 'Posted', toStatus: 'Void', reason: voidReason, userId,
+        });
 
         await client.query('COMMIT');
         res.json({ message: 'Voided', reversing_gl_entry_id: reversingGlId });
     } catch (err) {
         await client.query('ROLLBACK');
+        console.error('Error voiding ar_transaction:', err);
+        res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
+    }
+};
+
+// --- 3b. Reverse to Draft (Posted → Draft) ---
+// ลบรายการบัญชีที่ระบบสร้าง (เก็บเลขที่ไว้ที่ ar_transaction.gl_doc_no — โพสต์ใหม่ใช้เลขเดิม), ภาษีขาย
+// และรายการรับเงินผ่านธนาคารที่ยังรอเคลียร์ (โพสต์ใหม่จะสร้างใหม่) และคืนยอดวางบิลที่ใบเสร็จเคลียร์ไว้
+// apply ที่จับคู่ไว้ยังอยู่กับร่าง (ร่างนับยอดอยู่แล้ว ตามที่ create/update ทำ) จึงไม่ต้องปรับยอด
+// เลขที่เอกสาร AR คงเดิม และบันทึกประวัติการถอยที่ sa_document_reverse_log
+const reverseTransaction = async (req, res) => {
+    const { id } = req.params;
+    const reason = (req.body?.reason || '').trim();
+    const userId = req.body?.user_id || req.headers['userid'] || null;
+    const userName = req.headers['username'] || null;
+    if (!reason) return res.status(400).json({ error: 'กรุณาระบุเหตุผลการถอยเอกสาร' });
+
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        const lock = await client.query(`SELECT id, ref_no FROM ar_transaction WHERE id=$1 FOR UPDATE`, [id]);
+        if (lock.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
+        const info = (await client.query(AR_REVERSE_INFO_SQL, [id])).rows[0];
+        const block = getArReverseBlock(info);
+        if (block) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: arBlockMessage(block), code: block.code, ref: block.ref || null });
+        }
+
+        if (info.gl_entry_id) {
+            // ตัด FK ก่อน (ar_transaction.gl_entry_id ไม่มี ON DELETE SET NULL)
+            await client.query(`UPDATE ar_transaction SET gl_entry_id=NULL WHERE id=$1`, [id]);
+            await client.query(`DELETE FROM gl_entry_header WHERE id=$1`, [info.gl_entry_id]);
+        }
+        await client.query(`DELETE FROM vt_transaction WHERE module_code='AR' AND source_header_id=$1`, [id]);
+        if (info.sys_doc_type === '80') {
+            await client.query(`DELETE FROM cm_receipt WHERE ar_transaction_id=$1`, [id]);
+            await restoreBillCollection(client, lock.rows[0].ref_no);
+        }
+        // DN-35, CN-55, RDP-65: ตอนโพสต์ตั้ง balance = 0 → คืนยอดเต็มให้ร่าง (ตามที่ create ตั้งไว้)
+        if (['35', '55', '65'].includes(info.sys_doc_type)) {
+            await client.query(`UPDATE ar_transaction SET balance_amount_lc = total_amount_lc WHERE id=$1`, [id]);
+        }
+
+        await client.query(`
+            UPDATE ar_transaction SET status='Draft', gl_entry_id=NULL, updated_at=NOW(), updated_by=$1 WHERE id=$2`,
+            [userName, id]);
+        await logReverse(client, {
+            sysModule: '11', tableName: 'ar_transaction', recordId: Number(id),
+            docNo: info.doc_no, fromStatus: info.status, reason, userId,
+        });
+
+        await client.query('COMMIT');
+        res.json({ message: 'Reversed' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Error reversing ar_transaction:', err);
         res.status(500).json({ error: err.message });
     } finally {
         client.release();
@@ -1581,58 +1606,42 @@ const voidTransaction = async (req, res) => {
 };
 
 // --- 4. Delete Draft ---
+// เอกสารที่โพสต์แล้วต้องถอยเป็นร่างก่อนจึงลบได้ (กันลบโดยไม่ตั้งใจ)
+// ลบแล้วยังเก็บแถว (รวม apply) ไว้ด้วยสถานะ 'Deleted' เพื่อตรวจสอบ แต่นำกลับมาใช้ไม่ได้ และคืนยอดคงค้างให้เอกสารที่จับคู่ไว้
 const deleteTransaction = async (req, res) => {
     const { id } = req.params;
+    const reason = (req.body?.reason || '').trim();
+    const userId = req.body?.user_id || req.headers['userid'] || null;
+    const userName = req.headers['username'] || null;
+    if (!reason) return res.status(400).json({ error: 'กรุณาระบุเหตุผลการลบเอกสาร' });
+
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
-
-        const checkRes = await client.query(
-            `SELECT status FROM ar_transaction WHERE id=$1`, [id]
-        );
-        if (!checkRes.rows[0] || checkRes.rows[0].status !== 'Draft')
-            return res.status(400).json({ error: 'Cannot delete: Not Draft or not found' });
-
-        // Fetch applies before deleting, to restore invoice balances
-        const appliesRes = await client.query(
-            `SELECT applied_to_id, apply_type FROM ar_transaction_apply WHERE transaction_id=$1`, [id]
-        );
-        const regularIds = [...new Set(
-            appliesRes.rows
-                .filter(a => !['bc_invoice','bc_advance','bc_cn'].includes(a.apply_type))
-                .map(a => a.applied_to_id).filter(Boolean)
-        )];
-
-        await client.query('DELETE FROM ar_transaction_apply WHERE transaction_id=$1', [id]);
-        await client.query(`UPDATE ar_transaction SET status='Deleted' WHERE id=$1`, [id]);
-
-        // Recalculate balances for invoices that were referenced by the deleted Draft's applies
-        for (const invoiceId of regularIds) {
-            await client.query(`
-                UPDATE ar_transaction t SET
-                    paid_amount_lc = COALESCE((
-                        SELECT SUM(ata.applied_amount_fc * t.exchange_rate)
-                        FROM ar_transaction_apply ata
-                        WHERE ata.applied_to_id = t.id
-                          AND ata.apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')
-                    ), 0),
-                    balance_amount_lc = t.total_amount_lc
-                        + COALESCE((SELECT SUM(ata.applied_amount_fc * t.exchange_rate)
-                                    FROM ar_transaction_apply ata
-                                    WHERE ata.applied_to_id = t.id AND ata.apply_type = 'dn_ref'), 0)
-                        - COALESCE((SELECT SUM(ata.applied_amount_fc * t.exchange_rate)
-                                    FROM ar_transaction_apply ata
-                                    WHERE ata.applied_to_id = t.id
-                                      AND ata.apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')), 0),
-                    updated_at = NOW()
-                WHERE id = $1
-            `, [invoiceId]);
+        const existing = await client.query(`SELECT id, doc_no, status FROM ar_transaction WHERE id=$1 FOR UPDATE`, [id]);
+        if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
+        const tx = existing.rows[0];
+        if (tx.status !== 'Draft') {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                error: tx.status === 'Posted'
+                    ? 'เอกสารที่โพสต์แล้วลบไม่ได้ กรุณาถอยเป็นร่างก่อน'
+                    : 'ลบได้เฉพาะเอกสาร Draft เท่านั้น',
+            });
         }
+
+        await client.query(`UPDATE ar_transaction SET status='Deleted', updated_at=NOW(), updated_by=$1 WHERE id=$2`, [userName, id]);
+        await recalcInvoiceBalances(client, await appliedTargetIds(client, id));
+        await logReverse(client, {
+            sysModule: '11', tableName: 'ar_transaction', recordId: Number(id),
+            docNo: tx.doc_no, fromStatus: tx.status, toStatus: 'Deleted', reason, userId,
+        });
 
         await client.query('COMMIT');
         res.json({ message: 'Deleted' });
     } catch (err) {
         await client.query('ROLLBACK');
+        console.error('Error deleting ar_transaction:', err);
         res.status(500).json({ error: err.message });
     } finally {
         client.release();
@@ -1663,9 +1672,10 @@ const fetchRows = async (req, res) => {
         LEFT JOIN gl_dimension_value v3 ON v3.id = t.dim3_id
         LEFT JOIN gl_dimension_value v4 ON v4.id = t.dim4_id
         LEFT JOIN gl_dimension_value v5 ON v5.id = t.dim5_id
-        WHERE t.status != 'Deleted' AND d.sys_module = '11'
+        WHERE d.sys_module = '11'
     `;
     const params = [];
+    if (status !== 'Deleted') sql += ` AND t.status != 'Deleted'`;
 
     if (doc_type) {
         sql += ` AND d.sys_doc_type = $${params.length + 1}`;
@@ -1756,11 +1766,11 @@ const fetchRow = async (req, res) => {
                 SELECT p.*,
                        ga.account_code AS gl_account_code, ga.account_name_thai AS gl_account_name,
                        ba.account_code AS bank_account_code, ba.account_name_th AS bank_account_name_th,
-                       b.bank_name_th
+                       b.bank_name_thai AS bank_name_th
                 FROM ar_transaction_payment p
                 LEFT JOIN gl_account ga ON ga.id = p.gl_account_id
                 LEFT JOIN cm_bank_account ba ON ba.id = p.cm_bank_account_id
-                LEFT JOIN cm_bank b ON b.id = ba.bank_id
+                LEFT JOIN cd_bank b ON b.id = ba.bank_id
                 WHERE p.header_id=$1 ORDER BY p.line_no
             `, [id]);
             paymentsRows = paymentsRes.rows;
@@ -1768,7 +1778,19 @@ const fetchRow = async (req, res) => {
             console.warn('ar_transaction_payment query failed (table may not exist):', e.message);
         }
 
-        res.json({ header: hRes.rows[0], details: detailsRes.rows, applies: appliesRes.rows, payments: paymentsRows });
+        const info = (await req.dbPool.query(AR_REVERSE_INFO_SQL, [id])).rows[0];
+        const rBlock = info ? getArReverseBlock(info) : null;
+        const vBlock = info ? getArVoidBlock(info) : null;
+        const history = await getReverseHistory(req.dbPool, 'ar_transaction', Number(id));
+
+        res.json({
+            header: hRes.rows[0], details: detailsRes.rows, applies: appliesRes.rows, payments: paymentsRows,
+            reverse_block: rBlock ? rBlock.code : null,
+            reverse_block_ref: rBlock ? (rBlock.ref || null) : null,
+            void_block: vBlock ? vBlock.code : null,
+            void_block_ref: vBlock ? (vBlock.ref || null) : null,
+            reverse_history: history,
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -1961,6 +1983,7 @@ module.exports = {
     createTransaction,
     updateTransaction,
     voidTransaction,
+    reverseTransaction,
     deleteTransaction,
     fetchRows,
     fetchRow,

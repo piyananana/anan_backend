@@ -40,7 +40,7 @@ const preCloseCheck = async (req, res) => {
             FROM ar_transaction t
             JOIN sa_module_document d ON d.id = t.doc_id
             WHERE d.sys_doc_type IN ('60', '65')
-              AND t.status NOT IN ('Void')
+              AND t.status NOT IN ('Void', 'Deleted')
               AND t.balance_amount_lc > 0.005
               AND EXTRACT(YEAR FROM t.doc_date) <= $1
             ORDER BY t.doc_date, t.doc_no

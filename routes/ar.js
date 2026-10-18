@@ -78,6 +78,7 @@ router.get('/ar_transaction/:id', arTransactionController.fetchRow);
 router.post('/ar_transaction', arTransactionController.createTransaction);
 router.put('/ar_transaction/:id', arTransactionController.updateTransaction);
 router.put('/ar_transaction/:id/void', arTransactionController.voidTransaction);
+router.put('/ar_transaction/:id/reverse', arTransactionController.reverseTransaction);
 router.delete('/ar_transaction/:id', arTransactionController.deleteTransaction);
 
 // Router สำหรับรายงานลูกหนี้คงค้างตามอายุ

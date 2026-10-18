@@ -140,7 +140,7 @@ const getMovementReport = async (req, res) => {
                 WHERE (
                           t.status = 'Posted'
                           -- Advance receipts ที่ถูกตัดชำระหมดแล้วอาจมี status อื่น ให้แสดงด้วยตราบที่ไม่ใช่ Void
-                          OR (d.sys_doc_type = ANY($6::text[]) AND t.status <> 'Void')
+                          OR (d.sys_doc_type = ANY($6::text[]) AND t.status NOT IN ('Void', 'Deleted'))
                       )
                   AND d.sys_doc_type = ANY($5::text[])
                   AND t.doc_date <= $2::date
