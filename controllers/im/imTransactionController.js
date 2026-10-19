@@ -2534,26 +2534,6 @@ const postBillingForDln = async (req, res) => {
     } finally { client.release(); }
 };
 
-// --- 3. Void ---
-// Voids one ap_transaction + its GL entry, guarding against paid/applied — used by
-// imConsignmentSettlementController.voidSettlement (which has no im_transaction of its own
-// to hang this off of, since a settlement bill is created directly, not via the normal Draft->Post flow).
-const voidLinkedApTransaction = async (client, apTransactionId, verb) => {
-    const apRes = await client.query(`SELECT * FROM ap_transaction WHERE id = $1 FOR UPDATE`, [apTransactionId]);
-    const apTx = apRes.rows[0];
-    if (!apTx || apTx.status === 'Void') return;
-    const appliedRes = await client.query(
-        `SELECT COUNT(*) FROM ap_transaction_apply WHERE applied_to_id = $1`, [apTransactionId]
-    );
-    if (Number(appliedRes.rows[0].count) > 0 || Number(apTx.paid_amount_lc) > 0) {
-        throw new Error(`ไม่สามารถ${verb}ได้ เนื่องจากใบตั้งหนี้ที่สร้างจากเอกสารนี้มีการจ่ายชำระ/จับคู่ไปแล้วในโมดูล AP`);
-    }
-    if (apTx.gl_entry_id) {
-        await client.query(`UPDATE gl_entry_header SET status='Void', updated_at=NOW() WHERE id=$1`, [apTx.gl_entry_id]);
-    }
-    await client.query(`UPDATE ap_transaction SET status='Void', updated_at=NOW() WHERE id=$1`, [apTransactionId]);
-};
-
 // ===== ถอยเป็นร่าง / ยกเลิก / ลบ =====
 // - ถอย: งวดของวันที่เอกสาร (GL + IM และ AP/AR ของใบตั้งหนี้ที่สร้างให้) ยังเปิด และไม่มีเอกสารอื่นอ้างอิง
 //   ลบรายการบัญชีและใบตั้งหนี้ที่สร้างให้ เก็บเลขที่ไว้ (gl_doc_no / linked_ap_doc_no / linked_ar_doc_no) ใช้ซ้ำตอนโพสต์ใหม่
@@ -2891,7 +2871,7 @@ const deleteTransaction = async (req, res) => {
 module.exports = {
     ensureImTransactionTable,
     fetchRows, fetchRow, fetchSystemQty, fetchReturnableDocs, fetchReturnableLines,
-    createTransaction, createMoReceipt, updateTransaction, postTransaction, postBillingForGrn, postBillingForDln, voidTransaction, voidLinkedApTransaction, reverseToDraft, deleteTransaction,
+    createTransaction, createMoReceipt, updateTransaction, postTransaction, postBillingForGrn, postBillingForDln, voidTransaction, reverseToDraft, deleteTransaction,
     computeImBlocks, voidImDocument, removeSystemImDocument, reasonOf, userIdOf,
     insertAndPostAdjustment, STOCK_BALANCE_KEY,
     upsertStockBalance, recomputeBalanceFromLayers,

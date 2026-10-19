@@ -103,6 +103,9 @@ router.get('/im_consignment_settlement/pending', imConsignmentSettlementControll
 router.post('/im_consignment_settlement', imConsignmentSettlementController.postSettlement);
 router.get('/im_consignment_settlement', imConsignmentSettlementController.fetchSettled);
 router.put('/im_consignment_settlement/:id/void', imConsignmentSettlementController.voidSettlement);
+router.put('/im_consignment_settlement/:id/reverse', imConsignmentSettlementController.reverseSettlement);
+router.put('/im_consignment_settlement/:id/post', imConsignmentSettlementController.repostSettlement);
+router.delete('/im_consignment_settlement/:id', imConsignmentSettlementController.deleteSettlement);
 router.get('/im_transaction',            imTransactionController.fetchRows);
 router.get('/im_transaction/:id',        imTransactionController.fetchRow);
 router.get('/im_transaction/:id/returnable_lines', imTransactionController.fetchReturnableLines);

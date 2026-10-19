@@ -727,7 +727,7 @@ const getApReverseBlock = (r) => {
 const AP_REVERSE_BLOCK_MESSAGES = {
     NOT_REVERSIBLE: 'ถอยได้เฉพาะเอกสารที่โพสต์แล้ว หรือรออนุมัติ/อนุมัติแล้ว',
     IM_SOURCE:      'เอกสารนี้สร้างจากโมดูลสินค้าคงคลัง กรุณาถอยจากเอกสาร IM ต้นทาง',
-    CONSIGNMENT:    'เอกสารนี้สร้างจากการตั้งหนี้สินค้าฝากขาย กรุณายกเลิกจากหน้าจอตั้งหนี้สินค้าฝากขาย',
+    CONSIGNMENT:    'เอกสารนี้สร้างจากการตั้งหนี้สินค้าฝากขาย กรุณาทำจากหน้าจอตั้งหนี้สินค้าฝากขาย',
     IMPORTED:       'เอกสารยอดยกมาที่นำเข้า ไม่มีรายการบัญชี ถอยเป็นร่างไม่ได้',
     PERIOD_CLOSED:  'งวดบัญชีของเอกสารนี้ปิดแล้ว ถอยเป็นร่างไม่ได้',
     APPLIED:        'มีเอกสารอ้างอิงเอกสารนี้อยู่',
@@ -755,16 +755,25 @@ AP_REVERSE_BLOCK_MESSAGES.NOT_POSTED = 'ยกเลิกได้เฉพา�
 
 const apReverseBlockMessage = (b) => AP_REVERSE_BLOCK_MESSAGES[b.code] + (b.ref ? ` (${b.ref})` : '');
 
-// ใช้จาก IM: ใบตั้งหนี้ที่เอกสาร IM สร้างให้ — สถานะ, เหตุที่ถอย/ยกเลิกไม่ได้ (ไม่นับ IM_SOURCE), งวดยังเปิดหรือไม่
+// ใช้จาก IM: ใบตั้งหนี้ที่เอกสาร IM / การตั้งหนี้ฝากขายสร้างให้ — สถานะ, เหตุที่ถอย/ยกเลิกไม่ได้
+// (ไม่นับ IM_SOURCE / CONSIGNMENT เพราะผู้เรียกคือต้นทางเอง), งวดยังเปิดหรือไม่
 const getApLinkedState = async (db, id) => {
     const info = (await db.query(AP_REVERSE_INFO_SQL, [id])).rows[0];
     if (!info) return null;
-    const b = info.status === 'Posted' ? getApVoidBlock({ ...info, from_im: false }) : null;
+    const b = info.status === 'Posted' ? getApVoidBlock({ ...info, from_im: false, from_consignment: false }) : null;
     return {
         status: info.status, doc_no: info.doc_no, gl_entry_id: info.gl_entry_id,
         block: b ? { ...b, message: apReverseBlockMessage(b) } : null,
         periodOpen: info.ap_status === 'OPEN' && (!info.gl_period_status || info.gl_period_status === 'OPEN'),
     };
+};
+
+// ใบตั้งหนี้ฝากขายที่ถอยเป็นร่าง: แก้ไข / ส่งอนุมัติ / โพสต์ / ลบ ได้จากหน้าจอตั้งหนี้ฝากขายเท่านั้น
+// (หน้าจอนั้นโพสต์ใหม่จากรายการขายฝากขายเดิม และลบแล้วคืนรายการกลับไปรอตั้งหนี้)
+const consignmentLockMessage = async (db, id) => {
+    const r = (await db.query(
+        `SELECT 1 FROM ap_transaction WHERE id=$1 AND COALESCE(description, '') LIKE 'ตั้งหนี้สินค้าฝากขาย%'`, [id])).rows[0];
+    return r ? AP_REVERSE_BLOCK_MESSAGES.CONSIGNMENT : null;
 };
 
 // --- Ensure payment table exists ---
@@ -1370,6 +1379,8 @@ const updateTransaction = async (req, res) => {
         const existing = await client.query(`SELECT status FROM ap_transaction WHERE id=$1 FOR UPDATE`, [id]);
         if (existing.rows.length === 0) throw new Error('Not found');
         if (existing.rows[0].status !== 'Draft') throw new Error('แก้ไขได้เฉพาะเอกสาร Draft เท่านั้น');
+        const consLock = await consignmentLockMessage(client, id);
+        if (consLock) throw new Error(consLock);
 
         const periodRes = await client.query(
             `SELECT id FROM gl_posting_period
@@ -1511,6 +1522,8 @@ const submitTransaction = async (req, res) => {
         if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
         const tx = existing.rows[0];
         if (tx.status !== 'Draft') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'ส่งอนุมัติได้เฉพาะเอกสาร Draft เท่านั้น' }); }
+        const consLock = await consignmentLockMessage(client, id);
+        if (consLock) { await client.query('ROLLBACK'); return res.status(400).json({ message: consLock, code: 'CONSIGNMENT' }); }
 
         const isRa = tx.sys_doc_type === '70';
         const isPaymentNoRef = tx.sys_doc_type === '80' && (!tx.ref_no || !tx.ref_no.trim());
@@ -1676,6 +1689,8 @@ const postTransaction = async (req, res) => {
             await client.query('ROLLBACK');
             return res.status(400).json({ message: 'Post ได้เฉพาะเอกสาร Draft หรือ Approved เท่านั้น' });
         }
+        const consLock = await consignmentLockMessage(client, id);
+        if (consLock) { await client.query('ROLLBACK'); return res.status(400).json({ message: consLock, code: 'CONSIGNMENT' }); }
 
         const periodRes = await client.query(
             `SELECT id FROM gl_posting_period
@@ -1730,14 +1745,14 @@ const postTransaction = async (req, res) => {
 //   เพื่อไม่ให้รายงานภาษีของเดือนที่ยื่นไปแล้วเปลี่ยน
 // คืนยอดคงค้างให้ใบตั้งหนี้ที่จับคู่ไว้ และยกเลิกรายการจ่ายผ่านธนาคารที่ยังรอเคลียร์
 // แกนกลางของการยกเลิก ทำงานใน transaction ของผู้เรียก (ใช้ร่วมกับ IM ที่ยกเลิกใบตั้งหนี้ที่สร้างให้)
-// fromIm = เรียกจากเอกสาร IM ต้นทาง → ข้ามเงื่อนไข IM_SOURCE
+// fromIm = เรียกจากเอกสาร IM ต้นทาง → ข้ามเงื่อนไข IM_SOURCE, fromConsignment = เรียกจากหน้าจอตั้งหนี้ฝากขาย → ข้าม CONSIGNMENT
 // คืน { message, code, ref, httpStatus } เมื่อทำไม่ได้ หรือ { reversingGlId } เมื่อสำเร็จ
-const voidApDocument = async (client, id, { voidReason, userId, userName, fromIm = false }) => {
+const voidApDocument = async (client, id, { voidReason, userId, userName, fromIm = false, fromConsignment = false }) => {
         const lock = await client.query(`SELECT * FROM ap_transaction WHERE id=$1 FOR UPDATE`, [id]);
         if (lock.rows.length === 0) return { message: 'Not found', httpStatus: 404 };
         const tx = lock.rows[0];
         const info = (await client.query(AP_REVERSE_INFO_SQL, [id])).rows[0];
-        const block = getApVoidBlock(fromIm ? { ...info, from_im: false } : info);
+        const block = getApVoidBlock({ ...info, from_im: info.from_im && !fromIm, from_consignment: info.from_consignment && !fromConsignment });
         if (block) return { message: apReverseBlockMessage(block), code: block.code, ref: block.ref || null };
 
         const voidDate = todayYmd();
@@ -1938,6 +1953,8 @@ const deleteTransaction = async (req, res) => {
                     : 'ลบได้เฉพาะเอกสาร Draft เท่านั้น',
             });
         }
+        const consLock = await consignmentLockMessage(client, id);
+        if (consLock) { await client.query('ROLLBACK'); return res.status(400).json({ message: consLock, code: 'CONSIGNMENT' }); }
 
         await adjustInvoiceBalances(client, id, -1);
         await client.query(`DELETE FROM ap_transaction_approval WHERE transaction_id=$1`, [id]).catch(() => {});

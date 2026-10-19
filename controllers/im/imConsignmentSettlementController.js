@@ -7,8 +7,9 @@
 //      => Dr เจ้าหนี้ฝากขาย / Cr เจ้าหนี้การค้า (AP)
 //   2. ไม่มี VAT (มิเรอร์ '10' GRN ธรรมดาที่ไม่มี VAT ตอน Post — ถ้าใบกำกับจริงจากผู้ฝากขายมี VAT ผู้ใช้ปรับเพิ่มเองใน AP ภายหลัง)
 //   3. มาจากการตัด im_stock_layer หลายใบของหลายเอกสารขายมารวมเป็นบิลเดียว ไม่ใช่ 1:1 กับเอกสารรับเหมือน '11'/'12'
-const { generateDocNo, voidLinkedApTransaction } = require('./imTransactionController');
-const { today } = require('../../utils/dateUtil');
+const { generateDocNo } = require('./imTransactionController');
+const { today, ymd } = require('../../utils/dateUtil');
+const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 
 // หา consumption ที่มาจาก layer ของเอกสารรับฝากขาย (sys_doc_type='13') และยังไม่ถูก settle
 const PENDING_SELECT = `
@@ -51,11 +52,73 @@ const fetchPending = async (req, res) => {
     } finally { client.release(); }
 };
 
+// Marker set on every ap_transaction row postSettlement creates — used to identify "is this ap_transaction a
+// consignment settlement" independent of im_stock_layer_consumption.settlement_ap_transaction_id, which gets nulled
+// out on void / delete (so a join against it would make those settlements vanish from history).
+// apTransactionController ใช้คำนำหน้าเดียวกันกันหน้าจอ AP ถอย/ยกเลิก/แก้ไขใบนี้ (CONSIGNMENT)
+const SETTLEMENT_DESCRIPTION_PREFIX = 'ตั้งหนี้สินค้าฝากขาย';
+
+const userIdOf = (req) => {
+    const v = Number(req.body?.user_id || req.headers['userid']);
+    return Number.isFinite(v) && v > 0 ? v : null;
+};
+const reasonOf = (req) => (req.body?.reason || '').trim();
+
+// งวดที่ GL และ AP เปิด (OPEN) สำหรับวันที่ใบตั้งหนี้
+const openPeriodId = async (client, date) => (await client.query(
+    `SELECT id FROM gl_posting_period WHERE $1::date BETWEEN period_start_date AND period_end_date
+       AND gl_status = 'OPEN' AND ap_status = 'OPEN' LIMIT 1`, [date])).rows[0]?.id || null;
+
+// ลงรายการบัญชีของใบตั้งหนี้ฝากขายจากบรรทัดใน ap_transaction_detail (Dr เจ้าหนี้ฝากขาย / Cr เจ้าหนี้การค้า)
+// ใช้ตอนตั้งหนี้ครั้งแรก และตอนโพสต์ใหม่หลังถอยเป็นร่าง (เลขที่รายการบัญชีเดิมเก็บไว้ที่ gl_doc_no)
+const postSettlementGl = async (client, apTransactionId, userId) => {
+    const tx = (await client.query(`SELECT * FROM ap_transaction WHERE id = $1`, [apTransactionId])).rows[0];
+    const lines = (await client.query(
+        `SELECT expense_account_id, total_amount_lc FROM ap_transaction_detail WHERE header_id = $1 ORDER BY line_no`,
+        [apTransactionId])).rows;
+    const debitByAccount = {};
+    for (const l of lines) {
+        debitByAccount[l.expense_account_id] = (debitByAccount[l.expense_account_id] || 0) + Number(l.total_amount_lc);
+    }
+    const glDetails = [];
+    for (const [accId, amt] of Object.entries(debitByAccount)) {
+        if (amt === 0) continue;
+        glDetails.push({ account_id: Number(accId), description: `Settle เจ้าหนี้ฝากขาย ${tx.doc_no}`, debit_lc: amt, credit_lc: 0 });
+    }
+    const total = glDetails.reduce((s, l) => s + l.debit_lc, 0);
+    if (total !== 0) {
+        glDetails.push({ account_id: Number(tx.ap_account_id), description: `ตั้งหนี้ผู้ฝากขาย ${tx.doc_no}`, debit_lc: 0, credit_lc: total });
+    }
+    if (glDetails.length === 0) return null;
+
+    const glDocNo = tx.gl_doc_no || `GL-${tx.doc_no}`;
+    const glRes = await client.query(`
+        INSERT INTO gl_entry_header
+        (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
+         currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
+         created_by, ref_doc_id, ref_doc_no, external_source_id, ref_doc_date)
+        VALUES ($1,$2,$3,$3,$4,$5,$6,1,1,'Posted',$7,$7,0,0,$8,$9,$10,$11,$3)
+        RETURNING id
+    `, [
+        tx.gl_doc_id, glDocNo, tx.doc_date, tx.period_id, tx.ref_no, tx.description,
+        total, userId, tx.doc_id, tx.doc_no, apTransactionId,
+    ]);
+    const glEntryId = glRes.rows[0].id;
+    let glLineNo = 1;
+    for (const l of glDetails) {
+        await client.query(`
+            INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
+            VALUES ($1,$2,$3,$4,$5,$6,0,0)
+        `, [glEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc]);
+    }
+    await client.query(`UPDATE ap_transaction SET gl_entry_id = $1, gl_doc_no = $2 WHERE id = $3`, [glEntryId, glDocNo, apTransactionId]);
+    return glEntryId;
+};
+
 // POST /im_consignment_settlement { vendor_id, consumption_ids: [...], ref_no?, doc_date? }
 // สร้างใบตั้งหนี้ AP ก้อนเดียว (Dr เจ้าหนี้ฝากขาย / Cr เจ้าหนี้การค้า) จาก consumption ที่เลือก แล้ว mark ว่า settle แล้ว
 const postSettlement = async (req, res) => {
     const { vendor_id, consumption_ids, ref_no, doc_date } = req.body;
-    const userName = req.headers.username || null;
     const client = await req.dbPool.connect();
     try {
         if (!vendor_id) return res.status(400).json({ message: 'กรุณาระบุผู้ฝากขาย' });
@@ -107,21 +170,12 @@ const postSettlement = async (req, res) => {
         if (!apAccountId) throw new Error('ไม่พบบัญชีเจ้าหนี้สำหรับการลงบัญชี กรุณาตั้งค่าใน ap_gl_account_setup หรือผู้ขาย');
 
         const vendorRow = rows[0];
-        const periodRes = await client.query(
-            `SELECT id FROM gl_posting_period WHERE $1::date BETWEEN period_start_date AND period_end_date AND gl_status='OPEN' AND ap_status != 'CLOSED' LIMIT 1`,
-            [settleDate]
-        );
-        if (periodRes.rows.length === 0) throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่ ${settleDate}`);
-        const periodId = periodRes.rows[0].id;
+        const periodId = await openPeriodId(client, settleDate);
+        if (!periodId) throw new Error(`งวดบัญชี/งวด AP ของวันที่ ${settleDate} ยังไม่เปิด ตั้งหนี้ไม่ได้`);
 
         let apDocNo = await generateDocNo(client, apDocId, settleDate, null);
         if (!apDocNo) apDocNo = `CONS-${Date.now()}`;
-
-        let createdByUserId = null;
-        if (userName) {
-            const userRes = await client.query(`SELECT id FROM sa_user WHERE user_name = $1 LIMIT 1`, [userName]);
-            if (userRes.rows.length > 0) createdByUserId = userRes.rows[0].id;
-        }
+        const createdByUserId = userIdOf(req);
 
         // unit_cost บน im_stock_layer เป็นบาทเสมอ (ไม่มี FC บน stock layer — ดู plan) แปลงกลับเป็นสกุลเงินของใบรับ
         // ฝากขายต้นทาง (docExchangeRate ตรวจแล้วว่าทุกบรรทัดมาจากอัตราเดียวกันข้างบน) เพื่อให้ใบตั้งหนี้ AP ที่สร้าง
@@ -150,7 +204,7 @@ const postSettlement = async (req, res) => {
         `, [
             apDocId, apDocNo, settleDate, periodId, vendor_id, vendorRow.vendor_code, vendorRow.vendor_name_th, apAccountId, apSetup.gl_doc_id,
             docCurrencyCode, docExchangeRate, totalAmountFc,
-            totalAmountLc, ref_no || null, `ตั้งหนี้สินค้าฝากขาย (Consignment Settlement) ${apDocNo}`, createdByUserId,
+            totalAmountLc, ref_no || null, `${SETTLEMENT_DESCRIPTION_PREFIX} (Consignment Settlement) ${apDocNo}`, createdByUserId,
         ]);
         const apTransactionId = apHeaderRes.rows[0].id;
 
@@ -164,44 +218,7 @@ const postSettlement = async (req, res) => {
             `, [apTransactionId, lineNo++, l.itemName || l.itemCode, l.quantity, l.unitPriceFc, l.amountFc, l.consignmentPayableAccountId, l.amountLc]);
         }
 
-        const debitByAccount = {};
-        for (const l of lineRows) {
-            debitByAccount[l.consignmentPayableAccountId] = (debitByAccount[l.consignmentPayableAccountId] || 0) + l.amountLc;
-        }
-        const apGlDetails = [];
-        for (const [accId, amt] of Object.entries(debitByAccount)) {
-            if (amt === 0) continue;
-            apGlDetails.push({ account_id: Number(accId), description: `Settle เจ้าหนี้ฝากขาย ${apDocNo}`, debit_lc: amt, credit_lc: 0 });
-        }
-        if (totalAmountLc !== 0) {
-            apGlDetails.push({ account_id: apAccountId, description: `ตั้งหนี้ผู้ฝากขาย ${apDocNo}`, debit_lc: 0, credit_lc: totalAmountLc });
-        }
-
-        if (apGlDetails.length > 0) {
-            const totalDebit = apGlDetails.reduce((s, l) => s + l.debit_lc, 0);
-            const totalCredit = apGlDetails.reduce((s, l) => s + l.credit_lc, 0);
-            const apGlHeaderRes = await client.query(`
-                INSERT INTO gl_entry_header
-                (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
-                 currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-                 created_by, ref_doc_id, ref_doc_no, external_source_id, ref_doc_date)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'Posted',$9,$10,0,0,$11,$12,$13,$14,$3)
-                RETURNING id
-            `, [
-                apSetup.gl_doc_id, `GL-${apDocNo}`, settleDate, settleDate, periodId,
-                ref_no || null, `ตั้งหนี้สินค้าฝากขาย (Consignment Settlement) ${apDocNo}`,
-                1, totalDebit, totalCredit, createdByUserId, apDocId, apDocNo, apTransactionId,
-            ]);
-            const apGlEntryId = apGlHeaderRes.rows[0].id;
-            let glLineNo = 1;
-            for (const l of apGlDetails) {
-                await client.query(`
-                    INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
-                    VALUES ($1,$2,$3,$4,$5,$6,0,0)
-                `, [apGlEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc]);
-            }
-            await client.query(`UPDATE ap_transaction SET gl_entry_id = $1 WHERE id = $2`, [apGlEntryId, apTransactionId]);
-        }
+        await postSettlementGl(client, apTransactionId, createdByUserId);
 
         await client.query(
             `UPDATE im_stock_layer_consumption SET settlement_ap_transaction_id = $1 WHERE id = ANY($2::int[])`,
@@ -217,66 +234,180 @@ const postSettlement = async (req, res) => {
     } finally { client.release(); }
 };
 
-// Marker set on every ap_transaction row postSettlement creates (see the two INSERTs above) — used to identify
-// "is this ap_transaction a consignment settlement" independent of im_stock_layer_consumption.settlement_ap_transaction_id,
-// which gets nulled out on void (so a join against it would make voided settlements vanish from history and make
-// voiding twice mis-report as "not found" instead of "already voided").
-const SETTLEMENT_DESCRIPTION_PREFIX = 'ตั้งหนี้สินค้าฝากขาย';
+// ===== ถอยเป็นร่าง / โพสต์ใหม่ / ยกเลิก / ลบ =====
+// - ถอย (Posted → Draft): งวด GL + AP ของใบตั้งหนี้ยังเปิด และใบตั้งหนี้ยังไม่ถูกจ่าย/จับคู่/อยู่ในชุดจ่ายเงิน/ปรับอัตราแลกเปลี่ยน
+//   ลบรายการบัญชี (เก็บเลขที่ไว้ที่ gl_doc_no) รายการขายฝากขายยังผูกกับร่างนี้ โพสต์ใหม่ได้ด้วยเลขที่เดิม
+// - ลบ: เฉพาะร่าง เก็บไว้ด้วยสถานะ Deleted คืนรายการขายฝากขายกลับไปรอตั้งหนี้ (เลขที่นี้ใช้ต่อไม่ได้)
+// - ยกเลิก: ใช้เมื่อถอยไม่ได้ (เช่น งวดเดิมปิดแล้ว) ลงรายการบัญชีกลับในวันที่ยกเลิก คืนรายการขายฝากขายกลับไปรอตั้งหนี้
+// ทุกการกระทำต้องมีเหตุผล บันทึกที่ sa_document_reverse_log (ตาราง ap_transaction — หน้าจอ AP เห็นประวัติเดียวกัน)
+const SETTLEMENT_BLOCK_MESSAGES = {
+    NOT_REVERSIBLE: 'ถอยได้เฉพาะใบตั้งหนี้ที่โพสต์แล้ว',
+    NOT_POSTED:     'ยกเลิกได้เฉพาะใบตั้งหนี้ที่โพสต์แล้ว (ร่างให้ลบแทน)',
+    NOT_DRAFT:      'ใบตั้งหนี้ที่โพสต์แล้วลบไม่ได้ กรุณาถอยเป็นร่างก่อน',
+    PERIOD_CLOSED:  'งวดบัญชีของใบตั้งหนี้นี้ปิดแล้ว ถอยไม่ได้',
+    VOIDED:         'ใบตั้งหนี้นี้ถูกยกเลิกหรือลบแล้ว',
+};
+const packBlock = (code, ref, message) => ({ code, ref: ref || null, message: message || SETTLEMENT_BLOCK_MESSAGES[code] });
 
-// GET /im_consignment_settlement?vendor_id= — settlement history for one vendor, including voided ones.
+// เหตุที่ถอย / ยกเลิก / ลบ / โพสต์ใหม่ไม่ได้ (null = ทำได้)
+const computeSettlementBlocks = async (db, id) => {
+    const { getApLinkedState } = require('../ap/apTransactionController');
+    const st = await getApLinkedState(db, id);
+    if (!st) return {};
+    if (['Void', 'Deleted'].includes(st.status)) {
+        const v = packBlock('VOIDED');
+        return { reverse_block: v, void_block: v, delete_block: v, post_block: v };
+    }
+    if (st.status !== 'Posted') {
+        return {
+            reverse_block: packBlock('NOT_REVERSIBLE'), void_block: packBlock('NOT_POSTED'),
+            delete_block: null, post_block: null,
+        };
+    }
+    // AP_BLOCKED: ใบตั้งหนี้ถูกจ่าย / จับคู่ / อยู่ในชุดจ่ายเงิน / ปรับอัตราแลกเปลี่ยน / จ่ายผ่านธนาคารที่เคลียร์แล้ว
+    const apBlock = st.block ? packBlock('AP_BLOCKED', st.block.ref, st.block.message) : null;
+    return {
+        reverse_block: apBlock || (!st.periodOpen ? packBlock('PERIOD_CLOSED') : null),
+        void_block: apBlock,
+        delete_block: packBlock('NOT_DRAFT'),
+        post_block: packBlock('NOT_DRAFT', null, 'ใบตั้งหนี้นี้โพสต์แล้ว'),
+    };
+};
+
+// ล็อกใบตั้งหนี้ฝากขาย (ต้องเป็นใบที่ postSettlement สร้าง)
+const lockSettlement = async (client, id) => (await client.query(
+    `SELECT * FROM ap_transaction WHERE id = $1 AND description LIKE $2 FOR UPDATE`,
+    [id, `${SETTLEMENT_DESCRIPTION_PREFIX}%`])).rows[0] || null;
+
+const fetchSettlementById = async (db, id) => {
+    const row = (await db.query(`
+        SELECT id, doc_no, doc_date, status, total_amount_lc, ref_no, gl_doc_no, void_reason, voided_at,
+               (SELECT COUNT(*)::int FROM im_stock_layer_consumption c WHERE c.settlement_ap_transaction_id = t.id) AS line_count
+          FROM ap_transaction t WHERE id = $1`, [id])).rows[0];
+    if (!row) return null;
+    return {
+        ...row, ...(await computeSettlementBlocks(db, id)),
+        reverse_history: await getReverseHistory(db, 'ap_transaction', id),
+    };
+};
+
+// GET /im_consignment_settlement?vendor_id= — settlement history for one vendor, including voided / deleted ones.
 const fetchSettled = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         const { vendor_id } = req.query;
         if (!vendor_id) return res.status(400).json({ message: 'กรุณาระบุผู้ฝากขาย' });
-        const result = await client.query(`
-            SELECT id, doc_no, doc_date, status, total_amount_lc, ref_no
-            FROM ap_transaction
+        const ids = (await client.query(`
+            SELECT id FROM ap_transaction
             WHERE vendor_id = $1 AND description LIKE $2
             ORDER BY doc_date DESC, id DESC
-        `, [vendor_id, `${SETTLEMENT_DESCRIPTION_PREFIX}%`]);
-        res.json(result.rows);
+        `, [vendor_id, `${SETTLEMENT_DESCRIPTION_PREFIX}%`])).rows;
+        const rows = [];
+        for (const r of ids) rows.push(await fetchSettlementById(client, r.id));
+        res.json(rows);
     } catch (error) {
         console.error('Error fetching consignment settlement history:', error);
         res.status(500).json({ message: 'Internal server error' });
     } finally { client.release(); }
 };
 
-// PUT /im_consignment_settlement/:id/void — id is the ap_transaction id created by postSettlement. Voids the AP
-// bill + its GL entry (guarded against paid/applied via voidLinkedApTransaction) and releases the consumption
-// rows it settled back to pending, so they can be re-settled.
-const voidSettlement = async (req, res) => {
+// ดำเนินการกับใบตั้งหนี้ฝากขายใน transaction เดียว: fn คืน { status, message, code, ref } เมื่อทำไม่ได้
+const runAction = async (req, res, label, fn) => {
     const { id } = req.params;
+    const reason = reasonOf(req);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
-
-        const apRes = await client.query(
-            `SELECT status FROM ap_transaction WHERE id=$1 AND description LIKE $2`,
-            [id, `${SETTLEMENT_DESCRIPTION_PREFIX}%`]
-        );
-        if (apRes.rows.length === 0) {
+        const tx = await lockSettlement(client, id);
+        if (!tx) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'ไม่พบรายการตั้งหนี้สินค้าฝากขายนี้' }); }
+        const err = await fn(client, tx, reason);
+        if (err) {
             await client.query('ROLLBACK');
-            return res.status(404).json({ message: 'ไม่พบรายการตั้งหนี้สินค้าฝากขายนี้' });
+            return res.status(err.status || 400).json({ message: err.message, code: err.code || null, ref: err.ref || null });
         }
-        if (apRes.rows[0].status === 'Void') {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: 'เอกสารถูกยกเลิกแล้ว' });
-        }
-
-        await voidLinkedApTransaction(client, id, 'ยกเลิก');
-
-        const releasedRes = await client.query(
-            `UPDATE im_stock_layer_consumption SET settlement_ap_transaction_id=NULL WHERE settlement_ap_transaction_id=$1`, [id]
-        );
-
         await client.query('COMMIT');
-        res.status(200).json({ voided: true, released_lines: releasedRes.rowCount });
+        res.status(200).json(await fetchSettlementById(req.dbPool, id));
     } catch (error) {
         await client.query('ROLLBACK');
-        console.error('Error voiding consignment settlement:', error);
+        console.error(`Error ${label} consignment settlement:`, error);
         res.status(500).json({ message: error.message || 'Internal server error' });
     } finally { client.release(); }
 };
+const blockError = (b) => ({ message: b.message + (b.ref && b.code !== 'AP_BLOCKED' ? ` (${b.ref})` : ''), code: b.code, ref: b.ref });
 
-module.exports = { fetchPending, postSettlement, fetchSettled, voidSettlement };
+// PUT /im_consignment_settlement/:id/reverse { reason } — Posted → Draft
+const reverseSettlement = (req, res) => runAction(req, res, 'reversing', async (client, tx, reason) => {
+    if (!reason) return { message: 'กรุณาระบุเหตุผลการถอยเอกสาร' };
+    const b = (await computeSettlementBlocks(client, tx.id)).reverse_block;
+    if (b) return blockError(b);
+    let glDocNo = tx.gl_doc_no;
+    if (tx.gl_entry_id) {
+        glDocNo = (await client.query(`SELECT doc_no FROM gl_entry_header WHERE id = $1`, [tx.gl_entry_id])).rows[0]?.doc_no || glDocNo;
+        // ตัด FK ก่อน (ap_transaction.gl_entry_id ไม่มี ON DELETE SET NULL)
+        await client.query(`UPDATE ap_transaction SET gl_entry_id = NULL WHERE id = $1`, [tx.id]);
+        await client.query(`DELETE FROM gl_entry_header WHERE id = $1`, [tx.gl_entry_id]);
+    }
+    await client.query(`DELETE FROM vt_transaction WHERE module_code = 'AP' AND source_header_id = $1`, [tx.id]);
+    await client.query(`
+        UPDATE ap_transaction SET status = 'Draft', gl_doc_no = $1, updated_by = $2, updated_at = NOW()
+         WHERE id = $3`, [glDocNo, req.headers.username || null, tx.id]);
+    await logReverse(client, {
+        sysModule: '21', tableName: 'ap_transaction', recordId: Number(tx.id), docNo: tx.doc_no,
+        fromStatus: tx.status, toStatus: 'Draft', reason, userId: userIdOf(req),
+    });
+    return null;
+});
+
+// PUT /im_consignment_settlement/:id/post { doc_date?, ref_no? } — โพสต์ร่างใหม่ด้วยเลขที่เดิม (รายการขายฝากขายชุดเดิม)
+const repostSettlement = (req, res) => runAction(req, res, 'reposting', async (client, tx) => {
+    const b = (await computeSettlementBlocks(client, tx.id)).post_block;
+    if (b) return blockError(b);
+    const docDate = req.body?.doc_date || tx.doc_date;
+    const periodId = await openPeriodId(client, docDate);
+    if (!periodId) return { message: `งวดบัญชี/งวด AP ของวันที่ ${ymd(docDate)} ยังไม่เปิด โพสต์ไม่ได้`, code: 'PERIOD_CLOSED' };
+    const refNo = req.body?.ref_no !== undefined ? (req.body.ref_no || null) : tx.ref_no;
+    await client.query(`
+        UPDATE ap_transaction SET status = 'Posted', doc_date = $1, period_id = $2, ref_no = $3,
+               updated_by = $4, updated_at = NOW()
+         WHERE id = $5`, [docDate, periodId, refNo, req.headers.username || null, tx.id]);
+    await postSettlementGl(client, tx.id, userIdOf(req));
+    return null;
+});
+
+// DELETE /im_consignment_settlement/:id { reason } — เฉพาะร่าง: เก็บไว้ด้วยสถานะ Deleted คืนรายการกลับไปรอตั้งหนี้
+const deleteSettlement = (req, res) => runAction(req, res, 'deleting', async (client, tx, reason) => {
+    if (!reason) return { message: 'กรุณาระบุเหตุผลการลบเอกสาร' };
+    const b = (await computeSettlementBlocks(client, tx.id)).delete_block;
+    if (b) return blockError(b);
+    await client.query(
+        `UPDATE im_stock_layer_consumption SET settlement_ap_transaction_id = NULL WHERE settlement_ap_transaction_id = $1`, [tx.id]);
+    await client.query(`
+        UPDATE ap_transaction SET status = 'Deleted', updated_by = $1, updated_at = NOW() WHERE id = $2`,
+        [req.headers.username || null, tx.id]);
+    await logReverse(client, {
+        sysModule: '21', tableName: 'ap_transaction', recordId: Number(tx.id), docNo: tx.doc_no,
+        fromStatus: tx.status, toStatus: 'Deleted', reason, userId: userIdOf(req),
+    });
+    return null;
+});
+
+// PUT /im_consignment_settlement/:id/void { reason } — ยกเลิกผ่าน AP (รายการบัญชีกลับวันที่ยกเลิก + ประวัติ)
+// แล้วคืนรายการขายฝากขายกลับไปรอตั้งหนี้ ตั้งหนี้ใหม่ได้
+const voidSettlement = (req, res) => runAction(req, res, 'voiding', async (client, tx, reason) => {
+    if (!reason) return { message: 'กรุณาระบุเหตุผลการยกเลิก' };
+    const b = (await computeSettlementBlocks(client, tx.id)).void_block;
+    if (b) return blockError(b);
+    const { voidApDocument } = require('../ap/apTransactionController');
+    const r = await voidApDocument(client, tx.id, {
+        voidReason: reason, userId: userIdOf(req), userName: req.headers.username || null, fromConsignment: true,
+    });
+    if (r.message) return { message: r.message, code: r.code, ref: r.ref, status: r.httpStatus };
+    await client.query(
+        `UPDATE im_stock_layer_consumption SET settlement_ap_transaction_id = NULL WHERE settlement_ap_transaction_id = $1`, [tx.id]);
+    return null;
+});
+
+module.exports = {
+    fetchPending, postSettlement, fetchSettled,
+    reverseSettlement, repostSettlement, deleteSettlement, voidSettlement, computeSettlementBlocks,
+};
