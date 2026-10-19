@@ -18,6 +18,7 @@ router.put('/so_transaction/:id',               soTransactionController.updateTr
 router.put('/so_transaction/:id/approve',       soTransactionController.approveTransaction);
 router.put('/so_transaction/:id/close',         soTransactionController.closeTransaction);
 router.put('/so_transaction/:id/void',          soTransactionController.voidTransaction);
+router.put('/so_transaction/:id/reverse',      soTransactionController.reverseTransaction);
 router.delete('/so_transaction/:id',            soTransactionController.deleteTransaction);
 
 // quote_transaction (ใบเสนอราคา — ส่วนหนึ่งของ workflow สั่งขายเดียวกับ SO — Draft/Rejected->Submitted->
@@ -34,6 +35,7 @@ router.put('/quote_transaction/:id/approve',       soQuoteTransactionController.
 router.put('/quote_transaction/:id/reject',        soQuoteTransactionController.rejectTransaction);
 router.put('/quote_transaction/:id/close',         soQuoteTransactionController.closeTransaction);
 router.put('/quote_transaction/:id/void',          soQuoteTransactionController.voidTransaction);
+router.put('/quote_transaction/:id/reverse',       soQuoteTransactionController.reverseTransaction);
 router.delete('/quote_transaction/:id',            soQuoteTransactionController.deleteTransaction);
 
 // quote_so_status_report (ติดตามสถานะใบเสนอราคา/ใบสั่งขายคู่กัน — อ่านอย่างเดียว)

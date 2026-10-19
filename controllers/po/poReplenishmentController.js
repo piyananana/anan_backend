@@ -131,7 +131,7 @@ const fetchSuggestions = async (req, res) => {
                     pod.item_id, po.vendor_id, po.vendor_code, po.vendor_name_th, pod.unit_price_fc, po.doc_date
                 FROM po_transaction_detail pod
                 JOIN po_transaction po ON po.id = pod.header_id
-                WHERE pod.item_id = ANY($1::int[]) AND po.status <> 'Void'
+                WHERE pod.item_id = ANY($1::int[]) AND po.status NOT IN ('Void', 'Deleted')
                 ORDER BY pod.item_id, po.doc_date DESC, po.id DESC
             `, [itemIds]);
             const byItem = new Map(vendorRes.rows.map(v => [v.item_id, v]));

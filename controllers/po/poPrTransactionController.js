@@ -10,6 +10,8 @@
 'use strict';
 
 const { generateDocNo } = require('../im/imTransactionController');
+const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
+const { reasonOf, userIdOf, sendErr, blk } = require('../../utils/docAction');
 
 const ensurePrTransactionTable = async (client) => {
     await client.query(`
@@ -91,6 +93,12 @@ const ensurePrTransactionTable = async (client) => {
     await client.query(`ALTER TABLE pr_transaction ADD COLUMN IF NOT EXISTS currency_id INTEGER REFERENCES cd_currency(id)`);
     await client.query(`ALTER TABLE pr_transaction ADD COLUMN IF NOT EXISTS currency_code VARCHAR(10) DEFAULT 'THB'`);
     await client.query(`ALTER TABLE pr_transaction ADD COLUMN IF NOT EXISTS exchange_rate NUMERIC(15,6) NOT NULL DEFAULT 1`);
+    // ยกเลิกแบบมีเหตุผล (sql/pr_transaction_reverse_to_draft.sql)
+    await client.query(`
+        ALTER TABLE pr_transaction
+            ADD COLUMN IF NOT EXISTS void_reason TEXT,
+            ADD COLUMN IF NOT EXISTS voided_by   VARCHAR(100),
+            ADD COLUMN IF NOT EXISTS voided_at   TIMESTAMPTZ`);
 };
 
 // --- Fetch helpers ---
@@ -115,7 +123,7 @@ const fetchRowById = async (pool, id) => {
                COALESCE((
                    SELECT SUM(pod.qty_ordered) FROM po_transaction_detail pod
                    JOIN po_transaction po ON po.id = pod.header_id
-                   WHERE pod.ref_pr_detail_id = dt.id AND po.status <> 'Void'
+                   WHERE pod.ref_pr_detail_id = dt.id AND po.status NOT IN ('Void', 'Deleted')
                ), 0) AS qty_converted
         FROM pr_transaction_detail dt
         LEFT JOIN im_uom u ON u.id = dt.uom_id
@@ -145,6 +153,7 @@ const fetchRows = async (req, res) => {
         const params = [];
         let pi = 1;
         if (status)       { params.push(status);       query += ` AND t.status = $${pi++}`; }
+        else query += ` AND t.status <> 'Deleted'`; // ใบที่ลบแล้วแสดงเฉพาะเมื่อเลือกสถานะ Deleted
         if (vendor_id)    { params.push(vendor_id);    query += ` AND t.vendor_id = $${pi++}`; }
         if (requested_by) { params.push(requested_by); query += ` AND t.requested_by = $${pi++}`; }
         if (date_from)    { params.push(date_from);    query += ` AND t.doc_date >= $${pi++}`; }
@@ -170,6 +179,8 @@ const fetchRow = async (req, res) => {
         await ensurePrTransactionTable(client);
         const data = await fetchRowById(req.dbPool, req.params.id);
         if (!data) return res.status(404).json({ message: 'Not found.' });
+        Object.assign(data, await computeBlocks(client, req.params.id));
+        data.reverse_history = await getReverseHistory(client, 'pr_transaction', req.params.id);
         res.status(200).json(data);
     } catch (error) {
         console.error('Error fetching pr_transaction row:', error);
@@ -530,56 +541,103 @@ const closeTransaction = async (req, res) => {
     } finally { client.release(); }
 };
 
-// --- 7. Void (Draft/Rejected/Approved/PartiallyConverted -> Void — บล็อกถ้ามี PO อ้างอิงแล้ว) ---
-const voidTransaction = async (req, res) => {
+// --- ถอย / ยกเลิก / ลบ: เงื่อนไข ---
+// ใบสั่งซื้อที่แปลงจากใบนี้ (ทุกสถานะยกเว้น Void/Deleted — รวมร่าง เพราะแก้ร่างใบขอซื้อจะสร้างบรรทัดใหม่)
+const refDocsOf = async (client, id) => (await client.query(`
+    SELECT string_agg(DISTINCT t.doc_no, ', ') AS docs
+      FROM po_transaction_detail td JOIN po_transaction t ON t.id = td.header_id
+      JOIN pr_transaction_detail d ON d.id = td.ref_pr_detail_id
+     WHERE d.header_id = $1 AND t.status NOT IN ('Void', 'Deleted')`, [id])).rows[0].docs;
+
+const computeBlocks = async (client, id) => {
+    const t = (await client.query(`SELECT status FROM pr_transaction WHERE id = $1`, [id])).rows[0];
+    if (!t) return {};
+    const refs = await refDocsOf(client, id);
+    const voided = blk('VOIDED', 'ใบขอซื้อนี้ถูกยกเลิกหรือลบแล้ว');
+    const refBlock = refs
+        ? blk('REF_DOCS', `มีใบสั่งซื้อแปลงจากใบขอซื้อนี้ (${refs}) ต้องถอยและลบใบสั่งซื้อเหล่านั้นก่อน`, refs)
+        : null;
+    const out = { reverse_block: null, void_block: null, delete_block: null };
+    switch (t.status) {
+        case 'Submitted': out.reverse_block = refBlock; out.void_block = blk('NOT_APPROVED', 'ใบขอซื้อที่รออนุมัติให้ถอยเป็นร่างแล้วลบแทนการยกเลิก'); break;
+        case 'Approved': out.reverse_block = refBlock; out.void_block = refBlock; break;
+        case 'Closed': out.void_block = blk('NOT_APPROVED', 'ใบขอซื้อที่ปิดแล้วยกเลิกไม่ได้ ถอยการปิดก่อน'); break;
+        case 'PartiallyConverted':
+        case 'FullyConverted':
+            out.reverse_block = blk('REF_DOCS', `มีใบสั่งซื้อแปลงจากใบนี้แล้ว (${refs || '-'}) ถอยใบสั่งซื้อก่อน หรือปิดใบขอซื้อแทน`, refs);
+            out.void_block = out.reverse_block;
+            break;
+        case 'Draft':
+        case 'Rejected':
+            out.reverse_block = blk('NOT_REVERSIBLE', 'ถอยได้เฉพาะใบขอซื้อที่ส่งอนุมัติ อนุมัติแล้ว หรือปิดแล้ว');
+            out.void_block = blk('NOT_POSTED', 'ใบขอซื้อที่ยังไม่อนุมัติให้ลบแทนการยกเลิก');
+            break;
+        default: out.reverse_block = voided; out.void_block = voided;
+    }
+    if (!['Draft', 'Rejected'].includes(t.status)) {
+        out.delete_block = ['Void', 'Deleted'].includes(t.status)
+            ? voided : blk('NOT_DRAFT', 'ลบได้เฉพาะร่างหรือใบที่ถูกปฏิเสธ ใบที่ส่งอนุมัติแล้วต้องถอยเป็นร่างก่อน');
+    }
+    return out;
+};
+
+const lockedAction = async (req, res, kind, label, work) => {
     const { id } = req.params;
-    const userName = req.headers['username'] || null;
+    const reason = reasonOf(req);
+    if (!reason) return sendErr(res, 400, `กรุณาระบุเหตุผล${label}`);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
-        const existing = await client.query(`SELECT status FROM pr_transaction WHERE id=$1 FOR UPDATE`, [id]);
-        if (existing.rows.length === 0) throw new Error('Not found');
-        if (!['Draft', 'Rejected', 'Approved', 'PartiallyConverted'].includes(existing.rows[0].status)) {
-            throw new Error('ยกเลิกได้เฉพาะเอกสารสถานะ Draft, Rejected, Approved หรือ PartiallyConverted เท่านั้น (FullyConverted ต้องปิดเอกสารแทนการยกเลิก)');
-        }
-        const convertedRes = await client.query(`
-            SELECT COUNT(*) FROM po_transaction_detail pod
-            JOIN po_transaction po ON po.id = pod.header_id
-            JOIN pr_transaction_detail prd ON prd.id = pod.ref_pr_detail_id
-            WHERE prd.header_id = $1 AND po.status <> 'Void'
-        `, [id]);
-        if (Number(convertedRes.rows[0].count) > 0) {
-            throw new Error('ไม่สามารถยกเลิกได้ เนื่องจากมีใบสั่งซื้อ (PO) อ้างอิงใบขอซื้อนี้ไปแล้ว');
-        }
-        await client.query(`UPDATE pr_transaction SET status='Void', updated_by=$1, updated_at=NOW() WHERE id=$2`, [userName, id]);
+        await ensurePrTransactionTable(client);
+        const t = (await client.query(`SELECT * FROM pr_transaction WHERE id=$1 FOR UPDATE`, [id])).rows[0];
+        if (!t) { await client.query('ROLLBACK'); return sendErr(res, 404, 'Not found'); }
+        const b = (await computeBlocks(client, id))[kind];
+        if (b) { await client.query('ROLLBACK'); return sendErr(res, 400, b.message, { code: b.code, ref: b.ref }); }
+        const userName = req.headers.username || null;
+        const toStatus = await work(client, t, { reason, userName });
+        await logReverse(client, {
+            sysModule: '51', tableName: 'pr_transaction', recordId: Number(id), docNo: t.doc_no,
+            fromStatus: t.status, toStatus, reason, userId: userIdOf(req),
+        });
         await client.query('COMMIT');
-        const full = await fetchRowById(req.dbPool, id);
-        res.status(200).json(full);
+        if (toStatus === 'Deleted') return res.status(200).json({ message: 'Deleted' });
+        res.status(200).json(await fetchRowById(req.dbPool, id));
     } catch (error) {
         await client.query('ROLLBACK');
-        console.error('Error voiding pr_transaction:', error);
-        res.status(error.message === 'Not found' ? 404 : 500).json({ message: error.message || 'Internal server error' });
+        console.error(`Error ${kind} pr_transaction:`, error);
+        sendErr(res, 500, error.message || 'Internal server error');
     } finally { client.release(); }
 };
 
-// --- 8. Delete (Draft only) ---
-const deleteTransaction = async (req, res) => {
-    const { id } = req.params;
-    const client = await req.dbPool.connect();
-    try {
-        await client.query('BEGIN');
-        const existing = await client.query(`SELECT status FROM pr_transaction WHERE id=$1`, [id]);
-        if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
-        if (existing.rows[0].status !== 'Draft') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'ลบได้เฉพาะเอกสาร Draft เท่านั้น' }); }
-        await client.query(`DELETE FROM pr_transaction WHERE id=$1`, [id]);
-        await client.query('COMMIT');
-        res.status(204).send();
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error('Error deleting pr_transaction:', error);
-        res.status(500).json({ message: 'Internal server error' });
-    } finally { client.release(); }
-};
+// --- 7. ถอย (ต้องมีเหตุผล) ---
+// Submitted / Approved -> Draft: ยังไม่มีใบสั่งซื้อแปลงจากใบนี้ ผู้อนุมัติที่ยังไม่ตัดสินถูกข้าม แก้ไขแล้วส่งอนุมัติใหม่ได้
+// Closed -> เปิดใหม่: สถานะคำนวณจากใบสั่งซื้อที่แปลงไปแล้ว (Approved / PartiallyConverted / FullyConverted)
+const reverseTransaction = (req, res) => lockedAction(req, res, 'reverse_block', 'การถอยเอกสาร', async (client, t, { userName }) => {
+    if (['Submitted', 'Approved'].includes(t.status)) {
+        await client.query(`UPDATE pr_transaction_approval SET status='Skipped' WHERE header_id=$1 AND status='Pending'`, [t.id]);
+        await client.query(`
+            UPDATE pr_transaction SET status='Draft', submitted_at=NULL, submitted_by=NULL, updated_by=$1, updated_at=NOW()
+             WHERE id=$2`, [userName, t.id]);
+        return 'Draft';
+    }
+    await client.query(`UPDATE pr_transaction SET status='Approved', updated_by=$1, updated_at=NOW() WHERE id=$2`, [userName, t.id]);
+    await refreshPrStatus(client, t.id);
+    return (await client.query(`SELECT status FROM pr_transaction WHERE id=$1`, [t.id])).rows[0].status;
+});
+
+// --- 8. ยกเลิก (Approved เท่านั้น ต้องมีเหตุผล — บล็อกถ้ามีใบสั่งซื้อแปลงจากใบนี้) ---
+const voidTransaction = (req, res) => lockedAction(req, res, 'void_block', 'การยกเลิก', async (client, t, { reason, userName }) => {
+    await client.query(`
+        UPDATE pr_transaction SET status='Void', void_reason=$1, voided_by=$2, voided_at=NOW(), updated_by=$2, updated_at=NOW()
+         WHERE id=$3`, [reason, userName, t.id]);
+    return 'Void';
+});
+
+// --- 9. ลบ (Draft/Rejected ต้องมีเหตุผล — เก็บไว้ด้วยสถานะ Deleted ตรวจสอบได้แต่นำกลับมาใช้ไม่ได้) ---
+const deleteTransaction = (req, res) => lockedAction(req, res, 'delete_block', 'การลบ', async (client, t, { userName }) => {
+    await client.query(`UPDATE pr_transaction SET status='Deleted', updated_by=$1, updated_at=NOW() WHERE id=$2`, [userName, t.id]);
+    return 'Deleted';
+});
 
 // --- GET pr_transaction pending current user's approval ---
 const fetchMyPending = async (req, res) => {
@@ -616,7 +674,7 @@ const fetchConvertibleLines = async (req, res) => {
                    COALESCE((
                        SELECT SUM(pod.qty_ordered) FROM po_transaction_detail pod
                        JOIN po_transaction po ON po.id = pod.header_id
-                       WHERE pod.ref_pr_detail_id = dt.id AND po.status <> 'Void'
+                       WHERE pod.ref_pr_detail_id = dt.id AND po.status NOT IN ('Void', 'Deleted')
                    ), 0) AS qty_converted
             FROM pr_transaction_detail dt
             JOIN pr_transaction t ON t.id = dt.header_id
@@ -654,7 +712,7 @@ const validatePrConvertibleQty = async (client, { refPrDetailId, requestedQty })
     const convertedRes = await client.query(`
         SELECT COALESCE(SUM(pod.qty_ordered), 0) AS converted
         FROM po_transaction_detail pod JOIN po_transaction po ON po.id = pod.header_id
-        WHERE pod.ref_pr_detail_id = $1 AND po.status <> 'Void'
+        WHERE pod.ref_pr_detail_id = $1 AND po.status NOT IN ('Void', 'Deleted')
     `, [refPrDetailId]);
     const remaining = Number(orig.qty_requested) - Number(convertedRes.rows[0].converted);
     if (requestedQty > remaining + 0.0001) {
@@ -676,7 +734,7 @@ const refreshPrStatus = async (client, prTransactionId) => {
             COALESCE(SUM((
                 SELECT SUM(pod.qty_ordered) FROM po_transaction_detail pod
                 JOIN po_transaction po ON po.id = pod.header_id
-                WHERE pod.ref_pr_detail_id = prd.id AND po.status <> 'Void'
+                WHERE pod.ref_pr_detail_id = prd.id AND po.status NOT IN ('Void', 'Deleted')
             )), 0) AS converted
         FROM pr_transaction_detail prd WHERE prd.header_id = $1
     `, [prTransactionId]);
@@ -692,6 +750,6 @@ module.exports = {
     ensurePrTransactionTable,
     fetchRows, fetchRow, fetchRowById, fetchConvertibleLines, fetchMyPending,
     createTransaction, updateTransaction, submitTransaction, approveTransaction, rejectTransaction,
-    closeTransaction, voidTransaction, deleteTransaction,
+    closeTransaction, voidTransaction, deleteTransaction, reverseTransaction,
     validatePrConvertibleQty, refreshPrStatus,
 };

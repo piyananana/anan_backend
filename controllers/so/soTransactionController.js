@@ -10,6 +10,8 @@
 'use strict';
 
 const { generateDocNo, ensureImTransactionTable } = require('../im/imTransactionController');
+const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
+const { reasonOf, userIdOf, sendErr, blk } = require('../../utils/docAction');
 
 const ensureSoTransactionTable = async (client) => {
     await client.query(`
@@ -62,6 +64,12 @@ const ensureSoTransactionTable = async (client) => {
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_so_transaction_detail_header ON so_transaction_detail(header_id)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_so_transaction_detail_item   ON so_transaction_detail(item_id)`);
+    // ยกเลิกแบบมีเหตุผล (sql/so_transaction_reverse_to_draft.sql)
+    await client.query(`
+        ALTER TABLE so_transaction
+            ADD COLUMN IF NOT EXISTS void_reason TEXT,
+            ADD COLUMN IF NOT EXISTS voided_by   VARCHAR(100),
+            ADD COLUMN IF NOT EXISTS voided_at   TIMESTAMPTZ`);
 };
 
 // --- Fetch helpers ---
@@ -120,6 +128,7 @@ const fetchRows = async (req, res) => {
         const params = [];
         let pi = 1;
         if (status)      { params.push(status);      query += ` AND t.status = $${pi++}`; }
+        else query += ` AND t.status <> 'Deleted'`; // ใบที่ลบแล้วแสดงเฉพาะเมื่อเลือกสถานะ Deleted
         if (customer_id) { params.push(customer_id);  query += ` AND t.customer_id = $${pi++}`; }
         if (date_from)   { params.push(date_from);    query += ` AND t.doc_date >= $${pi++}`; }
         if (date_to)     { params.push(date_to);      query += ` AND t.doc_date <= $${pi++}`; }
@@ -144,6 +153,8 @@ const fetchRow = async (req, res) => {
         await ensureSoTransactionTable(client);
         const data = await fetchRowById(req.dbPool, req.params.id);
         if (!data) return res.status(404).json({ message: 'Not found.' });
+        Object.assign(data, await computeBlocks(client, req.params.id));
+        data.reverse_history = await getReverseHistory(client, 'so_transaction', req.params.id);
         res.status(200).json(data);
     } catch (error) {
         console.error('Error fetching so_transaction row:', error);
@@ -391,56 +402,114 @@ const closeTransaction = async (req, res) => {
     } finally { client.release(); }
 };
 
-// --- 5. Void (Draft/Approved/PartiallyDelivered -> Void — blocked if any DLN has already Posted/Delivered against it) ---
-const voidTransaction = async (req, res) => {
+// --- ถอย / ยกเลิก / ลบ: เงื่อนไข ---
+// เอกสารใบส่งสินค้าที่อ้างอิง (ทุกสถานะยกเว้น Void/Deleted — รวมร่าง เพราะแก้ร่างใบสั่งขายจะสร้างบรรทัดใหม่)
+const refDocsOf = async (client, id) => (await client.query(`
+    SELECT string_agg(DISTINCT imt.doc_no, ', ') AS docs FROM im_transaction imt
+     WHERE imt.status NOT IN ('Void', 'Deleted')
+       AND (imt.ref_so_id = $1 OR EXISTS (
+            SELECT 1 FROM im_transaction_detail imd JOIN so_transaction_detail d ON d.id = imd.ref_so_detail_id
+             WHERE imd.header_id = imt.id AND d.header_id = $1))`, [id])).rows[0].docs;
+
+const computeBlocks = async (client, id) => {
+    const t = (await client.query(`SELECT status FROM so_transaction WHERE id = $1`, [id])).rows[0];
+    if (!t) return {};
+    const refs = await refDocsOf(client, id);
+    const voided = blk('VOIDED', 'ใบสั่งขายนี้ถูกยกเลิกหรือลบแล้ว');
+    const refBlock = refs
+        ? blk('REF_DOCS', `มีใบส่งสินค้าอ้างอิงใบสั่งขายนี้ (${refs}) ต้องถอยและลบเอกสารเหล่านั้นก่อน`, refs)
+        : null;
+    const out = { reverse_block: null, void_block: null, delete_block: null };
+    switch (t.status) {
+        case 'Approved': out.reverse_block = refBlock; out.void_block = refBlock; break;
+        case 'Closed':
+            out.void_block = blk('NOT_APPROVED', 'ใบสั่งขายที่ปิดแล้วยกเลิกไม่ได้ ถอยการปิดก่อน');
+            break;
+        case 'PartiallyDelivered':
+        case 'FullyDelivered':
+            out.reverse_block = blk('REF_DOCS', `มีใบส่งสินค้าอ้างอิงแล้ว (${refs || '-'}) ถอยใบส่งสินค้าก่อน หรือปิดใบสั่งขายแทน`, refs);
+            out.void_block = out.reverse_block;
+            break;
+        case 'Draft':
+            out.reverse_block = blk('NOT_REVERSIBLE', 'ถอยได้เฉพาะใบสั่งขายที่อนุมัติแล้วหรือปิดแล้ว');
+            out.void_block = blk('NOT_POSTED', 'ใบสั่งขายที่ยังเป็นร่างให้ลบแทนการยกเลิก');
+            break;
+        default: out.reverse_block = voided; out.void_block = voided;
+    }
+    if (t.status !== 'Draft') {
+        out.delete_block = ['Void', 'Deleted'].includes(t.status)
+            ? voided : blk('NOT_DRAFT', 'ลบได้เฉพาะร่าง ใบสั่งขายที่อนุมัติแล้วต้องถอยเป็นร่างก่อน');
+    }
+    return out;
+};
+
+// ต้นทางที่บรรทัดของใบนี้แปลงมา — คำนวณสถานะใหม่หลังยกเลิก/ลบ (จำนวนที่แปลงแล้วไม่นับใบ Void/Deleted)
+const refreshSources = async (client, id) => {
+    const { refreshQuoteStatus } = require('./soQuoteTransactionController');
+    const r = await client.query(`
+        SELECT DISTINCT s.header_id FROM so_transaction_detail d JOIN quote_transaction_detail s ON s.id = d.ref_quote_detail_id
+         WHERE d.header_id = $1`, [id]);
+    for (const x of r.rows) await refreshQuoteStatus(client, x.header_id);
+};
+
+const lockedAction = async (req, res, kind, label, work) => {
     const { id } = req.params;
-    const userName = req.headers.username || null;
+    const reason = reasonOf(req);
+    if (!reason) return sendErr(res, 400, `กรุณาระบุเหตุผล${label}`);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
-        const existing = await client.query(`SELECT status FROM so_transaction WHERE id=$1 FOR UPDATE`, [id]);
-        if (existing.rows.length === 0) throw new Error('Not found');
-        if (!['Draft', 'Approved', 'PartiallyDelivered'].includes(existing.rows[0].status)) {
-            throw new Error('ยกเลิกได้เฉพาะเอกสารสถานะ Draft, Approved หรือ PartiallyDelivered เท่านั้น (FullyDelivered ต้องปิดเอกสารแทนการยกเลิก)');
-        }
-        const deliveredRes = await client.query(`
-            SELECT COUNT(*) FROM im_transaction_detail imd
-            JOIN im_transaction imt ON imt.id = imd.header_id
-            JOIN so_transaction_detail sod ON sod.id = imd.ref_so_detail_id
-            WHERE sod.header_id = $1 AND imt.status IN ('Posted', 'Delivered')
-        `, [id]);
-        if (Number(deliveredRes.rows[0].count) > 0) {
-            throw new Error('ไม่สามารถยกเลิกได้ เนื่องจากมีใบส่งสินค้า (DLN) อ้างอิงใบสั่งขายนี้ไปแล้ว');
-        }
-        await client.query(`UPDATE so_transaction SET status='Void', updated_by=$1, updated_at=NOW() WHERE id=$2`, [userName, id]);
+        await ensureSoTransactionTable(client);
+        const t = (await client.query(`SELECT * FROM so_transaction WHERE id=$1 FOR UPDATE`, [id])).rows[0];
+        if (!t) { await client.query('ROLLBACK'); return sendErr(res, 404, 'Not found'); }
+        const b = (await computeBlocks(client, id))[kind];
+        if (b) { await client.query('ROLLBACK'); return sendErr(res, 400, b.message, { code: b.code, ref: b.ref }); }
+        const userName = req.headers.username || null;
+        const toStatus = await work(client, t, { reason, userName });
+        await logReverse(client, {
+            sysModule: '41', tableName: 'so_transaction', recordId: Number(id), docNo: t.doc_no,
+            fromStatus: t.status, toStatus, reason, userId: userIdOf(req),
+        });
         await client.query('COMMIT');
-        const full = await fetchRowById(req.dbPool, id);
-        res.status(200).json(full);
+        if (toStatus === 'Deleted') return res.status(200).json({ message: 'Deleted' });
+        res.status(200).json(await fetchRowById(req.dbPool, id));
     } catch (error) {
         await client.query('ROLLBACK');
-        console.error('Error voiding so_transaction:', error);
-        res.status(error.message === 'Not found' ? 404 : 500).json({ message: error.message || 'Internal server error' });
+        console.error(`Error ${kind} so_transaction:`, error);
+        sendErr(res, 500, error.message || 'Internal server error');
     } finally { client.release(); }
 };
 
-// --- 6. Delete (Draft only) ---
-const deleteTransaction = async (req, res) => {
-    const { id } = req.params;
-    const client = await req.dbPool.connect();
-    try {
-        await client.query('BEGIN');
-        const existing = await client.query(`SELECT status FROM so_transaction WHERE id=$1`, [id]);
-        if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
-        if (existing.rows[0].status !== 'Draft') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'ลบได้เฉพาะเอกสาร Draft เท่านั้น' }); }
-        await client.query(`DELETE FROM so_transaction WHERE id=$1`, [id]);
-        await client.query('COMMIT');
-        res.status(204).send();
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error('Error deleting so_transaction:', error);
-        res.status(500).json({ message: 'Internal server error' });
-    } finally { client.release(); }
-};
+// --- 5. ถอย (ต้องมีเหตุผล) ---
+// Approved -> Draft: ยังไม่มีใบส่งสินค้าอ้างอิง แก้ไขแล้วอนุมัติใหม่ได้ด้วยเลขที่เดิม
+// Closed -> เปิดใหม่: สถานะคำนวณจากใบส่งสินค้าที่อ้างอิง (Approved / PartiallyDelivered / FullyDelivered)
+const reverseTransaction = (req, res) => lockedAction(req, res, 'reverse_block', 'การถอยเอกสาร', async (client, t, { userName }) => {
+    if (t.status === 'Approved') {
+        await client.query(`
+            UPDATE so_transaction SET status='Draft', approved_at=NULL, approved_by=NULL, updated_by=$1, updated_at=NOW()
+             WHERE id=$2`, [userName, t.id]);
+        return 'Draft';
+    }
+    await client.query(`UPDATE so_transaction SET status='Approved', updated_by=$1, updated_at=NOW() WHERE id=$2`, [userName, t.id]);
+    await refreshSoStatus(client, t.id);
+    return (await client.query(`SELECT status FROM so_transaction WHERE id=$1`, [t.id])).rows[0].status;
+});
+
+// --- 6. ยกเลิก (Approved เท่านั้น ต้องมีเหตุผล — บล็อกถ้ามีใบส่งสินค้าอ้างอิง) ---
+const voidTransaction = (req, res) => lockedAction(req, res, 'void_block', 'การยกเลิก', async (client, t, { reason, userName }) => {
+    await client.query(`
+        UPDATE so_transaction SET status='Void', void_reason=$1, voided_by=$2, voided_at=NOW(), updated_by=$2, updated_at=NOW()
+         WHERE id=$3`, [reason, userName, t.id]);
+    await refreshSources(client, t.id);
+    return 'Void';
+});
+
+// --- 7. ลบ (Draft เท่านั้น ต้องมีเหตุผล — เก็บไว้ด้วยสถานะ Deleted ตรวจสอบได้แต่นำกลับมาใช้ไม่ได้) ---
+const deleteTransaction = (req, res) => lockedAction(req, res, 'delete_block', 'การลบ', async (client, t, { userName }) => {
+    await client.query(`UPDATE so_transaction SET status='Deleted', updated_by=$1, updated_at=NOW() WHERE id=$2`, [userName, t.id]);
+    await refreshSources(client, t.id);
+    return 'Deleted';
+});
 
 // GET /so_transaction/deliverable_lines?customer_id=&search= — SO ที่ Approved/PartiallyDelivered ของลูกค้านี้
 // พร้อมจำนวนคงเหลือที่ส่งได้ต่อบรรทัด ใช้โดย document picker ในหน้าจอ DLN (อ้างอิง SO) — สูตรเดียวกับ
@@ -542,6 +611,6 @@ const refreshSoStatus = async (client, soTransactionId) => {
 module.exports = {
     ensureSoTransactionTable,
     fetchRows, fetchRow, fetchRowById, fetchDeliverableLines,
-    createTransaction, updateTransaction, approveTransaction, closeTransaction, voidTransaction, deleteTransaction,
+    createTransaction, updateTransaction, approveTransaction, closeTransaction, voidTransaction, deleteTransaction, reverseTransaction,
     validateSoDeliverableQty, refreshSoStatus,
 };

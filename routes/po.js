@@ -19,6 +19,7 @@ router.put('/po_transaction/:id',              poTransactionController.updateTra
 router.put('/po_transaction/:id/approve',      poTransactionController.approveTransaction);
 router.put('/po_transaction/:id/close',        poTransactionController.closeTransaction);
 router.put('/po_transaction/:id/void',         poTransactionController.voidTransaction);
+router.put('/po_transaction/:id/reverse',      poTransactionController.reverseTransaction);
 router.delete('/po_transaction/:id',           poTransactionController.deleteTransaction);
 
 // po_replenishment (ใบแนะนำสั่งซื้อเพื่อเติมสต็อก — อ่านอย่างเดียว)
@@ -39,6 +40,7 @@ router.put('/pr_transaction/:id/approve',       poPrTransactionController.approv
 router.put('/pr_transaction/:id/reject',        poPrTransactionController.rejectTransaction);
 router.put('/pr_transaction/:id/close',         poPrTransactionController.closeTransaction);
 router.put('/pr_transaction/:id/void',          poPrTransactionController.voidTransaction);
+router.put('/pr_transaction/:id/reverse',       poPrTransactionController.reverseTransaction);
 router.delete('/pr_transaction/:id',            poPrTransactionController.deleteTransaction);
 
 // pr_po_status_report (ติดตามสถานะใบขอซื้อ/ใบสั่งซื้อคู่กัน — อ่านอย่างเดียว)

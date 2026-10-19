@@ -1,0 +1,5 @@
+-- ใบสั่งขาย: ถอย (อนุมัติ -> ร่าง, ปิด -> เปิดใหม่) / ยกเลิกแบบมีเหตุผล / ลบแบบเก็บไว้ (status 'Deleted')
+ALTER TABLE so_transaction
+    ADD COLUMN IF NOT EXISTS void_reason TEXT,
+    ADD COLUMN IF NOT EXISTS voided_by   VARCHAR(100),
+    ADD COLUMN IF NOT EXISTS voided_at   TIMESTAMPTZ;
