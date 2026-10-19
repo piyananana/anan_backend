@@ -1,7 +1,7 @@
 // controllers/im/imStockCountController.js — im_stock_count (ใบตรวจนับสต็อก, ต่อคลังสินค้าเดียว)
 // Workflow แยกจาก im_transaction (AJS): Draft (ตรวจสอบผังก่อนบันทึก) -> Posted (บันทึกใบตรวจนับ —
 // ล็อครายการ + freeze system_qty) -> Approved (ตรวจผล+อนุมัติ) -> Closed (บันทึกปรับยอด — สร้าง+
-// โพสต์ im_transaction AJS) กิ่ง Void แยกจาก Draft/Posted ได้
+// โพสต์ im_transaction AJS) — ถอยทีละขั้นได้ (ดู reverseCount) ยกเลิกได้เมื่อบันทึกแล้ว ร่างให้ลบ (Deleted)
 // ไม่มี approver queue แบบ AP — ใช้ menu permission canApprove ธรรมดา (ดู routes/im.js)
 'use strict';
 
@@ -17,9 +17,10 @@ const { ensureImStockBalanceTable } = require('./imStockBalanceController');
 const {
     ensureImTransactionTable,
     insertAndPostAdjustment,
-    voidTransactionCore,
+    computeImBlocks, voidImDocument, removeSystemImDocument, reasonOf, userIdOf,
     STOCK_BALANCE_KEY,
 } = require('./imTransactionController');
+const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const {
     ensureImStockCountRunningTable,
     generateNextCode,
@@ -56,6 +57,12 @@ const ensureImStockCountTable = async (client) => {
     await client.query(`ALTER TABLE im_stock_count ADD COLUMN IF NOT EXISTS print_count INTEGER NOT NULL DEFAULT 0`).catch(() => {});
     await client.query(`ALTER TABLE im_stock_count ADD COLUMN IF NOT EXISTS closed_at   TIMESTAMPTZ`).catch(() => {});
     await client.query(`ALTER TABLE im_stock_count ADD COLUMN IF NOT EXISTS closed_by   VARCHAR(100)`).catch(() => {});
+    // ถอย / ยกเลิก: เลขที่ใบปรับยอดและรายการบัญชีที่เก็บไว้ใช้ซ้ำ + ข้อมูลการยกเลิก (sql/im_stock_count_reverse_to_draft.sql)
+    await client.query(`ALTER TABLE im_stock_count ADD COLUMN IF NOT EXISTS adj_doc_no    VARCHAR(30)`).catch(() => {});
+    await client.query(`ALTER TABLE im_stock_count ADD COLUMN IF NOT EXISTS adj_gl_doc_no VARCHAR(30)`).catch(() => {});
+    await client.query(`ALTER TABLE im_stock_count ADD COLUMN IF NOT EXISTS void_reason   TEXT`).catch(() => {});
+    await client.query(`ALTER TABLE im_stock_count ADD COLUMN IF NOT EXISTS voided_by     VARCHAR(100)`).catch(() => {});
+    await client.query(`ALTER TABLE im_stock_count ADD COLUMN IF NOT EXISTS voided_at     TIMESTAMPTZ`).catch(() => {});
     // backfill any legacy rows created before count_no existed, and legacy status names
     await client.query(`UPDATE im_stock_count SET count_no = 'CNT-' || LPAD(id::text, 6, '0') WHERE count_no IS NULL`).catch(() => {});
     await client.query(`UPDATE im_stock_count SET status = 'Posted' WHERE status = 'Counting'`).catch(() => {});
@@ -156,7 +163,11 @@ const fetchRowById = async (pool, id) => {
         LEFT JOIN im_location l ON l.id = d.location_id
         WHERE d.header_id = $1 ORDER BY d.line_no
     `, [id]);
-    return { ...hRes.rows[0], details: dRes.rows };
+    return {
+        ...hRes.rows[0], details: dRes.rows,
+        ...(await computeCountBlocks(pool, id)),
+        reverse_history: await getReverseHistory(pool, 'im_stock_count', Number(id)),
+    };
 };
 
 const fetchRows = async (req, res) => {
@@ -169,9 +180,10 @@ const fetchRows = async (req, res) => {
         let pi = 1;
         if (warehouse_id) { params.push(warehouse_id); where += ` AND c.warehouse_id = $${pi++}`; }
         if (status)       { params.push(status);       where += ` AND c.status = $${pi++}`; }
+        else where += ` AND c.status <> 'Deleted'`;
         if (date_from)    { params.push(date_from);    where += ` AND c.count_date >= $${pi++}`; }
         if (date_to)      { params.push(date_to);      where += ` AND c.count_date <= $${pi++}`; }
-        if (exclude_closed_void === 'true') where += ` AND c.status NOT IN ('Closed','Void')`;
+        if (exclude_closed_void === 'true') where += ` AND c.status NOT IN ('Closed','Void','Deleted')`;
         const result = await client.query(`
             SELECT c.*,
                    w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
@@ -332,65 +344,6 @@ const postCount = async (req, res) => {
     } finally { client.release(); }
 };
 
-// --- Void (Draft or Posted) ---
-const voidCount = async (req, res) => {
-    const { id } = req.params;
-    const userName = req.headers.username || null;
-    const client = await req.dbPool.connect();
-    try {
-        await client.query('BEGIN');
-        const hRes = await client.query(`SELECT status FROM im_stock_count WHERE id=$1`, [id]);
-        if (hRes.rows.length === 0) throw new Error('Not found');
-        if (!['Draft', 'Posted'].includes(hRes.rows[0].status)) throw new Error('ยกเลิกได้เฉพาะสถานะ Draft หรือ Posted เท่านั้น');
-        await client.query(`UPDATE im_stock_count SET status='Void', updated_by=$1, updated_at=NOW() WHERE id=$2`, [userName, id]);
-        await client.query('COMMIT');
-        const full = await fetchRowById(req.dbPool, id);
-        res.status(200).json(full);
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error('Error voiding im_stock_count:', error);
-        res.status(500).json({ message: error.message || 'Internal server error' });
-    } finally { client.release(); }
-};
-
-// --- Reverse (Approved or Closed -> Posted) — un-does the approval and, if Closed, voids the linked '80' AJS
-// im_transaction (reversing its stock movement + GL entry via voidTransactionCore) so the count sheet can be
-// re-recorded and re-approved/closed. Mirrors reverseToDraft's role for im_transaction, but lands on 'Posted'
-// (not 'Draft') because that's the only status updateCounts accepts — counted_qty is left untouched.
-const reverseCount = async (req, res) => {
-    const { id } = req.params;
-    const userName = req.headers.username || null;
-    const client = await req.dbPool.connect();
-    try {
-        await client.query('BEGIN');
-        const hRes = await client.query(`SELECT * FROM im_stock_count WHERE id=$1 FOR UPDATE`, [id]);
-        if (hRes.rows.length === 0) throw new Error('Not found');
-        const header = hRes.rows[0];
-        if (!['Approved', 'Closed'].includes(header.status)) {
-            throw new Error('ถอยกลับได้เฉพาะสถานะ Approved หรือ Closed เท่านั้น');
-        }
-
-        if (header.status === 'Closed' && header.im_transaction_id) {
-            await voidTransactionCore(client, header.im_transaction_id);
-        }
-
-        await client.query(`
-            UPDATE im_stock_count SET
-                status='Posted', approved_at=NULL, approved_by=NULL,
-                im_transaction_id=NULL, closed_at=NULL, closed_by=NULL,
-                updated_by=$1, updated_at=NOW()
-            WHERE id=$2
-        `, [userName, id]);
-        await client.query('COMMIT');
-        const full = await fetchRowById(req.dbPool, id);
-        res.status(200).json(full);
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error('Error reversing im_stock_count:', error);
-        res.status(error.message === 'Not found' ? 404 : 500).json({ message: error.message || 'Internal server error' });
-    } finally { client.release(); }
-};
-
 // --- Print counter (screen 3 calls this right before generating the PDF) ---
 const incrementPrintCount = async (req, res) => {
     const { id } = req.params;
@@ -417,7 +370,7 @@ const fetchLinesForRecording = async (req, res) => {
     try {
         const hRes = await client.query(`SELECT status, warehouse_id FROM im_stock_count WHERE id=$1`, [id]);
         if (hRes.rows.length === 0) return res.status(404).json({ message: 'Not found' });
-        if (['Closed', 'Void'].includes(hRes.rows[0].status)) {
+        if (['Closed', 'Void', 'Deleted'].includes(hRes.rows[0].status)) {
             return res.status(400).json({ message: 'เอกสารนี้ปิดหรือยกเลิกแล้ว ไม่สามารถบันทึกยอดตรวจนับได้' });
         }
         const result = await client.query(`
@@ -570,6 +523,7 @@ const closeCount = async (req, res) => {
             imTransactionId = await insertAndPostAdjustment(client, {
                 sysDocType: '80', docDate: header.count_date, warehouseId: header.warehouse_id,
                 description: header.description, lines: changedLines, createdBy: userName, action: 'Post',
+                docNo: header.adj_doc_no || undefined, glDocNo: header.adj_gl_doc_no || undefined,
             });
         }
         await client.query(`
@@ -588,13 +542,166 @@ const closeCount = async (req, res) => {
     } finally { client.release(); }
 };
 
+// ===== ถอย / ยกเลิก / ลบ =====
+// - ถอยทีละขั้น: Closed / Approved → Posted (ยกเลิกการอนุมัติ), Posted → Draft (ปลดล็อกรายการ)
+//   Closed ที่มีใบปรับยอด: ลบใบปรับยอดออกทั้งใบ (ย้อนสต็อก + ลบรายการบัญชี) เก็บเลขที่ใบปรับยอดและรายการบัญชีไว้
+//   ใช้ซ้ำตอนบันทึกปรับยอดใหม่ — ทำได้เมื่องวดของใบปรับยอดยังเปิดและสินค้าที่ปรับเข้ายังไม่ถูกใช้
+// - ยกเลิก: Posted / Approved (ไม่มีผลต่อสต็อก) หรือ Closed — ใบปรับยอดถูกยกเลิกด้วยรายการกลับวันนี้
+// - ลบ: เฉพาะร่าง เก็บไว้ด้วยสถานะ Deleted
+// ทุกการกระทำต้องมีเหตุผล และบันทึกที่ sa_document_reverse_log
+const COUNT_BLOCK_MESSAGES = {
+    NOT_REVERSIBLE: 'ถอยได้เฉพาะใบตรวจนับที่บันทึก อนุมัติ หรือปิดแล้ว',
+    NOT_POSTED:     'ยกเลิกได้เฉพาะใบตรวจนับที่บันทึกแล้ว (ใบร่างให้ลบแทน)',
+    NOT_DRAFT:      'ใบตรวจนับที่บันทึกแล้วลบไม่ได้ กรุณาถอยเป็นร่างก่อน',
+    VOIDED:         'ใบตรวจนับนี้ถูกยกเลิกหรือลบแล้ว',
+};
+
+// เหตุที่ถอย / ยกเลิก / ลบไม่ได้ (null = ทำได้) + สถานะปลายทางของการถอย
+const computeCountBlocks = async (db, id) => {
+    const h = (await db.query(`
+        SELECT c.status, c.im_transaction_id, t.doc_no AS adj_doc_no, t.status AS adj_status
+          FROM im_stock_count c LEFT JOIN im_transaction t ON t.id = c.im_transaction_id
+         WHERE c.id = $1`, [id])).rows[0];
+    if (!h) return {};
+    const pack = (code) => ({ code, ref: null, message: COUNT_BLOCK_MESSAGES[code] });
+    if (h.status === 'Void' || h.status === 'Deleted') {
+        return { reverse_block: pack('VOIDED'), reverse_to: null, void_block: pack('VOIDED'), delete_block: pack('VOIDED') };
+    }
+    let reverseTo = null, reverse = null, voidB = null;
+    if (h.status === 'Draft') { reverse = pack('NOT_REVERSIBLE'); voidB = pack('NOT_POSTED'); }
+    else if (h.status === 'Posted') reverseTo = 'Draft';
+    else reverseTo = 'Posted'; // Approved / Closed
+    if (h.status === 'Closed' && h.im_transaction_id && h.adj_status === 'Posted') {
+        const b = await computeImBlocks(db, h.im_transaction_id, { ignoreStockCount: true });
+        const adj = (x) => x ? { code: x.code, ref: h.adj_doc_no, message: `ใบปรับยอด ${h.adj_doc_no}: ${x.message}` } : null;
+        reverse = adj(b.reverse_block);
+        voidB = adj(b.void_block);
+    }
+    return {
+        reverse_block: reverse, reverse_to: reverseTo,
+        void_block: voidB,
+        delete_block: h.status === 'Draft' ? null : pack('NOT_DRAFT'),
+    };
+};
+
+const sendBlock = async (client, res, b) => {
+    await client.query('ROLLBACK');
+    return res.status(400).json({ message: b.message, code: b.code, ref: b.ref });
+};
+
+// PUT /:id/reverse — ถอยหนึ่งขั้น
+const reverseCount = async (req, res) => {
+    const { id } = req.params;
+    const reason = reasonOf(req);
+    const userName = req.headers.username || null;
+    if (!reason) return res.status(400).json({ message: 'กรุณาระบุเหตุผลการถอยเอกสาร' });
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        const header = (await client.query(`SELECT * FROM im_stock_count WHERE id=$1 FOR UPDATE`, [id])).rows[0];
+        if (!header) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
+        const blocks = await computeCountBlocks(client, id);
+        if (blocks.reverse_block) return sendBlock(client, res, blocks.reverse_block);
+
+        let adjDocNo = header.adj_doc_no, adjGlDocNo = header.adj_gl_doc_no;
+        if (header.status === 'Closed' && header.im_transaction_id) {
+            await client.query(`UPDATE im_stock_count SET im_transaction_id=NULL WHERE id=$1`, [id]);
+            const r = await removeSystemImDocument(client, header.im_transaction_id);
+            adjDocNo = r.docNo || adjDocNo;
+            adjGlDocNo = r.glDocNo || adjGlDocNo;
+        }
+        await client.query(`
+            UPDATE im_stock_count SET
+                status=$1, adj_doc_no=$2, adj_gl_doc_no=$3,
+                approved_at=NULL, approved_by=NULL, im_transaction_id=NULL, closed_at=NULL, closed_by=NULL,
+                updated_by=$4, updated_at=NOW()
+            WHERE id=$5
+        `, [blocks.reverse_to, adjDocNo, adjGlDocNo, userName, id]);
+        await logReverse(client, {
+            sysModule: '31', tableName: 'im_stock_count', recordId: Number(id), docNo: header.count_no,
+            fromStatus: header.status, toStatus: blocks.reverse_to, reason, userId: userIdOf(req),
+        });
+        await client.query('COMMIT');
+        res.status(200).json(await fetchRowById(req.dbPool, id));
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error reversing im_stock_count:', error);
+        res.status(500).json({ message: error.message || 'Internal server error' });
+    } finally { client.release(); }
+};
+
+// PUT /:id/void — ยกเลิก (Closed: ยกเลิกใบปรับยอดด้วยรายการกลับวันนี้)
+const voidCount = async (req, res) => {
+    const { id } = req.params;
+    const reason = reasonOf(req);
+    const userId = userIdOf(req);
+    const userName = req.headers.username || null;
+    if (!reason) return res.status(400).json({ message: 'กรุณาระบุเหตุผลการยกเลิก' });
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        const header = (await client.query(`SELECT * FROM im_stock_count WHERE id=$1 FOR UPDATE`, [id])).rows[0];
+        if (!header) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
+        const blocks = await computeCountBlocks(client, id);
+        if (blocks.void_block) return sendBlock(client, res, blocks.void_block);
+
+        if (header.status === 'Closed' && header.im_transaction_id) {
+            const r = await voidImDocument(client, header.im_transaction_id, {
+                reason: `${reason} (ใบตรวจนับ ${header.count_no})`, userId, userName, ignoreStockCount: true,
+            });
+            if (r.message) return sendBlock(client, res, r);
+        }
+        await client.query(`
+            UPDATE im_stock_count SET status='Void', void_reason=$1, voided_by=$2, voided_at=NOW(),
+                   updated_by=$2, updated_at=NOW()
+             WHERE id=$3`, [reason, userName, id]);
+        await logReverse(client, {
+            sysModule: '31', tableName: 'im_stock_count', recordId: Number(id), docNo: header.count_no,
+            fromStatus: header.status, toStatus: 'Void', reason, userId,
+        });
+        await client.query('COMMIT');
+        res.status(200).json(await fetchRowById(req.dbPool, id));
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error voiding im_stock_count:', error);
+        res.status(500).json({ message: error.message || 'Internal server error' });
+    } finally { client.release(); }
+};
+
+// DELETE /:id — เฉพาะร่าง เก็บไว้ด้วยสถานะ Deleted
+const deleteCount = async (req, res) => {
+    const { id } = req.params;
+    const reason = reasonOf(req);
+    const userName = req.headers.username || null;
+    if (!reason) return res.status(400).json({ message: 'กรุณาระบุเหตุผลการลบเอกสาร' });
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        const header = (await client.query(`SELECT id, count_no, status FROM im_stock_count WHERE id=$1 FOR UPDATE`, [id])).rows[0];
+        if (!header) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
+        const blocks = await computeCountBlocks(client, id);
+        if (blocks.delete_block) return sendBlock(client, res, blocks.delete_block);
+        await client.query(`UPDATE im_stock_count SET status='Deleted', updated_by=$1, updated_at=NOW() WHERE id=$2`, [userName, id]);
+        await logReverse(client, {
+            sysModule: '31', tableName: 'im_stock_count', recordId: Number(id), docNo: header.count_no,
+            fromStatus: 'Draft', toStatus: 'Deleted', reason, userId: userIdOf(req),
+        });
+        await client.query('COMMIT');
+        res.status(200).json({ message: 'Deleted' });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error deleting im_stock_count:', error);
+        res.status(500).json({ message: error.message || 'Internal server error' });
+    } finally { client.release(); }
+};
+
 // --- Variance report ---
 const fetchVarianceReport = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await ensureImStockCountTable(client);
         const { count_id, warehouse_id, location_id, date_from, date_to, variance_only } = req.query;
-        let where = 'WHERE 1=1';
+        let where = "WHERE c.status <> 'Deleted'";
         const params = [];
         let pi = 1;
         if (count_id)     { params.push(count_id);     where += ` AND c.id = $${pi++}`; }
@@ -812,10 +919,10 @@ const importConfirm = async (req, res) => {
 module.exports = {
     ensureImStockCountTable,
     fetchRows, fetchRow, addRow, updateHeader, resyncLines,
-    postCount, voidCount, incrementPrintCount,
+    postCount, voidCount, deleteCount, incrementPrintCount,
     fetchLinesForRecording, updateCounts,
     checkResults, approveCount, closeCount, reverseCount,
     fetchVarianceReport,
     exportExcel, importValidate, importConfirm,
-    fetchRowById,
+    fetchRowById, computeCountBlocks,
 };

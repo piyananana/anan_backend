@@ -1940,7 +1940,7 @@ const insertAndPostAdjustment = async (client, {
     refNo, refDocId, refDocNo, refImTransactionId, refPoId, refSoId, refMoId, description,
     currencyId, currencyCode, exchangeRate,
     dim1Id, dim2Id, dim3Id, dim4Id, dim5Id, branchId, createdBy,
-    lines, action,
+    lines, action, glDocNo,
 }) => {
     let resolvedDocId = docId;
     let resolvedDocCode = docCode;
@@ -2105,6 +2105,7 @@ const insertAndPostAdjustment = async (client, {
             currency_code: currencyCode || 'THB', exchange_rate: exchangeRate || 1,
             dim1_id: dim1Id, dim2_id: dim2Id, dim3_id: dim3Id, dim4_id: dim4Id, dim5_id: dim5Id,
             branch_id: branchId, created_by: createdBy, updated_by: createdBy,
+            gl_doc_no: glDocNo || null,
         };
         await postDetailLines(client, newHeaderId, headerForPost, finalDocNo);
     }
@@ -2534,11 +2535,8 @@ const postBillingForDln = async (req, res) => {
 };
 
 // --- 3. Void ---
-// ย้อนกลับผลของการ Post ทั้งหมด (ตัดสต็อกกลับ, Void GL/AP/AR ที่ผูกไว้) — ใช้ร่วมกันทั้ง voidTransaction (จบที่
-// status='Void' ถาวร เก็บ audit trail) และ reverseToDraft (จบที่ status='Draft' ให้แก้ไขแล้ว Post ใหม่ได้) โยน
-// error กลับให้ผู้เรียก catch/ROLLBACK เอง (ไม่ COMMIT ในนี้) — action label ใช้แค่ปรับข้อความ error ให้ตรงบริบท
-// Voids one ap_transaction + its GL entry, guarding against paid/applied — shared by _reverseLinkedPostings
-// (GRN/DLN reverse) and imConsignmentSettlementController.voidSettlement (which has no im_transaction of its own
+// Voids one ap_transaction + its GL entry, guarding against paid/applied — used by
+// imConsignmentSettlementController.voidSettlement (which has no im_transaction of its own
 // to hang this off of, since a settlement bill is created directly, not via the normal Draft->Post flow).
 const voidLinkedApTransaction = async (client, apTransactionId, verb) => {
     const apRes = await client.query(`SELECT * FROM ap_transaction WHERE id = $1 FOR UPDATE`, [apTransactionId]);
@@ -2554,58 +2552,6 @@ const voidLinkedApTransaction = async (client, apTransactionId, verb) => {
         await client.query(`UPDATE gl_entry_header SET status='Void', updated_at=NOW() WHERE id=$1`, [apTx.gl_entry_id]);
     }
     await client.query(`UPDATE ap_transaction SET status='Void', updated_at=NOW() WHERE id=$1`, [apTransactionId]);
-};
-
-const _reverseLinkedPostings = async (client, tx, action = 'Void') => {
-    const verb = action === 'Void' ? 'Void' : 'ถอยกลับเป็นฉบับร่าง';
-    // 'Received' = '12' ที่ Post IM แล้วแต่ยังไม่ Post AP/GL, 'Delivered' = '32' ที่ Post IM แล้วแต่ยังไม่ Post
-    // AR/GL — ย้อนกลับได้เหมือนกัน แค่บาง entry ยังไม่มีให้ย้อนกลับ (คู่ '32': COGS Post ไปแล้วตอน Delivered, ต่างจาก
-    // '12' ที่ยังไม่มี GL ใดๆ เลยตอน Received)
-    if (tx.status !== 'Posted' && tx.status !== 'Received' && tx.status !== 'Delivered') {
-        throw new Error(`${verb} ได้เฉพาะเอกสารที่ Posted, Received หรือ Delivered แล้วเท่านั้น`);
-    }
-
-    // GRN Billing ('11') สร้าง ap_transaction ไว้ — ต้อง Void ตามด้วยเสมอ เว้นแต่มีการจ่ายชำระ/จับคู่ไปแล้ว
-    if (tx.linked_ap_transaction_id) {
-        await voidLinkedApTransaction(client, tx.linked_ap_transaction_id, verb);
-    }
-
-    // DLN Billing ('31'/'32' หลัง Post AR/GL) สร้าง ar_transaction ไว้ — ต้อง Void ตามด้วยเสมอ เว้นแต่มีการรับชำระ/จับคู่ไปแล้ว
-    if (tx.linked_ar_transaction_id) {
-        const arRes = await client.query(`SELECT * FROM ar_transaction WHERE id = $1 FOR UPDATE`, [tx.linked_ar_transaction_id]);
-        const arTx = arRes.rows[0];
-        if (arTx && arTx.status !== 'Void') {
-            const appliedRes = await client.query(
-                `SELECT COUNT(*) FROM ar_transaction_apply WHERE applied_to_id = $1`,
-                [tx.linked_ar_transaction_id]
-            );
-            if (Number(appliedRes.rows[0].count) > 0 || Number(arTx.paid_amount_lc) > 0) {
-                throw new Error(`ไม่สามารถ${verb}ได้ เนื่องจากใบแจ้งหนี้ที่สร้างจากเอกสารนี้มีการรับชำระ/จับคู่ไปแล้วในโมดูล AR`);
-            }
-            if (arTx.gl_entry_id) {
-                await client.query(`UPDATE gl_entry_header SET status='Void', updated_at=NOW() WHERE id=$1`, [arTx.gl_entry_id]);
-            }
-            await client.query(`UPDATE ar_transaction SET status='Void', updated_at=NOW() WHERE id=$1`, [tx.linked_ar_transaction_id]);
-        }
-    }
-
-    await reverseStockMovement(client, tx.id);
-
-    if (tx.gl_entry_id) {
-        await client.query(`UPDATE gl_entry_header SET status='Void', updated_at=NOW() WHERE id=$1`, [tx.gl_entry_id]);
-    }
-};
-
-// Core of Void, extracted so other controllers (e.g. imStockCountController's reverseCount, which needs to void
-// the linked '80' AJS transaction when un-closing a count sheet) can reuse it inside their own BEGIN/COMMIT.
-const voidTransactionCore = async (client, id) => {
-    const existing = await client.query(`SELECT * FROM im_transaction WHERE id=$1 FOR UPDATE`, [id]);
-    if (existing.rows.length === 0) throw new Error('Not found');
-    const tx = existing.rows[0];
-    tx.id = Number(id);
-
-    await _reverseLinkedPostings(client, tx, 'Void');
-    await client.query(`UPDATE im_transaction SET status='Void', updated_at=NOW() WHERE id=$1`, [id]);
 };
 
 // ===== ถอยเป็นร่าง / ยกเลิก / ลบ =====
@@ -2668,7 +2614,8 @@ const IM_BLOCK_MESSAGES = {
 const imBlockMessage = (b) => IM_BLOCK_MESSAGES[b.code] + (b.ref ? ` (${b.ref})` : '');
 
 // เหตุที่ถอย / ยกเลิก / ลบไม่ได้ (null = ทำได้) + สถานะปลายทางของการถอย — fetchRowById ส่งให้หน้าจอล็อกปุ่ม
-const computeImBlocks = async (db, id) => {
+// opts.ignoreStockCount: ใบตรวจนับเรียกเองสำหรับใบปรับยอดของตัวเอง (ไม่ติด STOCK_COUNT)
+const computeImBlocks = async (db, id, opts = {}) => {
     const hasStockCount = (await db.query(`SELECT to_regclass('im_stock_count') IS NOT NULL AS ok`)).rows[0].ok;
     const r = (await db.query(imBlockInfoSql(hasStockCount), [id])).rows[0];
     if (!r) return {};
@@ -2681,7 +2628,7 @@ const computeImBlocks = async (db, id) => {
     const arLive = ar?.status === 'Posted' ? ar : null;
 
     const sourceBlock = () => {
-        if (r.stock_count) return { code: 'STOCK_COUNT', ref: r.stock_count };
+        if (r.stock_count && !opts.ignoreStockCount) return { code: 'STOCK_COUNT', ref: r.stock_count };
         if (r.mo_closed) return { code: 'MO_CLOSED', ref: r.mo_closed };
         return null;
     };
@@ -2802,84 +2749,107 @@ const reverseToDraft = async (req, res) => {
     } finally { client.release(); }
 };
 
-// PUT /:id/void — ยกเลิก: ย้อนสต็อก + รายการบัญชีกลับวันที่ยกเลิก (เอกสารเดิมยังอยู่ในงวดเดิม)
+// ยกเลิกเอกสาร IM (core — ใช้ร่วมกับใบตรวจนับ): ย้อนสต็อก + รายการบัญชีกลับวันที่ยกเลิก (เอกสารเดิมยังอยู่ในงวดเดิม)
+// คืน { message, code, ref } เมื่อทำไม่ได้ (ผู้เรียก ROLLBACK เอง) หรือ {} เมื่อสำเร็จ
+const voidImDocument = async (client, id, { reason, userId, userName, ignoreStockCount = false }) => {
+    const tx = (await client.query(`SELECT * FROM im_transaction WHERE id=$1 FOR UPDATE`, [id])).rows[0];
+    if (!tx) return { message: 'Not found', code: 'NOT_FOUND', httpStatus: 404 };
+    const blocks = await computeImBlocks(client, id, { ignoreStockCount });
+    if (blocks.void_block) {
+        const b = blocks.void_block;
+        return { message: b.message, code: b.code, ref: b.ref };
+    }
+    const voidDate = todayYmd();
+    const per = (await client.query(`
+        SELECT id FROM gl_posting_period
+         WHERE $1::date BETWEEN period_start_date AND period_end_date
+           AND gl_status = 'OPEN' AND im_status = 'OPEN' LIMIT 1`, [voidDate])).rows[0];
+    if (!per) return { message: `ไม่พบงวดบัญชี (GL/IM) ที่เปิดอยู่ สำหรับวันที่ยกเลิก ${voidDate}`, code: 'PERIOD_CLOSED' };
+
+    // ใบตั้งหนี้ที่สร้างให้: ยกเลิกผ่าน AP/AR (รายการกลับวันที่ยกเลิก + ภาษี + ประวัติของเอกสารนั้น)
+    const billArgs = { voidReason: `[ยกเลิก ${tx.doc_no}] ${reason}`, userId, userName, fromIm: true };
+    if (tx.linked_ap_transaction_id) {
+        const r = await require('../ap/apTransactionController').voidApDocument(client, tx.linked_ap_transaction_id, billArgs);
+        if (r.message) return { message: r.message, code: r.code };
+    }
+    if (tx.linked_ar_transaction_id) {
+        const r = await require('../ar/arTransactionController').voidArDocument(client, tx.linked_ar_transaction_id, billArgs);
+        if (r.error) return { message: r.error, code: r.code };
+    }
+
+    await reverseStockMovement(client, tx.id);
+
+    let reversingGlId = null;
+    if (tx.gl_entry_id) {
+        const orig = (await client.query(`SELECT * FROM gl_entry_header WHERE id=$1`, [tx.gl_entry_id])).rows[0];
+        let revDocNo = await generateDocNo(client, orig.doc_id, voidDate, tx.branch_id);
+        if (!revDocNo) revDocNo = `RV-${orig.doc_no}`;
+        reversingGlId = (await client.query(`
+            INSERT INTO gl_entry_header
+            (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
+             currency_id, exchange_rate, status,
+             total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
+             created_by, branch_id, ref_doc_id, ref_doc_no, ref_doc_date, external_source_id)
+            VALUES ($1,$2,$3,$3,$4,$5,$6,$7,$8,'Posted',$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+            RETURNING id`, [
+            orig.doc_id, revDocNo, voidDate, per.id, orig.ref_no, `[ยกเลิก ${tx.doc_no}] ${reason}`,
+            orig.currency_id, orig.exchange_rate,
+            orig.total_credit_lc, orig.total_debit_lc, orig.total_credit_fc, orig.total_debit_fc,
+            orig.created_by, orig.branch_id, tx.doc_id, tx.doc_no, tx.doc_date, tx.id,
+        ])).rows[0].id;
+        await client.query(`
+            INSERT INTO gl_entry_detail
+            (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc,
+             branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+            SELECT $1, line_no, account_id, '[ยกเลิก] ' || COALESCE(description, ''),
+                   credit_lc, debit_lc, credit_fc, debit_fc,
+                   branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id
+              FROM gl_entry_detail WHERE header_id = $2 ORDER BY line_no`, [reversingGlId, tx.gl_entry_id]);
+    }
+
+    await client.query(`
+        UPDATE im_transaction SET status='Void', void_reason=$1, voided_by=$2, voided_at=NOW(), void_date=$3,
+               void_gl_entry_id=$4, updated_by=$2, updated_at=NOW()
+         WHERE id=$5`, [reason, userName, voidDate, reversingGlId, id]);
+    await refreshReferencedDocs(client, tx.id);
+    await logReverse(client, {
+        sysModule: '31', tableName: 'im_transaction', recordId: Number(id), docNo: tx.doc_no,
+        fromStatus: tx.status, toStatus: 'Void', reason, userId,
+    });
+    return {};
+};
+
+// ลบเอกสาร IM ที่ระบบสร้างให้ (ใบปรับยอดจากใบตรวจนับ) ออกทั้งใบตอนถอยเอกสารต้นทาง: ย้อนสต็อก ลบรายการบัญชี
+// และตัวเอกสาร — คืน { docNo, glDocNo } ให้ต้นทางเก็บไว้ใช้ซ้ำตอนสร้างใหม่ (ผู้เรียกตรวจ computeImBlocks ก่อน)
+const removeSystemImDocument = async (client, id) => {
+    const tx = (await client.query(`SELECT * FROM im_transaction WHERE id=$1 FOR UPDATE`, [id])).rows[0];
+    if (!tx) return {};
+    let glDocNo = tx.gl_doc_no;
+    if (IM_POSTED_STATUSES.includes(tx.status)) {
+        await reverseStockMovement(client, tx.id);
+        if (tx.gl_entry_id) {
+            glDocNo = (await client.query(`SELECT doc_no FROM gl_entry_header WHERE id=$1`, [tx.gl_entry_id])).rows[0]?.doc_no || glDocNo;
+            await client.query(`UPDATE im_transaction SET gl_entry_id=NULL WHERE id=$1`, [id]);
+            await client.query(`DELETE FROM gl_entry_header WHERE id=$1`, [tx.gl_entry_id]);
+        }
+    }
+    await client.query(`DELETE FROM im_transaction WHERE id=$1`, [id]);
+    return { docNo: tx.doc_no, glDocNo };
+};
+
+// PUT /:id/void — ยกเลิก
 const voidTransaction = async (req, res) => {
     const { id } = req.params;
     const reason = reasonOf(req);
-    const userId = userIdOf(req);
-    const userName = req.headers.username || null;
     if (!reason) return res.status(400).json({ message: 'กรุณาระบุเหตุผลการยกเลิก' });
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
-        const tx = (await client.query(`SELECT * FROM im_transaction WHERE id=$1 FOR UPDATE`, [id])).rows[0];
-        if (!tx) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
-        const blocks = await computeImBlocks(client, id);
-        if (blocks.void_block) {
+        const r = await voidImDocument(client, id, { reason, userId: userIdOf(req), userName: req.headers.username || null });
+        if (r.message) {
             await client.query('ROLLBACK');
-            const b = blocks.void_block;
-            return res.status(400).json({ message: b.message, code: b.code, ref: b.ref });
+            return res.status(r.httpStatus || 400).json({ message: r.message, code: r.code, ref: r.ref });
         }
-        const voidDate = todayYmd();
-        const per = (await client.query(`
-            SELECT id FROM gl_posting_period
-             WHERE $1::date BETWEEN period_start_date AND period_end_date
-               AND gl_status = 'OPEN' AND im_status = 'OPEN' LIMIT 1`, [voidDate])).rows[0];
-        if (!per) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: `ไม่พบงวดบัญชี (GL/IM) ที่เปิดอยู่ สำหรับวันที่ยกเลิก ${voidDate}` });
-        }
-
-        // ใบตั้งหนี้ที่สร้างให้: ยกเลิกผ่าน AP/AR (รายการกลับวันที่ยกเลิก + ภาษี + ประวัติของเอกสารนั้น)
-        const billArgs = { voidReason: `[ยกเลิก ${tx.doc_no}] ${reason}`, userId, userName, fromIm: true };
-        if (tx.linked_ap_transaction_id) {
-            const r = await require('../ap/apTransactionController').voidApDocument(client, tx.linked_ap_transaction_id, billArgs);
-            if (r.message) { await client.query('ROLLBACK'); return res.status(400).json({ message: r.message, code: r.code }); }
-        }
-        if (tx.linked_ar_transaction_id) {
-            const r = await require('../ar/arTransactionController').voidArDocument(client, tx.linked_ar_transaction_id, billArgs);
-            if (r.error) { await client.query('ROLLBACK'); return res.status(400).json({ message: r.error, code: r.code }); }
-        }
-
-        await reverseStockMovement(client, tx.id);
-
-        let reversingGlId = null;
-        if (tx.gl_entry_id) {
-            const orig = (await client.query(`SELECT * FROM gl_entry_header WHERE id=$1`, [tx.gl_entry_id])).rows[0];
-            let revDocNo = await generateDocNo(client, orig.doc_id, voidDate, tx.branch_id);
-            if (!revDocNo) revDocNo = `RV-${orig.doc_no}`;
-            reversingGlId = (await client.query(`
-                INSERT INTO gl_entry_header
-                (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
-                 currency_id, exchange_rate, status,
-                 total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-                 created_by, branch_id, ref_doc_id, ref_doc_no, ref_doc_date, external_source_id)
-                VALUES ($1,$2,$3,$3,$4,$5,$6,$7,$8,'Posted',$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-                RETURNING id`, [
-                orig.doc_id, revDocNo, voidDate, per.id, orig.ref_no, `[ยกเลิก ${tx.doc_no}] ${reason}`,
-                orig.currency_id, orig.exchange_rate,
-                orig.total_credit_lc, orig.total_debit_lc, orig.total_credit_fc, orig.total_debit_fc,
-                orig.created_by, orig.branch_id, tx.doc_id, tx.doc_no, tx.doc_date, tx.id,
-            ])).rows[0].id;
-            await client.query(`
-                INSERT INTO gl_entry_detail
-                (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc,
-                 branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
-                SELECT $1, line_no, account_id, '[ยกเลิก] ' || COALESCE(description, ''),
-                       credit_lc, debit_lc, credit_fc, debit_fc,
-                       branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id
-                  FROM gl_entry_detail WHERE header_id = $2 ORDER BY line_no`, [reversingGlId, tx.gl_entry_id]);
-        }
-
-        await client.query(`
-            UPDATE im_transaction SET status='Void', void_reason=$1, voided_by=$2, voided_at=NOW(), void_date=$3,
-                   void_gl_entry_id=$4, updated_by=$2, updated_at=NOW()
-             WHERE id=$5`, [reason, userName, voidDate, reversingGlId, id]);
-        await refreshReferencedDocs(client, tx.id);
-        await logReverse(client, {
-            sysModule: '31', tableName: 'im_transaction', recordId: Number(id), docNo: tx.doc_no,
-            fromStatus: tx.status, toStatus: 'Void', reason, userId,
-        });
         await client.query('COMMIT');
         res.status(200).json(await fetchRowById(req.dbPool, id));
     } catch (error) {
@@ -2921,8 +2891,8 @@ const deleteTransaction = async (req, res) => {
 module.exports = {
     ensureImTransactionTable,
     fetchRows, fetchRow, fetchSystemQty, fetchReturnableDocs, fetchReturnableLines,
-    createTransaction, createMoReceipt, updateTransaction, postTransaction, postBillingForGrn, postBillingForDln, voidTransaction, voidTransactionCore, voidLinkedApTransaction, reverseToDraft, deleteTransaction,
-    computeImBlocks,
+    createTransaction, createMoReceipt, updateTransaction, postTransaction, postBillingForGrn, postBillingForDln, voidTransaction, voidLinkedApTransaction, reverseToDraft, deleteTransaction,
+    computeImBlocks, voidImDocument, removeSystemImDocument, reasonOf, userIdOf,
     insertAndPostAdjustment, STOCK_BALANCE_KEY,
     upsertStockBalance, recomputeBalanceFromLayers,
     generateDocNo,

@@ -137,7 +137,7 @@ router.get('/im_stock_count_running/preview_code', imStockCountRunningController
 router.get('/im_stock_count_running',              imStockCountRunningController.fetchConfig);
 router.post('/im_stock_count_running',             imStockCountRunningController.saveConfig);
 
-// im_stock_count (ใบตรวจนับสต็อก — Draft->Posted->Approved->Closed, กิ่ง Void แยกจาก Draft/Posted)
+// im_stock_count (ใบตรวจนับสต็อก — Draft->Posted->Approved->Closed, ถอยทีละขั้น / ยกเลิก / ลบร่าง)
 // Closed = บันทึกปรับยอดแล้ว สร้าง+โพสต์ im_transaction AJS ให้อัตโนมัติ
 router.get('/im_stock_count/variance_report',   imStockCountController.fetchVarianceReport);
 router.get('/im_stock_count',                   imStockCountController.fetchRows);
@@ -154,6 +154,7 @@ router.put('/im_stock_count/:id/counts',        imStockCountController.updateCou
 router.put('/im_stock_count/:id/approve',       imStockCountController.approveCount);
 router.put('/im_stock_count/:id/close',         imStockCountController.closeCount);
 router.put('/im_stock_count/:id/reverse',       imStockCountController.reverseCount);
+router.delete('/im_stock_count/:id',            imStockCountController.deleteCount);
 router.get('/im_stock_count/:id/export',        imStockCountController.exportExcel);
 router.post('/im_stock_count/:id/import/validate', imStockCountController.importValidate);
 router.post('/im_stock_count/:id/import/confirm',  imStockCountController.importConfirm);
