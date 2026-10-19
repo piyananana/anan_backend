@@ -97,6 +97,8 @@ router.put('/ap_payment_run/:id/submit',       apPaymentRunController.submitRun)
 router.put('/ap_payment_run/:id/approve',      apPaymentRunController.approveRun);
 router.put('/ap_payment_run/:id/reject',       apPaymentRunController.rejectRun);
 router.put('/ap_payment_run/:id/void',         apPaymentRunController.voidRun);
+router.put('/ap_payment_run/:id/reverse',      apPaymentRunController.reverseRun);
+router.delete('/ap_payment_run/:id',           apPaymentRunController.deleteRun);
 router.put('/ap_payment_run/:id/finalize',     apPaymentRunController.finalizeRun);
 router.put('/ap_payment_run/:id',              apPaymentRunController.updateRun);
 

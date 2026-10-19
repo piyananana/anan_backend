@@ -57,6 +57,8 @@ router.put('/im_price_change/:id/submit',        imPriceChangeController.submitC
 router.put('/im_price_change/:id/approve',       imPriceChangeController.approveChange);
 router.put('/im_price_change/:id/reject',        imPriceChangeController.rejectChange);
 router.put('/im_price_change/:id/void',          imPriceChangeController.voidChange);
+router.put('/im_price_change/:id/reverse',       imPriceChangeController.reverseChange);
+router.delete('/im_price_change/:id',            imPriceChangeController.deleteChange);
 
 // im_price_change_report (รายงานตรวจเช็คการเปลี่ยนแปลงราคา — อ่านอย่างเดียว)
 router.get('/im_price_change_report/categories', imPriceChangeReportController.fetchCategories); // ต้องมาก่อน endpoint หลัก

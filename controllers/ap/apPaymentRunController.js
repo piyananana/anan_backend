@@ -2,6 +2,8 @@
 
 const { generateNextRunNumber } = require('./apPaymentRunRunningController');
 const apTransactionController = require('./apTransactionController');
+const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
+const { reasonOf, userIdOf, sendErr, blk } = require('../../utils/docAction');
 
 // --- Fallback auto-generate run_number PR-YYYYMMDD-NNN, used only when the
 // admin has not enabled/configured auto-numbering in ap_payment_run_running ---
@@ -53,6 +55,7 @@ const fetchRows = async (req, res) => {
     const params = [];
     let pi = 1;
     if (status && status !== 'All') { params.push(status); query += ` AND r.status = $${pi++}`; }
+    else query += ` AND r.status <> 'Deleted'`; // ใบที่ลบแล้วแสดงเฉพาะเมื่อเลือกสถานะ Deleted
     if (date_from) { params.push(date_from); query += ` AND r.run_date >= $${pi++}`; }
     if (date_to)   { params.push(date_to);   query += ` AND r.run_date <= $${pi++}`; }
     query += ` ORDER BY r.run_date DESC, r.id DESC`;
@@ -78,7 +81,7 @@ const fetchRow = async (req, res) => {
                    f.format_code AS bank_file_format_code,
                    f.format_name AS bank_file_format_name,
                    r.check_print_config_id, cpc.config_name AS check_print_config_name,
-                   r.created_by, r.updated_by
+                   r.created_by, r.updated_by, r.void_reason
             FROM ap_payment_run r
             LEFT JOIN cm_bank_file_format f ON f.id = r.bank_file_format_id
             LEFT JOIN cm_payment_method pm ON pm.id = r.payment_method_id
@@ -95,7 +98,11 @@ const fetchRow = async (req, res) => {
             SELECT * FROM ap_payment_run_approval
             WHERE run_id = $1 ORDER BY sequence_no`, [id]);
 
-        res.status(200).json({ ...header, lines: lRes.rows, approvals: apprRes.rows });
+        res.status(200).json({
+            ...header, lines: lRes.rows, approvals: apprRes.rows,
+            ...(await computeRunBlocks(req.dbPool, id)),
+            reverse_history: await getReverseHistory(req.dbPool, 'ap_payment_run', id),
+        });
     } catch (error) {
         console.error('Error fetching ap_payment_run:', error);
         res.status(500).json({ message: 'Internal server error' });
@@ -110,6 +117,12 @@ const ensureApPaymentRunColumns = async (dbPool) => {
     await dbPool.query(`ALTER TABLE ap_payment_run ADD COLUMN IF NOT EXISTS due_date_filter DATE`);
     // รูปแบบเช็ค — ใช้เมื่อประเภทการชำระเป็น CHECK (คู่กับ bank_file_format_id ที่ใช้เมื่อเป็น TRANSFER)
     await dbPool.query(`ALTER TABLE ap_payment_run ADD COLUMN IF NOT EXISTS check_print_config_id INTEGER`);
+    // ยกเลิกแบบมีเหตุผล (sql/ap_payment_run_reverse_to_draft.sql)
+    await dbPool.query(`
+        ALTER TABLE ap_payment_run
+            ADD COLUMN IF NOT EXISTS void_reason TEXT,
+            ADD COLUMN IF NOT EXISTS voided_by   VARCHAR(100),
+            ADD COLUMN IF NOT EXISTS voided_at   TIMESTAMPTZ`);
 };
 
 // --- POST create (Draft) ---
@@ -293,32 +306,101 @@ const submitRun = async (req, res) => {
     }
 };
 
-// --- PUT void (Draft | Submitted → Void) ---
-const voidRun = async (req, res) => {
+// --- ถอย / ยกเลิก / ลบ: เงื่อนไข ---
+// ใบจ่ายชำระ (ap_transaction) ที่ส่งชำระสร้างจากรอบนี้และยังไม่ถูกยกเลิก/ลบ — ต้องจัดการในหน้าจอ AP ก่อน
+const activePaymentsOf = async (db, id) => {
+    await ensureRunPaymentTable(db);
+    return (await db.query(`
+        SELECT string_agg(t.doc_no, ', ' ORDER BY t.id) AS docs
+          FROM ap_payment_run_payment p JOIN ap_transaction t ON t.id = p.ap_transaction_id
+         WHERE p.run_id = $1 AND t.status NOT IN ('Void', 'Deleted')`, [id])).rows[0].docs;
+};
+
+const computeRunBlocks = async (db, id) => {
+    const r = (await db.query(`SELECT status FROM ap_payment_run WHERE id = $1`, [id])).rows[0];
+    if (!r) return {};
+    const pays = await activePaymentsOf(db, id);
+    const payBlock = pays
+        ? blk('REF_DOCS', `มีใบจ่ายชำระที่สร้างจากรอบนี้ (${pays}) ต้องถอย/ยกเลิกหรือลบในหน้าจอเจ้าหนี้ก่อน`, pays)
+        : null;
+    const voided = blk('VOIDED', 'ใบอนุมัติจ่ายนี้ถูกยกเลิกหรือลบแล้ว');
+    const out = { reverse_block: null, void_block: null, delete_block: null };
+    switch (r.status) {
+        case 'Submitted': out.void_block = blk('NOT_APPROVED', 'ใบที่รออนุมัติให้ถอยเป็นร่างแล้วลบแทนการยกเลิก'); break;
+        case 'Approved': out.reverse_block = payBlock; out.void_block = payBlock; break;
+        case 'Completed':
+            out.reverse_block = payBlock;
+            out.void_block = blk('NOT_APPROVED', 'ใบที่ส่งชำระแล้วยกเลิกไม่ได้ ถอยการส่งชำระก่อน');
+            break;
+        case 'Draft':
+            out.reverse_block = blk('NOT_REVERSIBLE', 'ถอยได้เฉพาะใบที่ส่งอนุมัติ อนุมัติแล้ว หรือส่งชำระแล้ว');
+            out.void_block = blk('NOT_POSTED', 'ใบที่ยังเป็นร่างให้ลบแทนการยกเลิก');
+            break;
+        default: out.reverse_block = voided; out.void_block = voided;
+    }
+    if (r.status !== 'Draft') {
+        out.delete_block = ['Void', 'Deleted'].includes(r.status)
+            ? voided : blk('NOT_DRAFT', 'ลบได้เฉพาะร่าง ใบที่ส่งอนุมัติแล้วต้องถอยเป็นร่างก่อน');
+    }
+    return out;
+};
+
+const runAction = async (req, res, kind, label, work) => {
     const { id } = req.params;
-    const userName = req.headers['username'] || null;
+    const reason = reasonOf(req);
+    if (!reason) return sendErr(res, 400, `กรุณาระบุเหตุผล${label}`);
     const client = await req.dbPool.connect();
     try {
+        await ensureApPaymentRunColumns(client);
         await client.query('BEGIN');
-        const existing = await client.query(`SELECT status FROM ap_payment_run WHERE id=$1`, [id]);
-        if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
-        if (!['Draft', 'Submitted'].includes(existing.rows[0].status)) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: 'ยกเลิกได้เฉพาะเอกสาร Draft หรือ Submitted เท่านั้น' });
-        }
-        await client.query(`
-            UPDATE ap_payment_run SET status='Void', updated_at=NOW(), updated_by=$1 WHERE id=$2`,
-            [userName, id]);
+        const run = (await client.query(`SELECT * FROM ap_payment_run WHERE id=$1 FOR UPDATE`, [id])).rows[0];
+        if (!run) { await client.query('ROLLBACK'); return sendErr(res, 404, 'Not found'); }
+        const b = (await computeRunBlocks(client, id))[kind];
+        if (b) { await client.query('ROLLBACK'); return sendErr(res, 400, b.message, { code: b.code, ref: b.ref }); }
+        const userName = req.headers['username'] || null;
+        const toStatus = await work(client, run, { reason, userName });
+        await logReverse(client, {
+            sysModule: '21', tableName: 'ap_payment_run', recordId: Number(id), docNo: run.run_number,
+            fromStatus: run.status, toStatus, reason, userId: userIdOf(req),
+        });
         await client.query('COMMIT');
-        res.status(200).json({ message: 'ยกเลิกเอกสารสำเร็จ' });
+        res.status(200).json({ message: 'OK', status: toStatus });
     } catch (error) {
         await client.query('ROLLBACK');
-        console.error('Error voiding ap_payment_run:', error);
-        res.status(500).json({ message: 'Internal server error' });
-    } finally {
-        client.release();
-    }
+        console.error(`Error ${kind} ap_payment_run:`, error);
+        sendErr(res, 500, error.message || 'Internal server error');
+    } finally { client.release(); }
 };
+
+// --- PUT reverse { reason } ---
+// Submitted / Approved -> Draft: ผู้อนุมัติที่ยังไม่ตัดสินถูกข้าม แก้ไขแล้วส่งอนุมัติใหม่ได้
+// Completed -> Approved: ใบจ่ายชำระที่สร้างไว้ถูกยกเลิก/ลบหมดแล้ว — ส่งชำระใหม่ได้
+// ทั้งสองกรณีล้างการผูกใบจ่ายที่ยกเลิก/ลบแล้ว (ap_payment_run_payment) เพื่อให้ส่งชำระใหม่สร้างใบให้อีกครั้ง
+const reverseRun = (req, res) => runAction(req, res, 'reverse_block', 'การถอยเอกสาร', async (client, run, { userName }) => {
+    await client.query(`DELETE FROM ap_payment_run_payment WHERE run_id=$1`, [run.id]);
+    if (run.status === 'Completed') {
+        await client.query(`UPDATE ap_payment_run SET status='Approved', updated_at=NOW(), updated_by=$1 WHERE id=$2`, [userName, run.id]);
+        return 'Approved';
+    }
+    await client.query(`UPDATE ap_payment_run_approval SET status='Skipped' WHERE run_id=$1 AND status='Pending'`, [run.id]);
+    await client.query(`UPDATE ap_payment_run SET status='Draft', updated_at=NOW(), updated_by=$1 WHERE id=$2`, [userName, run.id]);
+    return 'Draft';
+});
+
+// --- PUT void { reason } (Approved เท่านั้น — ยังไม่มีใบจ่ายชำระที่ใช้งานอยู่) ---
+const voidRun = (req, res) => runAction(req, res, 'void_block', 'การยกเลิก', async (client, run, { reason, userName }) => {
+    await client.query(`DELETE FROM ap_payment_run_payment WHERE run_id=$1`, [run.id]);
+    await client.query(`
+        UPDATE ap_payment_run SET status='Void', void_reason=$1, voided_by=$2, voided_at=NOW(), updated_at=NOW(), updated_by=$2
+         WHERE id=$3`, [reason, userName, run.id]);
+    return 'Void';
+});
+
+// --- DELETE { reason } (Draft เท่านั้น — เก็บไว้ด้วยสถานะ Deleted ตรวจสอบได้แต่นำกลับมาใช้ไม่ได้) ---
+const deleteRun = (req, res) => runAction(req, res, 'delete_block', 'การลบ', async (client, run, { userName }) => {
+    await client.query(`UPDATE ap_payment_run SET status='Deleted', updated_at=NOW(), updated_by=$1 WHERE id=$2`, [userName, run.id]);
+    return 'Deleted';
+});
 
 // --- PUT approve (Submitted → Approved when all approve) ---
 const approveRun = async (req, res) => {
@@ -632,6 +714,8 @@ module.exports = {
     approveRun,
     rejectRun,
     voidRun,
+    reverseRun,
+    deleteRun,
     finalizeRun,
     fetchMyPending,
     fetchOpenInvoicesForRun,

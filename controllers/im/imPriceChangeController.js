@@ -12,6 +12,8 @@ const { ensureImItemCategoryTable } = require('./imItemCategoryController');
 // ตั้งค่าเลขที่อัตโนมัติมาจาก config ของ doc_id นั้นโดยตรง (จัดการผ่านหน้าจอ sa_module_document ของ SA เหมือน GRN/DLN)
 const { generateDocNo } = require('./imTransactionController');
 const { addDays } = require('../../utils/dateUtil');
+const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
+const { reasonOf, userIdOf, sendErr, blk } = require('../../utils/docAction');
 
 const CHANGE_TYPES = ['REVISE', 'PROMOTION'];
 const ADJUSTMENT_MODES = ['PERCENT', 'AMOUNT', 'SET_PRICE'];
@@ -71,6 +73,17 @@ const ensureImPriceChangeTable = async (client) => {
     // ensureImPriceListTable) เพราะ im_price_change_header ต้องถูกสร้างก่อนจึงอ้าง FK ได้ ไม่งั้นเกิด circular
     // ensure-table dependency ระหว่างสองไฟล์
     await client.query(`ALTER TABLE im_price_list_detail ADD COLUMN IF NOT EXISTS source_price_change_id INTEGER REFERENCES im_price_change_header(id)`).catch(() => {});
+    // ถอย / ยกเลิกแบบมีเหตุผล (sql/im_price_change_reverse_to_draft.sql) — src_* = วันสิ้นสุดเดิมของแถวราคาที่ถูกปิดตอนอนุมัติ
+    // ใช้คืนค่าเมื่อถอยหรือยกเลิกใบที่อนุมัติแล้ว
+    await client.query(`
+        ALTER TABLE im_price_change_header
+            ADD COLUMN IF NOT EXISTS void_reason TEXT,
+            ADD COLUMN IF NOT EXISTS voided_by   VARCHAR(100),
+            ADD COLUMN IF NOT EXISTS voided_at   TIMESTAMPTZ`).catch(() => {});
+    await client.query(`
+        ALTER TABLE im_price_change_detail
+            ADD COLUMN IF NOT EXISTS src_closed            BOOLEAN,
+            ADD COLUMN IF NOT EXISTS src_prev_effective_to DATE`).catch(() => {});
 };
 
 const HEADER_SELECT = `
@@ -106,6 +119,7 @@ const fetchRows = async (req, res) => {
         let where = 'WHERE 1=1';
         const params = [];
         if (status) { params.push(status); where += ` AND h.status = $${params.length}`; }
+        else where += ` AND h.status <> 'Deleted'`; // ใบที่ลบแล้วแสดงเฉพาะเมื่อเลือกสถานะ Deleted
         if (price_list_id) { params.push(price_list_id); where += ` AND h.price_list_id = $${params.length}`; }
         const result = await client.query(`${HEADER_SELECT} ${where} ORDER BY h.id DESC`, params);
         res.status(200).json(result.rows);
@@ -124,7 +138,11 @@ const fetchRow = async (req, res) => {
         const header = await client.query(`${HEADER_SELECT} WHERE h.id = $1`, [id]);
         if (header.rows.length === 0) return res.status(404).json({ message: 'ไม่พบธุรกรรมเปลี่ยนแปลงราคา' });
         const details = await client.query(DETAIL_SELECT, [id]);
-        res.status(200).json({ ...header.rows[0], details: details.rows });
+        res.status(200).json({
+            ...header.rows[0], details: details.rows,
+            ...(await computeChangeBlocks(client, id)),
+            reverse_history: await getReverseHistory(client, 'im_price_change_header', id),
+        });
     } catch (error) {
         console.error('Error fetching im_price_change row:', error);
         res.status(500).json({ message: 'Internal server error' });
@@ -386,30 +404,119 @@ const rejectChange = async (req, res) => {
     } finally { client.release(); }
 };
 
-// PUT /im_price_change/:id/void — Draft/Pending -> Void
-const voidChange = async (req, res) => {
+// --- ถอย / ยกเลิก / ลบ: เงื่อนไข ---
+// ใบเปลี่ยนราคาอื่นที่ใช้แถวราคาที่ใบนี้สร้างเป็นราคาต้นทาง (ทุกสถานะยกเว้น Void/Deleted) — ต้องถอย/ลบใบนั้นก่อน
+const laterChangesOf = async (client, id) => (await client.query(`
+    SELECT string_agg(DISTINCT h.change_no, ', ') AS docs
+      FROM im_price_change_detail cd
+      JOIN im_price_change_header h ON h.id = cd.header_id
+      JOIN im_price_list_detail pd ON pd.id = cd.source_detail_id
+     WHERE pd.source_price_change_id = $1 AND h.id <> $1 AND h.status NOT IN ('Void', 'Deleted')`, [id])).rows[0].docs;
+
+const computeChangeBlocks = async (client, id) => {
+    const h = (await client.query(`SELECT status FROM im_price_change_header WHERE id = $1`, [id])).rows[0];
+    if (!h) return {};
+    const voided = blk('VOIDED', 'ธุรกรรมเปลี่ยนแปลงราคานี้ถูกยกเลิกหรือลบแล้ว');
+    const out = { reverse_block: null, void_block: null, delete_block: null };
+    switch (h.status) {
+        case 'Pending': out.void_block = blk('NOT_APPROVED', 'ใบที่รออนุมัติให้ถอยเป็นร่างแล้วลบแทนการยกเลิก'); break;
+        case 'Approved': {
+            const later = await laterChangesOf(client, id);
+            if (later) {
+                out.reverse_block = blk('LATER_CHANGE', `มีธุรกรรมเปลี่ยนแปลงราคาที่ต่อจากราคาของใบนี้ (${later}) ต้องถอยหรือลบใบนั้นก่อน`, later);
+                out.void_block = out.reverse_block;
+            }
+            break;
+        }
+        case 'Draft':
+            out.reverse_block = blk('NOT_REVERSIBLE', 'ถอยได้เฉพาะใบที่รออนุมัติหรืออนุมัติแล้ว');
+            out.void_block = blk('NOT_POSTED', 'ใบที่ยังเป็นร่างให้ลบแทนการยกเลิก');
+            break;
+        default: out.reverse_block = voided; out.void_block = voided;
+    }
+    if (h.status !== 'Draft') {
+        out.delete_block = ['Void', 'Deleted'].includes(h.status)
+            ? voided : blk('NOT_DRAFT', 'ลบได้เฉพาะร่าง ใบที่ส่งอนุมัติแล้วต้องถอยเป็นร่างก่อน');
+    }
+    return out;
+};
+
+// ย้อนผลการอนุมัติ: ลบแถวราคาที่ใบนี้สร้าง แล้วคืนวันสิ้นสุดของแถวราคาเดิมที่ถูกปิด (REVISE) — ใบที่อนุมัติก่อนมีการ
+// เก็บค่าเดิม (src_closed เป็น null) ถือว่าเดิมไม่มีวันสิ้นสุด ตรวจช่วงวันที่ซ้อนกันหลังคืนค่าทุกครั้ง
+const undoApproval = async (client, header, userName) => {
+    await client.query(`DELETE FROM im_price_list_detail WHERE source_price_change_id = $1`, [header.id]);
+    if (header.change_type !== 'REVISE') return;
+    const lines = (await client.query(`
+        SELECT cd.*, pd.price_type, pd.effective_from AS src_from, i.item_code
+          FROM im_price_change_detail cd
+          JOIN im_price_list_detail pd ON pd.id = cd.source_detail_id
+          LEFT JOIN im_item i ON i.id = cd.item_id
+         WHERE cd.header_id = $1 AND cd.is_selected = true`, [header.id])).rows;
+    for (const l of lines) {
+        const prevTo = l.src_closed ? l.src_prev_effective_to : null;
+        const overlap = await findOverlapAgainstExisting(client, {
+            priceListId: header.price_list_id, itemId: l.item_id, uomId: l.uom_id, minQty: l.min_qty,
+            priceType: l.price_type, effectiveFrom: l.src_from, effectiveTo: prevTo, excludeDetailId: l.source_detail_id,
+        });
+        if (overlap) throw Object.assign(new Error(`สินค้า ${l.item_code}: คืนวันสิ้นสุดของราคาเดิมแล้วช่วงวันที่ซ้อนกับราคาอื่นในตารางราคา`), { status: 400 });
+        await client.query(`UPDATE im_price_list_detail SET effective_to = $1, updated_by = $2, updated_at = NOW() WHERE id = $3`,
+            [prevTo, userName, l.source_detail_id]);
+    }
+    await client.query(`UPDATE im_price_change_detail SET src_closed = NULL, src_prev_effective_to = NULL WHERE header_id = $1`, [header.id]);
+};
+
+const changeAction = async (req, res, kind, label, work) => {
     const { id } = req.params;
-    const userName = req.headers.username || null;
+    const reason = reasonOf(req);
+    if (!reason) return sendErr(res, 400, `กรุณาระบุเหตุผล${label}`);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
         await ensureImPriceChangeTable(client);
-        const cur = await client.query(`SELECT status FROM im_price_change_header WHERE id = $1 FOR UPDATE`, [id]);
-        if (cur.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'ไม่พบธุรกรรมเปลี่ยนแปลงราคา' }); }
-        if (!['Draft', 'Pending'].includes(cur.rows[0].status)) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: 'ยกเลิกได้เฉพาะธุรกรรมที่ยังไม่อนุมัติเท่านั้น' });
-        }
-        await client.query(`UPDATE im_price_change_header SET status = 'Void', updated_by = $1, updated_at = NOW() WHERE id = $2`, [userName, id]);
+        const header = (await client.query(`SELECT * FROM im_price_change_header WHERE id = $1 FOR UPDATE`, [id])).rows[0];
+        if (!header) { await client.query('ROLLBACK'); return sendErr(res, 404, 'ไม่พบธุรกรรมเปลี่ยนแปลงราคา'); }
+        const b = (await computeChangeBlocks(client, id))[kind];
+        if (b) { await client.query('ROLLBACK'); return sendErr(res, 400, b.message, { code: b.code, ref: b.ref }); }
+        const userName = req.headers.username || null;
+        const toStatus = await work(client, header, { reason, userName });
+        await logReverse(client, {
+            sysModule: '31', tableName: 'im_price_change_header', recordId: Number(id), docNo: header.change_no,
+            fromStatus: header.status, toStatus, reason, userId: userIdOf(req),
+        });
         await client.query('COMMIT');
+        if (toStatus === 'Deleted') return res.status(200).json({ message: 'Deleted' });
         const full = await client.query(`${HEADER_SELECT} WHERE h.id = $1`, [id]);
         res.status(200).json(full.rows[0]);
     } catch (error) {
         await client.query('ROLLBACK');
-        console.error('Error voiding im_price_change:', error);
-        res.status(500).json({ message: 'Internal server error' });
+        console.error(`Error ${kind} im_price_change:`, error);
+        sendErr(res, error.status || 500, error.message || 'Internal server error');
     } finally { client.release(); }
 };
+
+// PUT /im_price_change/:id/reverse { reason } — Pending/Approved -> Draft (Approved: ย้อนราคาในตารางราคาก่อน)
+const reverseChange = (req, res) => changeAction(req, res, 'reverse_block', 'การถอยเอกสาร', async (client, header, { userName }) => {
+    if (header.status === 'Approved') await undoApproval(client, header, userName);
+    await client.query(`
+        UPDATE im_price_change_header SET status = 'Draft', approved_at = NULL, approved_by = NULL, updated_by = $1, updated_at = NOW()
+         WHERE id = $2`, [userName, header.id]);
+    return 'Draft';
+});
+
+// PUT /im_price_change/:id/void { reason } — Approved -> Void (ย้อนราคาในตารางราคา)
+const voidChange = (req, res) => changeAction(req, res, 'void_block', 'การยกเลิก', async (client, header, { reason, userName }) => {
+    await undoApproval(client, header, userName);
+    await client.query(`
+        UPDATE im_price_change_header SET status = 'Void', void_reason = $1, voided_by = $2, voided_at = NOW(), updated_by = $2, updated_at = NOW()
+         WHERE id = $3`, [reason, userName, header.id]);
+    return 'Void';
+});
+
+// DELETE /im_price_change/:id { reason } — Draft เท่านั้น เก็บไว้ด้วยสถานะ Deleted ตรวจสอบได้แต่นำกลับมาใช้ไม่ได้
+const deleteChange = (req, res) => changeAction(req, res, 'delete_block', 'การลบ', async (client, header, { userName }) => {
+    await client.query(`UPDATE im_price_change_header SET status = 'Deleted', updated_by = $1, updated_at = NOW() WHERE id = $2`, [userName, header.id]);
+    return 'Deleted';
+});
 
 // PUT /im_price_change/:id/approve — Pending -> Approved, เขียนผลจริงลง im_price_list_detail
 // REVISE: ปิด effective_to ของ source_detail_id (ถ้ามี) ที่วันก่อนวันมีผลใหม่ 1 วัน แล้ว insert แถว STANDARD ใหม่
@@ -443,7 +550,11 @@ const approveChange = async (req, res) => {
                     await client.query('ROLLBACK');
                     return res.status(400).json({ message: `สินค้ารหัส item_id=${line.item_id}: วันที่มีผลใหม่ต้องมากกว่าวันที่เริ่มราคาเดิม` });
                 }
-                                await client.query(
+                // เก็บวันสิ้นสุดเดิมไว้คืนค่าเมื่อถอย/ยกเลิกใบนี้
+                await client.query(`
+                    UPDATE im_price_change_detail cd SET src_closed = true, src_prev_effective_to = pd.effective_to
+                      FROM im_price_list_detail pd WHERE pd.id = cd.source_detail_id AND cd.id = $1`, [line.id]);
+                await client.query(
                     `UPDATE im_price_list_detail SET effective_to = $1, updated_by = $2, updated_at = NOW() WHERE id = $3`,
                     [addDays(header.effective_from, -1), userName, line.source_detail_id]
                 );
@@ -487,5 +598,5 @@ const approveChange = async (req, res) => {
 
 module.exports = {
     ensureImPriceChangeTable, fetchRows, fetchRow, previewLines, addRow, updateHeader,
-    submitChange, rejectChange, voidChange, approveChange, CHANGE_TYPES, ADJUSTMENT_MODES,
+    submitChange, rejectChange, voidChange, approveChange, reverseChange, deleteChange, CHANGE_TYPES, ADJUSTMENT_MODES,
 };
