@@ -116,6 +116,7 @@ router.get('/ar_fx_revaluation/:id',          arFxRevaluationController.fetchRow
 router.post('/ar_fx_revaluation',             arFxRevaluationController.createReval);
 router.post('/ar_fx_revaluation/:id/post',    arFxRevaluationController.postReval);
 router.post('/ar_fx_revaluation/:id/void',    arFxRevaluationController.voidReval);
+router.put('/ar_fx_revaluation/:id/reverse', arFxRevaluationController.reverseReval);
 router.delete('/ar_fx_revaluation/:id',       arFxRevaluationController.deleteReval);
 
 // Allowance for Doubtful Accounts
@@ -125,6 +126,7 @@ router.get('/ar_allowance_run/:id',          arAllowanceRunController.fetchRow);
 router.post('/ar_allowance_run',             arAllowanceRunController.createRun);
 router.post('/ar_allowance_run/:id/post',    arAllowanceRunController.postRun);
 router.post('/ar_allowance_run/:id/void',    arAllowanceRunController.voidRun);
+router.put('/ar_allowance_run/:id/reverse', arAllowanceRunController.reverseRun);
 router.delete('/ar_allowance_run/:id',       arAllowanceRunController.deleteRun);
 
 // Developer-only: reset AR transaction data

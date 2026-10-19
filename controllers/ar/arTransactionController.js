@@ -937,10 +937,10 @@ const AR_REVERSE_INFO_SQL = `
                AND r.status NOT IN ('Void', 'Deleted')) AS bc_paid_by,
            (SELECT string_agg(DISTINCT to_char(fr.reval_date, 'DD/MM/YYYY'), ', ')
               FROM ar_fx_revaluation_detail fd JOIN ar_fx_revaluation fr ON fr.id = fd.revaluation_id
-             WHERE fd.invoice_id = t.id AND fr.status <> 'Void') AS in_fx_reval,
+             WHERE fd.invoice_id = t.id AND fr.status NOT IN ('Void', 'Deleted')) AS in_fx_reval,
            (SELECT string_agg(DISTINCT to_char(ar.run_date, 'DD/MM/YYYY'), ', ')
               FROM ar_allowance_run_detail ad JOIN ar_allowance_run ar ON ar.id = ad.run_id
-             WHERE ad.invoice_id = t.id AND ar.status <> 'Void') AS in_allowance,
+             WHERE ad.invoice_id = t.id AND ar.status NOT IN ('Void', 'Deleted')) AS in_allowance,
            (SELECT string_agg(DISTINCT COALESCE(c.check_no, c.ar_doc_no, c.id::text), ', ')
               FROM cm_receipt c
              WHERE c.ar_transaction_id = t.id
@@ -2013,6 +2013,7 @@ module.exports = {
     voidArDocument,
     getArVoidBlockById,
     getArLinkedState,
+    generateDocNo,
     reverseTransaction,
     deleteTransaction,
     fetchRows,

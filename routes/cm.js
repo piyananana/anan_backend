@@ -128,6 +128,7 @@ router.post('/cm_bank_fx_revaluation',            cmBankFxRevaluationController.
 router.put('/cm_bank_fx_revaluation/:id',         cmBankFxRevaluationController.updateRow);
 router.put('/cm_bank_fx_revaluation/:id/post',    cmBankFxRevaluationController.postRow);
 router.put('/cm_bank_fx_revaluation/:id/void',    cmBankFxRevaluationController.voidRow);
+router.put('/cm_bank_fx_revaluation/:id/reverse', cmBankFxRevaluationController.reverseRow);
 router.delete('/cm_bank_fx_revaluation/:id',      cmBankFxRevaluationController.deleteRow);
 
 // cm_report

@@ -1,5 +1,6 @@
 // controllers/cm/cmBankFxRevaluationController.js
-const { today: todayYmd } = require('../../utils/dateUtil');
+const { today: todayYmd, ymd } = require('../../utils/dateUtil');
+const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 'use strict';
 
 const ensureTables = async (client) => {
@@ -35,6 +36,12 @@ const ensureTables = async (client) => {
             fx_gain_loss       NUMERIC(18,4) NOT NULL DEFAULT 0,
             created_at         TIMESTAMP DEFAULT NOW()
         )`);
+    // ยกเลิกแบบมีเหตุผล (sql/cm_bank_fx_revaluation_reverse_to_draft.sql)
+    await client.query(`
+        ALTER TABLE cm_bank_fx_revaluation
+            ADD COLUMN IF NOT EXISTS void_reason TEXT,
+            ADD COLUMN IF NOT EXISTS voided_by VARCHAR(100),
+            ADD COLUMN IF NOT EXISTS voided_at TIMESTAMP`);
 };
 
 const generateGlDocNo = async (client, glDocId, date) => {
@@ -220,6 +227,7 @@ const fetchRows = async (req, res) => {
         const params = [];
         let pi = 1;
         if (status && status !== 'All') { where += ` AND r.status = $${pi++}`; params.push(status); }
+        else where += ` AND r.status <> 'Deleted'`;
         if (date_from)                  { where += ` AND r.revaluation_date >= $${pi++}`; params.push(date_from); }
         if (date_to)                    { where += ` AND r.revaluation_date <= $${pi++}`; params.push(date_to); }
         const result = await client.query(
@@ -248,6 +256,8 @@ const fetchRow = async (req, res) => {
             ORDER BY l.id`,
             [req.params.id]);
         row.lines = lRes.rows;
+        Object.assign(row, await computeRevalBlocks(client, req.params.id));
+        row.reverse_history = await getReverseHistory(client, 'cm_bank_fx_revaluation', req.params.id);
         res.json(row);
     } catch (err) { res.status(500).json({ error: err.message }); }
     finally { client.release(); }
@@ -378,10 +388,63 @@ const updateRow = async (req, res) => {
     } finally { client.release(); }
 };
 
+// ===== ถอยเป็นร่าง / ยกเลิก / ลบ =====
+// - ถอย (Posted → Draft): งวด GL + CM ของวันที่ปรับมูลค่ายังเปิด และไม่มีการปรับมูลค่าครั้งถัดไปที่โพสต์แล้วของบัญชีเดียวกัน
+//   (ครั้งถัดไปใช้ยอดหลังปรับมูลค่าของครั้งนี้เป็นจุดตั้งต้น — calcAccountBalance) — ลบรายการบัญชี เก็บเลขที่ (gl_doc_no) ไว้ใช้ซ้ำ
+//   ร่างแก้ไขได้ (คำนวณบรรทัดใหม่) แล้วโพสต์ใหม่ด้วยเลขที่เดิม
+// - ยกเลิก (Voided): ใช้เมื่อถอยไม่ได้ (เช่น งวดปิดแล้ว) ลงรายการกลับในวันที่ยกเลิก — ติดเงื่อนไขครั้งถัดไปเหมือนกัน
+// - ลบ: เฉพาะร่าง เก็บไว้ด้วยสถานะ Deleted
+// ทุกการกระทำต้องมีเหตุผล และบันทึกที่ sa_document_reverse_log
+const REVAL_BLOCK_MESSAGES = {
+    NOT_REVERSIBLE: 'ถอยได้เฉพาะรายการที่โพสต์แล้ว',
+    NOT_POSTED:     'ยกเลิกได้เฉพาะรายการที่โพสต์แล้ว (ร่างให้ลบแทน)',
+    NOT_DRAFT:      'รายการที่โพสต์แล้วลบไม่ได้ กรุณาถอยเป็นร่างก่อน',
+    PERIOD_CLOSED:  'งวดบัญชีของรายการนี้ปิดแล้ว ถอยไม่ได้',
+    LATER_REVAL:    'มีการปรับมูลค่าครั้งถัดไปของบัญชีธนาคารเดียวกันที่โพสต์แล้ว (ใช้ยอดหลังปรับมูลค่าครั้งนี้เป็นจุดตั้งต้น)',
+    VOIDED:         'รายการนี้ถูกยกเลิกหรือลบแล้ว',
+};
+const packBlock = (code, ref) => code
+    ? { code, ref: ref || null, message: REVAL_BLOCK_MESSAGES[code] + (ref ? ` (${ref})` : '') } : null;
+
+const REVAL_INFO_SQL = `
+    SELECT r.id, r.status, p.gl_status, COALESCE(p.cm_status, 'OPEN') AS cm_status,
+           (SELECT string_agg(DISTINCT COALESCE(n.gl_doc_no, to_char(n.revaluation_date, 'DD/MM/YYYY')), ', ')
+              FROM cm_bank_fx_revaluation n
+              JOIN cm_bank_fx_revaluation_line nl ON nl.revaluation_id = n.id
+             WHERE n.id <> r.id AND n.status = 'Posted'
+               AND (n.revaluation_date > r.revaluation_date OR (n.revaluation_date = r.revaluation_date AND n.id > r.id))
+               AND nl.bank_account_id IN (SELECT bank_account_id FROM cm_bank_fx_revaluation_line WHERE revaluation_id = r.id)) AS later_revals
+      FROM cm_bank_fx_revaluation r
+      LEFT JOIN gl_posting_period p ON r.revaluation_date BETWEEN p.period_start_date AND p.period_end_date
+     WHERE r.id = $1`;
+
+const computeRevalBlocks = async (db, id) => {
+    const r = (await db.query(REVAL_INFO_SQL, [id])).rows[0];
+    if (!r) return {};
+    if (['Voided', 'Deleted'].includes(r.status)) {
+        const v = packBlock('VOIDED');
+        return { reverse_block: v, void_block: v, delete_block: v };
+    }
+    if (r.status !== 'Posted') {
+        return { reverse_block: packBlock('NOT_REVERSIBLE'), void_block: packBlock('NOT_POSTED'), delete_block: null };
+    }
+    const later = r.later_revals ? packBlock('LATER_REVAL', r.later_revals) : null;
+    const reverse = (r.gl_status !== 'OPEN' || r.cm_status !== 'OPEN') ? packBlock('PERIOD_CLOSED') : later;
+    return { reverse_block: reverse, void_block: later, delete_block: packBlock('NOT_DRAFT') };
+};
+
+const reasonOf = (req) => (req.body?.reason || '').trim();
+const userIdOf = (req) => req.body?.user_id || req.headers['userid'] || null;
+// gl_entry_header.created_by เป็นรหัสผู้ใช้ (int)
+const glUserOf = (req) => { const v = Number(req.headers['userid']); return Number.isFinite(v) && v > 0 ? v : null; };
+const openPeriodId = async (client, date) => (await client.query(`
+    SELECT id FROM gl_posting_period
+     WHERE $1::date BETWEEN period_start_date AND period_end_date
+       AND gl_status = 'OPEN' AND COALESCE(cm_status, 'OPEN') = 'OPEN' LIMIT 1`, [date])).rows[0]?.id || null;
+
 // PUT post: Draft → Posted, create GL entry
 const postRow = async (req, res) => {
     const { id }   = req.params;
-    const userName = req.headers['username'] || null;
     const client   = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
@@ -417,21 +480,15 @@ const postRow = async (req, res) => {
             return res.status(400).json({ error: 'ไม่มีรายการที่มี FX Gain/Loss คุ้มค่าจะ Post' });
         }
 
-        // 3. Find open period (gl_posting_period — เหมือนทุกโมดูล ไม่ใช่ gl_period ที่ไม่มีจริง)
-        const periodRes = await client.query(`
-            SELECT id FROM gl_posting_period
-            WHERE $1::date BETWEEN period_start_date AND period_end_date AND gl_status = 'OPEN'
-            LIMIT 1`, [reval.revaluation_date]);
-        if (!periodRes.rows.length) {
+        // 3. งวด GL + CM ต้องเปิด
+        const periodId = await openPeriodId(client, reval.revaluation_date);
+        if (!periodId) {
             await client.query('ROLLBACK');
-            return res.status(400).json({
-                error: `ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่ ${reval.revaluation_date}`
-            });
+            return res.status(400).json({ error: `งวดบัญชี/งวด CM ของวันที่ ${ymd(reval.revaluation_date)} ยังไม่เปิด โพสต์ไม่ได้` });
         }
-        const periodId = periodRes.rows[0].id;
 
-        // 4. Generate GL doc_no
-        let glDocNo = await generateGlDocNo(client, reval.gl_doc_id, reval.revaluation_date);
+        // 4. GL doc_no — ถอยแล้วโพสต์ใหม่ใช้เลขเดิม (gl_doc_no เก็บไว้ตอนถอย)
+        let glDocNo = reval.gl_doc_no || await generateGlDocNo(client, reval.gl_doc_id, reval.revaluation_date);
         if (!glDocNo) glDocNo = `FXRV-${id}`;
 
         // 5. Resolve base currency
@@ -443,7 +500,7 @@ const postRow = async (req, res) => {
         for (const l of lines) {
             const gainLoss = parseFloat(l.fx_gain_loss);
             const absAmt   = Math.abs(gainLoss);
-            const desc     = `FX Reval ${l.currency_code} - ${reval.revaluation_date}`;
+            const desc     = `FX Reval ${l.currency_code} - ${ymd(reval.revaluation_date)}`;
             if (gainLoss > 0) {
                 glDetails.push({ account_id: l.gl_account_id, description: desc, debit_lc: absAmt, credit_lc: 0 });
                 glDetails.push({ account_id: reval.fx_gain_account_id, description: desc, debit_lc: 0, credit_lc: absAmt });
@@ -465,8 +522,8 @@ const postRow = async (req, res) => {
             RETURNING id`,
             [reval.gl_doc_id, glDocNo, reval.revaluation_date,
              periodId,
-             reval.description || `FX Revaluation ${reval.revaluation_date}`,
-             currencyId, totalDebitLc, totalCreditLc, userName]);
+             reval.description || `FX Revaluation ${ymd(reval.revaluation_date)}`,
+             currencyId, totalDebitLc, totalCreditLc, glUserOf(req)]);
         const glEntryId = glHRes.rows[0].id;
 
         // 8. Insert GL detail lines — gl_entry_detail (real table, ไม่ใช่ gl_entry_line ที่ไม่มีจริง)
@@ -478,7 +535,7 @@ const postRow = async (req, res) => {
                 [glEntryId, lineNo++, d.account_id, d.description, d.debit_lc, d.credit_lc]);
         }
 
-        // 8. Update revaluation
+        // 9. Update revaluation
         await client.query(`
             UPDATE cm_bank_fx_revaluation
             SET status = 'Posted', gl_entry_id = $1, gl_doc_no = $2,
@@ -495,98 +552,99 @@ const postRow = async (req, res) => {
     } finally { client.release(); }
 };
 
-// PUT void: create reversing GL entry
-const voidRow = async (req, res) => {
-    const { id }   = req.params;
-    const userName = req.headers['username'] || null;
-    const client   = await req.dbPool.connect();
-    try {
-        await client.query('BEGIN');
-        await ensureTables(client);
-
-        const rRes = await client.query(`SELECT * FROM cm_bank_fx_revaluation WHERE id=$1 FOR UPDATE`, [id]);
-        if (!rRes.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
-        const reval = rRes.rows[0];
-        if (reval.status === 'Voided') { await client.query('ROLLBACK'); return res.status(400).json({ error: 'ถูก Void ไปแล้ว' }); }
-
-        if (reval.status === 'Posted' && reval.gl_entry_id) {
-            // Load original GL lines and create reversal
-            const origLines = await client.query(
-                `SELECT * FROM gl_entry_detail WHERE header_id = $1`, [reval.gl_entry_id]);
-
-            const today = todayYmd();
-
-            const periodRes = await client.query(`
-                SELECT id FROM gl_posting_period
-                WHERE $1::date BETWEEN period_start_date AND period_end_date AND gl_status = 'OPEN' LIMIT 1`,
-                [today]);
-            if (!periodRes.rows.length) {
-                await client.query('ROLLBACK');
-                return res.status(400).json({ error: `ไม่พบงวดบัญชีเปิดสำหรับวันที่ ${today}` });
-            }
-            const periodId = periodRes.rows[0].id;
-
-            const currRes = await client.query(`SELECT id FROM cd_currency WHERE currency_code='THB' LIMIT 1`);
-            const currencyId = currRes.rows[0]?.id || null;
-            const totalAbs = origLines.rows.reduce((s, l) => s + parseFloat(l.debit_lc || 0), 0);
-            const totalAbsRounded = Math.round(totalAbs * 100) / 100;
-
-            const rvHRes = await client.query(`
-                INSERT INTO gl_entry_header
-                    (doc_id, doc_no, doc_date, posting_date, period_id,
-                     ref_no, description, currency_id, exchange_rate, status,
-                     total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc, created_by)
-                VALUES ($1,$2,$3,$3,$4,$5,$6,$7,1,'Posted',$8,$8,$8,$8,$9)
-                RETURNING id`,
-                [reval.gl_doc_id_ref || null,
-                 `RVSL-${reval.gl_doc_no || id}`,
-                 today, periodId,
-                 reval.gl_doc_no,
-                 `ยกเลิก FX Reval ${reval.revaluation_date}`,
-                 currencyId, totalAbsRounded, userName]);
-            const rvEntryId = rvHRes.rows[0].id;
-
-            let lineNo = 1;
-            for (const l of origLines.rows) {
-                await client.query(`
-                    INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
-                    VALUES ($1,$2,$3,$4,$5,$6,$5,$6)`,
-                    [rvEntryId, lineNo++, l.account_id,
-                     `ยกเลิก: ${l.description}`,
-                     parseFloat(l.credit_lc || 0),
-                     parseFloat(l.debit_lc  || 0)]);
-            }
-
-            await client.query(`
-                UPDATE cm_bank_fx_revaluation
-                SET status = 'Voided', reversal_entry_id = $1, updated_at = NOW()
-                WHERE id = $2`,
-                [rvEntryId, id]);
-        } else {
-            await client.query(`UPDATE cm_bank_fx_revaluation SET status='Voided', updated_at=NOW() WHERE id=$1`, [id]);
-        }
-
-        await client.query('COMMIT');
-        const result = await client.query(`${BASE_SELECT} WHERE r.id=$1`, [id]);
-        res.json(result.rows[0]);
-    } catch (err) {
-        await client.query('ROLLBACK');
-        res.status(500).json({ error: err.message });
-    } finally { client.release(); }
-};
-
-// DELETE (Draft only)
-const deleteRow = async (req, res) => {
+// ดำเนินการกับรายการปรับมูลค่าใน transaction เดียว: fn คืน { status, message, code, ref } เมื่อทำไม่ได้
+const runAction = async (req, res, label, fn) => {
     const { id } = req.params;
     const client = await req.dbPool.connect();
     try {
+        await client.query('BEGIN');
         await ensureTables(client);
-        const result = await client.query(
-            `DELETE FROM cm_bank_fx_revaluation WHERE id=$1 AND status='Draft' RETURNING id`, [id]);
-        if (!result.rows.length) return res.status(400).json({ error: 'ลบได้เฉพาะ Draft' });
-        res.json({ message: 'Deleted' });
-    } catch (err) { res.status(500).json({ error: err.message }); }
-    finally { client.release(); }
+        const reval = (await client.query(`SELECT * FROM cm_bank_fx_revaluation WHERE id=$1 FOR UPDATE`, [id])).rows[0];
+        if (!reval) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
+        const err = await fn(client, reval, reasonOf(req));
+        if (err) {
+            await client.query('ROLLBACK');
+            return res.status(err.status || 400).json({ error: err.message, message: err.message, code: err.code || null, ref: err.ref || null });
+        }
+        await client.query('COMMIT');
+        const result = await client.query(`${BASE_SELECT} WHERE r.id=$1`, [id]);
+        res.json(result.rows[0]);
+    } catch (e) {
+        await client.query('ROLLBACK');
+        console.error(`cm bank fx ${label} error:`, e);
+        res.status(500).json({ error: e.message });
+    } finally { client.release(); }
 };
+const blockErr = (b) => ({ message: b.message, code: b.code, ref: b.ref });
+const revalLabel = (reval) => reval.gl_doc_no || `FX Reval ${ymd(reval.revaluation_date)}`;
 
-module.exports = { fetchRows, fetchRow, previewLines, createRow, updateRow, postRow, voidRow, deleteRow, ensureTables, getOutstandingCurrencies };
+// PUT reverse { reason }: Posted → Draft
+const reverseRow = (req, res) => runAction(req, res, 'reverse', async (client, reval, reason) => {
+    if (!reason) return { message: 'กรุณาระบุเหตุผลการถอยเอกสาร' };
+    const b = (await computeRevalBlocks(client, reval.id)).reverse_block;
+    if (b) return blockErr(b);
+    await client.query(`UPDATE cm_bank_fx_revaluation SET status='Draft', gl_entry_id=NULL, updated_at=NOW() WHERE id=$1`, [reval.id]);
+    if (reval.gl_entry_id) await client.query(`DELETE FROM gl_entry_header WHERE id=$1`, [reval.gl_entry_id]);
+    await logReverse(client, {
+        sysModule: '81', tableName: 'cm_bank_fx_revaluation', recordId: Number(reval.id), docNo: revalLabel(reval),
+        fromStatus: 'Posted', toStatus: 'Draft', reason, userId: userIdOf(req),
+    });
+    return null;
+});
+
+// PUT void { reason }: create reversing GL entry dated today
+const voidRow = (req, res) => runAction(req, res, 'void', async (client, reval, reason) => {
+    if (!reason) return { message: 'กรุณาระบุเหตุผลการยกเลิก' };
+    const b = (await computeRevalBlocks(client, reval.id)).void_block;
+    if (b) return blockErr(b);
+
+    const today = todayYmd();
+    const periodId = await openPeriodId(client, today);
+    if (!periodId) return { message: `ไม่พบงวดบัญชี (GL/CM) ที่เปิดอยู่ สำหรับวันที่ยกเลิก ${today}`, code: 'PERIOD_CLOSED' };
+
+    let rvEntryId = null;
+    if (reval.gl_entry_id) {
+        const orig = (await client.query(`SELECT * FROM gl_entry_header WHERE id=$1`, [reval.gl_entry_id])).rows[0];
+        const rvDocNo = (orig.doc_id && await generateGlDocNo(client, orig.doc_id, today)) || `RVSL-${reval.gl_doc_no || reval.id}`;
+        const rvHRes = await client.query(`
+            INSERT INTO gl_entry_header
+                (doc_id, doc_no, doc_date, posting_date, period_id,
+                 ref_no, description, currency_id, exchange_rate, status,
+                 total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc, created_by)
+            VALUES ($1,$2,$3,$3,$4,$5,$6,$7,1,'Posted',$8,$9,$8,$9,$10)
+            RETURNING id`,
+            [orig.doc_id, rvDocNo, today, periodId, reval.gl_doc_no,
+             `[ยกเลิก FX Reval ${ymd(reval.revaluation_date)}] ${reason}`,
+             orig.currency_id, orig.total_credit_lc, orig.total_debit_lc, glUserOf(req)]);
+        rvEntryId = rvHRes.rows[0].id;
+        await client.query(`
+            INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
+            SELECT $1, line_no, account_id, 'ยกเลิก: ' || COALESCE(description, ''), credit_lc, debit_lc, credit_lc, debit_lc
+              FROM gl_entry_detail WHERE header_id = $2 ORDER BY line_no`,
+            [rvEntryId, reval.gl_entry_id]);
+    }
+    await client.query(`
+        UPDATE cm_bank_fx_revaluation
+           SET status = 'Voided', reversal_entry_id = $1, void_reason = $2, voided_by = $3, voided_at = NOW(), updated_at = NOW()
+         WHERE id = $4`, [rvEntryId, reason, req.headers['username'] || null, reval.id]);
+    await logReverse(client, {
+        sysModule: '81', tableName: 'cm_bank_fx_revaluation', recordId: Number(reval.id), docNo: revalLabel(reval),
+        fromStatus: 'Posted', toStatus: 'Void', reason, userId: userIdOf(req),
+    });
+    return null;
+});
+
+// DELETE { reason } (Draft only): เก็บไว้ด้วยสถานะ Deleted
+const deleteRow = (req, res) => runAction(req, res, 'delete', async (client, reval, reason) => {
+    if (!reason) return { message: 'กรุณาระบุเหตุผลการลบเอกสาร' };
+    const b = (await computeRevalBlocks(client, reval.id)).delete_block;
+    if (b) return blockErr(b);
+    await client.query(`UPDATE cm_bank_fx_revaluation SET status='Deleted', updated_at=NOW() WHERE id=$1`, [reval.id]);
+    await logReverse(client, {
+        sysModule: '81', tableName: 'cm_bank_fx_revaluation', recordId: Number(reval.id), docNo: revalLabel(reval),
+        fromStatus: 'Draft', toStatus: 'Deleted', reason, userId: userIdOf(req),
+    });
+    return null;
+});
+
+module.exports = { fetchRows, fetchRow, previewLines, createRow, updateRow, postRow, reverseRow, voidRow, deleteRow, ensureTables, getOutstandingCurrencies, computeRevalBlocks };

@@ -696,7 +696,7 @@ const AP_REVERSE_INFO_SQL = `
              WHERE rd.ap_transaction_id = t.id AND r.status IN ('Draft', 'Submitted', 'Approved')) AS in_payment_run,
            (SELECT string_agg(DISTINCT to_char(fr.reval_date, 'DD/MM/YYYY'), ', ')
               FROM ap_fx_revaluation_detail fd JOIN ap_fx_revaluation fr ON fr.id = fd.revaluation_id
-             WHERE fd.invoice_id = t.id AND fr.status <> 'Void') AS in_fx_reval,
+             WHERE fd.invoice_id = t.id AND fr.status NOT IN ('Void', 'Deleted')) AS in_fx_reval,
            (SELECT string_agg(DISTINCT COALESCE(c.check_no, c.ap_doc_no, c.id::text), ', ')
               FROM cm_payment c
              WHERE c.ap_transaction_id = t.id
@@ -1981,6 +1981,6 @@ module.exports = {
     fetchOpenRemittanceAdvices, fetchRaInvoices,
     fetchRemittanceAdviceByDocNo,
     createTransaction, updateTransaction, voidTransaction, deleteTransaction, reverseTransaction,
-    voidApDocument, getApLinkedState,
+    voidApDocument, getApLinkedState, generateDocNo,
     submitTransaction, approveTransaction, rejectTransaction, postTransaction,
 };

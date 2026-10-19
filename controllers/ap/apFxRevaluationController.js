@@ -1,5 +1,7 @@
 // controllers/ap/apFxRevaluationController.js
 const { today: todayYmd, ymd } = require('../../utils/dateUtil');
+const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
+const { generateDocNo } = require('./apTransactionController');
 // FX Revaluation สำหรับเจ้าหนี้สกุลเงินต่างประเทศ ณ วันปิดปี
 //
 // ทิศทาง GL ตรงข้ามกับ AR:
@@ -45,6 +47,20 @@ const ensureRevalTables = async (client) => {
     await client.query(`
         ALTER TABLE ap_transaction ADD COLUMN IF NOT EXISTS revaluation_rate NUMERIC(20,6)
     `).catch(() => {});
+    // ถอยเป็นร่าง / ยกเลิก (sql/ap_fx_revaluation_reverse_to_draft.sql)
+    await client.query(`
+        ALTER TABLE ap_fx_revaluation
+            ADD COLUMN IF NOT EXISTS void_reason TEXT,
+            ADD COLUMN IF NOT EXISTS voided_by VARCHAR(100),
+            ADD COLUMN IF NOT EXISTS voided_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS void_gl_entry_id INT,
+            ADD COLUMN IF NOT EXISTS void_reversal_gl_entry_id INT,
+            ADD COLUMN IF NOT EXISTS kept_gl_doc_no VARCHAR(50),
+            ADD COLUMN IF NOT EXISTS kept_reversal_doc_no VARCHAR(50)
+    `).catch(() => {});
+    await client.query(`
+        ALTER TABLE ap_fx_revaluation_detail ADD COLUMN IF NOT EXISTS prev_revaluation_rate NUMERIC(20,6)
+    `).catch(() => {});
 };
 
 // ── Helper: คำนวณ revaluation details สำหรับ outstanding FC invoices ──────────
@@ -56,6 +72,7 @@ const calcRevalDetails = async (client, revalDate, yearEndRates) => {
                t.doc_no,
                v.vendor_code, v.vendor_name_th, v.vendor_name_en,
                COALESCE(t.revaluation_rate, t.exchange_rate) AS current_rate,
+               t.revaluation_rate AS prev_revaluation_rate,
                CASE WHEN COALESCE(t.revaluation_rate, t.exchange_rate) > 0
                     THEN t.balance_amount_lc / COALESCE(t.revaluation_rate, t.exchange_rate)
                     ELSE 0
@@ -98,6 +115,7 @@ const calcRevalDetails = async (client, revalDate, yearEndRates) => {
             year_end_rate:      yearEndRate,
             revalued_amount_lc: revaluedLc,
             fx_gain_loss:       fxGainLoss,
+            prev_revaluation_rate: row.prev_revaluation_rate,
         });
     }
     return details;
@@ -141,10 +159,11 @@ const postRevalGlEntry = async (client, setup, details, revalDate, isUnrealized,
     for (const d of details) {
         const apAccId = await getApControlAccount(client, d.invoice_id);
         if (!apAccId) continue;
-        apAdjMap[apAccId] = (apAdjMap[apAccId] || 0) + d.fx_gain_loss;
+        const fxGl = Number(d.fx_gain_loss); // อ่านจาก DB เป็นข้อความ (NUMERIC) — ต้องแปลงก่อนบวก
+        apAdjMap[apAccId] = (apAdjMap[apAccId] || 0) + fxGl;
         // positive → AP grew → FX Loss; negative → AP shrank → FX Gain
-        if (d.fx_gain_loss > 0) totalLoss += d.fx_gain_loss;
-        else totalGain += Math.abs(d.fx_gain_loss);
+        if (fxGl > 0) totalLoss += fxGl;
+        else totalGain += Math.abs(fxGl);
     }
 
     const totalDebitLc  = Math.round((totalGain + totalLoss) * 100) / 100;
@@ -235,11 +254,13 @@ const fetchRows = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await ensureRevalTables(client);
+        const showDeleted = req.query.status === 'Deleted';
         const result = await client.query(`
             SELECT r.*, u.doc_no AS gl_doc_no, v.doc_no AS reversal_doc_no
             FROM ap_fx_revaluation r
             LEFT JOIN gl_entry_header u ON u.id = r.gl_entry_id
             LEFT JOIN gl_entry_header v ON v.id = r.reversal_gl_entry_id
+            WHERE ${showDeleted ? `r.status = 'Deleted'` : `r.status <> 'Deleted'`}
             ORDER BY r.reval_date DESC, r.id DESC
         `);
         res.json(result.rows);
@@ -275,7 +296,10 @@ const fetchRow = async (req, res) => {
             ORDER BY v.vendor_code, t.doc_date, t.doc_no
         `, [id]);
 
-        res.json({ header: hdr.rows[0], details: dtl.rows });
+        res.json({
+            header: hdr.rows[0], details: dtl.rows, ...(await computeRevalBlocks(client, id)),
+            reverse_history: await getReverseHistory(client, 'ap_fx_revaluation', id),
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     } finally {
@@ -338,11 +362,11 @@ const createReval = async (req, res) => {
                 INSERT INTO ap_fx_revaluation_detail
                 (revaluation_id, invoice_id, vendor_id, currency_code,
                  balance_amount_fc, original_rate, balance_amount_lc,
-                 year_end_rate, revalued_amount_lc, fx_gain_loss)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                 year_end_rate, revalued_amount_lc, fx_gain_loss, prev_revaluation_rate)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
             `, [revalId, d.invoice_id, d.vendor_id, d.currency_code,
                 d.balance_amount_fc, d.original_rate, d.balance_amount_lc,
-                d.year_end_rate, d.revalued_amount_lc, d.fx_gain_loss]);
+                d.year_end_rate, d.revalued_amount_lc, d.fx_gain_loss, d.prev_revaluation_rate]);
         }
 
         await client.query('COMMIT');
@@ -356,6 +380,83 @@ const createReval = async (req, res) => {
     }
 };
 
+// ===== ถอยเป็นร่าง / ยกเลิก / ลบ =====
+// - ถอย (Posted → Draft): งวด GL + AP ของวันที่ปรับมูลค่า (และของรายการกลับ ถ้ามี) ยังเปิด
+//   แบบ realized: ใบตั้งหนี้ต้องยังไม่เปลี่ยนตั้งแต่ปรับมูลค่า (ไม่มีจ่ายชำระ/ปรับมูลค่าครั้งถัดไป) จึงคืนยอดเดิมได้
+//   ลบรายการบัญชี (และรายการกลับ) — เลขที่รายการบัญชีมาจากวันที่ (AP-FXR-YYYYMMDD) โพสต์ใหม่ได้เลขเดิม
+// - ยกเลิก: ใช้เมื่อถอยไม่ได้ (เช่น งวดปิดแล้ว) ลงรายการกลับในวันที่ยกเลิก (รายการกลับเดิมลงกลับในวันที่ช้ากว่า
+//   ระหว่างวันนี้กับวันที่กลับรายการ เพื่อให้ยอดสุทธิเป็นศูนย์ทุกช่วงเวลา)
+// - ลบ: เฉพาะร่าง เก็บไว้ด้วยสถานะ Deleted (ไม่แสดงในรายการ เว้นแต่เลือกดูใบที่ลบ)
+// ทุกการกระทำต้องมีเหตุผล และบันทึกที่ sa_document_reverse_log
+const REVAL_BLOCK_MESSAGES = {
+    NOT_REVERSIBLE:  'ถอยได้เฉพาะรายการที่โพสต์แล้ว',
+    NOT_POSTED:      'ยกเลิกได้เฉพาะรายการที่โพสต์แล้ว (ร่างให้ลบแทน)',
+    NOT_DRAFT:       'รายการที่โพสต์แล้วลบไม่ได้ กรุณาถอยเป็นร่างก่อน',
+    PERIOD_CLOSED:   'งวดบัญชีของรายการนี้ปิดแล้ว ถอยไม่ได้',
+    INVOICE_CHANGED: 'ใบตั้งหนี้ที่ปรับมูลค่ามีการเปลี่ยนแปลงหลังปรับมูลค่า (จ่ายชำระ/ปรับมูลค่าครั้งถัดไป/ถอย)',
+    VOIDED:          'รายการนี้ถูกยกเลิกหรือลบแล้ว',
+};
+const packBlock = (code, ref) => code
+    ? { code, ref: ref || null, message: REVAL_BLOCK_MESSAGES[code] + (ref ? ` (${ref})` : '') } : null;
+
+const REVAL_INFO_SQL = `
+    SELECT r.id, r.status, r.method, r.gl_entry_id, r.reversal_gl_entry_id,
+           p.gl_status, p.ap_status,
+           rp.gl_status AS rev_gl_status, rp.ap_status AS rev_ap_status, rg.doc_no AS reversal_doc_no,
+           (SELECT string_agg(DISTINCT t.doc_no, ', ')
+              FROM ap_fx_revaluation_detail d JOIN ap_transaction t ON t.id = d.invoice_id
+             WHERE d.revaluation_id = r.id
+               AND (t.status <> 'Posted' OR ABS(t.balance_amount_lc - d.revalued_amount_lc) > 0.005
+                    OR t.revaluation_rate IS DISTINCT FROM d.year_end_rate)) AS changed_invoices
+      FROM ap_fx_revaluation r
+      LEFT JOIN gl_posting_period p  ON r.reval_date BETWEEN p.period_start_date AND p.period_end_date
+      LEFT JOIN gl_entry_header   rg ON rg.id = r.reversal_gl_entry_id
+      LEFT JOIN gl_posting_period rp ON rp.id = rg.period_id
+     WHERE r.id = $1`;
+
+const computeRevalBlocks = async (db, id) => {
+    const r = (await db.query(REVAL_INFO_SQL, [id])).rows[0];
+    if (!r) return {};
+    if (['Void', 'Deleted'].includes(r.status)) {
+        const v = packBlock('VOIDED');
+        return { reverse_block: v, void_block: v, delete_block: v };
+    }
+    if (r.status !== 'Posted') {
+        return { reverse_block: packBlock('NOT_REVERSIBLE'), void_block: packBlock('NOT_POSTED'), delete_block: null };
+    }
+    const changed = r.method === 'realized' && r.changed_invoices ? packBlock('INVOICE_CHANGED', r.changed_invoices) : null;
+    let reverse = null;
+    if (r.gl_status !== 'OPEN' || r.ap_status !== 'OPEN') reverse = packBlock('PERIOD_CLOSED');
+    else if (r.reversal_gl_entry_id && (r.rev_gl_status !== 'OPEN' || r.rev_ap_status !== 'OPEN')) reverse = packBlock('PERIOD_CLOSED', r.reversal_doc_no);
+    else reverse = changed;
+    return { reverse_block: reverse, void_block: changed, delete_block: packBlock('NOT_DRAFT') };
+};
+
+// คืนยอดใบตั้งหนี้ (realized) กลับเป็นก่อนปรับมูลค่า — รายการเก่าที่ไม่มี prev_revaluation_rate ใช้อัตราจากยอดคงค้างเดิม
+const restoreInvoices = async (client, id) => {
+    await client.query(`
+        UPDATE ap_transaction t SET
+               revaluation_rate = COALESCE(d.prev_revaluation_rate,
+                   CASE WHEN d.balance_amount_fc = 0
+                          OR ABS(d.balance_amount_lc / d.balance_amount_fc - t.exchange_rate) < 0.0001 THEN NULL
+                        ELSE ROUND(d.balance_amount_lc / d.balance_amount_fc, 6) END),
+               balance_amount_lc = d.balance_amount_lc, updated_at = NOW()
+          FROM ap_fx_revaluation_detail d
+         WHERE d.revaluation_id = $1 AND t.id = d.invoice_id`, [id]);
+};
+
+const reasonOf = (req) => (req.body?.reason || '').trim();
+const userIdOf = (req) => req.body?.user_id || req.headers['userid'] || null;
+// gl_entry_header.created_by เป็นรหัสผู้ใช้ (int)
+const glUserOf = (req) => { const v = Number(req.headers['userid']); return Number.isFinite(v) && v > 0 ? v : null; };
+const sendErr = (res, status, message, extra = {}) => res.status(status).json({ error: message, message, ...extra });
+
+// เลขที่รายการบัญชี: เลขอัตโนมัติของประเภทเอกสาร GL — ถ้าประเภทเอกสารไม่ได้ตั้งเลขอัตโนมัติ ใช้รูปแบบเดิม + id
+// (รูปแบบเดิม AP-FXR-YYYYMMDD ซ้ำกันเมื่อมีรายการวันเดียวกันที่ยกเลิกไปแล้ว)
+const nextGlDocNo = async (client, glDocId, date, fallback) =>
+    (glDocId && await generateDocNo(client, glDocId, date, null)) || fallback;
+const revalLabel = (reval) => reval.kept_gl_doc_no || `AP-FXR ${ymd(reval.reval_date)}`;
+
 // ── POST /api/ap/ap_fx_revaluation/:id/post ──────────────────────────────────
 const postReval = async (req, res) => {
     const { id } = req.params;
@@ -367,22 +468,44 @@ const postReval = async (req, res) => {
         const hdr = await client.query(
             `SELECT * FROM ap_fx_revaluation WHERE id=$1 FOR UPDATE`, [id]
         );
-        if (!hdr.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
-        if (hdr.rows[0].status !== 'Draft') { await client.query('ROLLBACK'); return res.status(422).json({ error: 'Only Draft can be posted' }); }
+        if (!hdr.rows[0]) { await client.query('ROLLBACK'); return sendErr(res, 404, 'Not found'); }
+        if (hdr.rows[0].status !== 'Draft') { await client.query('ROLLBACK'); return sendErr(res, 422, 'Only Draft can be posted'); }
 
         const reval   = hdr.rows[0];
         const setup   = (await client.query('SELECT * FROM ap_year_end_setup LIMIT 1')).rows[0];
-        if (!setup) { await client.query('ROLLBACK'); return res.status(422).json({ error: 'ยังไม่ได้ตั้งค่าบัญชีปิดสิ้นปี AP' }); }
+        if (!setup) { await client.query('ROLLBACK'); return sendErr(res, 422, 'ยังไม่ได้ตั้งค่าบัญชีปิดสิ้นปี AP'); }
 
         const details = (await client.query(
             `SELECT * FROM ap_fx_revaluation_detail WHERE revaluation_id=$1`, [id]
         )).rows;
 
+        // ร่าง (รวมที่ถอยกลับมา) คำนวณจากยอดคงค้าง ณ ตอนสร้าง — ถ้าใบตั้งหนี้เปลี่ยนไปแล้วต้องสร้างใหม่
+        const stale = (await client.query(`
+            SELECT string_agg(DISTINCT t.doc_no, ', ') AS docs
+              FROM ap_fx_revaluation_detail d JOIN ap_transaction t ON t.id = d.invoice_id
+             WHERE d.revaluation_id = $1
+               AND (t.status <> 'Posted' OR ABS(t.balance_amount_lc - d.balance_amount_lc) > 0.005)`, [id])).rows[0].docs;
+        if (stale) {
+            await client.query('ROLLBACK');
+            return sendErr(res, 422, `ยอดคงค้างของใบตั้งหนี้เปลี่ยนไปหลังสร้างรายการนี้ (${stale}) กรุณาลบแล้วสร้างใหม่`);
+        }
+
+        const periodOk = await client.query(
+            `SELECT 1 FROM gl_posting_period WHERE $1::date BETWEEN period_start_date AND period_end_date
+               AND gl_status = 'OPEN' AND ap_status = 'OPEN' LIMIT 1`, [reval.reval_date]);
+        if (periodOk.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return sendErr(res, 422, `งวดบัญชี/งวด AP ของวันที่ ${ymd(reval.reval_date)} ยังไม่เปิด โพสต์ไม่ได้`);
+        }
+
         const isUnrealized = reval.method === 'reversing';
-        const docNo = `AP-FXR-${ymd(reval.reval_date).replace(/-/g, '')}`;
+        // ถอยแล้วโพสต์ใหม่ใช้เลขเดิม
+        const docNo = reval.kept_gl_doc_no || await nextGlDocNo(client, setup.fx_reval_gl_doc_id, reval.reval_date,
+            `AP-FXR-${ymd(reval.reval_date).replace(/-/g, '')}-${reval.id}`);
+        let revDocNo = null;
 
         const glEntryId = await postRevalGlEntry(
-            client, setup, details, reval.reval_date, isUnrealized, docNo, updatedBy
+            client, setup, details, reval.reval_date, isUnrealized, docNo, glUserOf(req)
         );
 
         let reversalGlEntryId = null;
@@ -397,7 +520,6 @@ const postReval = async (req, res) => {
                 );
             }
         } else {
-            const revDocNo = `AP-FXR-REV-${ymd(reval.reversal_date).replace(/-/g, '')}`;
             const revPeriodRes = await client.query(
                 `SELECT id FROM gl_posting_period
                  WHERE $1::date BETWEEN period_start_date AND period_end_date
@@ -405,171 +527,204 @@ const postReval = async (req, res) => {
             );
 
             if (revPeriodRes.rows.length > 0) {
-                const origDtl = await client.query(
-                    `SELECT * FROM gl_entry_detail WHERE header_id=$1`, [glEntryId]
-                );
-                const revPeriodId = revPeriodRes.rows[0].id;
-                const origHdr = (await client.query(
-                    `SELECT * FROM gl_entry_header WHERE id=$1`, [glEntryId]
-                )).rows[0];
-
-                const revHdrRes = await client.query(`
-                    INSERT INTO gl_entry_header
-                    (doc_id, doc_no, doc_date, posting_date, period_id, description,
-                     currency_id, exchange_rate, status,
-                     total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-                     created_by, ref_doc_id, ref_doc_no, ref_doc_date)
-                    VALUES ($1,$2,$3::date,$3::date,$4,$5,$6,1,'Posted',$7,$8,$7,$8,$9,$10,$11,$12)
-                    RETURNING id
-                `, [origHdr.doc_id, revDocNo, reval.reversal_date, revPeriodId,
-                    `[กลับรายการ] ${docNo}`,
-                    origHdr.currency_id, origHdr.total_credit_lc, origHdr.total_debit_lc,
-                    updatedBy, glEntryId, docNo, origHdr.doc_date]);
-                reversalGlEntryId = revHdrRes.rows[0].id;
-
-                for (const d of origDtl.rows) {
-                    await client.query(`
-                        INSERT INTO gl_entry_detail
-                        (header_id, line_no, account_id, debit_lc, credit_lc, debit_fc, credit_fc)
-                        VALUES ($1,$2,$3,$4,$5,$4,$5)
-                    `, [reversalGlEntryId, d.line_no, d.account_id, d.credit_lc, d.debit_lc]);
-                }
+                revDocNo = reval.kept_reversal_doc_no || await nextGlDocNo(client, setup.fx_reval_gl_doc_id, reval.reversal_date,
+                    `AP-FXR-REV-${ymd(reval.reversal_date).replace(/-/g, '')}-${reval.id}`);
+                reversalGlEntryId = await insertReversingEntry(client, glEntryId, {
+                    docNo: revDocNo, date: reval.reversal_date, periodId: revPeriodRes.rows[0].id,
+                    description: `[กลับรายการ] ${docNo}`, createdBy: glUserOf(req),
+                });
             }
         }
 
         await client.query(`
             UPDATE ap_fx_revaluation SET
             status='Posted', gl_entry_id=$1, reversal_gl_entry_id=$2,
-            updated_by=$3, updated_at=NOW()
-            WHERE id=$4
-        `, [glEntryId, reversalGlEntryId, updatedBy, id]);
+            kept_gl_doc_no=$3, kept_reversal_doc_no=COALESCE($4, kept_reversal_doc_no),
+            updated_by=$5, updated_at=NOW()
+            WHERE id=$6
+        `, [glEntryId, reversalGlEntryId, docNo, revDocNo, updatedBy, id]);
 
         await client.query('COMMIT');
         res.json({ success: true, gl_entry_id: glEntryId, reversal_gl_entry_id: reversalGlEntryId });
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('ap postReval error:', err);
-        res.status(500).json({ error: err.message });
+        sendErr(res, 500, err.message);
     } finally {
         client.release();
     }
 };
 
-// ── POST /api/ap/ap_fx_revaluation/:id/void ──────────────────────────────────
+// รายการบัญชีกลับด้านของ glEntryId (Dr ↔ Cr) — ใช้ทั้งรายการกลับต้นงวดและการยกเลิก
+// ref_doc_id อ้างอิงประเภทเอกสาร (FK sa_module_document) จึงใช้ doc_id ของรายการเดิม ไม่ใช่ id ของรายการบัญชี
+const insertReversingEntry = async (client, glEntryId, { docNo, date, periodId, description, createdBy }) => {
+    const origHdr = (await client.query(`SELECT * FROM gl_entry_header WHERE id=$1`, [glEntryId])).rows[0];
+    const revHdrRes = await client.query(`
+        INSERT INTO gl_entry_header
+        (doc_id, doc_no, doc_date, posting_date, period_id, description,
+         currency_id, exchange_rate, status,
+         total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
+         created_by, ref_doc_id, ref_doc_no, ref_doc_date)
+        VALUES ($1,$2,$3::date,$3::date,$4,$5,$6,1,'Posted',$7,$8,$7,$8,$9,$10,$11,$12)
+        RETURNING id
+    `, [origHdr.doc_id, docNo, date, periodId, description,
+        origHdr.currency_id, origHdr.total_credit_lc, origHdr.total_debit_lc,
+        createdBy, origHdr.doc_id, origHdr.doc_no, origHdr.doc_date]);
+    const revId = revHdrRes.rows[0].id;
+    await client.query(`
+        INSERT INTO gl_entry_detail
+        (header_id, line_no, account_id, debit_lc, credit_lc, debit_fc, credit_fc)
+        SELECT $1, line_no, account_id, credit_lc, debit_lc, credit_lc, debit_lc
+          FROM gl_entry_detail WHERE header_id = $2 ORDER BY line_no
+    `, [revId, glEntryId]);
+    return revId;
+};
+
+// ── PUT /api/ap/ap_fx_revaluation/:id/reverse { reason } — Posted → Draft ───
+const reverseReval = async (req, res) => {
+    const { id } = req.params;
+    const reason = reasonOf(req);
+    if (!reason) return sendErr(res, 400, 'กรุณาระบุเหตุผลการถอยเอกสาร');
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        await ensureRevalTables(client);
+        const reval = (await client.query(`SELECT * FROM ap_fx_revaluation WHERE id=$1 FOR UPDATE`, [id])).rows[0];
+        if (!reval) { await client.query('ROLLBACK'); return sendErr(res, 404, 'Not found'); }
+        const b = (await computeRevalBlocks(client, id)).reverse_block;
+        if (b) { await client.query('ROLLBACK'); return sendErr(res, 400, b.message, { code: b.code, ref: b.ref }); }
+
+        if (reval.method === 'realized') await restoreInvoices(client, id);
+        for (const glId of [reval.reversal_gl_entry_id, reval.gl_entry_id]) {
+            if (glId) await client.query(`DELETE FROM gl_entry_header WHERE id=$1`, [glId]);
+        }
+        await client.query(`
+            UPDATE ap_fx_revaluation SET status='Draft', gl_entry_id=NULL, reversal_gl_entry_id=NULL,
+                   updated_by=$1, updated_at=NOW()
+             WHERE id=$2`, [req.headers['username'] || null, id]);
+        await logReverse(client, {
+            sysModule: '21', tableName: 'ap_fx_revaluation', recordId: Number(id),
+            docNo: revalLabel(reval),
+            fromStatus: 'Posted', toStatus: 'Draft', reason, userId: userIdOf(req),
+        });
+        await client.query('COMMIT');
+        res.json({ success: true });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('ap reverseReval error:', err);
+        sendErr(res, 500, err.message);
+    } finally {
+        client.release();
+    }
+};
+
+// ── POST /api/ap/ap_fx_revaluation/:id/void { reason } ───────────────────────
 const voidReval = async (req, res) => {
     const { id } = req.params;
+    const reason = reasonOf(req);
+    if (!reason) return sendErr(res, 400, 'กรุณาระบุเหตุผลการยกเลิก');
     const updatedBy = req.headers['username'] || null;
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
+        await ensureRevalTables(client);
 
         const hdr = await client.query(
             `SELECT * FROM ap_fx_revaluation WHERE id=$1 FOR UPDATE`, [id]
         );
-        if (!hdr.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
+        if (!hdr.rows[0]) { await client.query('ROLLBACK'); return sendErr(res, 404, 'Not found'); }
         const reval = hdr.rows[0];
-        if (reval.status !== 'Posted') { await client.query('ROLLBACK'); return res.status(422).json({ error: 'Only Posted can be voided' }); }
+        const b = (await computeRevalBlocks(client, id)).void_block;
+        if (b) { await client.query('ROLLBACK'); return sendErr(res, 400, b.message, { code: b.code, ref: b.ref }); }
 
-        const today = todayYmd();
-        const todayPeriod = await client.query(
+        const openPeriod = async (date) => (await client.query(
             `SELECT id FROM gl_posting_period
              WHERE $1::date BETWEEN period_start_date AND period_end_date
-             AND gl_status = 'OPEN' LIMIT 1`, [today]
-        );
-        if (todayPeriod.rows.length === 0)
-            throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่ยกเลิก ${today}`);
-        const todayPeriodId = todayPeriod.rows[0].id;
+             AND gl_status = 'OPEN' AND ap_status = 'OPEN' LIMIT 1`, [date])).rows[0]?.id || null;
 
-        if (reval.method === 'realized') {
-            const details = (await client.query(
-                `SELECT invoice_id, balance_amount_lc FROM ap_fx_revaluation_detail WHERE revaluation_id=$1`, [id]
-            )).rows;
-            for (const d of details) {
-                await client.query(
-                    `UPDATE ap_transaction
-                     SET revaluation_rate=NULL, balance_amount_lc=$1, updated_at=NOW()
-                     WHERE id=$2`,
-                    [d.balance_amount_lc, d.invoice_id]
-                );
-            }
+        const today = todayYmd();
+        const todayPeriodId = await openPeriod(today);
+        if (!todayPeriodId) {
+            await client.query('ROLLBACK');
+            return sendErr(res, 400, `ไม่พบงวดบัญชี (GL/AP) ที่เปิดอยู่ สำหรับวันที่ยกเลิก ${today}`, { code: 'PERIOD_CLOSED' });
         }
 
+        if (reval.method === 'realized') await restoreInvoices(client, id);
+
+        let voidGlId = null, voidRevGlId = null;
         if (reval.gl_entry_id) {
-            const origHdr = (await client.query(
-                `SELECT * FROM gl_entry_header WHERE id=$1`, [reval.gl_entry_id]
-            )).rows[0];
-            const origDtl = (await client.query(
-                `SELECT * FROM gl_entry_detail WHERE header_id=$1 ORDER BY line_no`, [reval.gl_entry_id]
-            )).rows;
-
-            const revDocNo = `VOID-AP-FXR-${today.replace(/-/g, '')}`;
-            const revHdrRes = await client.query(`
-                INSERT INTO gl_entry_header
-                (doc_id, doc_no, doc_date, posting_date, period_id, description,
-                 currency_id, exchange_rate, status,
-                 total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-                 created_by, ref_doc_id, ref_doc_no, ref_doc_date)
-                VALUES ($1,$2,$3::date,$3::date,$4,$5,$6,1,'Posted',$7,$8,$7,$8,$9,$10,$11,$12)
-                RETURNING id
-            `, [origHdr.doc_id, revDocNo, today, todayPeriodId,
-                `[ยกเลิก AP FX Revaluation] ${origHdr.doc_no}`,
-                origHdr.currency_id, origHdr.total_credit_lc, origHdr.total_debit_lc,
-                updatedBy, reval.gl_entry_id, origHdr.doc_no, origHdr.doc_date]);
-            const voidGlId = revHdrRes.rows[0].id;
-
-            for (const d of origDtl) {
-                await client.query(`
-                    INSERT INTO gl_entry_detail
-                    (header_id, line_no, account_id, debit_lc, credit_lc, debit_fc, credit_fc)
-                    VALUES ($1,$2,$3,$4,$5,$4,$5)
-                `, [voidGlId, d.line_no, d.account_id, d.credit_lc, d.debit_lc]);
-            }
+            voidGlId = await insertReversingEntry(client, reval.gl_entry_id, {
+                docNo: await nextGlDocNo(client, (await client.query(`SELECT doc_id FROM gl_entry_header WHERE id=$1`, [reval.gl_entry_id])).rows[0].doc_id,
+                    today, `VOID-AP-FXR-${today.replace(/-/g, '')}-${reval.id}`), date: today, periodId: todayPeriodId,
+                description: `[ยกเลิก AP FX Revaluation] ${reason}`, createdBy: glUserOf(req),
+            });
         }
-
+        // รายการกลับต้นงวด: ลงกลับในวันที่ช้ากว่าระหว่างวันนี้กับวันที่กลับรายการ
         if (reval.reversal_gl_entry_id) {
-            await client.query(
-                `UPDATE gl_entry_header SET status='Void' WHERE id=$1`,
-                [reval.reversal_gl_entry_id]
-            );
+            const revDate = ymd(reval.reversal_date) > today ? ymd(reval.reversal_date) : today;
+            const revPeriodId = revDate === today ? todayPeriodId : await openPeriod(revDate);
+            if (!revPeriodId) {
+                await client.query('ROLLBACK');
+                return sendErr(res, 400, `ไม่พบงวดบัญชี (GL/AP) ที่เปิดอยู่ สำหรับวันที่กลับรายการ ${revDate}`, { code: 'PERIOD_CLOSED' });
+            }
+            voidRevGlId = await insertReversingEntry(client, reval.reversal_gl_entry_id, {
+                docNo: await nextGlDocNo(client, (await client.query(`SELECT doc_id FROM gl_entry_header WHERE id=$1`, [reval.reversal_gl_entry_id])).rows[0].doc_id,
+                    revDate, `VOID-AP-FXR-REV-${revDate.replace(/-/g, '')}-${reval.id}`), date: revDate, periodId: revPeriodId,
+                description: `[ยกเลิก AP FX Revaluation (รายการกลับ)] ${reason}`, createdBy: glUserOf(req),
+            });
         }
 
         await client.query(`
-            UPDATE ap_fx_revaluation SET status='Void', updated_by=$1, updated_at=NOW()
-            WHERE id=$2
-        `, [updatedBy, id]);
+            UPDATE ap_fx_revaluation SET status='Void', void_reason=$1, voided_by=$2, voided_at=NOW(),
+                   void_gl_entry_id=$3, void_reversal_gl_entry_id=$4, updated_by=$2, updated_at=NOW()
+            WHERE id=$5
+        `, [reason, updatedBy, voidGlId, voidRevGlId, id]);
+        await logReverse(client, {
+            sysModule: '21', tableName: 'ap_fx_revaluation', recordId: Number(id),
+            docNo: revalLabel(reval),
+            fromStatus: 'Posted', toStatus: 'Void', reason, userId: userIdOf(req),
+        });
 
         await client.query('COMMIT');
         res.json({ success: true });
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('ap voidReval error:', err);
-        res.status(500).json({ error: err.message });
+        sendErr(res, 500, err.message);
     } finally {
         client.release();
     }
 };
 
-// ── DELETE /api/ap/ap_fx_revaluation/:id ─────────────────────────────────────
+// ── DELETE /api/ap/ap_fx_revaluation/:id { reason } — เฉพาะร่าง เก็บไว้ด้วยสถานะ Deleted ──
 const deleteReval = async (req, res) => {
     const { id } = req.params;
+    const reason = reasonOf(req);
+    if (!reason) return sendErr(res, 400, 'กรุณาระบุเหตุผลการลบเอกสาร');
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
-        const hdr = await client.query(`SELECT status FROM ap_fx_revaluation WHERE id=$1`, [id]);
-        if (!hdr.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
-        if (hdr.rows[0].status !== 'Draft') { await client.query('ROLLBACK'); return res.status(422).json({ error: 'Only Draft can be deleted' }); }
+        const hdr = await client.query(`SELECT status, reval_date, kept_gl_doc_no FROM ap_fx_revaluation WHERE id=$1 FOR UPDATE`, [id]);
+        if (!hdr.rows[0]) { await client.query('ROLLBACK'); return sendErr(res, 404, 'Not found'); }
+        const b = (await computeRevalBlocks(client, id)).delete_block;
+        if (b) { await client.query('ROLLBACK'); return sendErr(res, 422, b.message, { code: b.code }); }
 
-        await client.query(`DELETE FROM ap_fx_revaluation_detail WHERE revaluation_id=$1`, [id]);
-        await client.query(`DELETE FROM ap_fx_revaluation WHERE id=$1`, [id]);
+        await client.query(`UPDATE ap_fx_revaluation SET status='Deleted', updated_by=$1, updated_at=NOW() WHERE id=$2`,
+            [req.headers['username'] || null, id]);
+        await logReverse(client, {
+            sysModule: '21', tableName: 'ap_fx_revaluation', recordId: Number(id),
+            docNo: revalLabel(hdr.rows[0]),
+            fromStatus: 'Draft', toStatus: 'Deleted', reason, userId: userIdOf(req),
+        });
         await client.query('COMMIT');
         res.json({ success: true });
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('ap deleteReval error:', err);
-        res.status(500).json({ error: err.message });
+        sendErr(res, 500, err.message);
     } finally {
         client.release();
     }
 };
 
-module.exports = { fetchOutstandingCurrencies, fetchRows, fetchRow, previewReval, createReval, postReval, voidReval, deleteReval };
+module.exports = { fetchOutstandingCurrencies, fetchRows, fetchRow, previewReval, createReval, postReval, reverseReval, voidReval, deleteReval, computeRevalBlocks };

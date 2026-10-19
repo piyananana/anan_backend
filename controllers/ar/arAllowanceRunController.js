@@ -1,5 +1,24 @@
 // controllers/ar/arAllowanceRunController.js
 const { today: todayYmd, ymd } = require('../../utils/dateUtil');
+const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
+const { generateDocNo } = require('./arTransactionController');
+
+// คอลัมน์สำหรับถอยเป็นร่าง / ยกเลิก / ลบ (sql/ar_allowance_run_reverse_to_draft.sql)
+const ensureRunColumns = async (db) => {
+    await db.query(`
+        ALTER TABLE ar_allowance_run
+            ADD COLUMN IF NOT EXISTS void_reason TEXT,
+            ADD COLUMN IF NOT EXISTS voided_by VARCHAR(100),
+            ADD COLUMN IF NOT EXISTS voided_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS void_gl_entry_id INT,
+            ADD COLUMN IF NOT EXISTS kept_gl_doc_no VARCHAR(50)
+    `).catch(() => {});
+    await db.query(`
+        ALTER TABLE ar_allowance_run DROP CONSTRAINT IF EXISTS ar_allowance_run_status_check;
+        ALTER TABLE ar_allowance_run ADD CONSTRAINT ar_allowance_run_status_check
+            CHECK (status IN ('Draft', 'Posted', 'Void', 'Deleted'))
+    `).catch(() => {});
+};
 // Allowance for Doubtful Accounts — คำนวณค่าเผื่อหนี้สงสัยจะสูญ
 
 // ── Helper: คำนวณ allowance details ─────────────────────────────────────────
@@ -71,10 +90,14 @@ const getPriorAllowance = async (client, setup) => {
 // ── GET /api/ar/ar_allowance_run ─────────────────────────────────────────────
 const fetchRows = async (req, res) => {
     try {
+        await ensureRunColumns(req.dbPool);
+        // ใบที่ลบซ่อนไว้ เว้นแต่ ?status=Deleted
+        const showDeleted = req.query.status === 'Deleted';
         const result = await req.dbPool.query(
             `SELECT r.*, g.doc_no AS gl_doc_no
              FROM ar_allowance_run r
              LEFT JOIN gl_entry_header g ON g.id = r.gl_entry_id
+             WHERE ${showDeleted ? `r.status = 'Deleted'` : `r.status <> 'Deleted'`}
              ORDER BY r.run_date DESC, r.id DESC`
         );
         res.json(result.rows);
@@ -87,6 +110,7 @@ const fetchRows = async (req, res) => {
 const fetchRow = async (req, res) => {
     const { id } = req.params;
     try {
+        await ensureRunColumns(req.dbPool);
         const hdr = await req.dbPool.query(
             `SELECT r.*, g.doc_no AS gl_doc_no
              FROM ar_allowance_run r
@@ -105,7 +129,10 @@ const fetchRow = async (req, res) => {
             ORDER BY c.customer_code, d.doc_date
         `, [id]);
 
-        res.json({ header: hdr.rows[0], details: dtl.rows });
+        res.json({
+            header: hdr.rows[0], details: dtl.rows, ...(await computeRunBlocks(req.dbPool, id)),
+            reverse_history: await getReverseHistory(req.dbPool, 'ar_allowance_run', id),
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -179,6 +206,59 @@ const createRun = async (req, res) => {
     }
 };
 
+// ===== ถอยเป็นร่าง / ยกเลิก / ลบ =====
+// - ถอย (Posted → Draft): งวด GL + AR ของวันที่คำนวณยังเปิด และไม่มีการคำนวณครั้งถัดไปที่โพสต์แล้ว
+//   (ครั้งถัดไปคำนวณยอดสะสมเดิม (prior_allowance) จากรายการบัญชีของครั้งนี้) — ลบรายการบัญชี เก็บเลขที่ไว้ใช้ซ้ำ
+// - ยกเลิก: ใช้เมื่อถอยไม่ได้ (เช่น งวดปิดแล้ว) ลงรายการกลับในวันที่ยกเลิก — ติดเงื่อนไขครั้งถัดไปเหมือนกัน
+// - ลบ: เฉพาะร่าง เก็บไว้ด้วยสถานะ Deleted
+// ทุกการกระทำต้องมีเหตุผล และบันทึกที่ sa_document_reverse_log
+const RUN_BLOCK_MESSAGES = {
+    NOT_REVERSIBLE: 'ถอยได้เฉพาะรายการที่โพสต์แล้ว',
+    NOT_POSTED:     'ยกเลิกได้เฉพาะรายการที่โพสต์แล้ว (ร่างให้ลบแทน)',
+    NOT_DRAFT:      'รายการที่โพสต์แล้วลบไม่ได้ กรุณาถอยเป็นร่างก่อน',
+    PERIOD_CLOSED:  'งวดบัญชีของรายการนี้ปิดแล้ว ถอยไม่ได้',
+    LATER_RUN:      'มีการคำนวณค่าเผื่อครั้งถัดไปที่โพสต์แล้ว (คำนวณจากยอดสะสมที่รวมครั้งนี้)',
+    VOIDED:         'รายการนี้ถูกยกเลิกหรือลบแล้ว',
+};
+const packBlock = (code, ref) => code
+    ? { code, ref: ref || null, message: RUN_BLOCK_MESSAGES[code] + (ref ? ` (${ref})` : '') } : null;
+
+const RUN_INFO_SQL = `
+    SELECT r.id, r.status, p.gl_status, p.ar_status,
+           (SELECT string_agg(to_char(n.run_date, 'DD/MM/YYYY'), ', ' ORDER BY n.run_date)
+              FROM ar_allowance_run n
+             WHERE n.id <> r.id AND n.status = 'Posted'
+               AND (n.run_date > r.run_date OR (n.run_date = r.run_date AND n.id > r.id))) AS later_runs
+      FROM ar_allowance_run r
+      LEFT JOIN gl_posting_period p ON r.run_date BETWEEN p.period_start_date AND p.period_end_date
+     WHERE r.id = $1`;
+
+const computeRunBlocks = async (db, id) => {
+    const r = (await db.query(RUN_INFO_SQL, [id])).rows[0];
+    if (!r) return {};
+    if (['Void', 'Deleted'].includes(r.status)) {
+        const v = packBlock('VOIDED');
+        return { reverse_block: v, void_block: v, delete_block: v };
+    }
+    if (r.status !== 'Posted') {
+        return { reverse_block: packBlock('NOT_REVERSIBLE'), void_block: packBlock('NOT_POSTED'), delete_block: null };
+    }
+    const later = r.later_runs ? packBlock('LATER_RUN', r.later_runs) : null;
+    const reverse = (r.gl_status !== 'OPEN' || r.ar_status !== 'OPEN') ? packBlock('PERIOD_CLOSED') : later;
+    return { reverse_block: reverse, void_block: later, delete_block: packBlock('NOT_DRAFT') };
+};
+
+const reasonOf = (req) => (req.body?.reason || '').trim();
+const userIdOf = (req) => req.body?.user_id || req.headers['userid'] || null;
+// gl_entry_header.created_by เป็นรหัสผู้ใช้ (int)
+const glUserOf = (req) => { const v = Number(req.headers['userid']); return Number.isFinite(v) && v > 0 ? v : null; };
+const sendErr = (res, status, message, extra = {}) => res.status(status).json({ error: message, message, ...extra });
+// เลขที่รายการบัญชี: เลขอัตโนมัติของประเภทเอกสาร GL — ถ้าไม่ได้ตั้งเลขอัตโนมัติ ใช้รูปแบบเดิม + id
+// (รูปแบบเดิม ALLOW-YYYYMMDD ซ้ำกันเมื่อมีรายการวันเดียวกันที่ยกเลิกไปแล้ว)
+const nextGlDocNo = async (client, glDocId, date, fallback) =>
+    (glDocId && await generateDocNo(client, glDocId, date, null)) || fallback;
+const runLabel = (run) => run.kept_gl_doc_no || `ALLOW ${ymd(run.run_date)}`;
+
 // ── POST /api/ar/ar_allowance_run/:id/post ───────────────────────────────────
 const postRun = async (req, res) => {
     const { id } = req.params;
@@ -186,12 +266,13 @@ const postRun = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
+        await ensureRunColumns(client);
 
         const hdr = await client.query(
             `SELECT * FROM ar_allowance_run WHERE id=$1 FOR UPDATE`, [id]
         );
-        if (!hdr.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
-        if (hdr.rows[0].status !== 'Draft') { await client.query('ROLLBACK'); return res.status(422).json({ error: 'Only Draft can be posted' }); }
+        if (!hdr.rows[0]) { await client.query('ROLLBACK'); return sendErr(res, 404, 'Not found'); }
+        if (hdr.rows[0].status !== 'Draft') { await client.query('ROLLBACK'); return sendErr(res, 422, 'Only Draft can be posted'); }
 
         const run   = hdr.rows[0];
         const setup = (await client.query('SELECT * FROM ar_year_end_setup LIMIT 1')).rows[0];
@@ -199,24 +280,34 @@ const postRun = async (req, res) => {
             throw new Error('ยังไม่ได้ตั้งค่าบัญชีค่าเผื่อหนี้สงสัยจะสูญ');
         if (Math.abs(Number(run.adjustment_amount)) < 0.005) {
             await client.query('ROLLBACK');
-            return res.status(422).json({ error: 'ยอดปรับ adjustment_amount เป็น 0 ไม่ต้องบันทึก GL' });
+            return sendErr(res, 422, 'ยอดปรับ adjustment_amount เป็น 0 ไม่ต้องบันทึก GL');
+        }
+        // ยอดปรับ = ยอดที่ควรเป็น − ยอดสะสม ณ ตอนสร้าง — ถ้ายอดสะสมเปลี่ยนไปแล้ว (มีการโพสต์/ยกเลิกครั้งอื่น) ต้องสร้างใหม่
+        const priorNow = await getPriorAllowance(client, setup);
+        if (Math.abs(priorNow - Number(run.prior_allowance)) > 0.005) {
+            await client.query('ROLLBACK');
+            return sendErr(res, 422, `ยอดค่าเผื่อสะสมเปลี่ยนไปหลังสร้างรายการนี้ (เดิม ${Number(run.prior_allowance).toFixed(2)} ปัจจุบัน ${priorNow.toFixed(2)}) กรุณาลบแล้วสร้างใหม่`);
         }
 
-        // หา period
+        // หา period (GL + AR ต้องเปิด)
         const periodRes = await client.query(
             `SELECT id FROM gl_posting_period
              WHERE $1::date BETWEEN period_start_date AND period_end_date
-             AND gl_status = 'OPEN' LIMIT 1`, [run.run_date]
+             AND gl_status = 'OPEN' AND ar_status = 'OPEN' LIMIT 1`, [run.run_date]
         );
-        if (periodRes.rows.length === 0)
-            throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่ ${run.run_date}`);
+        if (periodRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return sendErr(res, 422, `งวดบัญชี/งวด AR ของวันที่ ${ymd(run.run_date)} ยังไม่เปิด โพสต์ไม่ได้`);
+        }
         const periodId = periodRes.rows[0].id;
 
         const adj    = Number(run.adjustment_amount);
         const isInc  = adj > 0;   // เพิ่มค่าเผื่อ: DR expense, CR contra
         const absAdj = Math.abs(adj);
 
-        const docNo = `ALLOW-${ymd(run.run_date).replace(/-/g, '')}`;
+        // ถอยแล้วโพสต์ใหม่ใช้เลขเดิม
+        const docNo = run.kept_gl_doc_no || await nextGlDocNo(client, setup.allowance_gl_doc_id, run.run_date,
+            `ALLOW-${ymd(run.run_date).replace(/-/g, '')}-${run.id}`);
 
         const glRes = await client.query(`
             INSERT INTO gl_entry_header
@@ -229,7 +320,7 @@ const postRun = async (req, res) => {
             RETURNING id
         `, [setup.allowance_gl_doc_id, docNo, run.run_date, periodId,
             `ค่าเผื่อหนี้สงสัยจะสูญ ปี ${run.period_year}`,
-            absAdj, updatedBy]);
+            absAdj, glUserOf(req)]);
         const glEntryId = glRes.rows[0].id;
 
         // DR Expense (เพิ่ม) หรือ CR Expense (ลด)
@@ -247,56 +338,92 @@ const postRun = async (req, res) => {
             isInc ? 0 : absAdj, isInc ? absAdj : 0]);
 
         await client.query(`
-            UPDATE ar_allowance_run SET status='Posted', gl_entry_id=$1, updated_by=$2, updated_at=NOW()
-            WHERE id=$3
-        `, [glEntryId, updatedBy, id]);
+            UPDATE ar_allowance_run SET status='Posted', gl_entry_id=$1, kept_gl_doc_no=$2, updated_by=$3, updated_at=NOW()
+            WHERE id=$4
+        `, [glEntryId, docNo, updatedBy, id]);
 
         await client.query('COMMIT');
         res.json({ success: true, gl_entry_id: glEntryId });
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('postRun error:', err);
-        res.status(500).json({ error: err.message });
+        sendErr(res, 500, err.message);
     } finally {
         client.release();
     }
 };
 
-// ── POST /api/ar/ar_allowance_run/:id/void ───────────────────────────────────
+// ── PUT /api/ar/ar_allowance_run/:id/reverse { reason } — Posted → Draft ─────
+const reverseRun = async (req, res) => {
+    const { id } = req.params;
+    const reason = reasonOf(req);
+    if (!reason) return sendErr(res, 400, 'กรุณาระบุเหตุผลการถอยเอกสาร');
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        await ensureRunColumns(client);
+        const run = (await client.query(`SELECT * FROM ar_allowance_run WHERE id=$1 FOR UPDATE`, [id])).rows[0];
+        if (!run) { await client.query('ROLLBACK'); return sendErr(res, 404, 'Not found'); }
+        const b = (await computeRunBlocks(client, id)).reverse_block;
+        if (b) { await client.query('ROLLBACK'); return sendErr(res, 400, b.message, { code: b.code, ref: b.ref }); }
+
+        await client.query(`
+            UPDATE ar_allowance_run SET status='Draft', gl_entry_id=NULL, updated_by=$1, updated_at=NOW()
+             WHERE id=$2`, [req.headers['username'] || null, id]);
+        if (run.gl_entry_id) await client.query(`DELETE FROM gl_entry_header WHERE id=$1`, [run.gl_entry_id]);
+        await logReverse(client, {
+            sysModule: '11', tableName: 'ar_allowance_run', recordId: Number(id), docNo: runLabel(run),
+            fromStatus: 'Posted', toStatus: 'Draft', reason, userId: userIdOf(req),
+        });
+        await client.query('COMMIT');
+        res.json({ success: true });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('reverseRun error:', err);
+        sendErr(res, 500, err.message);
+    } finally {
+        client.release();
+    }
+};
+
+// ── POST /api/ar/ar_allowance_run/:id/void { reason } ────────────────────────
 const voidRun = async (req, res) => {
     const { id } = req.params;
+    const reason = reasonOf(req);
+    if (!reason) return sendErr(res, 400, 'กรุณาระบุเหตุผลการยกเลิก');
     const updatedBy = req.headers['username'] || null;
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
+        await ensureRunColumns(client);
 
         const hdr = await client.query(
             `SELECT * FROM ar_allowance_run WHERE id=$1 FOR UPDATE`, [id]
         );
-        if (!hdr.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
-        if (hdr.rows[0].status !== 'Posted') { await client.query('ROLLBACK'); return res.status(422).json({ error: 'Only Posted can be voided' }); }
-
+        if (!hdr.rows[0]) { await client.query('ROLLBACK'); return sendErr(res, 404, 'Not found'); }
         const run   = hdr.rows[0];
-        const today = todayYmd();
+        const b = (await computeRunBlocks(client, id)).void_block;
+        if (b) { await client.query('ROLLBACK'); return sendErr(res, 400, b.message, { code: b.code, ref: b.ref }); }
 
+        const today = todayYmd();
         const todayPeriod = await client.query(
             `SELECT id FROM gl_posting_period
              WHERE $1::date BETWEEN period_start_date AND period_end_date
-             AND gl_status = 'OPEN' LIMIT 1`, [today]
+             AND gl_status = 'OPEN' AND ar_status = 'OPEN' LIMIT 1`, [today]
         );
-        if (todayPeriod.rows.length === 0)
-            throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่ยกเลิก ${today}`);
+        if (todayPeriod.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return sendErr(res, 400, `ไม่พบงวดบัญชี (GL/AR) ที่เปิดอยู่ สำหรับวันที่ยกเลิก ${today}`, { code: 'PERIOD_CLOSED' });
+        }
         const todayPeriodId = todayPeriod.rows[0].id;
 
+        let voidGlId = null;
         if (run.gl_entry_id) {
             const origHdr = (await client.query(
                 `SELECT * FROM gl_entry_header WHERE id=$1`, [run.gl_entry_id]
             )).rows[0];
-            const origDtl = (await client.query(
-                `SELECT * FROM gl_entry_detail WHERE header_id=$1 ORDER BY line_no`, [run.gl_entry_id]
-            )).rows;
-
-            const revDocNo = `VOID-ALLOW-${today.replace(/-/g, '')}`;
+            const revDocNo = await nextGlDocNo(client, origHdr.doc_id, today, `VOID-ALLOW-${today.replace(/-/g, '')}-${run.id}`);
+            // ref_doc_id อ้างอิงประเภทเอกสาร (FK sa_module_document) จึงใช้ doc_id ของรายการเดิม
             const revRes = await client.query(`
                 INSERT INTO gl_entry_header
                 (doc_id, doc_no, doc_date, posting_date, period_id, description,
@@ -306,56 +433,67 @@ const voidRun = async (req, res) => {
                 VALUES ($1,$2,$3::date,$3::date,$4,$5,$6,1,'Posted',$7,$8,$7,$8,$9,$10,$11,$12)
                 RETURNING id
             `, [origHdr.doc_id, revDocNo, today, todayPeriodId,
-                `[ยกเลิก] ${origHdr.doc_no}`, origHdr.currency_id,
+                `[ยกเลิก ${origHdr.doc_no}] ${reason}`, origHdr.currency_id,
                 origHdr.total_credit_lc, origHdr.total_debit_lc,
-                updatedBy, run.gl_entry_id, origHdr.doc_no, origHdr.doc_date]);
-            const voidGlId = revRes.rows[0].id;
-
-            for (const d of origDtl) {
-                await client.query(`
-                    INSERT INTO gl_entry_detail
-                    (header_id, line_no, account_id, debit_lc, credit_lc, debit_fc, credit_fc)
-                    VALUES ($1,$2,$3,$4,$5,$4,$5)
-                `, [voidGlId, d.line_no, d.account_id, d.credit_lc, d.debit_lc]);
-            }
+                glUserOf(req), origHdr.doc_id, origHdr.doc_no, origHdr.doc_date]);
+            voidGlId = revRes.rows[0].id;
+            await client.query(`
+                INSERT INTO gl_entry_detail
+                (header_id, line_no, account_id, debit_lc, credit_lc, debit_fc, credit_fc)
+                SELECT $1, line_no, account_id, credit_lc, debit_lc, credit_lc, debit_lc
+                  FROM gl_entry_detail WHERE header_id = $2 ORDER BY line_no
+            `, [voidGlId, run.gl_entry_id]);
         }
 
         await client.query(`
-            UPDATE ar_allowance_run SET status='Void', updated_by=$1, updated_at=NOW()
-            WHERE id=$2
-        `, [updatedBy, id]);
+            UPDATE ar_allowance_run SET status='Void', void_reason=$1, voided_by=$2, voided_at=NOW(),
+                   void_gl_entry_id=$3, updated_by=$2, updated_at=NOW()
+            WHERE id=$4
+        `, [reason, updatedBy, voidGlId, id]);
+        await logReverse(client, {
+            sysModule: '11', tableName: 'ar_allowance_run', recordId: Number(id), docNo: runLabel(run),
+            fromStatus: 'Posted', toStatus: 'Void', reason, userId: userIdOf(req),
+        });
 
         await client.query('COMMIT');
         res.json({ success: true });
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('voidRun error:', err);
-        res.status(500).json({ error: err.message });
+        sendErr(res, 500, err.message);
     } finally {
         client.release();
     }
 };
 
-// ── DELETE /api/ar/ar_allowance_run/:id ──────────────────────────────────────
+// ── DELETE /api/ar/ar_allowance_run/:id { reason } — เฉพาะร่าง เก็บไว้ด้วยสถานะ Deleted ──
 const deleteRun = async (req, res) => {
     const { id } = req.params;
+    const reason = reasonOf(req);
+    if (!reason) return sendErr(res, 400, 'กรุณาระบุเหตุผลการลบเอกสาร');
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
-        const hdr = await client.query(`SELECT status FROM ar_allowance_run WHERE id=$1`, [id]);
-        if (!hdr.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
-        if (hdr.rows[0].status !== 'Draft') { await client.query('ROLLBACK'); return res.status(422).json({ error: 'Only Draft can be deleted' }); }
-        await client.query(`DELETE FROM ar_allowance_run_detail WHERE run_id=$1`, [id]);
-        await client.query(`DELETE FROM ar_allowance_run WHERE id=$1`, [id]);
+        await ensureRunColumns(client);
+        const hdr = await client.query(`SELECT * FROM ar_allowance_run WHERE id=$1 FOR UPDATE`, [id]);
+        if (!hdr.rows[0]) { await client.query('ROLLBACK'); return sendErr(res, 404, 'Not found'); }
+        const b = (await computeRunBlocks(client, id)).delete_block;
+        if (b) { await client.query('ROLLBACK'); return sendErr(res, 422, b.message, { code: b.code }); }
+        await client.query(`UPDATE ar_allowance_run SET status='Deleted', updated_by=$1, updated_at=NOW() WHERE id=$2`,
+            [req.headers['username'] || null, id]);
+        await logReverse(client, {
+            sysModule: '11', tableName: 'ar_allowance_run', recordId: Number(id), docNo: runLabel(hdr.rows[0]),
+            fromStatus: 'Draft', toStatus: 'Deleted', reason, userId: userIdOf(req),
+        });
         await client.query('COMMIT');
         res.json({ success: true });
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('deleteRun error:', err);
-        res.status(500).json({ error: err.message });
+        sendErr(res, 500, err.message);
     } finally {
         client.release();
     }
 };
 
-module.exports = { fetchRows, fetchRow, previewRun, createRun, postRun, voidRun, deleteRun };
+module.exports = { fetchRows, fetchRow, previewRun, createRun, postRun, reverseRun, voidRun, deleteRun, computeRunBlocks };

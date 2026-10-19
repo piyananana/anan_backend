@@ -135,6 +135,7 @@ router.post('/ap_fx_revaluation/preview',               apFxRevaluationControlle
 router.post('/ap_fx_revaluation',                       apFxRevaluationController.createReval);
 router.post('/ap_fx_revaluation/:id/post',              apFxRevaluationController.postReval);
 router.post('/ap_fx_revaluation/:id/void',              apFxRevaluationController.voidReval);
+router.put('/ap_fx_revaluation/:id/reverse',            apFxRevaluationController.reverseReval);
 router.delete('/ap_fx_revaluation/:id',                 apFxRevaluationController.deleteReval);
 
 // ── AP Remittance Advice — batch BEFORE /:payment_id ──────────────────────────
