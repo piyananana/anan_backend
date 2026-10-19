@@ -1,6 +1,11 @@
 // controllers/ar/arTransactionController.js
 const { today: todayYmd } = require('../../utils/dateUtil');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
+const { branchCodeSql } = require('../../utils/taxBranch');
+const { ensureSalespersonTable, saveDocSalespersons, loadSalespersons } = require('../../utils/docSalesperson');
+
+// พนักงานขายของเอกสาร (รายชื่อ — สัดส่วนอยู่ที่ข้อมูลลูกค้า) — ใบแจ้งหนี้/เพิ่มหนี้/ลดหนี้
+const ensureArSalesperson = (db) => ensureSalespersonTable(db, 'ar_transaction_salesperson', 'ar_transaction', 'header_id');
 
 // --- Helper: Generate Document Number (supports per-branch counter) ---
 const generateDocNo = async (client, docId, date, branchId = null) => {
@@ -93,9 +98,10 @@ const insertVtRecords = async (client, headerId, header, details, sysDocType) =>
              doc_no, doc_date, vat_rate,
              base_amount_lc, vat_amount_lc, base_amount_fc, vat_amount_fc,
              currency_id, exchange_rate,
-             customer_id, entity_name, entity_tax_id,
+             customer_id, entity_name, entity_tax_id, entity_branch_code,
              created_by)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+                    COALESCE($17, (SELECT tax_id FROM ar_customer WHERE id = $15)), ${branchCodeSql('ar_customer', '$15')},$18)
         `, [
             'AR', 'OUTPUT_VAT', header.doc_id, headerId, d.id || null,
             header.doc_no, header.doc_date, d.vat_rate ?? 7,
@@ -159,9 +165,10 @@ const insertDeferredVtRecordsForReceipt = async (client, receiptHeaderId, receip
                  doc_no, doc_date, vat_rate,
                  base_amount_lc, vat_amount_lc, base_amount_fc, vat_amount_fc,
                  currency_id, exchange_rate,
-                 customer_id, entity_name, entity_tax_id,
+                 customer_id, entity_name, entity_tax_id, entity_branch_code,
                  created_by)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+                    COALESCE($17, (SELECT tax_id FROM ar_customer WHERE id = $15)), ${branchCodeSql('ar_customer', '$15')},$18)
             `, [
                 'AR', 'VAT_DEFERRED', receiptHeader.doc_id, receiptHeaderId, d.id,
                 receiptHeader.doc_no, receiptHeader.doc_date, d.vat_rate ?? 7,
@@ -1075,6 +1082,7 @@ const ensurePaymentTable = async (client) => {
 // --- 1. Create Transaction (Draft/Post) ---
 const createTransaction = async (req, res) => {
     const { header, details, applies, payments, action } = req.body; // action: 'Draft' | 'Post'
+    await ensureArSalesperson(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
@@ -1155,6 +1163,7 @@ const createTransaction = async (req, res) => {
             header.billing_date || null, header.expected_payment_date || null
         ]);
         const newHeaderId = hRes.rows[0].id;
+        await saveDocSalespersons(client, 'ar_transaction_salesperson', 'header_id', newHeaderId, req.body.salespersons);
 
         // Insert details
         const detailSql = `
@@ -1272,6 +1281,7 @@ const createTransaction = async (req, res) => {
 const updateTransaction = async (req, res) => {
     const { id } = req.params;
     const { header, details, applies, payments, action } = req.body;
+    await ensureArSalesperson(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
@@ -1327,6 +1337,8 @@ const updateTransaction = async (req, res) => {
             header.branch_id || null, header.updated_by || null,
             header.billing_date || null, header.expected_payment_date || null, id
         ]);
+
+        await saveDocSalespersons(client, 'ar_transaction_salesperson', 'header_id', id, req.body.salespersons);
 
         // Replace details
         await client.query('DELETE FROM ar_transaction_detail WHERE header_id=$1', [id]);
@@ -1809,6 +1821,8 @@ const fetchRow = async (req, res) => {
         const rBlock = info ? getArReverseBlock(info) : null;
         const vBlock = info ? getArVoidBlock(info) : null;
         const history = await getReverseHistory(req.dbPool, 'ar_transaction', Number(id));
+        await ensureArSalesperson(req.dbPool);
+        const salespersons = await loadSalespersons(req.dbPool, 'ar_transaction_salesperson', 'header_id', id);
 
         res.json({
             header: hRes.rows[0], details: detailsRes.rows, applies: appliesRes.rows, payments: paymentsRows,
@@ -1817,6 +1831,7 @@ const fetchRow = async (req, res) => {
             void_block: vBlock ? vBlock.code : null,
             void_block_ref: vBlock ? (vBlock.ref || null) : null,
             reverse_history: history,
+            salespersons,
         });
     } catch (err) {
         res.status(500).json({ error: err.message });

@@ -13,6 +13,17 @@ const { fetchSetupByDocCode } = require('./imGlAccountSetupController');
 const { fetchMode, fetchSettingRow } = require('./imAccountingSettingController');
 const { today: todayYmd, ymd } = require('../../utils/dateUtil');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
+const { branchCodeSql } = require('../../utils/taxBranch');
+const { ensureSalespersonTable, saveDocSalespersons, loadSalespersons, copySalespersons } = require('../../utils/docSalesperson');
+
+// พนักงานขายของเอกสารฝั่งขาย (ส่งสินค้า/รับคืน/ลดหนี้/เพิ่มหนี้ลูกหนี้) — คัดลอกไปใบแจ้งหนี้ AR ที่สร้างอัตโนมัติ
+// สร้างทั้งของ IM และ AR พร้อมกัน (เรียกด้วย pool นอก transaction) เพราะ Post IM คัดลอกไป AR
+const ensureImSalesperson = async (db) => {
+    await ensureSalespersonTable(db, 'ar_transaction_salesperson', 'ar_transaction', 'header_id');
+    await ensureSalespersonTable(db, 'im_transaction_salesperson', 'im_transaction', 'header_id');
+};
+const saveImSalespersons = (client, id, list) =>
+    saveDocSalespersons(client, 'im_transaction_salesperson', 'header_id', id, list);
 
 // ปัดเป็น 2 ตำแหน่ง (ปัดครึ่งหนีศูนย์แบบเดียวกับ numeric ของ PostgreSQL) — ทุกยอดที่ลง GL/AP/AR ต้องปัดทีละบรรทัด
 // ก่อนรวม ไม่งั้นฐานข้อมูลปัดแต่ละช่องแยกกันแล้วเดบิต/เครดิตต่างกัน 0.01 (เช่น 40.3333 + VAT 2.8233 = 43.1566:
@@ -798,8 +809,9 @@ const insertImVtLine = async (client, {
         (module_code, vat_type, doc_id, source_header_id, source_detail_id,
          doc_no, doc_date, vat_rate,
          base_amount_lc, vat_amount_lc, base_amount_fc, vat_amount_fc,
-         currency_id, exchange_rate, ${entityIdField}, entity_name, entity_tax_id, created_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$9,$10,1,1,$11,$12,$13,$14)
+         currency_id, exchange_rate, ${entityIdField}, entity_name, entity_tax_id, entity_branch_code, created_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$9,$10,1,1,$11,$12,$13,
+                ${branchCodeSql(entityIdField === 'customer_id' ? 'ar_customer' : 'ap_vendor', '$11')},$14)
     `, [
         moduleCode, vatType, docId, headerId, detailId,
         docNo, docDate, vatRate,
@@ -1731,6 +1743,9 @@ const postDetailLines = async (client, headerId, header, docNo) => {
         UPDATE im_transaction SET status='Posted', gl_entry_id=$1, linked_ap_transaction_id=$2, linked_ar_transaction_id=$3,
             total_qty=$4, total_value_lc=$5, updated_at=NOW() WHERE id=$6
     `, [glEntryId, linkedApTransactionId, linkedArTransactionId, totalQty, totalValue, headerId]);
+    if (linkedArTransactionId) {
+        await copyImSalespersonsToAr(client, headerId, linkedArTransactionId);
+    }
     // ต้องทำ *หลัง* UPDATE สถานะ GRN เป็น Posted ข้างบนเสมอ (ดูเหตุผลเดียวกับ branch '12' ข้างบน)
     for (const poId of touchedPoIds) {
         await refreshPoStatus(client, poId);
@@ -1781,8 +1796,10 @@ const fetchRowById = async (pool, id) => {
         LEFT JOIN im_location l  ON l.id = dt.location_id
         LEFT JOIN im_location tl ON tl.id = dt.to_location_id
         WHERE dt.header_id = $1 ORDER BY dt.line_no`, [id]);
+    await ensureImSalesperson(pool);
     return {
         ...hRes.rows[0], details: dRes.rows,
+        salespersons: await loadSalespersons(pool, 'im_transaction_salesperson', 'header_id', id),
         ...(await computeImBlocks(pool, id)),
         reverse_history: await getReverseHistory(pool, 'im_transaction', Number(id)),
     };
@@ -1935,12 +1952,22 @@ const fetchReturnableLines = async (req, res) => {
 // ใช้ได้ 2 ทาง: (1) createTransaction (HTTP handler ด้านล่าง) ส่ง docId ที่ผู้ใช้เลือกมาจาก dropdown
 // (2) imStockCountController.closeCount เรียกตรงๆ ด้วย sysDocType='80' (มาตรฐาน AJS) โดยไม่เจาะจง doc_code —
 //     ให้ resolve เอาเองว่าจะใช้ doc_code ไหนใต้มาตรฐานนี้ (เผื่อมีหลาย doc_code ต่อ sys_doc_type)
+// พนักงานขาย IM → ใบแจ้งหนี้/ลดหนี้/เพิ่มหนี้ AR ที่สร้างอัตโนมัติ (รายชื่อเดียวกัน)
+const copyImSalespersonsToAr = async (client, imId, arId) => {
+    // ผู้เรียกอื่นที่ไม่ผ่านหน้าจอ (ยังไม่เคยสร้างตาราง) — ไม่มีพนักงานขายให้คัดลอก ข้ามไป
+    const t = (await client.query(`SELECT to_regclass('im_transaction_salesperson') IS NOT NULL AND to_regclass('ar_transaction_salesperson') IS NOT NULL AS ok`)).rows[0];
+    if (!t.ok) return;
+    await copySalespersons(client,
+        { table: 'im_transaction_salesperson', fk: 'header_id', id: imId },
+        { table: 'ar_transaction_salesperson', fk: 'header_id', id: arId });
+};
+
 const insertAndPostAdjustment = async (client, {
     docId, docCode, sysDocType, docNo, docDate, warehouseId, toWarehouseId, vendorId, customerId,
     refNo, refDocId, refDocNo, refImTransactionId, refPoId, refSoId, refMoId, description,
     currencyId, currencyCode, exchangeRate,
     dim1Id, dim2Id, dim3Id, dim4Id, dim5Id, branchId, createdBy,
-    lines, action, glDocNo,
+    lines, action, glDocNo, salespersons,
 }) => {
     let resolvedDocId = docId;
     let resolvedDocCode = docCode;
@@ -2097,6 +2124,9 @@ const insertAndPostAdjustment = async (client, {
         ]);
     }
 
+    // พนักงานขาย — บันทึกก่อน Post เพื่อให้ใบแจ้งหนี้ AR อัตโนมัติคัดลอกไปได้
+    await saveImSalespersons(client, newHeaderId, salespersons);
+
     if ((action || 'Post') === 'Post') {
         const headerForPost = {
             doc_id: resolvedDocId, doc_code: resolvedDocCode, doc_date: docDate, warehouse_id: warehouseId, to_warehouse_id: toWarehouseId || null,
@@ -2115,6 +2145,7 @@ const insertAndPostAdjustment = async (client, {
 
 const createTransaction = async (req, res) => {
     const { header, details, action } = req.body;
+    await ensureImSalesperson(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
@@ -2132,7 +2163,7 @@ const createTransaction = async (req, res) => {
             dim1Id: header.dim1_id, dim2Id: header.dim2_id, dim3Id: header.dim3_id,
             dim4Id: header.dim4_id, dim5Id: header.dim5_id,
             branchId: header.branch_id, createdBy: header.created_by,
-            lines: details, action,
+            lines: details, action, salespersons: req.body.salespersons,
         });
 
         await client.query('COMMIT');
@@ -2214,6 +2245,7 @@ const createMoReceipt = async (req, res) => {
 const updateTransaction = async (req, res) => {
     const { id } = req.params;
     const { header, details } = req.body;
+    await ensureImSalesperson(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
@@ -2256,6 +2288,7 @@ const updateTransaction = async (req, res) => {
                     [d.unit_price ?? null, d.id, id]
                 );
             }
+            await saveImSalespersons(client, id, req.body.salespersons);
             await client.query('COMMIT');
             const full = await fetchRowById(req.dbPool, id);
             return res.status(200).json(full);
@@ -2344,6 +2377,7 @@ const updateTransaction = async (req, res) => {
             header.branch_id || null, header.updated_by || null, id, header.ref_mo_id || null,
         ]);
 
+        await saveImSalespersons(client, id, req.body.salespersons);
         await client.query(`DELETE FROM im_transaction_detail WHERE header_id=$1`, [id]);
         // unit_cost (LC) คำนวณจาก unit_cost_fc * exchange_rate ของเอกสารนี้ — มิเรอร์ insertAndPostAdjustment ทุกประการ
         const updRate = Number(header.exchange_rate) || 1;
@@ -2380,6 +2414,7 @@ const updateTransaction = async (req, res) => {
 const postTransaction = async (req, res) => {
     const { id } = req.params;
     const userName = req.headers.username || null;
+    await ensureImSalesperson(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
@@ -2483,6 +2518,7 @@ const postBillingForDln = async (req, res) => {
     const { id } = req.params;
     const { ref_no: refNoBody, lines } = req.body || {};
     const userName = req.headers.username || null;
+    await ensureImSalesperson(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
@@ -2515,6 +2551,8 @@ const postBillingForDln = async (req, res) => {
         }
 
         const detailsRes = await client.query(`SELECT * FROM im_transaction_detail WHERE header_id=$1 ORDER BY line_no`, [id]);
+        // พนักงานขายที่แก้ในหน้าจอพร้อมกับการออกใบแจ้งหนี้ (ไม่บังคับ Save แยกก่อน เหมือนราคาขาย)
+        await saveImSalespersons(client, id, req.body?.salespersons);
         const headerForBilling = { ...tx, doc_code: tx.doc_code || tx.d_doc_code, updated_by: userName, ref_no: refNoBody || tx.ref_no };
         const arTransactionId = await postArBillFromDln(client, {
             header: headerForBilling, details: detailsRes.rows, docNo: tx.doc_no,
@@ -2523,6 +2561,7 @@ const postBillingForDln = async (req, res) => {
         await client.query(`
             UPDATE im_transaction SET status='Posted', linked_ar_transaction_id=$1, updated_by=$2, updated_at=NOW() WHERE id=$3
         `, [arTransactionId, userName, id]);
+        await copyImSalespersonsToAr(client, id, arTransactionId);
 
         await client.query('COMMIT');
         const full = await fetchRowById(req.dbPool, id);

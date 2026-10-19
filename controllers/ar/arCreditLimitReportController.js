@@ -1,3 +1,4 @@
+const { ensureSalespersonTable } = require('../../utils/docSalesperson');
 // controllers/ar/arCreditLimitReportController.js
 // รายงานวงเงินคงเหลือลูกหนี้
 
@@ -10,6 +11,8 @@ const getCreditLimitReport = async (req, res) => {
         credit_status, // 'over' | 'remaining' | 'full' | '' (all)
         sort_by,       // 'customer' | 'remaining_asc' | 'remaining_desc'
     } = req.query;
+
+    await ensureSalespersonTable(req.dbPool, 'ar_customer_salesperson', 'ar_customer', 'customer_id');
 
     const client = await req.dbPool.connect();
     try {
@@ -28,7 +31,9 @@ const getCreditLimitReport = async (req, res) => {
         }
         if (salesperson_id) {
             params.push(parseInt(salesperson_id));
-            filters.push(`c.salesperson_id = $${params.length}`);
+            // ลูกค้าที่มีพนักงานขายคนนี้ (คนหลักหรือคนร่วม) — รายงานวงเงินเป็นระดับลูกค้า ไม่มีเอกสารให้ผูก
+            filters.push(`(c.salesperson_id = $${params.length} OR EXISTS (SELECT 1 FROM ar_customer_salesperson xs
+                WHERE xs.customer_id = c.id AND xs.salesperson_id = $${params.length}))`);
         }
         if (customer_code_from) {
             params.push(customer_code_from);

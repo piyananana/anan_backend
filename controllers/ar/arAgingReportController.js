@@ -1,5 +1,6 @@
 // controllers/ar/arAgingReportController.js
 const { today } = require('../../utils/dateUtil');
+const { arDocSalespersonSql, ensureArDocSalesperson } = require('../../utils/docSalesperson');
 // รายงานลูกหนี้คงค้างตามอายุ (AR Aging Report)
 
 const getAgingReport = async (req, res) => {
@@ -13,6 +14,7 @@ const getAgingReport = async (req, res) => {
     } = req.query;
 
     const asOf = as_of_date || today();
+    await ensureArDocSalesperson(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         const params = [asOf];
@@ -33,7 +35,8 @@ const getAgingReport = async (req, res) => {
         // พนักงานขาย
         if (salesperson_id) {
             params.push(parseInt(salesperson_id));
-            filters.push(`c.salesperson_id = $${params.length}`);
+            // พนักงานขายของเอกสาร (ไม่ใช่ของลูกค้า) — ใบรับชำระ/ลดหนี้นับตามใบขายที่ตัด
+            filters.push(arDocSalespersonSql('t', `$${params.length}`));
         }
 
         // รหัสลูกค้า ตั้งแต่

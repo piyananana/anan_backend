@@ -12,6 +12,10 @@
 const { generateDocNo, ensureImTransactionTable } = require('../im/imTransactionController');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { reasonOf, userIdOf, sendErr, blk } = require('../../utils/docAction');
+const { ensureSalespersonTable, saveDocSalespersons, loadSalespersons } = require('../../utils/docSalesperson');
+
+// พนักงานขายของใบสั่งขาย (รายชื่อ — สัดส่วนอยู่ที่ข้อมูลลูกค้า)
+const ensureDocSalesperson = (db) => ensureSalespersonTable(db, 'so_transaction_salesperson', 'so_transaction', 'header_id');
 
 const ensureSoTransactionTable = async (client) => {
     await client.query(`
@@ -107,7 +111,9 @@ const fetchRowById = async (pool, id) => {
         FROM so_transaction_detail dt
         LEFT JOIN im_uom u ON u.id = dt.uom_id
         WHERE dt.header_id = $1 ORDER BY dt.line_no`, [id]);
-    return { ...hRes.rows[0], details: dRes.rows };
+    await ensureDocSalesperson(pool);
+    const salespersons = await loadSalespersons(pool, 'so_transaction_salesperson', 'header_id', id);
+    return { ...hRes.rows[0], details: dRes.rows, salespersons };
 };
 
 // --- GET list ---
@@ -165,6 +171,7 @@ const fetchRow = async (req, res) => {
 // --- 1. Create (always Draft — Approve is a separate explicit action) ---
 const createTransaction = async (req, res) => {
     const { header, details } = req.body;
+    await ensureDocSalesperson(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
@@ -238,6 +245,7 @@ const createTransaction = async (req, res) => {
             }
         }
         await client.query(`UPDATE so_transaction SET total_qty=$1, total_value_lc=$2 WHERE id=$3`, [totalQty, totalValue, headerId]);
+        await saveDocSalespersons(client, 'so_transaction_salesperson', 'header_id', headerId, req.body.salespersons);
         for (const quoteId of affectedQuoteIds) { await refreshQuoteStatus(client, quoteId); }
 
         await client.query('COMMIT');
@@ -254,6 +262,7 @@ const createTransaction = async (req, res) => {
 const updateTransaction = async (req, res) => {
     const { id } = req.params;
     const { header, details } = req.body;
+    await ensureDocSalesperson(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
@@ -343,6 +352,7 @@ const updateTransaction = async (req, res) => {
             }
         }
         await client.query(`UPDATE so_transaction SET total_qty=$1, total_value_lc=$2 WHERE id=$3`, [totalQty, totalValue, id]);
+        await saveDocSalespersons(client, 'so_transaction_salesperson', 'header_id', id, req.body.salespersons);
         for (const quoteId of affectedQuoteIds) { await refreshQuoteStatus(client, quoteId); }
 
         await client.query('COMMIT');

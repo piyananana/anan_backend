@@ -1,5 +1,6 @@
 // controllers/ar/arTransactionReportController.js
 const { today } = require('../../utils/dateUtil');
+const { arDocSalespersonSql, ensureArDocSalesperson } = require('../../utils/docSalesperson');
 // รายงานธุรกรรมลูกหนี้ — ยอดสรุปและรายละเอียดตามประเภทเอกสาร
 
 const AR_TYPES = ['10', '30', '35', '50', '55', '60', '65', '80'];
@@ -14,6 +15,8 @@ const getTransactionReport = async (req, res) => {
 
     const dateFrom = date_from || today();
     const dateTo   = date_to   || today();
+
+    await ensureArDocSalesperson(req.dbPool);
 
     const client = await req.dbPool.connect();
     try {
@@ -37,7 +40,8 @@ const getTransactionReport = async (req, res) => {
         }
         if (salesperson_id) {
             params.push(parseInt(salesperson_id));
-            filters.push(`c.salesperson_id = $${params.length}`);
+            // พนักงานขายของเอกสาร (ไม่ใช่ของลูกค้า) — ใบรับชำระ/ลดหนี้นับตามใบขายที่ตัด
+            filters.push(arDocSalespersonSql('t', `$${params.length}`));
         }
         if (customer_code_from) {
             params.push(customer_code_from);

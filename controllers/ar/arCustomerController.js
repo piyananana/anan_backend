@@ -5,6 +5,21 @@ const { generateNextCodeForGroup } = require('./arCustomerGroupController');
 // ลูกค้ารายนี้ใช้ ลูกค้าแต่ละรายใช้ได้รหัสเดียวเท่านั้น (ดู resolveItemPrice ใน imPriceListController.js) — ไม่ใช่
 // price_group_id (im_price_group เป็นแค่หมวดหมู่ของตารางราคา ไม่ใช่สิ่งที่ลูกค้าผูกตรง)
 const { ensureImPriceListTable } = require('../im/imPriceListController');
+const { normalizeTaxBranch } = require('../../utils/taxBranch');
+const { ensureSalespersonTable, normalizeSalespersons, replaceSalespersons, loadSalespersons } = require('../../utils/docSalesperson');
+
+// พนักงานขายหลายคนต่อลูกค้า + สัดส่วน % / จำนวนเงิน (กรอกที่นี่ที่เดียว — เอกสารขายเก็บแค่รายชื่อ) — ar_customer.salesperson_id = คนหลัก (sync ให้หน้าจอ/รายงานเดิม)
+const ensureCustomerSalesperson = (db) =>
+  ensureSalespersonTable(db, 'ar_customer_salesperson', 'ar_customer', 'customer_id');
+
+// body.salespersons (ใหม่) หรือ salesperson_id เดี่ยว (client เก่า / import)
+const salespersonRowsOf = (body) => Array.isArray(body.salespersons)
+  ? normalizeSalespersons(body.salespersons, true)
+  : normalizeSalespersons(body.salesperson_id ? [{ salesperson_id: body.salesperson_id, is_primary: true }] : [], true);
+
+// รหัสสาขาตามทะเบียน VAT (5 หลัก, 00000 = สำนักงานใหญ่) — 1 สาขา = 1 รหัสลูกค้า
+const ensureTaxBranchColumn = (db) =>
+  db.query(`ALTER TABLE ar_customer ADD COLUMN IF NOT EXISTS tax_branch_code VARCHAR(5)`).catch(() => {});
 
 const fetchRowById = async (pool, id) => {
   await ensureImPriceListTable(pool);
@@ -12,7 +27,9 @@ const fetchRowById = async (pool, id) => {
   // price_group_id รุ่นก่อนหน้า (ผูกกับ im_price_group ตรงๆ) ไม่มีข้อมูลจริงเลยตอนที่แก้ (เช็คแล้ว) แทนที่ด้วย
   // price_list_id ข้างบนนี้ทั้งหมด — ลบคอลัมน์เก่าทิ้งได้ปลอดภัย
   await pool.query(`ALTER TABLE ar_customer DROP COLUMN IF EXISTS price_group_id`).catch(() => {});
-  const [mainResult, addresses, contacts, banks, billingConds, paymentConds] =
+  await ensureTaxBranchColumn(pool);
+  await ensureCustomerSalesperson(pool);
+  const [mainResult, addresses, contacts, banks, billingConds, paymentConds, salespersons] =
     await Promise.all([
       pool.query(`
         SELECT
@@ -25,6 +42,7 @@ const fetchRowById = async (pool, id) => {
           t.territory_name_thai AS sales_territory_name_thai,
           sp.salesperson_code,
           sp.salesperson_name_thai,
+          sp.salesperson_name_eng,
           bc.collector_code      AS billing_collector_code,
           bc.collector_name_thai AS billing_collector_name_thai,
           cc.collector_code      AS collection_collector_code,
@@ -52,6 +70,7 @@ const fetchRowById = async (pool, id) => {
       pool.query(`SELECT * FROM ar_customer_bank_account WHERE customer_id=$1 ORDER BY id`, [id]),
       pool.query(`SELECT * FROM ar_customer_billing_condition  WHERE customer_id=$1 ORDER BY sort_order, id`, [id]),
       pool.query(`SELECT * FROM ar_customer_payment_condition  WHERE customer_id=$1 ORDER BY sort_order, id`, [id]),
+      loadSalespersons(pool, 'ar_customer_salesperson', 'customer_id', id),
     ]);
   if (mainResult.rows.length === 0) return null;
   return {
@@ -61,6 +80,14 @@ const fetchRowById = async (pool, id) => {
     bank_accounts:      banks.rows,
     billing_conditions: billingConds.rows,
     payment_conditions: paymentConds.rows,
+    // ยังไม่ได้รัน sql/ar_customer_salesperson.sql → แสดงพนักงานขายเดิม (คนเดียว) เป็นคนหลัก กันบันทึกทับจนหาย
+    salespersons: salespersons.length || !mainResult.rows[0].salesperson_id ? salespersons : [{
+      salesperson_id: mainResult.rows[0].salesperson_id, line_no: 1, is_primary: true,
+      share_percent: null, share_amount: null,
+      salesperson_code: mainResult.rows[0].salesperson_code,
+      salesperson_name_thai: mainResult.rows[0].salesperson_name_thai,
+      salesperson_name_eng: mainResult.rows[0].salesperson_name_eng,
+    }],
   };
 };
 
@@ -74,10 +101,11 @@ const fetchRows = async (req, res) => {
     await ensureImPriceListTable(req.dbPool);
     await req.dbPool.query(`ALTER TABLE ar_customer ADD COLUMN IF NOT EXISTS price_list_id INTEGER REFERENCES im_price_list(id)`).catch(() => {});
     await req.dbPool.query(`ALTER TABLE ar_customer DROP COLUMN IF EXISTS price_group_id`).catch(() => {});
+    await ensureTaxBranchColumn(req.dbPool);
     let query = `
       SELECT
         c.id, c.customer_code, c.old_customer_code, c.customer_name_th, c.customer_name_en,
-        c.tax_id, c.credit_term_months, c.credit_term_days, c.credit_limit, c.discount_percent,
+        c.tax_id, c.tax_branch_code, c.credit_term_months, c.credit_term_days, c.credit_limit, c.discount_percent,
         c.currency_code, c.is_active, c.requires_billing, c.is_code_auto_generated,
         c.business_type_id,  cbt.business_type_code, cbt.business_type_name_thai,
         c.customer_group_id, acg.group_code AS customer_group_code,
@@ -212,7 +240,7 @@ const insertRelated = async (client, cid, addresses, contacts, bank_accounts, bi
 // POST /ar_customer
 const addRow = async (req, res) => {
   const {
-    customer_code, old_customer_code, customer_name_th, customer_name_en, tax_id,
+    customer_code, old_customer_code, customer_name_th, customer_name_en, tax_id, tax_branch_code,
     business_type_id, customer_group_id, price_list_id,
     credit_term_months, credit_term_days, credit_limit, discount_percent,
     currency_code, is_active, remark,
@@ -224,6 +252,13 @@ const addRow = async (req, res) => {
     billing_collector_id, collection_collector_id,
   } = req.body;
   const userName = req.headers.username;
+  const branch = normalizeTaxBranch(tax_branch_code);
+  if (branch.error) return res.status(400).json({ message: branch.error });
+  const sps = salespersonRowsOf(req.body);
+  if (sps.error) return res.status(400).json({ message: sps.error });
+  const primarySpId = sps.rows.find(r => r.is_primary)?.salesperson_id ?? null;
+  await ensureTaxBranchColumn(req.dbPool);
+  await ensureCustomerSalesperson(req.dbPool);
   const client = await req.dbPool.connect();
   try {
     await client.query('BEGIN');
@@ -256,8 +291,8 @@ const addRow = async (req, res) => {
           sales_territory_id, salesperson_id,
           billing_collector_id, collection_collector_id,
           is_code_auto_generated,
-          created_by, updated_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$23)
+          created_by, updated_by, tax_branch_code)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$23,$24)
        RETURNING id`,
       [
         finalCode, old_customer_code || null,
@@ -271,14 +306,15 @@ const addRow = async (req, res) => {
         remark || null,
         requires_billing ?? false,
         ar_account_id ?? null,
-        sales_territory_id ?? null, salesperson_id ?? null,
+        sales_territory_id ?? null, primarySpId,
         billing_collector_id ?? null, collection_collector_id ?? null,
         isCodeAutoGenerated,
-        userName,
+        userName, branch.value,
       ]
     );
     const cid = result.rows[0].id;
     await insertRelated(client, cid, addresses, contacts, bank_accounts, billing_conditions, payment_conditions);
+    await replaceSalespersons(client, 'ar_customer_salesperson', 'customer_id', cid, sps.rows);
     await client.query('COMMIT');
     const full = await fetchRowById(req.dbPool, cid);
     res.status(201).json(full);
@@ -296,7 +332,7 @@ const addRow = async (req, res) => {
 const updateRow = async (req, res) => {
   const { id } = req.params;
   const {
-    customer_code, old_customer_code, customer_name_th, customer_name_en, tax_id,
+    customer_code, old_customer_code, customer_name_th, customer_name_en, tax_id, tax_branch_code,
     business_type_id, customer_group_id, price_list_id,
     credit_term_months, credit_term_days, credit_limit, discount_percent,
     currency_code, is_active, remark,
@@ -308,6 +344,13 @@ const updateRow = async (req, res) => {
     billing_collector_id, collection_collector_id,
   } = req.body;
   const userName = req.headers.username;
+  const branch = normalizeTaxBranch(tax_branch_code);
+  if (branch.error) return res.status(400).json({ message: branch.error });
+  const sps = salespersonRowsOf(req.body);
+  if (sps.error) return res.status(400).json({ message: sps.error });
+  const primarySpId = sps.rows.find(r => r.is_primary)?.salesperson_id ?? null;
+  await ensureTaxBranchColumn(req.dbPool);
+  await ensureCustomerSalesperson(req.dbPool);
   const client = await req.dbPool.connect();
   try {
     await client.query('BEGIN');
@@ -352,7 +395,8 @@ const updateRow = async (req, res) => {
          ar_account_id      = $17,
          sales_territory_id = $18, salesperson_id     = $19,
          billing_collector_id    = $20, collection_collector_id = $21,
-         updated_by         = $22, updated_at         = NOW()
+         updated_by         = $22, updated_at         = NOW(),
+         tax_branch_code    = $24
        WHERE id = $23
        RETURNING id`,
       [
@@ -366,9 +410,9 @@ const updateRow = async (req, res) => {
         remark || null,
         requires_billing ?? false,
         ar_account_id ?? null,
-        sales_territory_id ?? null, salesperson_id ?? null,
+        sales_territory_id ?? null, primarySpId,
         billing_collector_id ?? null, collection_collector_id ?? null,
-        userName, id,
+        userName, id, branch.value,
       ]
     );
     if (result.rows.length === 0) {
@@ -381,6 +425,7 @@ const updateRow = async (req, res) => {
     await client.query(`DELETE FROM ar_customer_billing_condition WHERE customer_id=$1`, [id]);
     await client.query(`DELETE FROM ar_customer_payment_condition WHERE customer_id=$1`, [id]);
     await insertRelated(client, id, addresses, contacts, bank_accounts, billing_conditions, payment_conditions);
+    await replaceSalespersons(client, 'ar_customer_salesperson', 'customer_id', id, sps.rows);
     await client.query('COMMIT');
     const full = await fetchRowById(req.dbPool, id);
     res.status(200).json(full);

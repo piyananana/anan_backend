@@ -1,4 +1,5 @@
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
+const { branchCodeSql } = require('../../utils/taxBranch');
 const { today: todayYmd } = require('../../utils/dateUtil');
 // controllers/ap/apTransactionController.js
 
@@ -108,9 +109,10 @@ const insertVtRecords = async (client, headerId, header, details, sysDocType) =>
              doc_no, doc_date, vat_rate,
              base_amount_lc, vat_amount_lc, base_amount_fc, vat_amount_fc,
              currency_id, exchange_rate,
-             vendor_id, entity_name, entity_tax_id,
+             vendor_id, entity_name, entity_tax_id, entity_branch_code,
              created_by)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+                    COALESCE($17, (SELECT tax_id FROM ap_vendor WHERE id = $15)), ${branchCodeSql('ap_vendor', '$15')},$18)
         `, [
             'AP', 'INPUT_VAT', header.doc_id, headerId, d.id || null,
             header.doc_no, header.doc_date, d.vat_rate ?? 7,

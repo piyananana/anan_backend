@@ -4,6 +4,8 @@ const multer = require('multer');
 const { generateNextCode } = require('./arCustomerRunningController');
 const { generateNextCodeForGroup } = require('./arCustomerGroupController');
 const { insertRelated } = require('./arCustomerController');
+const { normalizeTaxBranch } = require('../../utils/taxBranch');
+const { ensureSalespersonTable, replaceSalespersons, normalizeSalespersons } = require('../../utils/docSalesperson');
 
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -23,6 +25,7 @@ const TEMPLATE_SHEETS = [
       { key: 'customer_group_code',label: 'รหัสกลุ่มลูกค้า',                       required: false, example: 'RETAIL' },
       { key: 'customer_name_en',   label: 'ชื่อลูกหนี้ (อังกฤษ)',                  required: false, example: 'ABC Co., Ltd.' },
       { key: 'tax_id',              label: 'เลขประจำตัวผู้เสียภาษี',                required: false, example: '0105555012345' },
+      { key: 'tax_branch_code',     label: 'รหัสสาขา (00000 = สำนักงานใหญ่)',      required: false, example: '00000', optional: true },
       { key: 'business_type_code', label: 'รหัสประเภทธุรกิจ',                      required: false, example: 'TRADE' },
       { key: 'credit_term_months', label: 'เครดิต (เดือน)',                         required: false, example: '0' },
       { key: 'credit_term_days',   label: 'เครดิต (วัน)',                           required: false, example: '30' },
@@ -40,7 +43,6 @@ const TEMPLATE_SHEETS = [
     columns: [
       { key: 'old_customer_code',           label: 'รหัสเก่าลูกหนี้ — เชื่อมกับ sheet ข้อมูลทั่วไป', required: true,  example: 'CA0001' },
       { key: 'sales_territory_code',       label: 'รหัสเขตการขาย',     required: false, example: 'BKK' },
-      { key: 'salesperson_code',           label: 'รหัสพนักงานขาย',    required: false, example: 'SP001' },
       { key: 'billing_collector_code',     label: 'รหัสผู้วางบิล',     required: false, example: 'COL001' },
       { key: 'collection_collector_code',  label: 'รหัสผู้รับชำระ',    required: false, example: 'COL001' },
     ],
@@ -129,6 +131,18 @@ const TEMPLATE_SHEETS = [
       { key: 'ar_account_code',  label: 'รหัสบัญชีลูกหนี้ (บัญชีคุมยอด)',  required: false, example: '1130' },
     ],
   },
+  {
+    // พนักงานขายหลายคนต่อลูกค้า (1 แถว = 1 คน) + สัดส่วน % / จำนวนเงิน — เอกสารขายเก็บสัดส่วนนี้ไว้ตอนบันทึก
+    key: 'salespersons',
+    name: 'พนักงานขาย',
+    columns: [
+      { key: 'old_customer_code', label: 'รหัสเก่าลูกหนี้ — เชื่อมกับ sheet ข้อมูลทั่วไป', required: true,  example: 'CA0001' },
+      { key: 'salesperson_code',  label: 'รหัสพนักงานขาย',                                required: true,  example: 'SP001' },
+      { key: 'is_primary',        label: 'พนักงานขายหลัก (Y/N — ไม่ระบุ = คนแรก)',         required: false, example: 'Y' },
+      { key: 'share_percent',     label: 'สัดส่วน % (รวมไม่เกิน 100)',                     required: false, example: '60' },
+      { key: 'share_amount',      label: 'จำนวนเงิน',                                     required: false, example: '1500' },
+    ],
+  },
 ];
 
 const ADDRESS_TYPES = ['billing', 'shipping', 'billing note', 'payment'];
@@ -175,7 +189,8 @@ const readSheet = (workbook, sheetDef, { required = false } = {}) => {
   if (aoa.length === 0) return { present: false, colIdx: {}, rows: [] };
 
   const headers = aoa[0].map(h => String(h || '').trim());
-  const expectedKeys = sheetDef.columns.map(c => c.key);
+  // คอลัมน์ optional = เพิ่มเข้าเทมเพลตทีหลัง — ไฟล์เทมเพลตรุ่นเก่าที่ไม่มีคอลัมน์นี้ยังนำเข้าได้ (ถือว่าว่าง)
+  const expectedKeys = sheetDef.columns.filter(c => !c.optional).map(c => c.key);
   const missing = expectedKeys.filter(k => !headers.includes(k));
   if (missing.length > 0) {
     throw new ImportTemplateError(`Sheet "${sheetDef.name}" ไม่ตรงตามเทมเพลต ขาดคอลัมน์: ${missing.join(', ')}`);
@@ -240,7 +255,7 @@ const validateFile = [
     }
 
     try {
-      const [generalDef, salesDef, billingCondDef, paymentCondDef, addressDef, contactDef, bankDef, arAccountDef] = TEMPLATE_SHEETS;
+      const [generalDef, salesDef, billingCondDef, paymentCondDef, addressDef, contactDef, bankDef, arAccountDef, salespersonDef] = TEMPLATE_SHEETS;
 
       const general = readSheet(workbook, generalDef, { required: true });
       if (!general.present || general.rows.length === 0) {
@@ -255,6 +270,7 @@ const validateFile = [
       const contacts = readSheet(workbook, contactDef);
       const bankAccounts = readSheet(workbook, bankDef);
       const arAccount = readSheet(workbook, arAccountDef);
+      const salespersonSheet = readSheet(workbook, salespersonDef);
 
       // ── Pre-fetch lookup tables ──────────────────────────────────────────
       const [groupsR, businessTypesR, territoriesR, salespersonsR, collectorsR, accountsR, currenciesR, runningR] = await Promise.all([
@@ -375,6 +391,10 @@ const validateFile = [
             rowErrors.push({ column: 'discount_percent', message: 'ส่วนลดต้องอยู่ระหว่าง 0-100' });
         }
 
+        // tax_branch_code (5 หลัก — Excel อาจตัดศูนย์นำหน้า เติมกลับให้)
+        const taxBranch = normalizeTaxBranch(get('tax_branch_code'));
+        if (taxBranch.error) rowErrors.push({ column: 'tax_branch_code', message: taxBranch.error });
+
         const isActiveStr = get('is_active');
 
         const customer = {
@@ -387,6 +407,7 @@ const validateFile = [
           customer_name_th: nameTh,
           customer_name_en: get('customer_name_en') || null,
           tax_id: get('tax_id') || null,
+          tax_branch_code: taxBranch.value ?? null,
           business_type_code: businessTypeCode || null,
           business_type_id: resolvedBusinessType?.id || null,
           credit_term_months: creditTermMonths,
@@ -410,6 +431,7 @@ const validateFile = [
           bank_accounts: [],
           billing_conditions: [],
           payment_conditions: [],
+          salespersons: [],
         };
 
         customers.set(oldCode, customer);
@@ -447,11 +469,12 @@ const validateFile = [
           if (!t) customer.__rowErrors.push({ column: `${salesDef.name}: sales_territory_code`, message: `ไม่พบเขตการขาย "${territoryCode}"` });
           else { customer.sales_territory_code = territoryCode; customer.sales_territory_id = t.id; }
         }
-        const salespersonCode = get('salesperson_code').toUpperCase();
+        // เทมเพลตรุ่นเก่ามี salesperson_code ใน sheet นี้ (คนเดียว) — ถือเป็นพนักงานขายหลัก
+        const salespersonCode = sales.colIdx['salesperson_code'] !== undefined ? get('salesperson_code').toUpperCase() : '';
         if (salespersonCode) {
           const sp = salespersonMap[salespersonCode];
           if (!sp) customer.__rowErrors.push({ column: `${salesDef.name}: salesperson_code`, message: `ไม่พบพนักงานขาย "${salespersonCode}"` });
-          else { customer.salesperson_code = salespersonCode; customer.salesperson_id = sp.id; }
+          else customer.salespersons.push({ salesperson_id: sp.id, salesperson_code: salespersonCode, is_primary: true, share_percent: null, share_amount: null });
         }
         const billingCollectorCode = get('billing_collector_code').toUpperCase();
         if (billingCollectorCode) {
@@ -660,6 +683,47 @@ const validateFile = [
         }
       }
 
+      // ── Sheet 9: พนักงานขาย (หลายคน + สัดส่วน) ───────────────────────────────
+      for (let i = 0; i < salespersonSheet.rows.length; i++) {
+        const row = salespersonSheet.rows[i];
+        const rowNum = salespersonSheet.rowNums[i];
+        const found = findCustomer(salespersonDef, row, salespersonSheet.colIdx, rowNum);
+        if (!found) continue;
+        const { customer } = found;
+        const get = (key) => String(row[salespersonSheet.colIdx[key]] ?? '').trim();
+        const col = (k) => `${salespersonDef.name}: ${k}`;
+
+        const code = get('salesperson_code').toUpperCase();
+        if (!code) { customer.__rowErrors.push({ column: col('salesperson_code'), message: 'กรุณาระบุรหัสพนักงานขาย' }); continue; }
+        const sp = salespersonMap[code];
+        if (!sp) { customer.__rowErrors.push({ column: col('salesperson_code'), message: `ไม่พบพนักงานขาย "${code}"` }); continue; }
+        const num = (k) => {
+          const v = get(k).replace(/,/g, '');
+          if (!v) return null;
+          const n = Number(v);
+          if (isNaN(n) || n < 0) { customer.__rowErrors.push({ column: col(k), message: `"${get(k)}" ต้องเป็นตัวเลขไม่ติดลบ` }); return null; }
+          return n;
+        };
+        customer.salespersons.push({
+          salesperson_id: sp.id, salesperson_code: code,
+          is_primary: parseBool(get('is_primary')),
+          share_percent: num('share_percent'), share_amount: num('share_amount'),
+        });
+      }
+
+      // พนักงานขาย: ตรวจซ้ำ / % รวม / คนหลัก (กติกาเดียวกับหน้าจอข้อมูลลูกค้า) → salesperson_id = คนหลัก
+      for (const code of order) {
+        const customer = customers.get(code);
+        if (!customer.salespersons.length) continue;
+        const n = normalizeSalespersons(customer.salespersons, true);
+        if (n.error) { customer.__rowErrors.push({ column: salespersonDef.name, message: n.error }); continue; }
+        const codeOf = new Map(customer.salespersons.map(s => [s.salesperson_id, s.salesperson_code]));
+        customer.salespersons = n.rows.map(r => ({ ...r, salesperson_code: codeOf.get(r.salesperson_id) }));
+        const primary = customer.salespersons.find(r => r.is_primary);
+        customer.salesperson_id = primary?.salesperson_id ?? null;
+        customer.salesperson_code = primary?.salesperson_code ?? null;
+      }
+
       // ── สรุปผล ────────────────────────────────────────────────────────────
       const validatedRows = [];
       for (const code of order) {
@@ -704,6 +768,8 @@ const confirmImport = async (req, res) => {
   let imported = 0, skipped = 0;
   const importErrors = [];
   try {
+    await client.query(`ALTER TABLE ar_customer ADD COLUMN IF NOT EXISTS tax_branch_code VARCHAR(5)`).catch(() => {});
+    await ensureSalespersonTable(req.dbPool, 'ar_customer_salesperson', 'ar_customer', 'customer_id');
     await client.query('BEGIN');
     await client.query(`ALTER TABLE ar_customer ADD COLUMN IF NOT EXISTS is_code_auto_generated BOOLEAN NOT NULL DEFAULT false`).catch(() => {});
     for (let idx = 0; idx < rows.length; idx++) {
@@ -739,8 +805,8 @@ const confirmImport = async (req, res) => {
               sales_territory_id, salesperson_id,
               billing_collector_id, collection_collector_id,
               is_code_auto_generated,
-              created_by, updated_by)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$22)
+              created_by, updated_by, tax_branch_code)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$22,$23)
            ON CONFLICT (customer_code) DO NOTHING
            RETURNING id`,
           [
@@ -757,7 +823,7 @@ const confirmImport = async (req, res) => {
             r.sales_territory_id || null, r.salesperson_id || null,
             r.billing_collector_id || null, r.collection_collector_id || null,
             isCodeAutoGenerated,
-            userName,
+            userName, r.tax_branch_code || null,
           ]
         );
 
@@ -769,6 +835,10 @@ const confirmImport = async (req, res) => {
 
         const cid = result.rows[0].id;
         await insertRelated(client, cid, r.addresses, r.contacts, r.bank_accounts, r.billing_conditions, r.payment_conditions);
+        // พนักงานขายหลายคน + สัดส่วน (ตรวจแล้วตอน validate — ตรวจซ้ำกันข้อมูลถูกแก้ระหว่างทาง)
+        const sps = normalizeSalespersons(r.salespersons || [], true);
+        if (sps.error) throw new Error(sps.error);
+        if (sps.rows.length) await replaceSalespersons(client, 'ar_customer_salesperson', 'customer_id', cid, sps.rows);
 
         await client.query(`RELEASE SAVEPOINT ${savepointName}`);
         imported++;
