@@ -34,6 +34,7 @@ router.put('/mo_header/:id',         moHeaderController.updateTransaction);
 router.put('/mo_header/:id/release', moHeaderController.releaseTransaction);
 router.put('/mo_header/:id/cancel',  moHeaderController.cancelTransaction);
 router.put('/mo_header/:id/close',   moHeaderController.closeTransaction);
+router.put('/mo_header/:id/reverse', moHeaderController.reverseTransaction);
 router.get('/mo_header/:id/availability', moHeaderController.checkMaterialAvailability);
 router.get('/mo_header/:id/explosion_candidates', moHeaderController.fetchExplosionCandidates);
 router.post('/mo_header/:id/explode', moHeaderController.explodeSubAssembly);

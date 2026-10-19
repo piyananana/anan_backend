@@ -7,7 +7,11 @@
 //
 // workflow: Draft (แก้ไขได้ทั้งหมด) -> Released (ผูกพันแล้ว พร้อมให้ฝ่ายผลิตเริ่มเบิก/รับ)
 //   -> InProgress (auto เมื่อมีการเบิก/รับครั้งแรก) -> Completed (auto เมื่อรับผลผลิตครบตามแผนทุกรายการ)
-//   Draft/Released -> Cancelled (ยกเลิกได้ถ้ายังไม่มีการเบิก/รับใดๆ โพสต์เข้ามาอ้างอิงเลย)
+//   Released -> Cancelled (ยกเลิกได้ถ้ายังไม่มีการเบิก/รับใดๆ อ้างอิงเข้ามาเลย ต้องมีเหตุผล)
+//   Completed -> Closed (ปิดพร้อม WIP true-up เข้าบัญชีผลต่าง)
+// ถอยสถานะ (ต้องมีเหตุผล บันทึกที่ sa_document_reverse_log): Released -> Draft (ยังไม่มีเบิก/รับ/บันทึกเวลา/ใบสั่ง
+//   ผลิตย่อย) และ Closed -> Completed (ลบรายการปรับ WIP ถ้างวดยังเปิด ไม่เช่นนั้นลงรายการกลับวันนี้)
+// ลบ: เฉพาะ Draft เก็บไว้ด้วยสถานะ Deleted (ไม่แสดงในรายการ เว้นแต่เลือกสถานะ Deleted)
 // สถานะ Closed (ปิดพร้อม WIP true-up เข้าบัญชีผลต่าง) จะเพิ่มพร้อมกับ costing engine ('95' unit_cost) ในขั้นถัดไป
 'use strict';
 
@@ -19,6 +23,7 @@ const { ensureImWarehouseTable } = require('../im/imWarehouseController');
 const { ensureImLocationTable } = require('../im/imLocationController');
 const { ensureMoBomTable } = require('./moBomController');
 const { today } = require('../../utils/dateUtil');
+const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 
 const ensureMoHeaderTable = async (client) => {
     await ensureImItemTable(client);
@@ -66,6 +71,15 @@ const ensureMoHeaderTable = async (client) => {
     // Closed (ปิดใบสั่งผลิตพร้อม WIP true-up) — ดู closeTransaction ด้านล่าง
     await client.query(`ALTER TABLE mo_header ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ`).catch(() => {});
     await client.query(`ALTER TABLE mo_header ADD COLUMN IF NOT EXISTS closed_by VARCHAR(100)`).catch(() => {});
+    // ถอยสถานะ / ยกเลิกมีเหตุผล (sql/mo_header_reverse_to_draft.sql)
+    await client.query(`
+        ALTER TABLE mo_header
+            ADD COLUMN IF NOT EXISTS close_gl_entry_id    INTEGER,
+            ADD COLUMN IF NOT EXISTS close_date           DATE,
+            ADD COLUMN IF NOT EXISTS kept_close_gl_doc_no VARCHAR(50),
+            ADD COLUMN IF NOT EXISTS cancel_reason        TEXT,
+            ADD COLUMN IF NOT EXISTS cancelled_by         VARCHAR(100),
+            ADD COLUMN IF NOT EXISTS cancelled_at         TIMESTAMPTZ`).catch(() => {});
 
     await client.query(`
         CREATE TABLE IF NOT EXISTS mo_component_detail (
@@ -207,6 +221,7 @@ const fetchRows = async (req, res) => {
         const params = [];
         let pi2 = 1;
         if (status)       { params.push(status);       query += ` AND h.status = $${pi2++}`; }
+        else query += ` AND h.status <> 'Deleted'`;
         if (warehouse_id)  { params.push(warehouse_id);  query += ` AND h.warehouse_id = $${pi2++}`; }
         if (date_from)     { params.push(date_from);     query += ` AND h.doc_date >= $${pi2++}`; }
         if (date_to)       { params.push(date_to);       query += ` AND h.doc_date <= $${pi2++}`; }
@@ -252,6 +267,7 @@ const fetchStatusReport = async (req, res) => {
         const params = [];
         let pi2 = 1;
         if (status)       { params.push(status);       query += ` AND h.status = $${pi2++}`; }
+        else query += ` AND h.status <> 'Deleted'`;
         if (warehouse_id)  { params.push(warehouse_id);  query += ` AND h.warehouse_id = $${pi2++}`; }
         if (date_from)     { params.push(date_from);     query += ` AND h.doc_date >= $${pi2++}`; }
         if (date_to)       { params.push(date_to);       query += ` AND h.doc_date <= $${pi2++}`; }
@@ -336,6 +352,7 @@ const fetchCostVarianceReport = async (req, res) => {
         const params = [];
         let pi2 = 1;
         if (status)       { params.push(status);       query += ` AND h.status = $${pi2++}`; }
+        else query += ` AND h.status <> 'Deleted'`;
         if (warehouse_id)  { params.push(warehouse_id);  query += ` AND h.warehouse_id = $${pi2++}`; }
         if (date_from)     { params.push(date_from);     query += ` AND h.doc_date >= $${pi2++}`; }
         if (date_to)       { params.push(date_to);       query += ` AND h.doc_date <= $${pi2++}`; }
@@ -448,6 +465,8 @@ const fetchRow = async (req, res) => {
         await ensureMoHeaderTable(client);
         const data = await fetchRowById(req.dbPool, req.params.id);
         if (!data) return res.status(404).json({ message: 'ไม่พบใบสั่งผลิต' });
+        Object.assign(data, await computeMoBlocks(client, req.params.id));
+        data.reverse_history = await getReverseHistory(client, 'mo_header', req.params.id);
         res.status(200).json(data);
     } catch (error) {
         console.error('Error fetching mo_header row:', error);
@@ -636,35 +655,184 @@ const releaseTransaction = async (req, res) => {
     } finally { client.release(); }
 };
 
-// --- 4. Cancel (Draft/Released -> Cancelled — บล็อกถ้ามีการเบิก/รับใดๆ อ้างอิงเข้ามาแล้ว) ---
+// --- ถอยสถานะ / ยกเลิก / ลบ: เงื่อนไข ---
+// ส่งให้หน้าจอเป็น reverse_block / void_block / delete_block = { code, ref, message } (null = ทำได้)
+const reasonOf = (req) => (req.body?.reason || '').trim();
+const userIdOf = (req) => { const v = Number(req.headers['userid']); return Number.isFinite(v) && v > 0 ? v : null; };
+const sendErr = (res, status, message, extra = {}) => res.status(status).json({ error: message, message, ...extra });
+const blk = (code, message, ref = null) => ({ code, ref, message });
+
+// งวดบัญชีที่ลงรายการได้ (GL และ IM เปิด) ของวันที่ — null = ไม่มี
+const openPeriodId = async (client, date) => (await client.query(
+    `SELECT id FROM gl_posting_period WHERE $1::date BETWEEN period_start_date AND period_end_date
+       AND gl_status = 'OPEN' AND im_status = 'OPEN' LIMIT 1`, [date])).rows[0]?.id || null;
+
+// รายการปรับ WIP ตอนปิด — MO ที่ปิดก่อนมีคอลัมน์ close_gl_entry_id หาจากเลขที่อ้างอิง
+const findCloseGlEntryId = async (client, mo) => {
+    if (mo.close_gl_entry_id) return mo.close_gl_entry_id;
+    const r = await client.query(`
+        SELECT id FROM gl_entry_header
+         WHERE ref_doc_id = $1 AND ref_doc_no = $2 AND description LIKE 'ปิดใบสั่งผลิต%'
+         ORDER BY id DESC LIMIT 1`, [mo.doc_id, mo.doc_no]);
+    return r.rows[0]?.id || null;
+};
+
+const computeMoBlocks = async (client, id) => {
+    const mo = (await client.query(`SELECT * FROM mo_header WHERE id = $1`, [id])).rows[0];
+    if (!mo) return {};
+    const refs = (await client.query(`
+        SELECT string_agg(doc_no, ', ' ORDER BY id) AS docs FROM im_transaction
+         WHERE ref_mo_id = $1 AND status NOT IN ('Void', 'Deleted')`, [id])).rows[0].docs;
+    const out = { reverse_block: null, void_block: null, delete_block: null };
+
+    if (mo.status === 'Released') {
+        const timeLogged = (await client.query(`
+            SELECT 1 FROM mo_operation_detail
+             WHERE header_id = $1 AND (actual_labor_hours <> 0 OR actual_machine_hours <> 0 OR status <> 'Pending') LIMIT 1`, [id])).rows.length > 0;
+        const children = (await client.query(`
+            SELECT string_agg(doc_no, ', ' ORDER BY id) AS docs FROM mo_header
+             WHERE parent_mo_id = $1 AND status NOT IN ('Cancelled', 'Deleted')`, [id])).rows[0].docs;
+        if (refs) out.reverse_block = blk('REF_DOCS', `มีเอกสารเบิก/รับอ้างอิงใบสั่งผลิตนี้ (${refs}) ต้องถอยและลบเอกสารเหล่านั้นก่อน`, refs);
+        else if (timeLogged) out.reverse_block = blk('TIME_LOGGED', 'มีการบันทึกเวลาปฏิบัติงานแล้ว');
+        else if (children) out.reverse_block = blk('CHILD_MO', `มีใบสั่งผลิตย่อยที่สร้างจากใบนี้ (${children}) ต้องยกเลิกหรือลบก่อน`, children);
+    } else if (mo.status === 'Closed') {
+        const glId = await findCloseGlEntryId(client, mo);
+        if (glId) {
+            const gl = (await client.query(`
+                SELECT g.doc_no, p.gl_status, p.im_status FROM gl_entry_header g
+                  LEFT JOIN gl_posting_period p ON p.id = g.period_id WHERE g.id = $1`, [glId])).rows[0];
+            const sameOpen = gl && gl.gl_status === 'OPEN' && gl.im_status === 'OPEN';
+            if (!sameOpen && !(await openPeriodId(client, today()))) {
+                out.reverse_block = blk('PERIOD_CLOSED', 'งวดบัญชีของรายการปรับ WIP และงวดบัญชีวันนี้ปิดแล้ว', gl?.doc_no || null);
+            }
+        }
+    } else if (mo.status === 'Draft') {
+        out.reverse_block = blk('NOT_REVERSIBLE', 'ถอยได้เฉพาะใบสั่งผลิตที่ปล่อยแล้ว (ยังไม่เริ่มผลิต) หรือปิดแล้ว');
+    } else if (['InProgress', 'Completed'].includes(mo.status)) {
+        out.reverse_block = blk('REF_DOCS', `ใบสั่งผลิตเริ่มผลิตแล้ว ถอยเอกสารเบิก/รับที่อ้างอิง (${refs || '-'}) ก่อน สถานะจะกลับเป็นปล่อยแล้วเอง`, refs);
+    } else {
+        out.reverse_block = blk('VOIDED', 'ใบสั่งผลิตนี้ถูกยกเลิกหรือลบแล้ว');
+    }
+
+    if (mo.status === 'Released') {
+        if (refs) out.void_block = blk('REF_DOCS', `มีเอกสารเบิก/รับอ้างอิงใบสั่งผลิตนี้ (${refs}) ต้องถอยและลบเอกสารเหล่านั้นก่อน`, refs);
+    } else if (mo.status === 'Draft') {
+        out.void_block = blk('NOT_POSTED', 'ใบสั่งผลิตที่ยังเป็นร่างให้ลบแทนการยกเลิก');
+    } else if (['Cancelled', 'Deleted'].includes(mo.status)) {
+        out.void_block = blk('VOIDED', 'ใบสั่งผลิตนี้ถูกยกเลิกหรือลบแล้ว');
+    } else {
+        out.void_block = blk('NOT_RELEASED', 'ยกเลิกได้เฉพาะใบสั่งผลิตที่ปล่อยแล้วและยังไม่เริ่มผลิต');
+    }
+
+    if (mo.status !== 'Draft') {
+        out.delete_block = ['Cancelled', 'Deleted'].includes(mo.status)
+            ? blk('VOIDED', 'ใบสั่งผลิตนี้ถูกยกเลิกหรือลบแล้ว')
+            : blk('NOT_DRAFT', 'ลบได้เฉพาะร่าง ใบสั่งผลิตที่ปล่อยแล้วต้องถอยเป็นร่างก่อน');
+    }
+    return out;
+};
+
+// --- 4. Cancel (Released -> Cancelled — ต้องมีเหตุผล บล็อกถ้ามีการเบิก/รับใดๆ อ้างอิงเข้ามาแล้ว) ---
 const cancelTransaction = async (req, res) => {
     const { id } = req.params;
+    const reason = reasonOf(req);
+    if (!reason) return sendErr(res, 400, 'กรุณาระบุเหตุผลการยกเลิก');
     const userName = req.headers.username || null;
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
-        const existing = await client.query(`SELECT status FROM mo_header WHERE id=$1 FOR UPDATE`, [id]);
-        if (existing.rows.length === 0) throw new Error('Not found');
-        if (!['Draft', 'Released'].includes(existing.rows[0].status)) {
-            throw new Error('ยกเลิกได้เฉพาะเอกสารสถานะ Draft หรือ Released เท่านั้น');
-        }
-        const postedRes = await client.query(`
-            SELECT COALESCE(SUM(issued_qty), 0) AS issued FROM mo_component_detail WHERE header_id = $1
-        `, [id]);
-        const receivedRes = await client.query(`
-            SELECT COALESCE(SUM(received_qty), 0) AS received FROM mo_output_detail WHERE header_id = $1
-        `, [id]);
-        if (Number(postedRes.rows[0].issued) > 0 || Number(receivedRes.rows[0].received) > 0) {
-            throw new Error('ไม่สามารถยกเลิกได้ เนื่องจากมีการเบิกวัตถุดิบหรือรับสินค้าเข้าคลังจากใบสั่งผลิตนี้ไปแล้ว');
-        }
-        await client.query(`UPDATE mo_header SET status='Cancelled', updated_by=$1, updated_at=NOW() WHERE id=$2`, [userName, id]);
+        await ensureMoHeaderTable(client);
+        const mo = (await client.query(`SELECT * FROM mo_header WHERE id=$1 FOR UPDATE`, [id])).rows[0];
+        if (!mo) { await client.query('ROLLBACK'); return sendErr(res, 404, 'Not found'); }
+        const b = (await computeMoBlocks(client, id)).void_block;
+        if (b) { await client.query('ROLLBACK'); return sendErr(res, 400, b.message, { code: b.code, ref: b.ref }); }
+        await client.query(`
+            UPDATE mo_header SET status='Cancelled', cancel_reason=$1, cancelled_by=$2, cancelled_at=NOW(),
+                   updated_by=$2, updated_at=NOW() WHERE id=$3`, [reason, userName, id]);
+        await logReverse(client, {
+            sysModule: '61', tableName: 'mo_header', recordId: Number(id), docNo: mo.doc_no,
+            fromStatus: mo.status, toStatus: 'Void', reason, userId: userIdOf(req),
+        });
         await client.query('COMMIT');
-        const full = await fetchRowById(req.dbPool, id);
-        res.status(200).json(full);
+        res.status(200).json(await fetchRowById(req.dbPool, id));
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error cancelling mo_header:', error);
-        res.status(error.message === 'Not found' ? 404 : 500).json({ message: error.message || 'Internal server error' });
+        sendErr(res, 500, error.message || 'Internal server error');
+    } finally { client.release(); }
+};
+
+// --- ถอยสถานะ (ต้องมีเหตุผล) ---
+// Released -> Draft: ยังไม่มีเอกสารเบิก/รับ (รวมร่าง) บันทึกเวลา หรือใบสั่งผลิตย่อย — แก้ไขแล้วปล่อยใหม่ได้
+// Closed -> Completed: ลบรายการปรับ WIP (เก็บเลขที่ไว้ใช้ตอนปิดใหม่) ถ้างวดของรายการยังเปิด ไม่เช่นนั้นลงรายการ
+//   กลับในวันนี้ แล้วคำนวณยอด WIP ใหม่ — หลังถอยแล้วถอยเอกสารเบิก/รับที่อ้างอิงได้อีกครั้ง
+const reverseTransaction = async (req, res) => {
+    const { id } = req.params;
+    const reason = reasonOf(req);
+    if (!reason) return sendErr(res, 400, 'กรุณาระบุเหตุผลการถอยเอกสาร');
+    const userName = req.headers.username || null;
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        await ensureMoHeaderTable(client);
+        const mo = (await client.query(`SELECT * FROM mo_header WHERE id=$1 FOR UPDATE`, [id])).rows[0];
+        if (!mo) { await client.query('ROLLBACK'); return sendErr(res, 404, 'Not found'); }
+        const b = (await computeMoBlocks(client, id)).reverse_block;
+        if (b) { await client.query('ROLLBACK'); return sendErr(res, 400, b.message, { code: b.code, ref: b.ref }); }
+
+        let toStatus;
+        if (mo.status === 'Released') {
+            toStatus = 'Draft';
+            await client.query(`
+                UPDATE mo_header SET status='Draft', released_at=NULL, released_by=NULL, updated_by=$1, updated_at=NOW()
+                 WHERE id=$2`, [userName, id]);
+        } else {
+            toStatus = 'Completed';
+            const glId = await findCloseGlEntryId(client, mo);
+            let keptNo = null;
+            if (glId) {
+                const gl = (await client.query(`
+                    SELECT g.*, p.gl_status, p.im_status FROM gl_entry_header g
+                      LEFT JOIN gl_posting_period p ON p.id = g.period_id WHERE g.id = $1`, [glId])).rows[0];
+                if (gl.gl_status === 'OPEN' && gl.im_status === 'OPEN') {
+                    keptNo = gl.doc_no;
+                    await client.query(`DELETE FROM gl_entry_header WHERE id=$1`, [glId]);
+                } else {
+                    const date = today();
+                    const periodId = await openPeriodId(client, date);
+                    let revNo = await generateDocNo(client, gl.doc_id, date, mo.branch_id || null);
+                    if (!revNo) revNo = `GL-REOPEN-${mo.doc_no}-${glId}`;
+                    const description = `ยกเลิกการปิดใบสั่งผลิต ${mo.doc_no} - ${reason}`;
+                    const revId = (await client.query(`
+                        INSERT INTO gl_entry_header
+                        (doc_id, doc_no, doc_date, posting_date, period_id, description,
+                         currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
+                         created_by, ref_doc_id, ref_doc_no, ref_doc_date)
+                        VALUES ($1,$2,$3,$3,$4,$5,$6,1,'Posted',$7,$8,0,0,$9,$10,$11,$12)
+                        RETURNING id`, [gl.doc_id, revNo, date, periodId, description, gl.currency_id,
+                        gl.total_credit_lc, gl.total_debit_lc, userIdOf(req), mo.doc_id, mo.doc_no, mo.doc_date])).rows[0].id;
+                    await client.query(`
+                        INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
+                        SELECT $1, line_no, account_id, $2, credit_lc, debit_lc, 0, 0
+                          FROM gl_entry_detail WHERE header_id = $3 ORDER BY line_no`, [revId, description, glId]);
+                }
+            }
+            await client.query(`
+                UPDATE mo_header SET status='Completed', closed_at=NULL, closed_by=NULL, close_gl_entry_id=NULL,
+                       close_date=NULL, kept_close_gl_doc_no=COALESCE($1, kept_close_gl_doc_no),
+                       updated_by=$2, updated_at=NOW() WHERE id=$3`, [keptNo, userName, id]);
+            await refreshMoStatus(client, id); // คำนวณ wip_balance_lc กลับจากเอกสารเบิก/รับ
+        }
+        await logReverse(client, {
+            sysModule: '61', tableName: 'mo_header', recordId: Number(id), docNo: mo.doc_no,
+            fromStatus: mo.status, toStatus, reason, userId: userIdOf(req),
+        });
+        await client.query('COMMIT');
+        res.status(200).json(await fetchRowById(req.dbPool, id));
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error reversing mo_header:', error);
+        sendErr(res, 500, error.message || 'Internal server error');
     } finally { client.release(); }
 };
 
@@ -713,8 +881,8 @@ const closeTransaction = async (req, res) => {
                 if (userRes.rows.length > 0) createdByUserId = userRes.rows[0].id;
             }
 
-            let glDocNo = await generateDocNo(client, setup.gl_doc_id, closeDate, mo.branch_id || null);
-            if (!glDocNo) glDocNo = `GL-CLOSE-${mo.doc_no}`;
+            let glDocNo = mo.kept_close_gl_doc_no || await generateDocNo(client, setup.gl_doc_id, closeDate, mo.branch_id || null);
+            if (!glDocNo) glDocNo = `GL-CLOSE-${mo.doc_no}-${Date.now()}`;
 
             const amount = Math.abs(residual);
             // residual < 0 = WIP ถูก Cr ไปมากกว่าที่เคย Dr (ต้นทุนแปรรูปที่ไม่เคยเข้า WIP) -> Dr WIP / Cr ผลต่าง
@@ -749,9 +917,10 @@ const closeTransaction = async (req, res) => {
         }
 
         await client.query(`
-            UPDATE mo_header SET status='Closed', wip_balance_lc=0, closed_at=NOW(), closed_by=$1, updated_by=$1, updated_at=NOW()
+            UPDATE mo_header SET status='Closed', wip_balance_lc=0, closed_at=NOW(), closed_by=$1, updated_by=$1, updated_at=NOW(),
+                   close_gl_entry_id=$3, close_date=$4, kept_close_gl_doc_no=CASE WHEN $3::int IS NULL THEN kept_close_gl_doc_no END
             WHERE id=$2
-        `, [userName, id]);
+        `, [userName, id, glEntryId, closeDate]);
 
         await client.query('COMMIT');
         const full = await fetchRowById(req.dbPool, id);
@@ -953,22 +1122,31 @@ const explodeSubAssembly = async (req, res) => {
     } finally { client.release(); }
 };
 
-// --- 5. Delete (Draft only) ---
+// --- 5. Delete (Draft only — ต้องมีเหตุผล เก็บไว้ด้วยสถานะ Deleted ตรวจสอบได้แต่นำกลับมาใช้ไม่ได้) ---
 const deleteTransaction = async (req, res) => {
     const { id } = req.params;
+    const reason = reasonOf(req);
+    if (!reason) return sendErr(res, 400, 'กรุณาระบุเหตุผลการลบ');
+    const userName = req.headers.username || null;
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
-        const existing = await client.query(`SELECT status FROM mo_header WHERE id=$1`, [id]);
-        if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
-        if (existing.rows[0].status !== 'Draft') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'ลบได้เฉพาะเอกสาร Draft เท่านั้น' }); }
-        await client.query(`DELETE FROM mo_header WHERE id=$1`, [id]);
+        await ensureMoHeaderTable(client);
+        const mo = (await client.query(`SELECT * FROM mo_header WHERE id=$1 FOR UPDATE`, [id])).rows[0];
+        if (!mo) { await client.query('ROLLBACK'); return sendErr(res, 404, 'Not found'); }
+        const b = (await computeMoBlocks(client, id)).delete_block;
+        if (b) { await client.query('ROLLBACK'); return sendErr(res, 400, b.message, { code: b.code, ref: b.ref }); }
+        await client.query(`UPDATE mo_header SET status='Deleted', updated_by=$1, updated_at=NOW() WHERE id=$2`, [userName, id]);
+        await logReverse(client, {
+            sysModule: '61', tableName: 'mo_header', recordId: Number(id), docNo: mo.doc_no,
+            fromStatus: 'Draft', toStatus: 'Deleted', reason, userId: userIdOf(req),
+        });
         await client.query('COMMIT');
-        res.status(204).send();
+        res.status(200).json({ message: 'Deleted' });
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error deleting mo_header:', error);
-        res.status(500).json({ message: 'Internal server error' });
+        sendErr(res, 500, error.message || 'Internal server error');
     } finally { client.release(); }
 };
 
@@ -1197,7 +1375,7 @@ const logOperationTime = async (req, res) => {
 
 module.exports = {
     ensureMoHeaderTable, fetchRows, fetchRow, createTransaction, updateTransaction,
-    releaseTransaction, cancelTransaction, closeTransaction, deleteTransaction,
+    releaseTransaction, cancelTransaction, closeTransaction, deleteTransaction, reverseTransaction,
     validateMoComponentIssueQty, validateMoOutputReceiptQty, refreshMoStatus,
     computeMoReceiptUnitCost, logOperationTime, checkMaterialAvailability,
     fetchExplosionCandidates, explodeSubAssembly, fetchStatusReport, fetchCostVarianceReport,
