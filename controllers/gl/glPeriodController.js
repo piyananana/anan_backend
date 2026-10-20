@@ -741,6 +741,29 @@ const rejectCloseRequest = async (req, res) => {
     }
 };
 
+// GET /gl_period_close_request/my_pending — คำขอปิดงวดที่ถึงคิวผู้ใช้นี้อนุมัติ (กระดิ่งหน้า Home)
+// id = ปีบัญชี (fiscal_year_id) เพื่อให้หน้าจองวดบัญชีเปิดปีนั้นได้ทันที — คำขอแต่ละครั้งแยกด้วย request_id
+const fetchMyPendingCloseRequests = async (req, res) => {
+    const userId = Number(req.headers.userid);
+    if (!userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
+    try {
+        await ensureCloseRequestTable(req.dbPool);
+        const r = await req.dbPool.query(`
+            SELECT p.fiscal_year_id AS id, cr.id AS request_id, p.period_name AS doc_no, p.period_start_date AS doc_date,
+                   COALESCE(NULLIF(fy.description, ''), fy.fy_code) AS fiscal_year_name,
+                   cr.requested_by_name AS submitted_by
+              FROM gl_period_close_request cr
+              JOIN gl_posting_period p ON p.id = cr.period_id
+              LEFT JOIN gl_fiscal_year fy ON fy.id = p.fiscal_year_id
+             WHERE cr.status = 'Pending' AND ${DA.myTurnSql('cr', '$1', '$2')}
+             ORDER BY cr.requested_at`, [KIND, userId]);
+        res.status(200).json(r.rows);
+    } catch (error) {
+        console.error('Error fetching GL close my_pending:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    }
+};
+
 // ยกเลิกคำขอปิดงวด (เฉพาะผู้ที่ส่งคำขอ) — คืนสถานะ gl_status กลับเป็นค่าก่อนขอ
 const cancelCloseRequest = async (req, res) => {
     const { id } = req.params;
@@ -794,6 +817,7 @@ module.exports = {
     approveCloseRequest,
     rejectCloseRequest,
     cancelCloseRequest,
+    fetchMyPendingCloseRequests,
 };
 //     fetchRows,
 //     addRow,
