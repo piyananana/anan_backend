@@ -362,7 +362,7 @@ const submitTransaction = async (req, res) => {
     if (!menu_id) return res.status(400).json({ message: 'ต้องระบุ menu_id' });
     const client = await req.dbPool.connect();
     try {
-        const { ensureMenuApproverSchema, syncMenuApprovers } = require('../../utils/menuApproverSync');
+        const { ensureMenuApproverSchema, syncMenuApprovers, isNoApproverBlocked, NO_APPROVER_BLOCK_MSG } = require('../../utils/menuApproverSync');
         await ensureMenuApproverSchema(client);
         await client.query('BEGIN');
         await ensurePrTransactionTable(client);
@@ -374,7 +374,7 @@ const submitTransaction = async (req, res) => {
             return res.status(400).json({ message: 'ส่งอนุมัติได้เฉพาะเอกสาร Draft หรือ Rejected เท่านั้น' });
         }
 
-        const menuRes = await client.query(`SELECT approval_mode, uses_doc_type FROM sa_menu WHERE id=$1`, [menu_id]);
+        const menuRes = await client.query(`SELECT approval_mode, uses_doc_type, no_approver_action FROM sa_menu WHERE id=$1`, [menu_id]);
         const approvalMode = menuRes.rows[0]?.approval_mode === 'ANY' ? 'ANY' : 'ALL';
         const docType = menuRes.rows[0]?.uses_doc_type ? existing.rows[0].doc_code : null;
 
@@ -391,6 +391,11 @@ const submitTransaction = async (req, res) => {
 
         if (approvers.rows.length === 0) {
             // ไม่มีผู้มีสิทธิ์อนุมัติเลย — ข้ามขั้นตอนอนุมัติไปเลย ผ่านตรงไป Approved
+            if (isNoApproverBlocked(menuRes.rows[0])) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ message: NO_APPROVER_BLOCK_MSG });
+            }
+            // ตั้งค่าเมนู "ให้ผ่าน" (ALLOW) — ข้ามขั้นตอนอนุมัติ
             await client.query(`
                 UPDATE pr_transaction SET status='Approved', approval_mode=$1, submitted_at=NOW(), submitted_by=$2,
                     updated_at=NOW(), updated_by=$2 WHERE id=$3`,

@@ -73,6 +73,14 @@ router.get('/ar_transaction/open_advances_for_refund', arTransactionController.f
 router.get('/ar_transaction/open_credit_notes', arTransactionController.fetchOpenCreditNotes);
 router.get('/ar_transaction/invoice_billing_summary', arTransactionController.fetchInvoiceBillingSummary);
 router.get('/ar_transaction/bill_collection_by_doc_no', arTransactionController.fetchBillCollectionByDocNo);
+// ขออนุมัติเกินวงเงินเครดิต (utils/creditCheck.js)
+const arCredit = require('../controllers/sa/creditApprovalController').makeCreditHandlers('AR');
+router.get('/ar_transaction/credit_info', arCredit.creditInfo);
+router.get('/ar_transaction/credit_my_pending', arCredit.myPending);
+router.put('/ar_transaction/:id/credit_request', arCredit.request);
+router.put('/ar_transaction/:id/credit_approve', arCredit.approve);
+router.put('/ar_transaction/:id/credit_reject', arCredit.reject);
+router.put('/ar_transaction/:id/credit_withdraw', arCredit.withdraw);
 router.get('/ar_transaction', arTransactionController.fetchRows);
 router.get('/ar_transaction/:id', arTransactionController.fetchRow);
 router.post('/ar_transaction', arTransactionController.createTransaction);

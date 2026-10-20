@@ -16,6 +16,7 @@ const getAllMenu = async (req, res) => {
         await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS doc_type_module VARCHAR(10)");
         await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_description TEXT');
         await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_description_en TEXT');
+        await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS no_approver_action VARCHAR(10) DEFAULT 'ALLOW'");
 
         const isDeveloper = req.isDeveloper ?? false;
         // include_inactive=true — ใช้โดยหน้าจอจัดการเมนู (sa_menu_screen) เท่านั้น เพื่อให้ยังหาเมนูที่ถูกปิด
@@ -277,12 +278,14 @@ const updateMenu = async (req, res) => {
 // ระดับ admin ตั้งค่า approval_mode / คำอธิบายการอนุมัติ TH-EN / ใช้ประเภทเอกสารหรือไม่)
 const updateMenuApprovalConfig = async (req, res) => {
     const { id } = req.params;
-    const { approval_mode, approval_description, approval_description_en, uses_doc_type } = req.body;
+    const { approval_mode, approval_description, approval_description_en, uses_doc_type, no_approver_action } = req.body;
     try {
         await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL'");
         await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS uses_doc_type BOOLEAN DEFAULT FALSE');
         await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_description TEXT');
         await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_description_en TEXT');
+        // ไม่มีผู้อนุมัติในคิว: ALLOW = ให้ผ่าน (อนุมัติอัตโนมัติ), BLOCK = ไม่ให้ผ่าน — ใช้กับทุกการอนุมัติที่อิงคิวผู้อนุมัติของเมนู (utils/menuApproverSync.js)
+        await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS no_approver_action VARCHAR(10) DEFAULT 'ALLOW'");
 
         const result = await req.dbPool.query(
             `UPDATE sa_menu SET
@@ -290,10 +293,11 @@ const updateMenuApprovalConfig = async (req, res) => {
                 approval_description = $2,
                 approval_description_en = $3,
                 uses_doc_type = $4,
+                no_approver_action = $6,
                 updated_at = CURRENT_TIMESTAMP
              WHERE id = $5 RETURNING *`,
             [approval_mode ?? 'ALL', approval_description || null, approval_description_en || null,
-             uses_doc_type ?? false, id]
+             uses_doc_type ?? false, id, no_approver_action === 'BLOCK' ? 'BLOCK' : 'ALLOW']
         );
         if (result.rows.length === 0) {
             return res.status(404).json({ message: 'Menu not found.' });

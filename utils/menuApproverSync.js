@@ -8,7 +8,15 @@
 // สำหรับเมนูที่ไม่ได้ใช้ประเภทเอกสาร หรือประเภทเอกสารที่ยังไม่มีคิวเฉพาะ)
 // ไม่ว่าจะระดับเมนูหรือระดับประเภทเอกสาร ผู้มีสิทธิ์เป็นผู้อนุมัติต้องมี can_approve=true บนเมนูนั้นเสมอ
 
+// ไม่มีผู้อนุมัติในคิว (sa_menu.no_approver_action): ALLOW = ให้ผ่าน (อนุมัติอัตโนมัติ, ค่าเริ่มต้น), BLOCK = ไม่ให้ผ่าน
+// ตั้งที่หน้าจอ sa_module_approver_screen — ใช้กับทุกการอนุมัติที่อิงคิวผู้อนุมัติของเมนู
+const NO_APPROVER_BLOCK_MSG = 'ยังไม่ได้ตั้งผู้อนุมัติของเมนู/ประเภทเอกสารนี้ — ไม่สามารถดำเนินการต่อได้จนกว่าจะตั้งผู้อนุมัติ';
+const isNoApproverBlocked = (menuRow) => menuRow?.no_approver_action === 'BLOCK';
+
 const ensureMenuApproverSchema = async (pool) => {
+    try {
+        await pool.query(`ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS no_approver_action VARCHAR(10) DEFAULT 'ALLOW'`);
+    } catch (_) { /* ignore */ }
     try {
         await pool.query(`ALTER TABLE sa_module_approver ADD COLUMN IF NOT EXISTS menu_id INTEGER REFERENCES sa_menu(id) ON DELETE CASCADE`);
     } catch (_) { /* ignore */ }
@@ -75,4 +83,4 @@ const syncMenuApprovers = async (client, menuId, docType = null) => {
     }
 };
 
-module.exports = { ensureMenuApproverSchema, syncMenuApprovers };
+module.exports = { NO_APPROVER_BLOCK_MSG, isNoApproverBlocked, ensureMenuApproverSchema, syncMenuApprovers };

@@ -14,6 +14,20 @@ const { fetchMode, fetchSettingRow } = require('./imAccountingSettingController'
 const { today: todayYmd, ymd } = require('../../utils/dateUtil');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { branchCodeSql } = require('../../utils/taxBranch');
+const { IM_CHECK_TYPES, ensureCreditSchema, imDocAmount, assertCreditForPost, loadCreditApprovals } = require('../../utils/creditCheck');
+
+// ตรวจวงเงินเครดิตก่อนโพสต์เอกสารฝั่งขาย (ส่งสินค้า/รับคืน/ลดหนี้/เพิ่มหนี้ลูกหนี้) — เกินและยังไม่ได้รับอนุมัติ = throw
+const checkImCreditForPost = async (client, { docId, customerId, details, id, row }) => {
+    const d = (await client.query(`SELECT sys_doc_type FROM sa_module_document WHERE id=$1`, [docId])).rows[0];
+    if (!d || !IM_CHECK_TYPES.includes(d.sys_doc_type)) return;
+    await assertCreditForPost(client, {
+        customerId, amount: imDocAmount(d.sys_doc_type, details), excludeImId: id || 0, row,
+    });
+};
+const sendImError = (res, error) => res.status(error.status || 500).json({
+    message: error.message || 'Internal server error',
+    ...(error.code === 'CREDIT_LIMIT' ? { code: error.code, credit: error.credit } : {}),
+});
 const { ensureSalespersonTable, saveDocSalespersons, loadSalespersons, copySalespersons } = require('../../utils/docSalesperson');
 
 // พนักงานขายของเอกสารฝั่งขาย (ส่งสินค้า/รับคืน/ลดหนี้/เพิ่มหนี้ลูกหนี้) — คัดลอกไปใบแจ้งหนี้ AR ที่สร้างอัตโนมัติ
@@ -1797,9 +1811,11 @@ const fetchRowById = async (pool, id) => {
         LEFT JOIN im_location tl ON tl.id = dt.to_location_id
         WHERE dt.header_id = $1 ORDER BY dt.line_no`, [id]);
     await ensureImSalesperson(pool);
+    await ensureCreditSchema(pool);
     return {
         ...hRes.rows[0], details: dRes.rows,
         salespersons: await loadSalespersons(pool, 'im_transaction_salesperson', 'header_id', id),
+        credit_approvals: await loadCreditApprovals(pool, 'IM', Number(id)),
         ...(await computeImBlocks(pool, id)),
         reverse_history: await getReverseHistory(pool, 'im_transaction', Number(id)),
     };
@@ -2146,10 +2162,15 @@ const insertAndPostAdjustment = async (client, {
 const createTransaction = async (req, res) => {
     const { header, details, action } = req.body;
     await ensureImSalesperson(req.dbPool);
+    await ensureCreditSchema(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
         await ensureImTransactionTable(client);
+        // เอกสารใหม่ยังไม่มีคำขออนุมัติ — เกินวงเงินต้องบันทึกร่างแล้วขออนุมัติก่อน
+        if ((action || 'Post') === 'Post') {
+            await checkImCreditForPost(client, { docId: header.doc_id, customerId: header.customer_id, details, id: 0, row: null });
+        }
 
         const newHeaderId = await insertAndPostAdjustment(client, {
             docId: header.doc_id, docNo: header.doc_no, docDate: header.doc_date,
@@ -2171,8 +2192,8 @@ const createTransaction = async (req, res) => {
         res.status(201).json(full);
     } catch (error) {
         await client.query('ROLLBACK');
-        console.error('Error creating im_transaction:', error);
-        res.status(500).json({ message: error.message || 'Internal server error' });
+        if (!error.status) console.error('Error creating im_transaction:', error);
+        sendImError(res, error);
     } finally { client.release(); }
 };
 
@@ -2246,14 +2267,19 @@ const updateTransaction = async (req, res) => {
     const { id } = req.params;
     const { header, details } = req.body;
     await ensureImSalesperson(req.dbPool);
+    await ensureCreditSchema(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
         const existing = await client.query(`
-            SELECT t.status, t.exchange_rate, d.sys_doc_type FROM im_transaction t
+            SELECT t.status, t.exchange_rate, t.credit_status, d.sys_doc_type FROM im_transaction t
             JOIN sa_module_document d ON d.id = t.doc_id WHERE t.id=$1
         `, [id]);
         if (existing.rows.length === 0) throw new Error('Not found');
+        if (existing.rows[0].credit_status === 'Pending') {
+            const e = new Error('เอกสารนี้อยู่ระหว่างรออนุมัติเกินวงเงินเครดิต — ถอนคำขอก่อนแก้ไข');
+            e.status = 400; throw e;
+        }
 
         // '12' (รับสินค้า รอตั้งหนี้) ที่อยู่สถานะ Received: แก้ได้แค่เลขที่ใบกำกับ + billed cost รายบรรทัด — ไม่แตะ
         // จำนวน/สินค้า/คลัง เพราะรับของจริงไปแล้ว ไม่ใช่ flow เดียวกับการแก้ไข Draft ทั่วไป จึงแยก branch ต่างหาก
@@ -2405,8 +2431,8 @@ const updateTransaction = async (req, res) => {
         res.status(200).json(full);
     } catch (error) {
         await client.query('ROLLBACK');
-        console.error('Error updating im_transaction:', error);
-        res.status(500).json({ message: error.message || 'Internal server error' });
+        if (!error.status) console.error('Error updating im_transaction:', error);
+        sendImError(res, error);
     } finally { client.release(); }
 };
 
@@ -2415,6 +2441,7 @@ const postTransaction = async (req, res) => {
     const { id } = req.params;
     const userName = req.headers.username || null;
     await ensureImSalesperson(req.dbPool);
+    await ensureCreditSchema(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
@@ -2427,6 +2454,8 @@ const postTransaction = async (req, res) => {
             await client.query('ROLLBACK');
             return res.status(400).json({ message: 'Post ได้เฉพาะเอกสาร Draft เท่านั้น' });
         }
+        const draftLines = (await client.query(`SELECT * FROM im_transaction_detail WHERE header_id=$1`, [id])).rows;
+        await checkImCreditForPost(client, { docId: tx.doc_id, customerId: tx.customer_id, details: draftLines, id: Number(id), row: tx });
         const headerForPost = { ...tx, doc_code: tx.doc_code || tx.d_doc_code, updated_by: userName };
         await postDetailLines(client, id, headerForPost, tx.doc_no);
 
@@ -2435,8 +2464,8 @@ const postTransaction = async (req, res) => {
         res.status(200).json(full);
     } catch (error) {
         await client.query('ROLLBACK');
-        console.error('Error posting im_transaction:', error);
-        res.status(500).json({ message: error.message || 'Internal server error' });
+        if (!error.status) console.error('Error posting im_transaction:', error);
+        sendImError(res, error);
     } finally { client.release(); }
 };
 

@@ -3,6 +3,20 @@ const { today: todayYmd } = require('../../utils/dateUtil');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { branchCodeSql } = require('../../utils/taxBranch');
 const { ensureSalespersonTable, saveDocSalespersons, loadSalespersons } = require('../../utils/docSalesperson');
+const { AR_CHECK_TYPES, ensureCreditSchema, arDocAmount, assertCreditForPost, loadCreditApprovals } = require('../../utils/creditCheck');
+
+// ตรวจวงเงินเครดิตก่อนโพสต์ (ตั้งหนี้/เพิ่มหนี้/ลดหนี้) — เกินวงเงินและยังไม่ได้รับอนุมัติที่ครอบคลุมยอด = throw CREDIT_LIMIT
+const checkArCreditForPost = async (client, header, id, row) => {
+    const d = (await client.query(`SELECT sys_doc_type FROM sa_module_document WHERE id=$1`, [header.doc_id])).rows[0];
+    if (!d || !AR_CHECK_TYPES.includes(d.sys_doc_type)) return;
+    await assertCreditForPost(client, {
+        customerId: header.customer_id, amount: arDocAmount(d.sys_doc_type, header.total_amount_lc),
+        excludeArId: id || 0, row,
+    });
+};
+const sendArError = (res, err) => res.status(err.status || 500).json({
+    error: err.message, ...(err.code ? { code: err.code, credit: err.credit } : {}),
+});
 
 // พนักงานขายของเอกสาร (รายชื่อ — สัดส่วนอยู่ที่ข้อมูลลูกค้า) — ใบแจ้งหนี้/เพิ่มหนี้/ลดหนี้
 const ensureArSalesperson = (db) => ensureSalespersonTable(db, 'ar_transaction_salesperson', 'ar_transaction', 'header_id');
@@ -1083,6 +1097,7 @@ const ensurePaymentTable = async (client) => {
 const createTransaction = async (req, res) => {
     const { header, details, applies, payments, action } = req.body; // action: 'Draft' | 'Post'
     await ensureArSalesperson(req.dbPool);
+    await ensureCreditSchema(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
@@ -1097,6 +1112,8 @@ const createTransaction = async (req, res) => {
             );
             if (periodRes.rows.length === 0)
                 throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่เอกสาร ${header.doc_date}`);
+            // เอกสารใหม่ยังไม่มีคำขออนุมัติ — เกินวงเงินต้องบันทึกร่างแล้วขออนุมัติก่อน
+            await checkArCreditForPost(client, header, 0, null);
         }
 
         // Find period_id (always needed)
@@ -1271,7 +1288,7 @@ const createTransaction = async (req, res) => {
         res.status(201).json({ message: 'Success', id: newHeaderId, doc_no: finalDocNo });
     } catch (err) {
         await client.query('ROLLBACK');
-        res.status(500).json({ error: err.message });
+        sendArError(res, err);
     } finally {
         client.release();
     }
@@ -1282,14 +1299,20 @@ const updateTransaction = async (req, res) => {
     const { id } = req.params;
     const { header, details, applies, payments, action } = req.body;
     await ensureArSalesperson(req.dbPool);
+    await ensureCreditSchema(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
 
         // Check status
-        const checkRes = await client.query('SELECT status FROM ar_transaction WHERE id=$1', [id]);
+        const checkRes = await client.query('SELECT status, credit_status, credit_amount FROM ar_transaction WHERE id=$1 FOR UPDATE', [id]);
         if (!checkRes.rows[0]) return res.status(404).json({ error: 'Not found' });
         if (checkRes.rows[0].status !== 'Draft') throw new Error('Only Draft can be edited');
+        if (checkRes.rows[0].credit_status === 'Pending') {
+            const e = new Error('เอกสารนี้อยู่ระหว่างรออนุมัติเกินวงเงินเครดิต — ถอนคำขอก่อนแก้ไข');
+            e.status = 400; throw e;
+        }
+        if (action === 'Post') await checkArCreditForPost(client, header, Number(id), checkRes.rows[0]);
 
         // Find period_id
         const periodRes = await client.query(
@@ -1451,7 +1474,7 @@ const updateTransaction = async (req, res) => {
         res.json({ message: 'Updated', id: Number(id) });
     } catch (err) {
         await client.query('ROLLBACK');
-        res.status(500).json({ error: err.message });
+        sendArError(res, err);
     } finally {
         client.release();
     }
@@ -1823,6 +1846,8 @@ const fetchRow = async (req, res) => {
         const history = await getReverseHistory(req.dbPool, 'ar_transaction', Number(id));
         await ensureArSalesperson(req.dbPool);
         const salespersons = await loadSalespersons(req.dbPool, 'ar_transaction_salesperson', 'header_id', id);
+        await ensureCreditSchema(req.dbPool);
+        const creditApprovals = await loadCreditApprovals(req.dbPool, 'AR', Number(id));
 
         res.json({
             header: hRes.rows[0], details: detailsRes.rows, applies: appliesRes.rows, payments: paymentsRows,
@@ -1832,6 +1857,7 @@ const fetchRow = async (req, res) => {
             void_block_ref: vBlock ? (vBlock.ref || null) : null,
             reverse_history: history,
             salespersons,
+            credit_approvals: creditApprovals,
         });
     } catch (err) {
         res.status(500).json({ error: err.message });

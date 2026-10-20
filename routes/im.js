@@ -108,6 +108,14 @@ router.put('/im_consignment_settlement/:id/void', imConsignmentSettlementControl
 router.put('/im_consignment_settlement/:id/reverse', imConsignmentSettlementController.reverseSettlement);
 router.put('/im_consignment_settlement/:id/post', imConsignmentSettlementController.repostSettlement);
 router.delete('/im_consignment_settlement/:id', imConsignmentSettlementController.deleteSettlement);
+// ขออนุมัติเกินวงเงินเครดิต (utils/creditCheck.js)
+const imCredit = require('../controllers/sa/creditApprovalController').makeCreditHandlers('IM');
+router.get('/im_transaction/credit_info', imCredit.creditInfo);
+router.get('/im_transaction/credit_my_pending', imCredit.myPending);
+router.put('/im_transaction/:id/credit_request', imCredit.request);
+router.put('/im_transaction/:id/credit_approve', imCredit.approve);
+router.put('/im_transaction/:id/credit_reject', imCredit.reject);
+router.put('/im_transaction/:id/credit_withdraw', imCredit.withdraw);
 router.get('/im_transaction',            imTransactionController.fetchRows);
 router.get('/im_transaction/:id',        imTransactionController.fetchRow);
 router.get('/im_transaction/:id/returnable_lines', imTransactionController.fetchReturnableLines);

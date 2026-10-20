@@ -574,7 +574,7 @@ const requestClose = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await ensureCloseRequestTable(client);
-        const { ensureMenuApproverSchema, syncMenuApprovers } = require('../../utils/menuApproverSync');
+        const { ensureMenuApproverSchema, syncMenuApprovers, isNoApproverBlocked, NO_APPROVER_BLOCK_MSG } = require('../../utils/menuApproverSync');
         await ensureMenuApproverSchema(client);
         try { await client.query(`ALTER TABLE gl_period_close_request ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL'`); } catch (_) {}
         await client.query('BEGIN');
@@ -605,7 +605,7 @@ const requestClose = async (req, res) => {
             return res.status(400).json({ message: `มีรายการบัญชีที่ยังอยู่ในสถานะ Draft จำนวน ${draftCount} รายการ ไม่สามารถขอปิดงวดได้` });
         }
 
-        const menuRes = await client.query(`SELECT approval_mode FROM sa_menu WHERE id=$1`, [menu_id]);
+        const menuRes = await client.query(`SELECT approval_mode, no_approver_action FROM sa_menu WHERE id=$1`, [menu_id]);
         const approvalMode = menuRes.rows[0]?.approval_mode === 'ANY' ? 'ANY' : 'ALL';
 
         const approvers = await client.query(`
@@ -618,6 +618,11 @@ const requestClose = async (req, res) => {
         if (approvers.rows.length === 0) {
             // ไม่มีผู้มีสิทธิ์อนุมัติเลย หรือถูกงดอนุมัติหมดทุกคน — admin ไม่ต้องการอนุมัติสำหรับเมนูนี้
             // ข้ามขั้นตอนอนุมัติไปเลยโดยไม่ต้องแจ้งเตือน ปิดงวดตรงทันที
+            if (isNoApproverBlocked(menuRes.rows[0])) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ message: NO_APPROVER_BLOCK_MSG });
+            }
+            // ตั้งค่าเมนู "ให้ผ่าน" (ALLOW) — ข้ามขั้นตอนอนุมัติ
             await client.query(
                 `UPDATE gl_posting_period SET gl_status='CLOSED', updated_by=$1, updated_at=NOW() WHERE id=$2`,
                 [userId, id]);
