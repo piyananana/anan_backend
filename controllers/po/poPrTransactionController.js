@@ -12,6 +12,8 @@
 const { generateDocNo } = require('../im/imTransactionController');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { reasonOf, userIdOf, sendErr, blk } = require('../../utils/docAction');
+const DA = require('../../utils/docApproval');
+const KIND = 'PR';
 
 const ensurePrTransactionTable = async (client) => {
     await client.query(`
@@ -66,21 +68,7 @@ const ensurePrTransactionTable = async (client) => {
     await client.query(`CREATE INDEX IF NOT EXISTS idx_pr_transaction_detail_header ON pr_transaction_detail(header_id)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_pr_transaction_detail_item   ON pr_transaction_detail(item_id)`);
 
-    // มิเรอร์ ap_payment_run_approval ทุกประการ — ดูเหตุผล/รูปแบบใน apPaymentRunController.js
-    await client.query(`
-        CREATE TABLE IF NOT EXISTS pr_transaction_approval (
-            id                  SERIAL PRIMARY KEY,
-            header_id           INTEGER NOT NULL REFERENCES pr_transaction(id) ON DELETE CASCADE,
-            approver_user_id    INTEGER NOT NULL,
-            approver_user_name  VARCHAR(100),
-            sequence_no         INTEGER NOT NULL,
-            status              VARCHAR(20) NOT NULL DEFAULT 'Pending',
-            remarks             TEXT,
-            approved_at         TIMESTAMPTZ,
-            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    `);
-    await client.query(`CREATE INDEX IF NOT EXISTS idx_pr_transaction_approval_header ON pr_transaction_approval(header_id)`);
+    // คิวผู้อนุมัติอยู่ที่ตารางกลาง doc_approval (utils/docApproval.js, doc_kind 'PR') — ตาราง pr_transaction_approval เดิมเลิกใช้แล้ว
 
     // คอลัมน์อ้างอิงกลับที่ po_transaction/po_transaction_detail ต้องมีอยู่ก่อนจึง query qty_converted ได้ —
     // ALTER ไว้ที่นี่ด้วย (ไม่ require poTransactionController.js) เพื่อไม่ต้องพึ่งว่ามีคนเรียก endpoint ฝั่ง PO
@@ -128,9 +116,8 @@ const fetchRowById = async (pool, id) => {
         FROM pr_transaction_detail dt
         LEFT JOIN im_uom u ON u.id = dt.uom_id
         WHERE dt.header_id = $1 ORDER BY dt.line_no`, [id]);
-    const aRes = await pool.query(`
-        SELECT * FROM pr_transaction_approval WHERE header_id = $1 ORDER BY sequence_no`, [id]);
-    return { ...hRes.rows[0], details: dRes.rows, approvals: aRes.rows };
+    await DA.ensureDocApprovalSchema(pool);
+    return { ...hRes.rows[0], details: dRes.rows, approvals: await DA.loadApprovals(pool, KIND, Number(id)) };
 };
 
 // --- GET list ---
@@ -299,7 +286,8 @@ const updateTransaction = async (req, res) => {
         ]);
 
         // แก้ไขแล้วถือว่าเป็นรอบ Draft ใหม่ — ล้างคิวอนุมัติเดิมทิ้ง (ถ้ามีจากรอบที่ถูกปฏิเสธ)
-        await client.query(`DELETE FROM pr_transaction_approval WHERE header_id=$1`, [id]);
+        await DA.ensureDocApprovalSchema(client);
+        await client.query(`DELETE FROM doc_approval WHERE doc_kind=$1 AND record_id=$2`, [KIND, Number(id)]);
 
         // แก้ไขบรรทัดแบบ diff (UPDATE ของเดิม / INSERT ใหม่ / DELETE ที่ถูกลบ) แทนการ DELETE ทั้งหมดแล้ว INSERT ใหม่
         // ทุกครั้ง — เดิมทำให้ id ของทุกบรรทัดเปลี่ยนทุกครั้งที่ save แม้ไม่ได้แก้ไขอะไรเลย ซึ่งทำให้สิ่งที่ผูกกับ
@@ -351,177 +339,56 @@ const updateTransaction = async (req, res) => {
     } finally { client.release(); }
 };
 
-// --- 3. Submit (Draft/Rejected -> Submitted, ข้ามไป Approved อัตโนมัติถ้าไม่มีผู้อนุมัติ) ---
-// มิเรอร์ apPaymentRunController.js:submitRun ทุกประการ — คิวผู้อนุมัติ sync จาก sa_user_menu.can_approve ผ่าน
-// syncMenuApprovers เมนูนี้ (PrTransactionScreen, sa_menu.uses_doc_type=false) ใช้คิวระดับเมนู (doc_type=NULL)
-// เหมือน ap_payment_run — ถ้าในอนาคตตั้ง uses_doc_type=true ค่อยแยกคิวต่อประเภทเอกสารด้วย doc_code แทน
-const submitTransaction = async (req, res) => {
+// --- 3-5. ส่งอนุมัติ / อนุมัติ / ปฏิเสธ — คิวผู้อนุมัติของเมนูที่ตารางกลาง doc_approval (utils/docApproval.js)
+// ไม่มีผู้อนุมัติ = ตาม sa_menu.no_approver_action (ให้ผ่าน -> Approved ทันที / ไม่ให้ผ่าน -> ส่งไม่ได้)
+// Rejected แก้ไข+ส่งใหม่ได้เหมือน Draft (ไม่ย้อนกลับเป็น Draft ตรงๆ เพื่อให้เห็นประวัติว่าเคยถูกปฏิเสธ)
+const approvalAction = (label, work) => async (req, res) => {
     const { id } = req.params;
-    const { menu_id } = req.body || {};
-    const userName = req.headers['username'] || null;
-    if (!menu_id) return res.status(400).json({ message: 'ต้องระบุ menu_id' });
+    const ctx = {
+        userId: Number(req.headers.userid) || null, userName: req.headers.username || null,
+        menuId: req.body?.menu_id, remarks: req.body?.remarks,
+    };
+    if (label !== 'submitting' && !ctx.userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
+    await DA.ensureDocApprovalSchema(req.dbPool);
     const client = await req.dbPool.connect();
     try {
-        const { ensureMenuApproverSchema, syncMenuApprovers, isNoApproverBlocked, NO_APPROVER_BLOCK_MSG } = require('../../utils/menuApproverSync');
-        await ensureMenuApproverSchema(client);
         await client.query('BEGIN');
         await ensurePrTransactionTable(client);
-
-        const existing = await client.query(`SELECT status, doc_code FROM pr_transaction WHERE id=$1 FOR UPDATE`, [id]);
-        if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
-        if (!['Draft', 'Rejected'].includes(existing.rows[0].status)) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: 'ส่งอนุมัติได้เฉพาะเอกสาร Draft หรือ Rejected เท่านั้น' });
-        }
-
-        const menuRes = await client.query(`SELECT approval_mode, uses_doc_type, no_approver_action FROM sa_menu WHERE id=$1`, [menu_id]);
-        const approvalMode = menuRes.rows[0]?.approval_mode === 'ANY' ? 'ANY' : 'ALL';
-        const docType = menuRes.rows[0]?.uses_doc_type ? existing.rows[0].doc_code : null;
-
-        await syncMenuApprovers(client, menu_id, docType);
-
-        const approvers = await client.query(`
-            SELECT a.approval_level, a.approver_user_id, u.user_name
-            FROM sa_module_approver a
-            JOIN sa_user u ON u.id = a.approver_user_id
-            WHERE a.menu_id=$1 AND a.doc_type IS NOT DISTINCT FROM $2 AND a.is_active=true
-            ORDER BY a.approval_level`, [menu_id, docType]);
-
-        await client.query(`DELETE FROM pr_transaction_approval WHERE header_id=$1`, [id]);
-
-        if (approvers.rows.length === 0) {
-            // ไม่มีผู้มีสิทธิ์อนุมัติเลย — ข้ามขั้นตอนอนุมัติไปเลย ผ่านตรงไป Approved
-            if (isNoApproverBlocked(menuRes.rows[0])) {
-                await client.query('ROLLBACK');
-                return res.status(400).json({ message: NO_APPROVER_BLOCK_MSG });
-            }
-            // ตั้งค่าเมนู "ให้ผ่าน" (ALLOW) — ข้ามขั้นตอนอนุมัติ
-            await client.query(`
-                UPDATE pr_transaction SET status='Approved', approval_mode=$1, submitted_at=NOW(), submitted_by=$2,
-                    updated_at=NOW(), updated_by=$2 WHERE id=$3`,
-                [approvalMode, userName, id]);
-            await client.query('COMMIT');
-            const full = await fetchRowById(req.dbPool, id);
-            return res.status(200).json(full);
-        }
-
-        await client.query(`
-            UPDATE pr_transaction SET status='Submitted', approval_mode=$1, submitted_at=NOW(), submitted_by=$2,
-                updated_at=NOW(), updated_by=$2 WHERE id=$3`,
-            [approvalMode, userName, id]);
-        for (const apr of approvers.rows) {
-            await client.query(`
-                INSERT INTO pr_transaction_approval (header_id, approver_user_id, approver_user_name, sequence_no, status)
-                VALUES ($1,$2,$3,$4,'Pending')`,
-                [id, apr.approver_user_id, apr.user_name, apr.approval_level]);
-        }
+        const t = (await client.query(`SELECT * FROM pr_transaction WHERE id=$1 FOR UPDATE`, [id])).rows[0];
+        if (!t) throw DA.httpErr(404, 'Not found');
+        await work(client, t, ctx);
         await client.query('COMMIT');
-        const full = await fetchRowById(req.dbPool, id);
-        res.status(200).json(full);
+        res.status(200).json(await fetchRowById(req.dbPool, id));
     } catch (error) {
         await client.query('ROLLBACK');
-        console.error('Error submitting pr_transaction:', error);
-        res.status(500).json({ message: error.message || 'Internal server error' });
+        if (!error.status) console.error(`Error ${label} pr_transaction:`, error);
+        res.status(error.status || 500).json({ message: error.message || 'Internal server error' });
     } finally { client.release(); }
 };
 
-// --- 4. Approve (Submitted -> Approved when all/any approve per approval_mode) ---
-const approveTransaction = async (req, res) => {
-    const { id } = req.params;
-    const { remarks } = req.body || {};
-    const userId = req.headers['userid'];
-    const userName = req.headers['username'] || null;
-    if (!userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
-    const client = await req.dbPool.connect();
-    try {
-        await client.query('BEGIN');
-        const pr = await client.query(`SELECT status, approval_mode FROM pr_transaction WHERE id=$1 FOR UPDATE`, [id]);
-        if (pr.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
-        if (pr.rows[0].status !== 'Submitted') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'อนุมัติได้เฉพาะเอกสาร Submitted เท่านั้น' }); }
-        const isAnyMode = pr.rows[0].approval_mode === 'ANY';
+const markApproved = (client, id, userName) => client.query(`
+    UPDATE pr_transaction SET status='Approved', updated_at=NOW(), updated_by=$1 WHERE id=$2`, [userName, id]);
 
-        const myRecord = await client.query(`
-            SELECT a.id FROM pr_transaction_approval a
-            WHERE a.header_id=$1 AND a.approver_user_id=$2 AND a.status='Pending'
-              AND ($3::boolean OR NOT EXISTS (
-                SELECT 1 FROM pr_transaction_approval a2
-                WHERE a2.header_id=$1 AND a2.sequence_no < a.sequence_no AND a2.status='Pending'
-              ))`, [id, userId, isAnyMode]);
+const submitTransaction = approvalAction('submitting', async (client, t, { menuId, userName }) => {
+    if (!['Draft', 'Rejected'].includes(t.status)) throw DA.httpErr(400, 'ส่งอนุมัติได้เฉพาะเอกสาร Draft หรือ Rejected เท่านั้น');
+    const q = await DA.buildQueue(client, { kind: KIND, recordId: t.id, menuId, docCode: t.doc_code });
+    await client.query(`
+        UPDATE pr_transaction SET status='Submitted', approval_mode=$1, submitted_at=NOW(), submitted_by=$2,
+            updated_at=NOW(), updated_by=$2 WHERE id=$3`, [q.mode, userName, t.id]);
+    if (q.count === 0) await markApproved(client, t.id, userName);
+});
 
-        if (myRecord.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(403).json({ message: 'ไม่มีสิทธิ์อนุมัติ หรือยังรอการอนุมัติจากลำดับก่อนหน้า' });
-        }
+const approveTransaction = approvalAction('approving', async (client, t, { userId, userName, remarks }) => {
+    if (t.status !== 'Submitted') throw DA.httpErr(400, 'อนุมัติได้เฉพาะเอกสาร Submitted เท่านั้น');
+    const done = await DA.approveStep(client, { kind: KIND, recordId: t.id, userId, mode: t.approval_mode, remarks });
+    if (done) await markApproved(client, t.id, userName);
+});
 
-        await client.query(`
-            UPDATE pr_transaction_approval SET status='Approved', remarks=$1, approved_at=NOW() WHERE id=$2`,
-            [remarks || null, myRecord.rows[0].id]);
-
-        if (isAnyMode) {
-            await client.query(
-                `UPDATE pr_transaction_approval SET status='Skipped' WHERE header_id=$1 AND status='Pending'`, [id]);
-            await client.query(
-                `UPDATE pr_transaction SET status='Approved', updated_at=NOW(), updated_by=$1 WHERE id=$2`,
-                [userName, id]);
-        } else {
-            const remaining = await client.query(
-                `SELECT COUNT(*) FROM pr_transaction_approval WHERE header_id=$1 AND status='Pending'`, [id]);
-            if (parseInt(remaining.rows[0].count) === 0) {
-                await client.query(
-                    `UPDATE pr_transaction SET status='Approved', updated_at=NOW(), updated_by=$1 WHERE id=$2`,
-                    [userName, id]);
-            }
-        }
-        await client.query('COMMIT');
-        const full = await fetchRowById(req.dbPool, id);
-        res.status(200).json(full);
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error('Error approving pr_transaction:', error);
-        res.status(500).json({ message: 'Internal server error' });
-    } finally { client.release(); }
-};
-
-// --- 5. Reject (Submitted -> Rejected — แก้ไข+ส่งใหม่ได้เหมือน Draft, ไม่ย้อนกลับไปเป็น Draft ตรงๆ เพื่อให้
-// เห็นประวัติว่าเคยถูกปฏิเสธ) ---
-const rejectTransaction = async (req, res) => {
-    const { id } = req.params;
-    const { remarks } = req.body || {};
-    const userId = req.headers['userid'];
-    const userName = req.headers['username'] || null;
-    if (!userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
-    const client = await req.dbPool.connect();
-    try {
-        await client.query('BEGIN');
-        const pr = await client.query(`SELECT status FROM pr_transaction WHERE id=$1 FOR UPDATE`, [id]);
-        if (pr.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
-        if (pr.rows[0].status !== 'Submitted') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'ปฏิเสธได้เฉพาะเอกสาร Submitted เท่านั้น' }); }
-
-        const myRecord = await client.query(`
-            SELECT id FROM pr_transaction_approval
-            WHERE header_id=$1 AND approver_user_id=$2 AND status='Pending'`, [id, userId]);
-        if (myRecord.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(403).json({ message: 'ไม่มีสิทธิ์ปฏิเสธ หรืออนุมัติไปแล้ว' });
-        }
-
-        await client.query(`
-            UPDATE pr_transaction_approval SET status='Rejected', remarks=$1, approved_at=NOW() WHERE id=$2`,
-            [remarks || null, myRecord.rows[0].id]);
-        await client.query(`
-            UPDATE pr_transaction_approval SET status='Skipped' WHERE header_id=$1 AND status='Pending'`, [id]);
-        await client.query(`
-            UPDATE pr_transaction SET status='Rejected', updated_at=NOW(), updated_by=$1 WHERE id=$2`,
-            [userName, id]);
-        await client.query('COMMIT');
-        const full = await fetchRowById(req.dbPool, id);
-        res.status(200).json(full);
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error('Error rejecting pr_transaction:', error);
-        res.status(500).json({ message: 'Internal server error' });
-    } finally { client.release(); }
-};
+const rejectTransaction = approvalAction('rejecting', async (client, t, { userId, userName, remarks }) => {
+    if (t.status !== 'Submitted') throw DA.httpErr(400, 'ปฏิเสธได้เฉพาะเอกสาร Submitted เท่านั้น');
+    await DA.rejectStep(client, { kind: KIND, recordId: t.id, userId, remarks });
+    await client.query(`UPDATE pr_transaction SET status='Rejected', updated_at=NOW(), updated_by=$1 WHERE id=$2`, [userName, t.id]);
+});
 
 // --- 6. Close (Approved/PartiallyConverted/FullyConverted -> Closed) ---
 const closeTransaction = async (req, res) => {
@@ -619,7 +486,8 @@ const lockedAction = async (req, res, kind, label, work) => {
 // Closed -> เปิดใหม่: สถานะคำนวณจากใบสั่งซื้อที่แปลงไปแล้ว (Approved / PartiallyConverted / FullyConverted)
 const reverseTransaction = (req, res) => lockedAction(req, res, 'reverse_block', 'การถอยเอกสาร', async (client, t, { userName }) => {
     if (['Submitted', 'Approved'].includes(t.status)) {
-        await client.query(`UPDATE pr_transaction_approval SET status='Skipped' WHERE header_id=$1 AND status='Pending'`, [t.id]);
+        await DA.ensureDocApprovalSchema(client);
+        await DA.skipPending(client, KIND, t.id);
         await client.query(`
             UPDATE pr_transaction SET status='Draft', submitted_at=NULL, submitted_by=NULL, updated_by=$1, updated_at=NOW()
              WHERE id=$2`, [userName, t.id]);
@@ -646,18 +514,15 @@ const deleteTransaction = (req, res) => lockedAction(req, res, 'delete_block', '
 
 // --- GET pr_transaction pending current user's approval ---
 const fetchMyPending = async (req, res) => {
-    const userId = req.headers['userid'];
+    const userId = Number(req.headers['userid']);
     if (!userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
     try {
+        await DA.ensureDocApprovalSchema(req.dbPool);
         const result = await req.dbPool.query(`
             SELECT t.id, t.doc_no, t.doc_date, t.description, t.total_value_lc, t.status, t.submitted_by
             FROM pr_transaction t
-            WHERE t.status = 'Submitted'
-              AND EXISTS (
-                SELECT 1 FROM pr_transaction_approval a
-                WHERE a.header_id = t.id AND a.approver_user_id = $1 AND a.status = 'Pending'
-              )
-            ORDER BY t.doc_date DESC, t.id DESC`, [userId]);
+            WHERE t.status = 'Submitted' AND ${DA.myTurnSql('t', '$1', '$2')}
+            ORDER BY t.doc_date DESC, t.id DESC`, [KIND, userId]);
         res.status(200).json(result.rows);
     } catch (error) {
         console.error('Error fetching pr_transaction my_pending:', error);

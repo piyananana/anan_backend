@@ -13,6 +13,11 @@
 //     ผู้อนุมัติที่วงเงินไม่พอจะไม่ถูกใส่ในคิว — ไม่มีใครวงเงินพอเลย = ขออนุมัติไม่ได้
 //   - การอนุมัติผูกกับยอดเอกสาร: ยอดเพิ่มขึ้นจากที่อนุมัติ (ใบลดหนี้ = ลดน้อยลง) ต้องขออนุมัติใหม่
 // สถานะเอกสารไม่เปลี่ยน (ยังเป็น Draft) — ใช้คอลัมน์ credit_status: NULL / Pending / Approved แยกต่างหาก
+// คิวผู้อนุมัติเก็บที่ตารางกลาง doc_approval (utils/docApproval.js, doc_kind 'AR_CREDIT' / 'IM_CREDIT') — ตาราง
+// credit_approval เดิมเลิกใช้แล้ว; โหมด ALL/ANY เก็บที่คอลัมน์ credit_approval_mode ของหัวเอกสาร
+
+const DA = require('./docApproval');
+const kindOf = (module) => (module === 'AR' ? 'AR_CREDIT' : 'IM_CREDIT');
 
 const AR_CHECK_TYPES = ['10', '30', '35', '50', '55'];
 const AR_CREDIT_TYPES = ['50', '55'];
@@ -36,21 +41,7 @@ const ensureCreditSchema = async (db) => {
       ADD COLUMN IF NOT EXISTS credit_requested_by  VARCHAR(100),
       ADD COLUMN IF NOT EXISTS credit_requested_at  TIMESTAMPTZ`);
   }
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS credit_approval (
-      id                 SERIAL PRIMARY KEY,
-      module             VARCHAR(2)  NOT NULL,        -- 'AR' | 'IM'
-      record_id          INTEGER     NOT NULL,        -- ar_transaction.id / im_transaction.id
-      approver_user_id   INTEGER     NOT NULL,
-      approver_user_name VARCHAR(100),
-      sequence_no        INTEGER     NOT NULL DEFAULT 1,
-      status             VARCHAR(20) NOT NULL DEFAULT 'Pending', -- Pending / Approved / Rejected / Skipped
-      remarks            TEXT,
-      approved_at        TIMESTAMPTZ,
-      created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )`);
-  await db.query(`CREATE INDEX IF NOT EXISTS idx_credit_approval_record ON credit_approval (module, record_id)`);
-  await db.query(`ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS no_approver_action VARCHAR(10) DEFAULT 'ALLOW'`);
+  await DA.ensureDocApprovalSchema(db); // คิวผู้อนุมัติ + sa_menu.no_approver_action
   if (dbName) ensured.add(dbName);
 };
 
@@ -138,100 +129,63 @@ const assertCreditForPost = async (db, { customerId, amount, excludeArId, exclud
 // คืน { status: 'Pending' | 'Approved', approvers, excluded }
 const fmt2 = (n) => Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const requestCreditApproval = async (client, { table, module, id, menuId, docCode, ev, userName }) => {
-  const { syncMenuApprovers, isNoApproverBlocked } = require('./menuApproverSync');
-  await syncMenuApprovers(client, menuId, docCode);
-  const menu = (await client.query(`SELECT approval_mode, no_approver_action FROM sa_menu WHERE id=$1`, [menuId])).rows[0] || {};
-  const mode = menu.approval_mode === 'ANY' ? 'ANY' : 'ALL';
-  const all = (await client.query(`
-    SELECT a.approval_level, a.approver_user_id, u.user_name, COALESCE(a.approval_limit, 0)::float AS approval_limit
-      FROM sa_module_approver a JOIN sa_user u ON u.id = a.approver_user_id
-     WHERE a.menu_id = $1 AND a.doc_type = $2 AND a.is_active = true
-     ORDER BY a.approval_level`, [menuId, docCode])).rows;
-  if (!all.length && isNoApproverBlocked(menu)) {
-    const e = new Error('ยังไม่ได้ตั้งผู้อนุมัติเกินวงเงินของเมนู/ประเภทเอกสารนี้ — ไม่สามารถโพสต์เกินวงเงินเครดิตได้');
-    e.status = 400; throw e;
-  }
-  const approvers = all.filter(a => a.approval_limit <= 0 || a.approval_limit + 0.005 >= ev.over);
-  if (all.length && !approvers.length) {
-    const max = Math.max(...all.map(a => a.approval_limit));
-    const e = new Error(`ไม่มีผู้อนุมัติที่มีวงเงินอนุมัติพอสำหรับส่วนที่เกิน ${fmt2(ev.over)} (วงเงินอนุมัติสูงสุด ${fmt2(max)})`);
-    e.status = 400; throw e;
-  }
-  await client.query(`DELETE FROM credit_approval WHERE module=$1 AND record_id=$2`, [module, id]);
-  const status = approvers.length ? 'Pending' : 'Approved';
+  // คิวแยกตามประเภทเอกสาร (doc_code) เสมอ + ตัดผู้อนุมัติที่วงเงินอนุมัติไม่พอสำหรับส่วนที่เกิน
+  const q = await DA.buildQueue(client, {
+    kind: kindOf(module), recordId: id, menuId, docCode, alwaysDocType: true,
+    filter: (all) => {
+      const ok = all.filter((a) => a.approval_limit <= 0 || a.approval_limit + 0.005 >= ev.over);
+      if (all.length && !ok.length) {
+        const max = Math.max(...all.map((a) => a.approval_limit));
+        throw DA.httpErr(400, `ไม่มีผู้อนุมัติที่มีวงเงินอนุมัติพอสำหรับส่วนที่เกิน ${fmt2(ev.over)} (วงเงินอนุมัติสูงสุด ${fmt2(max)})`);
+      }
+      return ok;
+    },
+  });
+  const status = q.count ? 'Pending' : 'Approved';
   await client.query(`
     UPDATE ${table} SET credit_status=$1, credit_amount=$2, credit_limit_at=$3, credit_outstanding_at=$4,
            credit_approval_mode=$5, credit_requested_by=$6, credit_requested_at=NOW()
-     WHERE id=$7`, [status, ev.amount, ev.credit_limit, ev.outstanding, mode, userName, id]);
-  for (const a of approvers) {
-    await client.query(`
-      INSERT INTO credit_approval (module, record_id, approver_user_id, approver_user_name, sequence_no, status)
-      VALUES ($1,$2,$3,$4,$5,'Pending')`, [module, id, a.approver_user_id, a.user_name, a.approval_level]);
-  }
-  return { status, approvers: approvers.length, excluded: all.length - approvers.length };
+     WHERE id=$7`, [status, ev.amount, ev.credit_limit, ev.outstanding, q.mode, userName, id]);
+  return { status, approvers: q.count, excluded: q.total - q.count };
 };
 
 // อนุมัติ (ตามลำดับ หรือคนใดคนหนึ่งถ้า ANY) — คืนสถานะใหม่ของเอกสาร
 const approveCredit = async (client, { table, module, id, userId, remarks }) => {
   const doc = (await client.query(`SELECT credit_status, credit_approval_mode FROM ${table} WHERE id=$1 FOR UPDATE`, [id])).rows[0];
-  if (!doc) { const e = new Error('Not found'); e.status = 404; throw e; }
-  if (doc.credit_status !== 'Pending') { const e = new Error('เอกสารนี้ไม่ได้อยู่ระหว่างรออนุมัติเกินวงเงิน'); e.status = 400; throw e; }
-  const isAny = doc.credit_approval_mode === 'ANY';
-  const mine = (await client.query(`
-    SELECT a.id FROM credit_approval a
-     WHERE a.module=$1 AND a.record_id=$2 AND a.approver_user_id=$3 AND a.status='Pending'
-       AND ($4::boolean OR NOT EXISTS (
-         SELECT 1 FROM credit_approval a2
-          WHERE a2.module=$1 AND a2.record_id=$2 AND a2.sequence_no < a.sequence_no AND a2.status='Pending'))
-     ORDER BY a.sequence_no LIMIT 1`, [module, id, userId, isAny])).rows[0];
-  if (!mine) { const e = new Error('ไม่มีสิทธิ์อนุมัติ หรือยังรอการอนุมัติจากลำดับก่อนหน้า'); e.status = 403; throw e; }
-  await client.query(`UPDATE credit_approval SET status='Approved', remarks=$1, approved_at=NOW() WHERE id=$2`, [remarks || null, mine.id]);
-  if (isAny) await client.query(`UPDATE credit_approval SET status='Skipped' WHERE module=$1 AND record_id=$2 AND status='Pending'`, [module, id]);
-  const left = Number((await client.query(
-    `SELECT COUNT(*) FROM credit_approval WHERE module=$1 AND record_id=$2 AND status='Pending'`, [module, id])).rows[0].count);
-  if (left === 0) await client.query(`UPDATE ${table} SET credit_status='Approved' WHERE id=$1`, [id]);
-  return left === 0 ? 'Approved' : 'Pending';
+  if (!doc) throw DA.httpErr(404, 'Not found');
+  if (doc.credit_status !== 'Pending') throw DA.httpErr(400, 'เอกสารนี้ไม่ได้อยู่ระหว่างรออนุมัติเกินวงเงิน');
+  const done = await DA.approveStep(client, { kind: kindOf(module), recordId: id, userId, mode: doc.credit_approval_mode, remarks });
+  if (done) await client.query(`UPDATE ${table} SET credit_status='Approved' WHERE id=$1`, [id]);
+  return done ? 'Approved' : 'Pending';
 };
 
 // ปฏิเสธ (ผู้อนุมัติ) / ถอนคำขอ (ผู้ขอ) — กลับเป็นไม่มีคำขอ ให้แก้เอกสารแล้วขอใหม่ได้
 const rejectCredit = async (client, { table, module, id, userId, remarks }) => {
   const doc = (await client.query(`SELECT credit_status FROM ${table} WHERE id=$1 FOR UPDATE`, [id])).rows[0];
-  if (!doc) { const e = new Error('Not found'); e.status = 404; throw e; }
-  if (doc.credit_status !== 'Pending') { const e = new Error('เอกสารนี้ไม่ได้อยู่ระหว่างรออนุมัติเกินวงเงิน'); e.status = 400; throw e; }
-  const mine = (await client.query(
-    `SELECT id FROM credit_approval WHERE module=$1 AND record_id=$2 AND approver_user_id=$3 AND status='Pending' LIMIT 1`,
-    [module, id, userId])).rows[0];
-  if (!mine) { const e = new Error('ไม่มีสิทธิ์ปฏิเสธ หรืออนุมัติไปแล้ว'); e.status = 403; throw e; }
-  await client.query(`UPDATE credit_approval SET status='Rejected', remarks=$1, approved_at=NOW() WHERE id=$2`, [remarks || null, mine.id]);
-  await client.query(`UPDATE credit_approval SET status='Skipped' WHERE module=$1 AND record_id=$2 AND status='Pending'`, [module, id]);
+  if (!doc) throw DA.httpErr(404, 'Not found');
+  if (doc.credit_status !== 'Pending') throw DA.httpErr(400, 'เอกสารนี้ไม่ได้อยู่ระหว่างรออนุมัติเกินวงเงิน');
+  await DA.rejectStep(client, { kind: kindOf(module), recordId: id, userId, remarks });
   await client.query(`UPDATE ${table} SET credit_status=NULL WHERE id=$1`, [id]);
 };
 
 const withdrawCredit = async (client, { table, module, id }) => {
   const doc = (await client.query(`SELECT credit_status, status FROM ${table} WHERE id=$1 FOR UPDATE`, [id])).rows[0];
-  if (!doc) { const e = new Error('Not found'); e.status = 404; throw e; }
-  if (!doc.credit_status) { const e = new Error('เอกสารนี้ไม่มีคำขออนุมัติเกินวงเงิน'); e.status = 400; throw e; }
-  if (doc.status !== 'Draft') { const e = new Error('ถอนคำขอได้เฉพาะเอกสารร่าง'); e.status = 400; throw e; }
-  await client.query(`UPDATE credit_approval SET status='Skipped' WHERE module=$1 AND record_id=$2 AND status='Pending'`, [module, id]);
+  if (!doc) throw DA.httpErr(404, 'Not found');
+  if (!doc.credit_status) throw DA.httpErr(400, 'เอกสารนี้ไม่มีคำขออนุมัติเกินวงเงิน');
+  if (doc.status !== 'Draft') throw DA.httpErr(400, 'ถอนคำขอได้เฉพาะเอกสารร่าง');
+  await DA.skipPending(client, kindOf(module), id);
   await client.query(`UPDATE ${table} SET credit_status=NULL WHERE id=$1`, [id]);
 };
 
-const loadCreditApprovals = async (db, module, id) => (await db.query(`
-  SELECT approver_user_id, approver_user_name, sequence_no, status, remarks, approved_at
-    FROM credit_approval WHERE module=$1 AND record_id=$2 ORDER BY sequence_no, id`, [module, id])).rows;
+const loadCreditApprovals = (db, module, id) => DA.loadApprovals(db, kindOf(module), id);
 
 // รายการที่รอผู้ใช้คนนี้อนุมัติ (ตามลำดับ) — สำหรับกระดิ่งที่หน้า Home
 const myPendingCredit = async (db, { table, module, userId }) => (await db.query(`
   SELECT t.id, t.doc_no, t.doc_date, t.customer_code, t.customer_name_th, t.credit_amount::float AS amount,
          t.credit_limit_at::float AS credit_limit, t.credit_outstanding_at::float AS outstanding, t.credit_requested_by
     FROM ${table} t
-   WHERE t.credit_status = 'Pending'
-     AND EXISTS (SELECT 1 FROM credit_approval a
-                  WHERE a.module=$1 AND a.record_id=t.id AND a.approver_user_id=$2 AND a.status='Pending'
-                    AND (t.credit_approval_mode = 'ANY' OR NOT EXISTS (
-                      SELECT 1 FROM credit_approval a2 WHERE a2.module=$1 AND a2.record_id=t.id
-                         AND a2.sequence_no < a.sequence_no AND a2.status='Pending')))
-   ORDER BY t.credit_requested_at`, [module, userId])).rows;
+   WHERE t.credit_status = 'Pending' AND ${DA.myTurnSql('t', '$1', '$2', 'credit_approval_mode')}
+   ORDER BY t.credit_requested_at`, [kindOf(module), userId])).rows;
 
 module.exports = {
   AR_CHECK_TYPES, IM_CHECK_TYPES,

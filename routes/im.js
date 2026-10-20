@@ -49,6 +49,7 @@ router.delete('/im_price_list/:id',               imPriceListController.deleteRo
 
 // im_price_change (ธุรกรรมเปลี่ยนแปลงราคา — Draft -> Pending -> Approved, กิ่ง Void แยกจาก Draft/Pending)
 router.get('/im_price_change/preview_lines',     imPriceChangeController.previewLines); // ต้องมาก่อน /:id ด้านล่าง
+router.get('/im_price_change/my_pending',        imPriceChangeController.fetchMyPending); // ต้องมาก่อน /:id
 router.get('/im_price_change',                   imPriceChangeController.fetchRows);
 router.get('/im_price_change/:id',               imPriceChangeController.fetchRow);
 router.post('/im_price_change',                  imPriceChangeController.addRow);
@@ -153,6 +154,7 @@ router.post('/im_stock_count_running',             imStockCountRunningController
 // im_stock_count (ใบตรวจนับสต็อก — Draft->Posted->Approved->Closed, ถอยทีละขั้น / ยกเลิก / ลบร่าง)
 // Closed = บันทึกปรับยอดแล้ว สร้าง+โพสต์ im_transaction AJS ให้อัตโนมัติ
 router.get('/im_stock_count/variance_report',   imStockCountController.fetchVarianceReport);
+router.get('/im_stock_count/my_pending',        imStockCountController.fetchMyPending); // ต้องมาก่อน /:id
 router.get('/im_stock_count',                   imStockCountController.fetchRows);
 router.get('/im_stock_count/:id',               imStockCountController.fetchRow);
 router.get('/im_stock_count/:id/lines',         imStockCountController.fetchLinesForRecording);
@@ -164,7 +166,9 @@ router.put('/im_stock_count/:id/post',          imStockCountController.postCount
 router.put('/im_stock_count/:id/void',          imStockCountController.voidCount);
 router.put('/im_stock_count/:id/print_count',   imStockCountController.incrementPrintCount);
 router.put('/im_stock_count/:id/counts',        imStockCountController.updateCounts);
+router.put('/im_stock_count/:id/submit',        imStockCountController.submitCount);
 router.put('/im_stock_count/:id/approve',       imStockCountController.approveCount);
+router.put('/im_stock_count/:id/reject',        imStockCountController.rejectCount);
 router.put('/im_stock_count/:id/close',         imStockCountController.closeCount);
 router.put('/im_stock_count/:id/reverse',       imStockCountController.reverseCount);
 router.delete('/im_stock_count/:id',            imStockCountController.deleteCount);

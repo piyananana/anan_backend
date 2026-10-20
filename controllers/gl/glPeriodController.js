@@ -1,5 +1,9 @@
 // File: controllers/gl/glPeriodController.js
 const { ymd } = require('../../utils/dateUtil');
+// คิวผู้อนุมัติขอปิดงวดเก็บที่ตารางกลาง doc_approval (utils/docApproval.js, doc_kind 'GL_CLOSE', record_id =
+// gl_period_close_request.id — คิวผูกกับคำขอแต่ละครั้ง) — ตาราง gl_period_close_approval เดิมเลิกใช้แล้ว
+const DA = require('../../utils/docApproval');
+const KIND = 'GL_CLOSE';
 // const { Pool } = require('pg');
 
 // // *** ตัวอย่าง Pool Connection (คุณอาจต้องแก้ไขให้ถูกต้องตาม config ของคุณ) ***
@@ -241,13 +245,14 @@ const fetchDetailRows = async (req, res) => {
                    cr.id AS close_request_id,
                    cr.requested_by AS close_requested_by,
                    cr.requested_by_name AS close_requested_by_name,
+                   cr.approval_mode AS close_approval_mode,
                    (SELECT json_agg(json_build_object(
                         'approver_user_id', ca.approver_user_id,
                         'approver_user_name', ca.approver_user_name,
                         'sequence_no', ca.sequence_no,
                         'status', ca.status
                     ) ORDER BY ca.sequence_no)
-                    FROM gl_period_close_approval ca WHERE ca.request_id = cr.id) AS close_approvals
+                    FROM doc_approval ca WHERE ca.doc_kind = '${KIND}' AND ca.record_id = cr.id) AS close_approvals
             FROM gl_posting_period p
             LEFT JOIN gl_period_close_request cr ON cr.period_id = p.id AND cr.status = 'Pending'
             WHERE p.fiscal_year_id = $1
@@ -276,6 +281,17 @@ const ensureCloseRequestTable = async (pool) => {
     try {
         await pool.query(`ALTER TABLE gl_posting_period ALTER COLUMN gl_status TYPE VARCHAR(20)`);
     } catch (_) { /* ignore */ }
+    // ฐานข้อมูลเดิมมี check constraint ที่ยอมรับแค่ OPEN/LOCKED/CLOSED — ขอปิดงวดที่มีผู้อนุมัติจึงตั้ง PENDING_CLOSE ไม่ได้
+    try {
+        const c = (await pool.query(`
+            SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
+             WHERE conrelid = 'gl_posting_period'::regclass AND conname = 'gl_posting_period_gl_status_check'`)).rows[0];
+        if (c && !c.def.includes('PENDING_CLOSE')) {
+            await pool.query(`ALTER TABLE gl_posting_period DROP CONSTRAINT gl_posting_period_gl_status_check`);
+            await pool.query(`ALTER TABLE gl_posting_period ADD CONSTRAINT gl_posting_period_gl_status_check
+                CHECK (gl_status IN ('OPEN', 'LOCKED', 'CLOSED', 'PENDING_CLOSE'))`);
+        }
+    } catch (_) { /* ignore */ }
     try {
         await pool.query(`
             CREATE TABLE IF NOT EXISTS gl_period_close_request (
@@ -293,23 +309,14 @@ const ensureCloseRequestTable = async (pool) => {
             )`);
     } catch (_) { /* ignore if table doesn't exist yet */ }
     // เดิม approver_user_id เป็น NOT NULL (ผู้อนุมัติเดี่ยว) — ตอนนี้เปลี่ยนเป็นผู้อนุมัติหลายคนแบบมีลำดับ
-    // ผ่านตาราง gl_period_close_approval แทน คอลัมน์นี้เก็บไว้เฉยๆ เพื่อความเข้ากันได้ย้อนหลัง
+    // ผ่านตารางกลาง doc_approval แทน คอลัมน์นี้เก็บไว้เฉยๆ เพื่อความเข้ากันได้ย้อนหลัง
     try {
         await pool.query(`ALTER TABLE gl_period_close_request ALTER COLUMN approver_user_id DROP NOT NULL`);
     } catch (_) { /* ignore */ }
     try {
-        await pool.query(`
-            CREATE TABLE IF NOT EXISTS gl_period_close_approval (
-                id                  SERIAL PRIMARY KEY,
-                request_id          INTEGER NOT NULL REFERENCES gl_period_close_request(id) ON DELETE CASCADE,
-                approver_user_id    INTEGER NOT NULL,
-                approver_user_name  VARCHAR(100),
-                sequence_no         INTEGER NOT NULL,
-                status              VARCHAR(20) NOT NULL DEFAULT 'Pending',
-                remarks             TEXT,
-                approved_at         TIMESTAMPTZ
-            )`);
+        await pool.query(`ALTER TABLE gl_period_close_request ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL'`);
     } catch (_) { /* ignore */ }
+    await DA.ensureDocApprovalSchema(pool);
 };
 
 // GET period cm_status for a given date (used by Flutter CM period check)
@@ -574,11 +581,7 @@ const requestClose = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await ensureCloseRequestTable(client);
-        const { ensureMenuApproverSchema, syncMenuApprovers, isNoApproverBlocked, NO_APPROVER_BLOCK_MSG } = require('../../utils/menuApproverSync');
-        await ensureMenuApproverSchema(client);
-        try { await client.query(`ALTER TABLE gl_period_close_request ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL'`); } catch (_) {}
         await client.query('BEGIN');
-        await syncMenuApprovers(client, menu_id);
 
         const periodRes = await client.query(`SELECT * FROM gl_posting_period WHERE id=$1 FOR UPDATE`, [id]);
         if (periodRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'ไม่พบงวดบัญชี' }); }
@@ -605,45 +608,27 @@ const requestClose = async (req, res) => {
             return res.status(400).json({ message: `มีรายการบัญชีที่ยังอยู่ในสถานะ Draft จำนวน ${draftCount} รายการ ไม่สามารถขอปิดงวดได้` });
         }
 
-        const menuRes = await client.query(`SELECT approval_mode, no_approver_action FROM sa_menu WHERE id=$1`, [menu_id]);
-        const approvalMode = menuRes.rows[0]?.approval_mode === 'ANY' ? 'ANY' : 'ALL';
+        // สร้างคำขอก่อน แล้วสร้างคิวผู้อนุมัติของเมนู (ผูกกับ menu_id ของหน้าจองวดบัญชี) ที่ตารางกลาง doc_approval
+        const insertRes = await client.query(`
+            INSERT INTO gl_period_close_request
+                (period_id, previous_status, requested_by, requested_by_name, status)
+            VALUES ($1,$2,$3,$4,'Pending')
+            RETURNING id`,
+            [id, period.gl_status, userId, userName]);
+        const requestId = insertRes.rows[0].id;
+        const q = await DA.buildQueue(client, { kind: KIND, recordId: requestId, menuId: menu_id });
+        await client.query(`UPDATE gl_period_close_request SET approval_mode=$1 WHERE id=$2`, [q.mode, requestId]);
 
-        const approvers = await client.query(`
-            SELECT a.approval_level, a.approver_user_id, u.user_name
-            FROM sa_module_approver a
-            JOIN sa_user u ON u.id = a.approver_user_id
-            WHERE a.menu_id=$1 AND a.is_active=true
-            ORDER BY a.approval_level`, [menu_id]);
-
-        if (approvers.rows.length === 0) {
-            // ไม่มีผู้มีสิทธิ์อนุมัติเลย หรือถูกงดอนุมัติหมดทุกคน — admin ไม่ต้องการอนุมัติสำหรับเมนูนี้
-            // ข้ามขั้นตอนอนุมัติไปเลยโดยไม่ต้องแจ้งเตือน ปิดงวดตรงทันที
-            if (isNoApproverBlocked(menuRes.rows[0])) {
-                await client.query('ROLLBACK');
-                return res.status(400).json({ message: NO_APPROVER_BLOCK_MSG });
-            }
-            // ตั้งค่าเมนู "ให้ผ่าน" (ALLOW) — ข้ามขั้นตอนอนุมัติ
+        if (q.count === 0) {
+            // ไม่มีผู้อนุมัติ + เมนูตั้ง "ให้ผ่าน" (ALLOW) — ข้ามขั้นตอนอนุมัติ ปิดงวดตรงทันที (เก็บคำขอไว้เป็นประวัติ)
+            await client.query(`UPDATE gl_period_close_request SET status='Approved', approved_at=NOW() WHERE id=$1`, [requestId]);
             await client.query(
                 `UPDATE gl_posting_period SET gl_status='CLOSED', updated_by=$1, updated_at=NOW() WHERE id=$2`,
                 [userId, id]);
             await client.query('COMMIT');
             return res.status(200).json({ message: 'ปิดงวดบัญชีสำเร็จ' });
         }
-
-        const insertRes = await client.query(`
-            INSERT INTO gl_period_close_request
-                (period_id, previous_status, requested_by, requested_by_name, status, approval_mode)
-            VALUES ($1,$2,$3,$4,'Pending',$5)
-            RETURNING id`,
-            [id, period.gl_status, userId, userName, approvalMode]);
-        const requestId = insertRes.rows[0].id;
-
-        for (const apr of approvers.rows) {
-            await client.query(`
-                INSERT INTO gl_period_close_approval (request_id, approver_user_id, approver_user_name, sequence_no, status)
-                VALUES ($1,$2,$3,$4,'Pending')`,
-                [requestId, apr.approver_user_id, apr.user_name, apr.approval_level]);
-        }
+        const approverNames = (await DA.loadApprovals(client, KIND, requestId)).map((a) => a.approver_user_name);
 
         await client.query(
             `UPDATE gl_posting_period SET gl_status='PENDING_CLOSE', updated_by=$1, updated_at=NOW() WHERE id=$2`,
@@ -651,11 +636,12 @@ const requestClose = async (req, res) => {
 
         await client.query('COMMIT');
         res.status(200).json({
-            message: `ส่งคำขอปิดงวดบัญชีสำเร็จ รอการอนุมัติจาก ${approvers.rows.map(a => a.user_name).join(', ')}`,
+            message: `ส่งคำขอปิดงวดบัญชีสำเร็จ รอการอนุมัติจาก ${approverNames.join(', ')}`,
             requestId,
         });
     } catch (error) {
         await client.query('ROLLBACK');
+        if (error.status) return res.status(error.status).json({ message: error.message });
         console.error('Error requesting period close:', error);
         res.status(500).json({ message: 'Internal server error' });
     } finally {
@@ -669,6 +655,7 @@ const approveCloseRequest = async (req, res) => {
     const { remarks } = req.body || {};
     const userId = req.headers.userid;
     if (!userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
+    await ensureCloseRequestTable(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
@@ -676,20 +663,6 @@ const approveCloseRequest = async (req, res) => {
         if (reqRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'ไม่พบคำขอ' }); }
         const request = reqRes.rows[0];
         if (request.status !== 'Pending') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'คำขอนี้ถูกดำเนินการไปแล้ว' }); }
-        const isAnyMode = request.approval_mode === 'ANY';
-
-        // โหมด ALL: ต้องไม่มีลำดับก่อนหน้ายัง Pending อยู่ / โหมด ANY: ใครอนุมัติก่อนก็จบเลย ไม่ต้องรอลำดับ
-        const myRecord = await client.query(`
-            SELECT a.id FROM gl_period_close_approval a
-            WHERE a.request_id=$1 AND a.approver_user_id=$2 AND a.status='Pending'
-              AND ($3::boolean OR NOT EXISTS (
-                SELECT 1 FROM gl_period_close_approval a2
-                WHERE a2.request_id=$1 AND a2.sequence_no < a.sequence_no AND a2.status='Pending'
-              ))`, [id, userId, isAnyMode]);
-        if (myRecord.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(403).json({ message: 'ไม่มีสิทธิ์อนุมัติ หรือยังรอการอนุมัติจากลำดับก่อนหน้า' });
-        }
 
         // ตรวจซ้ำก่อนอนุมัติจริง (กันกรณีสถานะโมดูลอื่นเปลี่ยนไปหลังจากขอ)
         const periodRes = await client.query(`SELECT * FROM gl_posting_period WHERE id=$1`, [request.period_id]);
@@ -710,35 +683,21 @@ const approveCloseRequest = async (req, res) => {
             return res.status(400).json({ message: 'ไม่สามารถอนุมัติได้ เนื่องจากมีรายการบัญชีที่ยังอยู่ในสถานะ Draft' });
         }
 
-        await client.query(
-            `UPDATE gl_period_close_approval SET status='Approved', remarks=$1, approved_at=NOW() WHERE id=$2`,
-            [remarks || null, myRecord.rows[0].id]);
-
-        if (isAnyMode) {
-            // คนใดคนหนึ่งอนุมัติก็พอ — แถวที่เหลือของคนอื่นเปลี่ยนเป็น Skipped แล้วปิดงวดทันที
-            await client.query(
-                `UPDATE gl_period_close_approval SET status='Skipped' WHERE request_id=$1 AND status='Pending'`, [id]);
+        // อนุมัติลำดับของผู้ใช้นี้ (ALL: ลำดับก่อนหน้าต้องอนุมัติครบ / ANY: ใครอนุมัติก่อนก็จบ) — ครบแล้วจึงปิดงวด
+        const done = await DA.approveStep(client, { kind: KIND, recordId: Number(id), userId: Number(userId), mode: request.approval_mode, remarks });
+        if (done) {
             await client.query(
                 `UPDATE gl_period_close_request SET status='Approved', approved_at=NOW() WHERE id=$1`, [id]);
             await client.query(
                 `UPDATE gl_posting_period SET gl_status='CLOSED', updated_by=$1, updated_at=NOW() WHERE id=$2`,
                 [userId, request.period_id]);
-        } else {
-            const remaining = await client.query(
-                `SELECT COUNT(*) FROM gl_period_close_approval WHERE request_id=$1 AND status='Pending'`, [id]);
-            if (parseInt(remaining.rows[0].count) === 0) {
-                await client.query(
-                    `UPDATE gl_period_close_request SET status='Approved', approved_at=NOW() WHERE id=$1`, [id]);
-                await client.query(
-                    `UPDATE gl_posting_period SET gl_status='CLOSED', updated_by=$1, updated_at=NOW() WHERE id=$2`,
-                    [userId, request.period_id]);
-            }
         }
 
         await client.query('COMMIT');
         res.status(200).json({ message: 'อนุมัติสำเร็จ' });
     } catch (error) {
         await client.query('ROLLBACK');
+        if (error.status) return res.status(error.status).json({ message: error.message });
         console.error('Error approving close request:', error);
         res.status(500).json({ message: 'Internal server error' });
     } finally {
@@ -753,6 +712,7 @@ const rejectCloseRequest = async (req, res) => {
     const userId = req.headers.userid;
     if (!userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
     if (!remarks || !String(remarks).trim()) return res.status(400).json({ message: 'กรุณาระบุเหตุผลที่ปฏิเสธ' });
+    await ensureCloseRequestTable(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
@@ -761,17 +721,7 @@ const rejectCloseRequest = async (req, res) => {
         const request = reqRes.rows[0];
         if (request.status !== 'Pending') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'คำขอนี้ถูกดำเนินการไปแล้ว' }); }
 
-        const myRecord = await client.query(`
-            SELECT id FROM gl_period_close_approval
-            WHERE request_id=$1 AND approver_user_id=$2 AND status='Pending'`, [id, userId]);
-        if (myRecord.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(403).json({ message: 'ไม่มีสิทธิ์ปฏิเสธหรืออนุมัติไปแล้ว' });
-        }
-
-        await client.query(
-            `UPDATE gl_period_close_approval SET status='Rejected', remarks=$1, approved_at=NOW() WHERE id=$2`,
-            [remarks, myRecord.rows[0].id]);
+        await DA.rejectStep(client, { kind: KIND, recordId: Number(id), userId: Number(userId), remarks });
         await client.query(
             `UPDATE gl_period_close_request SET status='Rejected', remarks=$1, approved_at=NOW() WHERE id=$2`,
             [remarks, id]);
@@ -783,6 +733,7 @@ const rejectCloseRequest = async (req, res) => {
         res.status(200).json({ message: 'ปฏิเสธคำขอปิดงวดบัญชีสำเร็จ' });
     } catch (error) {
         await client.query('ROLLBACK');
+        if (error.status) return res.status(error.status).json({ message: error.message });
         console.error('Error rejecting close request:', error);
         res.status(500).json({ message: 'Internal server error' });
     } finally {
@@ -795,6 +746,7 @@ const cancelCloseRequest = async (req, res) => {
     const { id } = req.params;
     const userId = req.headers.userid;
     if (!userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
+    await ensureCloseRequestTable(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
@@ -808,6 +760,7 @@ const cancelCloseRequest = async (req, res) => {
         }
 
         await client.query(`UPDATE gl_period_close_request SET status='Cancelled', approved_at=NOW() WHERE id=$1`, [id]);
+        await DA.skipPending(client, KIND, Number(id));
         await client.query(
             `UPDATE gl_posting_period SET gl_status=$1, updated_by=$2, updated_at=NOW() WHERE id=$3`,
             [request.previous_status, userId, request.period_id]);

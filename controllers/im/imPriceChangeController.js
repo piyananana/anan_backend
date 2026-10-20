@@ -1,6 +1,8 @@
 // controllers/im/imPriceChangeController.js
 // ธุรกรรมเปลี่ยนแปลงราคา (im_price_change_header/detail) — พักรายการปรับราคาจำนวนมากไว้ตรวจสอบก่อนมีผลจริง
 // สถานะ: Draft (แก้ไขได้) -> Pending (ส่งขออนุมัติ, ล็อกแก้ไข) -> Approved (เขียนผลจริงลง im_price_list_detail)
+//   ส่งขออนุมัติ = เข้าคิวผู้อนุมัติของเมนู (utils/docApproval.js, doc_kind 'IM_PRICE') — อนุมัติครบ (หรือคนใดคนหนึ่งถ้า ANY)
+//   จึงเขียนราคาจริง; ไม่มีผู้อนุมัติ = ตาม sa_menu.no_approver_action (ให้ผ่าน = อนุมัติทันทีตอนส่ง / ไม่ให้ผ่าน)
 //                                                              -> Draft (ไม่อนุมัติ, กลับไปแก้ไขใหม่)
 // Draft/Pending -> Void (ยกเลิกทั้งใบ, ทำได้ก่อน Approved เท่านั้น — หลัง Approved ต้องสร้างธุรกรรมใหม่มาหักกลับ)
 'use strict';
@@ -14,6 +16,8 @@ const { generateDocNo } = require('./imTransactionController');
 const { addDays } = require('../../utils/dateUtil');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { reasonOf, userIdOf, sendErr, blk } = require('../../utils/docAction');
+const DA = require('../../utils/docApproval');
+const KIND = 'IM_PRICE';
 
 const CHANGE_TYPES = ['REVISE', 'PROMOTION'];
 const ADJUSTMENT_MODES = ['PERCENT', 'AMOUNT', 'SET_PRICE'];
@@ -84,6 +88,12 @@ const ensureImPriceChangeTable = async (client) => {
         ALTER TABLE im_price_change_detail
             ADD COLUMN IF NOT EXISTS src_closed            BOOLEAN,
             ADD COLUMN IF NOT EXISTS src_prev_effective_to DATE`).catch(() => {});
+    // คิวผู้อนุมัติ (utils/docApproval.js)
+    await client.query(`
+        ALTER TABLE im_price_change_header
+            ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL',
+            ADD COLUMN IF NOT EXISTS submitted_at  TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS submitted_by  VARCHAR(100)`).catch(() => {});
 };
 
 const HEADER_SELECT = `
@@ -132,6 +142,7 @@ const fetchRows = async (req, res) => {
 // GET /im_price_change/:id
 const fetchRow = async (req, res) => {
     const { id } = req.params;
+    await DA.ensureDocApprovalSchema(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await ensureImPriceChangeTable(client);
@@ -140,6 +151,7 @@ const fetchRow = async (req, res) => {
         const details = await client.query(DETAIL_SELECT, [id]);
         res.status(200).json({
             ...header.rows[0], details: details.rows,
+            approvals: await DA.loadApprovals(client, KIND, Number(id)),
             ...(await computeChangeBlocks(client, id)),
             reverse_history: await getReverseHistory(client, 'im_price_change_header', id),
         });
@@ -349,59 +361,71 @@ const updateHeader = async (req, res) => {
     } finally { client.release(); }
 };
 
-// PUT /im_price_change/:id/submit — Draft -> Pending
-const submitChange = async (req, res) => {
+// --- ส่งขออนุมัติ / อนุมัติ / ไม่อนุมัติ (คิวผู้อนุมัติของเมนู — utils/docApproval.js) ---
+const approvalAction = (label, work) => async (req, res) => {
     const { id } = req.params;
-    const userName = req.headers.username || null;
+    const ctx = {
+        userId: Number(req.headers.userid) || null, userName: req.headers.username || null,
+        menuId: req.body?.menu_id, remarks: req.body?.remarks,
+    };
+    await DA.ensureDocApprovalSchema(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
         await ensureImPriceChangeTable(client);
-        const cur = await client.query(`SELECT status FROM im_price_change_header WHERE id = $1 FOR UPDATE`, [id]);
-        if (cur.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'ไม่พบธุรกรรมเปลี่ยนแปลงราคา' }); }
-        if (cur.rows[0].status !== 'Draft') {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: 'ส่งขออนุมัติได้เฉพาะธุรกรรมที่เป็นสถานะ Draft เท่านั้น' });
-        }
-        const selectedRes = await client.query(`SELECT COUNT(*) AS c FROM im_price_change_detail WHERE header_id = $1 AND is_selected = true`, [id]);
-        if (Number(selectedRes.rows[0].c) === 0) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: 'กรุณาเลือกรายการที่จะปรับราคาอย่างน้อย 1 รายการ' });
-        }
-        await client.query(`UPDATE im_price_change_header SET status = 'Pending', updated_by = $1, updated_at = NOW() WHERE id = $2`, [userName, id]);
+        const header = (await client.query(`
+            SELECT h.*, COALESCE(h.doc_code, md.doc_code) AS doc_code FROM im_price_change_header h LEFT JOIN sa_module_document md ON md.id = h.doc_id
+             WHERE h.id = $1 FOR UPDATE OF h`, [id])).rows[0];
+        if (!header) throw DA.httpErr(404, 'ไม่พบธุรกรรมเปลี่ยนแปลงราคา');
+        await work(client, header, ctx);
         await client.query('COMMIT');
         const full = await client.query(`${HEADER_SELECT} WHERE h.id = $1`, [id]);
-        res.status(200).json(full.rows[0]);
+        const fullDetails = await client.query(DETAIL_SELECT, [id]);
+        res.status(200).json({ ...full.rows[0], details: fullDetails.rows, approvals: await DA.loadApprovals(client, KIND, Number(id)) });
     } catch (error) {
         await client.query('ROLLBACK');
-        console.error('Error submitting im_price_change:', error);
-        res.status(500).json({ message: 'Internal server error' });
+        if (!error.status) console.error(`Error ${label} im_price_change:`, error);
+        res.status(error.status || 500).json({ message: error.message || 'Internal server error' });
     } finally { client.release(); }
 };
 
-// PUT /im_price_change/:id/reject — Pending -> Draft (ไม่อนุมัติ, กลับไปแก้ไขใหม่)
-const rejectChange = async (req, res) => {
-    const { id } = req.params;
-    const userName = req.headers.username || null;
-    const client = await req.dbPool.connect();
+// PUT /im_price_change/:id/submit { menu_id } — Draft -> Pending (เข้าคิว) / ไม่มีผู้อนุมัติ + ให้ผ่าน -> Approved ทันที
+const submitChange = approvalAction('submitting', async (client, header, { menuId, userName }) => {
+    if (header.status !== 'Draft') throw DA.httpErr(400, 'ส่งขออนุมัติได้เฉพาะธุรกรรมที่เป็นสถานะ Draft เท่านั้น');
+    const selectedRes = await client.query(`SELECT COUNT(*) AS c FROM im_price_change_detail WHERE header_id = $1 AND is_selected = true`, [header.id]);
+    if (Number(selectedRes.rows[0].c) === 0) throw DA.httpErr(400, 'กรุณาเลือกรายการที่จะปรับราคาอย่างน้อย 1 รายการ');
+    const q = await DA.buildQueue(client, { kind: KIND, recordId: header.id, menuId, docCode: header.doc_code });
+    await client.query(`
+        UPDATE im_price_change_header SET status = 'Pending', approval_mode = $1, submitted_at = NOW(), submitted_by = $2,
+               updated_by = $2, updated_at = NOW() WHERE id = $3`, [q.mode, userName, header.id]);
+    if (q.count === 0) await applyApproval(client, header, userName);
+});
+
+// PUT /im_price_change/:id/reject { remarks } — Pending -> Draft (ไม่อนุมัติ, กลับไปแก้ไขใหม่)
+const rejectChange = approvalAction('rejecting', async (client, header, { userId, userName, remarks }) => {
+    if (header.status !== 'Pending') throw DA.httpErr(400, 'ไม่อนุมัติได้เฉพาะธุรกรรมที่เป็นสถานะ Pending เท่านั้น');
+    await DA.rejectStep(client, { kind: KIND, recordId: header.id, userId, remarks });
+    await client.query(`UPDATE im_price_change_header SET status = 'Draft', updated_by = $1, updated_at = NOW() WHERE id = $2`, [userName, header.id]);
+});
+
+// GET /im_price_change/my_pending — ใบที่ถึงคิวผู้ใช้นี้อนุมัติ (กระดิ่งหน้า Home)
+const fetchMyPending = async (req, res) => {
+    const userId = Number(req.headers.userid);
+    if (!userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
     try {
-        await client.query('BEGIN');
-        await ensureImPriceChangeTable(client);
-        const cur = await client.query(`SELECT status FROM im_price_change_header WHERE id = $1 FOR UPDATE`, [id]);
-        if (cur.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'ไม่พบธุรกรรมเปลี่ยนแปลงราคา' }); }
-        if (cur.rows[0].status !== 'Pending') {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: 'ไม่อนุมัติได้เฉพาะธุรกรรมที่เป็นสถานะ Pending เท่านั้น' });
-        }
-        await client.query(`UPDATE im_price_change_header SET status = 'Draft', updated_by = $1, updated_at = NOW() WHERE id = $2`, [userName, id]);
-        await client.query('COMMIT');
-        const full = await client.query(`${HEADER_SELECT} WHERE h.id = $1`, [id]);
-        res.status(200).json(full.rows[0]);
+        await DA.ensureDocApprovalSchema(req.dbPool);
+        const client = await req.dbPool.connect();
+        try { await ensureImPriceChangeTable(client); } finally { client.release(); }
+        const r = await req.dbPool.query(`
+            SELECT h.id, h.change_no AS doc_no, h.effective_from AS doc_date, pl.price_list_name, h.remark AS description, h.submitted_by
+              FROM im_price_change_header h LEFT JOIN im_price_list pl ON pl.id = h.price_list_id
+             WHERE h.status = 'Pending' AND ${DA.myTurnSql('h', '$1', '$2')}
+             ORDER BY h.submitted_at DESC NULLS LAST, h.id DESC`, [KIND, userId]);
+        res.status(200).json(r.rows);
     } catch (error) {
-        await client.query('ROLLBACK');
-        console.error('Error rejecting im_price_change:', error);
+        console.error('Error fetching im_price_change my_pending:', error);
         res.status(500).json({ message: 'Internal server error' });
-    } finally { client.release(); }
+    }
 };
 
 // --- ถอย / ยกเลิก / ลบ: เงื่อนไข ---
@@ -497,8 +521,12 @@ const changeAction = async (req, res, kind, label, work) => {
 // PUT /im_price_change/:id/reverse { reason } — Pending/Approved -> Draft (Approved: ย้อนราคาในตารางราคาก่อน)
 const reverseChange = (req, res) => changeAction(req, res, 'reverse_block', 'การถอยเอกสาร', async (client, header, { userName }) => {
     if (header.status === 'Approved') await undoApproval(client, header, userName);
+    // ผู้อนุมัติที่ยังไม่ตัดสินถูกข้าม — แก้ไขแล้วส่งขออนุมัติใหม่ได้
+    await DA.ensureDocApprovalSchema(client);
+    await DA.skipPending(client, KIND, header.id);
     await client.query(`
-        UPDATE im_price_change_header SET status = 'Draft', approved_at = NULL, approved_by = NULL, updated_by = $1, updated_at = NOW()
+        UPDATE im_price_change_header SET status = 'Draft', approved_at = NULL, approved_by = NULL, submitted_at = NULL, submitted_by = NULL,
+               updated_by = $1, updated_at = NOW()
          WHERE id = $2`, [userName, header.id]);
     return 'Draft';
 });
@@ -518,85 +546,67 @@ const deleteChange = (req, res) => changeAction(req, res, 'delete_block', 'ก�
     return 'Deleted';
 });
 
-// PUT /im_price_change/:id/approve — Pending -> Approved, เขียนผลจริงลง im_price_list_detail
+// เขียนผลจริงลง im_price_list_detail แล้วตั้งสถานะ Approved — เรียกเมื่ออนุมัติครบ (หรือส่งแล้วไม่มีผู้อนุมัติ + ให้ผ่าน)
 // REVISE: ปิด effective_to ของ source_detail_id (ถ้ามี) ที่วันก่อนวันมีผลใหม่ 1 วัน แล้ว insert แถว STANDARD ใหม่
 // PROMOTION: insert แถว PROMOTION ใหม่คู่ขนาน ไม่แก้ไขแถว STANDARD เดิมเลย
-const approveChange = async (req, res) => {
-    const { id } = req.params;
-    const userName = req.headers.username || null;
-    const client = await req.dbPool.connect();
-    try {
-        await client.query('BEGIN');
-        await ensureImPriceChangeTable(client);
-        const headerRes = await client.query(`SELECT * FROM im_price_change_header WHERE id = $1 FOR UPDATE`, [id]);
-        if (headerRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'ไม่พบธุรกรรมเปลี่ยนแปลงราคา' }); }
-        const header = headerRes.rows[0];
-        if (header.status !== 'Pending') {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ message: 'อนุมัติได้เฉพาะธุรกรรมที่เป็นสถานะ Pending เท่านั้น' });
-        }
+const applyApproval = async (client, header, userName) => {
+    const detailsRes = await client.query(
+        `SELECT * FROM im_price_change_detail WHERE header_id = $1 AND is_selected = true`,
+        [header.id]
+    );
+    const targetPriceType = header.change_type === 'PROMOTION' ? 'PROMOTION' : 'STANDARD';
 
-        const detailsRes = await client.query(
-            `SELECT * FROM im_price_change_detail WHERE header_id = $1 AND is_selected = true`,
-            [id]
-        );
-        const targetPriceType = header.change_type === 'PROMOTION' ? 'PROMOTION' : 'STANDARD';
-
-        for (const line of detailsRes.rows) {
-            if (header.change_type === 'REVISE' && line.source_detail_id) {
-                const srcRes = await client.query(`SELECT effective_from FROM im_price_list_detail WHERE id = $1`, [line.source_detail_id]);
-                const srcFrom = srcRes.rows[0]?.effective_from || null;
-                if (srcFrom && new Date(header.effective_from) <= new Date(srcFrom)) {
-                    await client.query('ROLLBACK');
-                    return res.status(400).json({ message: `สินค้ารหัส item_id=${line.item_id}: วันที่มีผลใหม่ต้องมากกว่าวันที่เริ่มราคาเดิม` });
-                }
-                // เก็บวันสิ้นสุดเดิมไว้คืนค่าเมื่อถอย/ยกเลิกใบนี้
-                await client.query(`
-                    UPDATE im_price_change_detail cd SET src_closed = true, src_prev_effective_to = pd.effective_to
-                      FROM im_price_list_detail pd WHERE pd.id = cd.source_detail_id AND cd.id = $1`, [line.id]);
-                await client.query(
-                    `UPDATE im_price_list_detail SET effective_to = $1, updated_by = $2, updated_at = NOW() WHERE id = $3`,
-                    [addDays(header.effective_from, -1), userName, line.source_detail_id]
-                );
+    for (const line of detailsRes.rows) {
+        if (header.change_type === 'REVISE' && line.source_detail_id) {
+            const srcRes = await client.query(`SELECT effective_from FROM im_price_list_detail WHERE id = $1`, [line.source_detail_id]);
+            const srcFrom = srcRes.rows[0]?.effective_from || null;
+            if (srcFrom && new Date(header.effective_from) <= new Date(srcFrom)) {
+                throw DA.httpErr(400, `สินค้ารหัส item_id=${line.item_id}: วันที่มีผลใหม่ต้องมากกว่าวันที่เริ่มราคาเดิม`);
             }
-
-            const hasOverlap = await findOverlapAgainstExisting(client, {
-                priceListId: header.price_list_id, itemId: line.item_id, uomId: line.uom_id, minQty: line.min_qty,
-                priceType: targetPriceType, effectiveFrom: header.effective_from, effectiveTo: header.effective_to,
-                excludeDetailId: null,
-            });
-            if (hasOverlap) {
-                await client.query('ROLLBACK');
-                return res.status(409).json({ message: `สินค้ารหัส item_id=${line.item_id}: ช่วงวันที่มีผลคาบเกี่ยวกับราคา ${targetPriceType === 'PROMOTION' ? 'โปรโมชั่น' : 'ปกติ'} ที่มีอยู่แล้ว` });
-            }
-
+            // เก็บวันสิ้นสุดเดิมไว้คืนค่าเมื่อถอย/ยกเลิกใบนี้
+            await client.query(`
+                UPDATE im_price_change_detail cd SET src_closed = true, src_prev_effective_to = pd.effective_to
+                  FROM im_price_list_detail pd WHERE pd.id = cd.source_detail_id AND cd.id = $1`, [line.id]);
             await client.query(
-                `INSERT INTO im_price_list_detail
-                    (price_list_id, item_id, uom_id, min_qty, unit_price_fc, price_type, effective_from, effective_to,
-                     source_price_change_id, created_by, updated_by)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10)`,
-                [header.price_list_id, line.item_id, line.uom_id, line.min_qty, line.new_unit_price_fc,
-                 targetPriceType, header.effective_from, header.change_type === 'PROMOTION' ? header.effective_to : null,
-                 header.id, userName]
+                `UPDATE im_price_list_detail SET effective_to = $1, updated_by = $2, updated_at = NOW() WHERE id = $3`,
+                [addDays(header.effective_from, -1), userName, line.source_detail_id]
             );
         }
 
+        const hasOverlap = await findOverlapAgainstExisting(client, {
+            priceListId: header.price_list_id, itemId: line.item_id, uomId: line.uom_id, minQty: line.min_qty,
+            priceType: targetPriceType, effectiveFrom: header.effective_from, effectiveTo: header.effective_to,
+            excludeDetailId: null,
+        });
+        if (hasOverlap) {
+            throw DA.httpErr(409, `สินค้ารหัส item_id=${line.item_id}: ช่วงวันที่มีผลคาบเกี่ยวกับราคา ${targetPriceType === 'PROMOTION' ? 'โปรโมชั่น' : 'ปกติ'} ที่มีอยู่แล้ว`);
+        }
+
         await client.query(
-            `UPDATE im_price_change_header SET status = 'Approved', approved_at = NOW(), approved_by = $1, updated_by = $1, updated_at = NOW() WHERE id = $2`,
-            [userName, id]
+            `INSERT INTO im_price_list_detail
+                (price_list_id, item_id, uom_id, min_qty, unit_price_fc, price_type, effective_from, effective_to,
+                 source_price_change_id, created_by, updated_by)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$10)`,
+            [header.price_list_id, line.item_id, line.uom_id, line.min_qty, line.new_unit_price_fc,
+             targetPriceType, header.effective_from, header.change_type === 'PROMOTION' ? header.effective_to : null,
+             header.id, userName]
         );
-        await client.query('COMMIT');
-        const full = await client.query(`${HEADER_SELECT} WHERE h.id = $1`, [id]);
-        const fullDetails = await client.query(DETAIL_SELECT, [id]);
-        res.status(200).json({ ...full.rows[0], details: fullDetails.rows });
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error('Error approving im_price_change:', error);
-        res.status(500).json({ message: 'Internal server error' });
-    } finally { client.release(); }
+    }
+
+    await client.query(
+        `UPDATE im_price_change_header SET status = 'Approved', approved_at = NOW(), approved_by = $1, updated_by = $1, updated_at = NOW() WHERE id = $2`,
+        [userName, header.id]
+    );
 };
+
+// PUT /im_price_change/:id/approve { remarks } — Pending: อนุมัติลำดับของผู้ใช้นี้ ครบแล้วจึงเขียนราคาจริง (applyApproval)
+const approveChange = approvalAction('approving', async (client, header, { userId, userName, remarks }) => {
+    if (header.status !== 'Pending') throw DA.httpErr(400, 'อนุมัติได้เฉพาะธุรกรรมที่เป็นสถานะ Pending เท่านั้น');
+    const done = await DA.approveStep(client, { kind: KIND, recordId: header.id, userId, mode: header.approval_mode, remarks });
+    if (done) await applyApproval(client, header, userName);
+});
 
 module.exports = {
     ensureImPriceChangeTable, fetchRows, fetchRow, previewLines, addRow, updateHeader,
-    submitChange, rejectChange, voidChange, approveChange, reverseChange, deleteChange, CHANGE_TYPES, ADJUSTMENT_MODES,
+    submitChange, rejectChange, voidChange, approveChange, reverseChange, deleteChange, fetchMyPending, CHANGE_TYPES, ADJUSTMENT_MODES,
 };

@@ -1,7 +1,8 @@
 // controllers/po/poTransactionController.js — ใบสั่งซื้อ (Purchase Order, sys_module='51')
 // เอกสารข้อผูกพันกับผู้ขายเท่านั้น — ไม่แตะ GL, ไม่แตะสต็อกเลย (ต่างจาก GRN/im_transaction ทุกประการ) ผลกระทบจริง
 // ต่อสต็อก/บัญชียังเกิดที่ GRN เหมือนเดิม — PO แค่เป็นข้อผูกพัน+ต้นทาง reference ให้ GRN อ้างอิงกลับมา (ดู ref_po_id/
-// ref_po_detail_id ใน imTransactionController.js) workflow: Draft (แก้ไขได้) -> Approved (ผูกพันแล้ว, GRN
+// ref_po_detail_id ใน imTransactionController.js) workflow: Draft (แก้ไขได้) -> Submitted (คิวผู้อนุมัติของเมนู
+// utils/docApproval.js, doc_kind 'PO' — Rejected แก้ไข+ส่งใหม่ได้เหมือน Draft) -> Approved (ผูกพันแล้ว, GRN
 // อ้างอิงได้) -> PartiallyReceived (คำนวณอัตโนมัติจาก GRN ที่อ้างอิงเข้ามา ไม่ใช่การกดเอง) -> Closed (กดปิดเอง เมื่อ
 // ไม่มีการรับเพิ่มแล้ว ไม่ auto-close แม้รับครบ 100% — มิเรอร์ im_stock_count ที่ Approve/Close ต้องเป็นการกดของคน)
 // กิ่ง Void แยกจาก Draft/Approved/PartiallyReceived ได้ แต่บล็อกถ้ามี GRN Posted/Received อ้างอิงเข้ามาแล้ว
@@ -11,6 +12,8 @@
 const { generateDocNo } = require('../im/imTransactionController');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { reasonOf, userIdOf, sendErr, blk } = require('../../utils/docAction');
+const DA = require('../../utils/docApproval');
+const KIND = 'PO';
 
 const ensurePoTransactionTable = async (client) => {
     await client.query(`
@@ -75,6 +78,12 @@ const ensurePoTransactionTable = async (client) => {
             ADD COLUMN IF NOT EXISTS void_reason TEXT,
             ADD COLUMN IF NOT EXISTS voided_by   VARCHAR(100),
             ADD COLUMN IF NOT EXISTS voided_at   TIMESTAMPTZ`);
+    // คิวผู้อนุมัติ (utils/docApproval.js)
+    await client.query(`
+        ALTER TABLE po_transaction
+            ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL',
+            ADD COLUMN IF NOT EXISTS submitted_at  TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS submitted_by  VARCHAR(100)`);
 };
 
 // --- Fetch helpers ---
@@ -104,7 +113,8 @@ const fetchRowById = async (pool, id) => {
         FROM po_transaction_detail dt
         LEFT JOIN im_uom u ON u.id = dt.uom_id
         WHERE dt.header_id = $1 ORDER BY dt.line_no`, [id]);
-    return { ...hRes.rows[0], details: dRes.rows };
+    await DA.ensureDocApprovalSchema(pool);
+    return { ...hRes.rows[0], details: dRes.rows, approvals: await DA.loadApprovals(pool, KIND, Number(id)) };
 };
 
 // --- GET list ---
@@ -260,7 +270,7 @@ const updateTransaction = async (req, res) => {
         await client.query('BEGIN');
         const existing = await client.query(`SELECT status FROM po_transaction WHERE id=$1`, [id]);
         if (existing.rows.length === 0) throw new Error('Not found');
-        if (existing.rows[0].status !== 'Draft') throw new Error('แก้ไขได้เฉพาะเอกสาร Draft เท่านั้น');
+        if (!['Draft', 'Rejected'].includes(existing.rows[0].status)) throw new Error('แก้ไขได้เฉพาะเอกสาร Draft หรือ Rejected เท่านั้น');
 
         if (!header.vendor_id) throw new Error('กรุณาระบุผู้ขาย');
         if (!header.warehouse_id) throw new Error('กรุณาระบุคลังปลายทาง');
@@ -356,28 +366,77 @@ const updateTransaction = async (req, res) => {
     } finally { client.release(); }
 };
 
-// --- 3. Approve (Draft -> Approved) ---
-const approveTransaction = async (req, res) => {
+// --- 3. ส่งอนุมัติ / อนุมัติ / ปฏิเสธ (คิวผู้อนุมัติของเมนู — utils/docApproval.js) ---
+// งานในคิวที่ล็อกแถวแล้ว: work(client, t, ctx) — error มี status ใช้เป็นรหัสตอบกลับ
+const approvalAction = (label, work) => async (req, res) => {
     const { id } = req.params;
-    const userName = req.headers.username || null;
+    const ctx = {
+        userId: Number(req.headers.userid) || null, userName: req.headers.username || null,
+        menuId: req.body?.menu_id, remarks: req.body?.remarks,
+    };
+    await DA.ensureDocApprovalSchema(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
-        const existing = await client.query(`SELECT status FROM po_transaction WHERE id=$1 FOR UPDATE`, [id]);
-        if (existing.rows.length === 0) throw new Error('Not found');
-        if (existing.rows[0].status !== 'Draft') throw new Error('อนุมัติได้เฉพาะเอกสาร Draft เท่านั้น');
-        await client.query(`
-            UPDATE po_transaction SET status='Approved', approved_at=NOW(), approved_by=$1, updated_by=$1, updated_at=NOW()
-            WHERE id=$2
-        `, [userName, id]);
+        await ensurePoTransactionTable(client);
+        const t = (await client.query(`SELECT * FROM po_transaction WHERE id=$1 FOR UPDATE`, [id])).rows[0];
+        if (!t) throw DA.httpErr(404, 'Not found');
+        await work(client, t, ctx);
         await client.query('COMMIT');
-        const full = await fetchRowById(req.dbPool, id);
-        res.status(200).json(full);
+        res.status(200).json(await fetchRowById(req.dbPool, id));
     } catch (error) {
         await client.query('ROLLBACK');
-        console.error('Error approving po_transaction:', error);
-        res.status(error.message === 'Not found' ? 404 : 500).json({ message: error.message || 'Internal server error' });
+        if (!error.status) console.error(`Error ${label} po_transaction:`, error);
+        res.status(error.status || 500).json({ message: error.message || 'Internal server error' });
     } finally { client.release(); }
+};
+
+const markApproved = (client, id, userName) => client.query(`
+    UPDATE po_transaction SET status='Approved', approved_at=NOW(), approved_by=$1, updated_by=$1, updated_at=NOW()
+     WHERE id=$2`, [userName, id]);
+
+// Draft/Rejected -> Submitted (ไม่มีผู้อนุมัติ + เมนูตั้ง "ให้ผ่าน" -> Approved ทันที)
+const submitTransaction = approvalAction('submitting', async (client, t, { menuId, userName }) => {
+    if (!['Draft', 'Rejected'].includes(t.status)) throw DA.httpErr(400, 'ส่งอนุมัติได้เฉพาะเอกสาร Draft หรือ Rejected เท่านั้น');
+    const q = await DA.buildQueue(client, { kind: KIND, recordId: t.id, menuId, docCode: t.doc_code });
+    await client.query(`
+        UPDATE po_transaction SET status='Submitted', approval_mode=$1, submitted_at=NOW(), submitted_by=$2,
+               updated_by=$2, updated_at=NOW() WHERE id=$3`, [q.mode, userName, t.id]);
+    if (q.count === 0) await markApproved(client, t.id, userName);
+});
+
+// Submitted -> Approved เมื่ออนุมัติครบ (หรือคนใดคนหนึ่งถ้า ANY)
+const approveTransaction = approvalAction('approving', async (client, t, { userId, userName, remarks }) => {
+    if (t.status !== 'Submitted') throw DA.httpErr(400, 'อนุมัติได้เฉพาะเอกสารที่ส่งอนุมัติแล้ว (Submitted) เท่านั้น');
+    const done = await DA.approveStep(client, { kind: KIND, recordId: t.id, userId, mode: t.approval_mode, remarks });
+    if (done) await markApproved(client, t.id, userName);
+});
+
+// Submitted -> Rejected (แก้ไขแล้วส่งใหม่ได้)
+const rejectTransaction = approvalAction('rejecting', async (client, t, { userId, userName, remarks }) => {
+    if (t.status !== 'Submitted') throw DA.httpErr(400, 'ปฏิเสธได้เฉพาะเอกสารที่ส่งอนุมัติแล้ว (Submitted) เท่านั้น');
+    await DA.rejectStep(client, { kind: KIND, recordId: t.id, userId, remarks });
+    await client.query(`UPDATE po_transaction SET status='Rejected', updated_by=$1, updated_at=NOW() WHERE id=$2`, [userName, t.id]);
+});
+
+// GET /po_transaction/my_pending — ใบสั่งซื้อที่ถึงคิวผู้ใช้นี้อนุมัติ (กระดิ่งหน้า Home)
+const fetchMyPending = async (req, res) => {
+    const userId = Number(req.headers.userid);
+    if (!userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
+    try {
+        await DA.ensureDocApprovalSchema(req.dbPool);
+        const client = await req.dbPool.connect();
+        try { await ensurePoTransactionTable(client); } finally { client.release(); }
+        const r = await req.dbPool.query(`
+            SELECT t.id, t.doc_no, t.doc_date, t.vendor_name_th, t.description, t.total_value_lc, t.submitted_by
+              FROM po_transaction t
+             WHERE t.status = 'Submitted' AND ${DA.myTurnSql('t', '$1', '$2')}
+             ORDER BY t.doc_date DESC, t.id DESC`, [KIND, userId]);
+        res.status(200).json(r.rows);
+    } catch (error) {
+        console.error('Error fetching po_transaction my_pending:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    }
 };
 
 // --- 4. Close (Approved/PartiallyReceived -> Closed — no more receiving expected, does not require 100% received) ---
@@ -422,6 +481,7 @@ const computeBlocks = async (client, id) => {
         : null;
     const out = { reverse_block: null, void_block: null, delete_block: null };
     switch (t.status) {
+        case 'Submitted': out.void_block = blk('NOT_APPROVED', 'ใบสั่งซื้อที่รออนุมัติให้ถอยเป็นร่างแล้วลบแทนการยกเลิก'); break;
         case 'Approved': out.reverse_block = refBlock; out.void_block = refBlock; break;
         case 'Closed':
             out.void_block = blk('NOT_APPROVED', 'ใบสั่งซื้อที่ปิดแล้วยกเลิกไม่ได้ ถอยการปิดก่อน');
@@ -432,14 +492,15 @@ const computeBlocks = async (client, id) => {
             out.void_block = out.reverse_block;
             break;
         case 'Draft':
-            out.reverse_block = blk('NOT_REVERSIBLE', 'ถอยได้เฉพาะใบสั่งซื้อที่อนุมัติแล้วหรือปิดแล้ว');
-            out.void_block = blk('NOT_POSTED', 'ใบสั่งซื้อที่ยังเป็นร่างให้ลบแทนการยกเลิก');
+        case 'Rejected':
+            out.reverse_block = blk('NOT_REVERSIBLE', 'ถอยได้เฉพาะใบสั่งซื้อที่ส่งอนุมัติ อนุมัติแล้ว หรือปิดแล้ว');
+            out.void_block = blk('NOT_POSTED', 'ใบสั่งซื้อที่ยังไม่อนุมัติให้ลบแทนการยกเลิก');
             break;
         default: out.reverse_block = voided; out.void_block = voided;
     }
-    if (t.status !== 'Draft') {
+    if (!['Draft', 'Rejected'].includes(t.status)) {
         out.delete_block = ['Void', 'Deleted'].includes(t.status)
-            ? voided : blk('NOT_DRAFT', 'ลบได้เฉพาะร่าง ใบสั่งซื้อที่อนุมัติแล้วต้องถอยเป็นร่างก่อน');
+            ? voided : blk('NOT_DRAFT', 'ลบได้เฉพาะร่างหรือใบที่ถูกปฏิเสธ ใบที่ส่งอนุมัติแล้วต้องถอยเป็นร่างก่อน');
     }
     return out;
 };
@@ -482,12 +543,15 @@ const lockedAction = async (req, res, kind, label, work) => {
 };
 
 // --- 5. ถอย (ต้องมีเหตุผล) ---
-// Approved -> Draft: ยังไม่มีใบรับสินค้าอ้างอิง แก้ไขแล้วอนุมัติใหม่ได้ด้วยเลขที่เดิม
+// Submitted / Approved -> Draft: ยังไม่มีใบรับสินค้าอ้างอิง ผู้อนุมัติที่ยังไม่ตัดสินถูกข้าม แก้ไขแล้วส่งอนุมัติใหม่ได้ด้วยเลขที่เดิม
 // Closed -> เปิดใหม่: สถานะคำนวณจากใบรับสินค้าที่อ้างอิง (Approved / PartiallyReceived / FullyReceived)
 const reverseTransaction = (req, res) => lockedAction(req, res, 'reverse_block', 'การถอยเอกสาร', async (client, t, { userName }) => {
-    if (t.status === 'Approved') {
+    if (['Submitted', 'Approved'].includes(t.status)) {
+        await DA.ensureDocApprovalSchema(client);
+        await DA.skipPending(client, KIND, t.id);
         await client.query(`
-            UPDATE po_transaction SET status='Draft', approved_at=NULL, approved_by=NULL, updated_by=$1, updated_at=NOW()
+            UPDATE po_transaction SET status='Draft', approved_at=NULL, approved_by=NULL, submitted_at=NULL, submitted_by=NULL,
+                   updated_by=$1, updated_at=NOW()
              WHERE id=$2`, [userName, t.id]);
         return 'Draft';
     }
@@ -610,6 +674,7 @@ const refreshPoStatus = async (client, poTransactionId) => {
 module.exports = {
     ensurePoTransactionTable,
     fetchRows, fetchRow, fetchRowById, fetchReceivableLines,
-    createTransaction, updateTransaction, approveTransaction, closeTransaction, voidTransaction, deleteTransaction, reverseTransaction,
+    createTransaction, updateTransaction, submitTransaction, approveTransaction, rejectTransaction, fetchMyPending,
+    closeTransaction, voidTransaction, deleteTransaction, reverseTransaction,
     validatePoReceivableQty, refreshPoStatus,
 };

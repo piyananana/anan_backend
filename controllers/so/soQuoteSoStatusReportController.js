@@ -11,7 +11,10 @@
 // จับคู่ที่ระดับหัวเอกสาร (distinct Quote header + SO header ที่มีอย่างน้อย 1 บรรทัดโยงกันผ่าน ref_quote_detail_id)
 'use strict';
 
+const { ensureDocApprovalSchema } = require('../../utils/docApproval');
+
 const fetchReport = async (req, res) => {
+    await ensureDocApprovalSchema(req.dbPool); // ผู้อนุมัติ/เวลาตัดสินมาจากตารางกลาง doc_approval
     const { quote_date_from, quote_date_to, so_date_from, so_date_to, quote_statuses, so_statuses, show_quote, show_so } = req.query;
     const quoteStatusList = (quote_statuses || '').split(',').map(s => s.trim()).filter(Boolean);
     const soStatusList = (so_statuses || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -30,11 +33,11 @@ const fetchReport = async (req, res) => {
                 SELECT q.id AS quote_id, q.doc_no AS quote_doc_no, q.doc_date AS quote_doc_date,
                        pu.user_name AS quote_prepared_by_name,
                        (SELECT string_agg(a.approver_user_name, ', ' ORDER BY a.sequence_no)
-                        FROM quote_transaction_approval a
-                        WHERE a.header_id = q.id AND a.status IN ('Approved','Rejected')) AS quote_approver_name,
+                        FROM doc_approval a
+                        WHERE a.doc_kind = 'QUOTE' AND a.record_id = q.id AND a.status IN ('Approved','Rejected')) AS quote_approver_name,
                        (SELECT MAX(a.approved_at)
-                        FROM quote_transaction_approval a
-                        WHERE a.header_id = q.id AND a.status IN ('Approved','Rejected')) AS quote_decided_at,
+                        FROM doc_approval a
+                        WHERE a.doc_kind = 'QUOTE' AND a.record_id = q.id AND a.status IN ('Approved','Rejected')) AS quote_decided_at,
                        q.status AS quote_status, q.updated_at AS quote_updated_at,
                        so.id AS so_id, so.doc_no AS so_doc_no, so.doc_date AS so_doc_date, so.approved_at AS so_approved_at,
                        so.created_by AS so_created_by, so.approved_by AS so_approver_name, so.status AS so_status, so.updated_at AS so_updated_at

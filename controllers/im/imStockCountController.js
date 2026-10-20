@@ -1,8 +1,9 @@
 // controllers/im/imStockCountController.js — im_stock_count (ใบตรวจนับสต็อก, ต่อคลังสินค้าเดียว)
 // Workflow แยกจาก im_transaction (AJS): Draft (ตรวจสอบผังก่อนบันทึก) -> Posted (บันทึกใบตรวจนับ —
-// ล็อครายการ + freeze system_qty) -> Approved (ตรวจผล+อนุมัติ) -> Closed (บันทึกปรับยอด — สร้าง+
-// โพสต์ im_transaction AJS) — ถอยทีละขั้นได้ (ดู reverseCount) ยกเลิกได้เมื่อบันทึกแล้ว ร่างให้ลบ (Deleted)
-// ไม่มี approver queue แบบ AP — ใช้ menu permission canApprove ธรรมดา (ดู routes/im.js)
+// ล็อครายการ + freeze system_qty) -> Submitted (ตรวจผลแล้วส่งขออนุมัติ — ล็อกยอดนับ, คิวผู้อนุมัติของเมนู
+// utils/docApproval.js doc_kind 'IM_COUNT'; ไม่อนุมัติ = กลับเป็น Posted แก้ยอดนับได้) -> Approved -> Closed
+// (บันทึกปรับยอด — สร้าง+โพสต์ im_transaction AJS) — ถอยทีละขั้นได้ (ดู reverseCount) ยกเลิกได้เมื่อบันทึกแล้ว
+// ร่างให้ลบ (Deleted)
 'use strict';
 
 const ExcelJS = require('exceljs');
@@ -21,6 +22,8 @@ const {
     STOCK_BALANCE_KEY,
 } = require('./imTransactionController');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
+const DA = require('../../utils/docApproval');
+const KIND = 'IM_COUNT';
 const {
     ensureImStockCountRunningTable,
     generateNextCode,
@@ -63,6 +66,10 @@ const ensureImStockCountTable = async (client) => {
     await client.query(`ALTER TABLE im_stock_count ADD COLUMN IF NOT EXISTS void_reason   TEXT`).catch(() => {});
     await client.query(`ALTER TABLE im_stock_count ADD COLUMN IF NOT EXISTS voided_by     VARCHAR(100)`).catch(() => {});
     await client.query(`ALTER TABLE im_stock_count ADD COLUMN IF NOT EXISTS voided_at     TIMESTAMPTZ`).catch(() => {});
+    // คิวผู้อนุมัติ (utils/docApproval.js)
+    await client.query(`ALTER TABLE im_stock_count ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL'`).catch(() => {});
+    await client.query(`ALTER TABLE im_stock_count ADD COLUMN IF NOT EXISTS submitted_at  TIMESTAMPTZ`).catch(() => {});
+    await client.query(`ALTER TABLE im_stock_count ADD COLUMN IF NOT EXISTS submitted_by  VARCHAR(100)`).catch(() => {});
     // backfill any legacy rows created before count_no existed, and legacy status names
     await client.query(`UPDATE im_stock_count SET count_no = 'CNT-' || LPAD(id::text, 6, '0') WHERE count_no IS NULL`).catch(() => {});
     await client.query(`UPDATE im_stock_count SET status = 'Posted' WHERE status = 'Counting'`).catch(() => {});
@@ -163,8 +170,10 @@ const fetchRowById = async (pool, id) => {
         LEFT JOIN im_location l ON l.id = d.location_id
         WHERE d.header_id = $1 ORDER BY d.line_no
     `, [id]);
+    await DA.ensureDocApprovalSchema(pool);
     return {
         ...hRes.rows[0], details: dRes.rows,
+        approvals: await DA.loadApprovals(pool, KIND, Number(id)),
         ...(await computeCountBlocks(pool, id)),
         reverse_history: await getReverseHistory(pool, 'im_stock_count', Number(id)),
     };
@@ -466,33 +475,78 @@ const checkResults = async (req, res) => {
     } finally { client.release(); }
 };
 
-// --- Approve: Posted -> Approved only (no AJS yet) ---
-const approveCount = async (req, res) => {
+// --- ส่งขออนุมัติ / อนุมัติ / ไม่อนุมัติ (คิวผู้อนุมัติของเมนู — utils/docApproval.js, ยังไม่สร้าง AJS) ---
+const approvalAction = (label, work) => async (req, res) => {
     const { id } = req.params;
-    const userName = req.headers.username || null;
+    const ctx = {
+        userId: Number(req.headers.userid) || null, userName: req.headers.username || null,
+        menuId: req.body?.menu_id, remarks: req.body?.remarks,
+    };
+    await DA.ensureDocApprovalSchema(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
-        const hRes = await client.query(`SELECT * FROM im_stock_count WHERE id=$1 FOR UPDATE`, [id]);
-        if (hRes.rows.length === 0) throw new Error('Not found');
-        const header = hRes.rows[0];
-        if (header.status !== 'Posted') throw new Error('อนุมัติได้เฉพาะเอกสารสถานะ Posted เท่านั้น');
-
-        const dRes = await client.query(`SELECT id FROM im_stock_count_detail WHERE header_id=$1 AND counted_qty IS NULL`, [id]);
-        if (dRes.rows.length > 0) throw new Error(`มี ${dRes.rows.length} รายการยังไม่ได้บันทึกยอดตรวจนับ`);
-
-        await client.query(`
-            UPDATE im_stock_count SET status='Approved', approved_at=NOW(), approved_by=$1, updated_by=$1, updated_at=NOW()
-            WHERE id=$2
-        `, [userName, id]);
+        await ensureImStockCountTable(client);
+        const header = (await client.query(`SELECT * FROM im_stock_count WHERE id=$1 FOR UPDATE`, [id])).rows[0];
+        if (!header) throw DA.httpErr(404, 'Not found');
+        await work(client, header, ctx);
         await client.query('COMMIT');
-        const full = await fetchRowById(req.dbPool, id);
-        res.status(200).json(full);
+        res.status(200).json(await fetchRowById(req.dbPool, id));
     } catch (error) {
         await client.query('ROLLBACK');
-        console.error('Error approving im_stock_count:', error);
-        res.status(500).json({ message: error.message || 'Internal server error' });
+        if (!error.status) console.error(`Error ${label} im_stock_count:`, error);
+        res.status(error.status || 500).json({ message: error.message || 'Internal server error' });
     } finally { client.release(); }
+};
+
+const markApproved = (client, id, userName) => client.query(`
+    UPDATE im_stock_count SET status='Approved', approved_at=NOW(), approved_by=$1, updated_by=$1, updated_at=NOW()
+     WHERE id=$2`, [userName, id]);
+
+// PUT /:id/submit { menu_id } — Posted -> Submitted (ทุกรายการต้องบันทึกยอดนับแล้ว) / ไม่มีผู้อนุมัติ + ให้ผ่าน -> Approved
+const submitCount = approvalAction('submitting', async (client, header, { menuId, userName }) => {
+    if (header.status !== 'Posted') throw DA.httpErr(400, 'ส่งขออนุมัติได้เฉพาะเอกสารสถานะ Posted เท่านั้น');
+    const dRes = await client.query(`SELECT id FROM im_stock_count_detail WHERE header_id=$1 AND counted_qty IS NULL`, [header.id]);
+    if (dRes.rows.length > 0) throw DA.httpErr(400, `มี ${dRes.rows.length} รายการยังไม่ได้บันทึกยอดตรวจนับ`);
+    const q = await DA.buildQueue(client, { kind: KIND, recordId: header.id, menuId });
+    await client.query(`
+        UPDATE im_stock_count SET status='Submitted', approval_mode=$1, submitted_at=NOW(), submitted_by=$2,
+               updated_by=$2, updated_at=NOW() WHERE id=$3`, [q.mode, userName, header.id]);
+    if (q.count === 0) await markApproved(client, header.id, userName);
+});
+
+// PUT /:id/approve { remarks } — Submitted -> Approved เมื่ออนุมัติครบ (หรือคนใดคนหนึ่งถ้า ANY)
+const approveCount = approvalAction('approving', async (client, header, { userId, userName, remarks }) => {
+    if (header.status !== 'Submitted') throw DA.httpErr(400, 'อนุมัติได้เฉพาะเอกสารที่ส่งขออนุมัติแล้ว (Submitted) เท่านั้น');
+    const done = await DA.approveStep(client, { kind: KIND, recordId: header.id, userId, mode: header.approval_mode, remarks });
+    if (done) await markApproved(client, header.id, userName);
+});
+
+// PUT /:id/reject { remarks } — Submitted -> Posted (ไม่อนุมัติ — แก้ยอดนับแล้วส่งใหม่ได้)
+const rejectCount = approvalAction('rejecting', async (client, header, { userId, userName, remarks }) => {
+    if (header.status !== 'Submitted') throw DA.httpErr(400, 'ไม่อนุมัติได้เฉพาะเอกสารที่ส่งขออนุมัติแล้ว (Submitted) เท่านั้น');
+    await DA.rejectStep(client, { kind: KIND, recordId: header.id, userId, remarks });
+    await client.query(`UPDATE im_stock_count SET status='Posted', updated_by=$1, updated_at=NOW() WHERE id=$2`, [userName, header.id]);
+});
+
+// GET /im_stock_count/my_pending — ใบตรวจนับที่ถึงคิวผู้ใช้นี้อนุมัติ (กระดิ่งหน้า Home)
+const fetchMyPending = async (req, res) => {
+    const userId = Number(req.headers.userid);
+    if (!userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
+    try {
+        await DA.ensureDocApprovalSchema(req.dbPool);
+        const client = await req.dbPool.connect();
+        try { await ensureImStockCountTable(client); } finally { client.release(); }
+        const r = await req.dbPool.query(`
+            SELECT c.id, c.count_no AS doc_no, c.count_date AS doc_date, w.warehouse_name_th, c.submitted_by
+              FROM im_stock_count c LEFT JOIN im_warehouse w ON w.id = c.warehouse_id
+             WHERE c.status = 'Submitted' AND ${DA.myTurnSql('c', '$1', '$2')}
+             ORDER BY c.count_date DESC, c.id DESC`, [KIND, userId]);
+        res.status(200).json(r.rows);
+    } catch (error) {
+        console.error('Error fetching im_stock_count my_pending:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    }
 };
 
 // --- Save Adjustment: Approved -> Closed — creates+posts the AJS im_transaction ---
@@ -543,7 +597,7 @@ const closeCount = async (req, res) => {
 };
 
 // ===== ถอย / ยกเลิก / ลบ =====
-// - ถอยทีละขั้น: Closed / Approved → Posted (ยกเลิกการอนุมัติ), Posted → Draft (ปลดล็อกรายการ)
+// - ถอยทีละขั้น: Closed / Approved / Submitted → Posted (ยกเลิกการอนุมัติ/ถอนคำขอ), Posted → Draft (ปลดล็อกรายการ)
 //   Closed ที่มีใบปรับยอด: ลบใบปรับยอดออกทั้งใบ (ย้อนสต็อก + ลบรายการบัญชี) เก็บเลขที่ใบปรับยอดและรายการบัญชีไว้
 //   ใช้ซ้ำตอนบันทึกปรับยอดใหม่ — ทำได้เมื่องวดของใบปรับยอดยังเปิดและสินค้าที่ปรับเข้ายังไม่ถูกใช้
 // - ยกเลิก: Posted / Approved (ไม่มีผลต่อสต็อก) หรือ Closed — ใบปรับยอดถูกยกเลิกด้วยรายการกลับวันนี้
@@ -570,7 +624,7 @@ const computeCountBlocks = async (db, id) => {
     let reverseTo = null, reverse = null, voidB = null;
     if (h.status === 'Draft') { reverse = pack('NOT_REVERSIBLE'); voidB = pack('NOT_POSTED'); }
     else if (h.status === 'Posted') reverseTo = 'Draft';
-    else reverseTo = 'Posted'; // Approved / Closed
+    else reverseTo = 'Posted'; // Submitted / Approved / Closed
     if (h.status === 'Closed' && h.im_transaction_id && h.adj_status === 'Posted') {
         const b = await computeImBlocks(db, h.im_transaction_id, { ignoreStockCount: true });
         const adj = (x) => x ? { code: x.code, ref: h.adj_doc_no, message: `ใบปรับยอด ${h.adj_doc_no}: ${x.message}` } : null;
@@ -610,10 +664,14 @@ const reverseCount = async (req, res) => {
             adjDocNo = r.docNo || adjDocNo;
             adjGlDocNo = r.glDocNo || adjGlDocNo;
         }
+        // ผู้อนุมัติที่ยังไม่ตัดสินถูกข้าม — ส่งขออนุมัติใหม่ได้
+        await DA.ensureDocApprovalSchema(client);
+        await DA.skipPending(client, KIND, Number(id));
         await client.query(`
             UPDATE im_stock_count SET
                 status=$1, adj_doc_no=$2, adj_gl_doc_no=$3,
                 approved_at=NULL, approved_by=NULL, im_transaction_id=NULL, closed_at=NULL, closed_by=NULL,
+                submitted_at=NULL, submitted_by=NULL,
                 updated_by=$4, updated_at=NOW()
             WHERE id=$5
         `, [blocks.reverse_to, adjDocNo, adjGlDocNo, userName, id]);
@@ -651,6 +709,8 @@ const voidCount = async (req, res) => {
             });
             if (r.message) return sendBlock(client, res, r);
         }
+        await DA.ensureDocApprovalSchema(client);
+        await DA.skipPending(client, KIND, Number(id));
         await client.query(`
             UPDATE im_stock_count SET status='Void', void_reason=$1, voided_by=$2, voided_at=NOW(),
                    updated_by=$2, updated_at=NOW()
@@ -921,7 +981,7 @@ module.exports = {
     fetchRows, fetchRow, addRow, updateHeader, resyncLines,
     postCount, voidCount, deleteCount, incrementPrintCount,
     fetchLinesForRecording, updateCounts,
-    checkResults, approveCount, closeCount, reverseCount,
+    checkResults, submitCount, approveCount, rejectCount, fetchMyPending, closeCount, reverseCount,
     fetchVarianceReport,
     exportExcel, importValidate, importConfirm,
     fetchRowById, computeCountBlocks,

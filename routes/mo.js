@@ -25,13 +25,17 @@ router.delete('/mo_work_center/:id', moWorkCenterController.deleteRow);
 
 // mo_header (ใบสั่งผลิต) + mo_component_detail/mo_output_detail/mo_operation_detail
 router.get('/mo_header',             moHeaderController.fetchRows);
+router.get('/mo_header/my_pending',  moHeaderController.fetchMyPending);
 router.get('/mo_header/report/status', moHeaderController.fetchStatusReport);
 router.get('/mo_header/report/cost_variance', moHeaderController.fetchCostVarianceReport);
 router.get('/mo_header/report/wip_valuation', moHeaderController.fetchWipValuationReport);
 router.get('/mo_header/:id',         moHeaderController.fetchRow);
 router.post('/mo_header',            moHeaderController.createTransaction);
 router.put('/mo_header/:id',         moHeaderController.updateTransaction);
-router.put('/mo_header/:id/release', moHeaderController.releaseTransaction);
+router.put('/mo_header/:id/release', moHeaderController.releaseTransaction); // = approve (ต้องส่งขออนุมัติก่อน)
+router.put('/mo_header/:id/submit',  moHeaderController.submitTransaction);
+router.put('/mo_header/:id/approve', moHeaderController.approveTransaction);
+router.put('/mo_header/:id/reject',  moHeaderController.rejectTransaction);
 router.put('/mo_header/:id/cancel',  moHeaderController.cancelTransaction);
 router.put('/mo_header/:id/close',   moHeaderController.closeTransaction);
 router.put('/mo_header/:id/reverse', moHeaderController.reverseTransaction);

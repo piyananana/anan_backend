@@ -15,7 +15,10 @@
 // ทั้งสองฝั่ง ไม่ใช่เฉพาะบรรทัดที่โยงกันจริง — เป็นข้อจำกัดที่ยอมรับได้เพราะส่วนใหญ่ 1 PR แปลงเป็น 1 PO เท่านั้น
 'use strict';
 
+const { ensureDocApprovalSchema } = require('../../utils/docApproval');
+
 const fetchReport = async (req, res) => {
+    await ensureDocApprovalSchema(req.dbPool); // ผู้อนุมัติ/เวลาตัดสินมาจากตารางกลาง doc_approval
     const { pr_date_from, pr_date_to, po_date_from, po_date_to, pr_statuses, po_statuses, show_pr, show_po } = req.query;
     const prStatusList = (pr_statuses || '').split(',').map(s => s.trim()).filter(Boolean);
     const poStatusList = (po_statuses || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -34,11 +37,11 @@ const fetchReport = async (req, res) => {
                 SELECT pr.id AS pr_id, pr.doc_no AS pr_doc_no, pr.doc_date AS pr_doc_date,
                        ru.user_name AS pr_requested_by_name,
                        (SELECT string_agg(a.approver_user_name, ', ' ORDER BY a.sequence_no)
-                        FROM pr_transaction_approval a
-                        WHERE a.header_id = pr.id AND a.status IN ('Approved','Rejected')) AS pr_approver_name,
+                        FROM doc_approval a
+                        WHERE a.doc_kind = 'PR' AND a.record_id = pr.id AND a.status IN ('Approved','Rejected')) AS pr_approver_name,
                        (SELECT MAX(a.approved_at)
-                        FROM pr_transaction_approval a
-                        WHERE a.header_id = pr.id AND a.status IN ('Approved','Rejected')) AS pr_decided_at,
+                        FROM doc_approval a
+                        WHERE a.doc_kind = 'PR' AND a.record_id = pr.id AND a.status IN ('Approved','Rejected')) AS pr_decided_at,
                        pr.status AS pr_status, pr.updated_at AS pr_updated_at,
                        po.id AS po_id, po.doc_no AS po_doc_no, po.doc_date AS po_doc_date, po.approved_at AS po_approved_at,
                        po.created_by AS po_created_by, po.approved_by AS po_approver_name, po.status AS po_status, po.updated_at AS po_updated_at

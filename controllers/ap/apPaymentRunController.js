@@ -1,6 +1,9 @@
 // controllers/ap/apPaymentRunController.js
 
 const { generateNextRunNumber } = require('./apPaymentRunRunningController');
+// คิวผู้อนุมัติเก็บที่ตารางกลาง doc_approval (utils/docApproval.js, doc_kind 'AP_PAYRUN') — ตาราง ap_payment_run_approval เดิมเลิกใช้แล้ว
+const DA = require('../../utils/docApproval');
+const KIND = 'AP_PAYRUN';
 const apTransactionController = require('./apTransactionController');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { reasonOf, userIdOf, sendErr, blk } = require('../../utils/docAction');
@@ -94,12 +97,9 @@ const fetchRow = async (req, res) => {
             SELECT * FROM ap_payment_run_detail
             WHERE run_id = $1 ORDER BY sort_order, id`, [id]);
 
-        const apprRes = await req.dbPool.query(`
-            SELECT * FROM ap_payment_run_approval
-            WHERE run_id = $1 ORDER BY sequence_no`, [id]);
-
+        await DA.ensureDocApprovalSchema(req.dbPool);
         res.status(200).json({
-            ...header, lines: lRes.rows, approvals: apprRes.rows,
+            ...header, lines: lRes.rows, approvals: await DA.loadApprovals(req.dbPool, KIND, Number(id)),
             ...(await computeRunBlocks(req.dbPool, id)),
             reverse_history: await getReverseHistory(req.dbPool, 'ap_payment_run', id),
         });
@@ -245,71 +245,45 @@ const updateRun = async (req, res) => {
     }
 };
 
-// --- PUT submit (Draft → Submitted) ---
-const submitRun = async (req, res) => {
+// --- ส่งอนุมัติ / อนุมัติ / ปฏิเสธ — คิวผู้อนุมัติของเมนู (ผูกกับ menu_id ของหน้าจอ Payment Run) ที่ตารางกลาง doc_approval ---
+// ไม่มีผู้อนุมัติ = ตาม sa_menu.no_approver_action (ให้ผ่าน -> Approved ทันที / ไม่ให้ผ่าน -> ส่งไม่ได้)
+const approvalAction = (label, okMsg, work) => async (req, res) => {
     const { id } = req.params;
-    const { menu_id } = req.body || {};
-    const userName = req.headers['username'] || null;
-    if (!menu_id) return res.status(400).json({ message: 'ต้องระบุ menu_id' });
+    const ctx = {
+        userId: Number(req.headers['userid']) || null, userName: req.headers['username'] || null,
+        menuId: req.body?.menu_id, remarks: req.body?.remarks,
+    };
+    if (label !== 'submitting' && !ctx.userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
+    if (label === 'submitting' && !ctx.menuId) return res.status(400).json({ message: 'ต้องระบุ menu_id' });
+    try { await req.dbPool.query(`ALTER TABLE ap_payment_run ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL'`); } catch (_) {}
+    await DA.ensureDocApprovalSchema(req.dbPool);
     const client = await req.dbPool.connect();
     try {
-        const { ensureMenuApproverSchema, syncMenuApprovers, isNoApproverBlocked, NO_APPROVER_BLOCK_MSG } = require('../../utils/menuApproverSync');
-        await ensureMenuApproverSchema(client);
-        try { await client.query(`ALTER TABLE ap_payment_run ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL'`); } catch (_) {}
         await client.query('BEGIN');
-        await syncMenuApprovers(client, menu_id);
-        const existing = await client.query(`SELECT status FROM ap_payment_run WHERE id=$1`, [id]);
-        if (existing.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
-        if (existing.rows[0].status !== 'Draft') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'ส่งอนุมัติได้เฉพาะเอกสาร Draft เท่านั้น' }); }
-
-        const menuRes = await client.query(`SELECT approval_mode, no_approver_action FROM sa_menu WHERE id=$1`, [menu_id]);
-        const approvalMode = menuRes.rows[0]?.approval_mode === 'ANY' ? 'ANY' : 'ALL';
-
-        // Create approval records from sa_module_approver (ผูกกับ menu_id ของหน้าจอ Payment Run)
-        const approvers = await client.query(`
-            SELECT a.approval_level, a.approver_user_id, u.user_name
-            FROM sa_module_approver a
-            JOIN sa_user u ON u.id = a.approver_user_id
-            WHERE a.menu_id=$1 AND a.is_active=true
-            ORDER BY a.approval_level`, [menu_id]);
-
-        if (approvers.rows.length === 0) {
-            // ไม่มีผู้มีสิทธิ์อนุมัติเลย หรือถูกงดอนุมัติหมดทุกคน — admin ไม่ต้องการอนุมัติสำหรับเมนูนี้
-            // ข้ามขั้นตอนอนุมัติไปเลยโดยไม่ต้องแจ้งเตือน แล้วผ่านตรงไป Approved
-            if (isNoApproverBlocked(menuRes.rows[0])) {
-                await client.query('ROLLBACK');
-                return res.status(400).json({ message: NO_APPROVER_BLOCK_MSG });
-            }
-            // ตั้งค่าเมนู "ให้ผ่าน" (ALLOW) — ข้ามขั้นตอนอนุมัติ
-            await client.query(`DELETE FROM ap_payment_run_approval WHERE run_id=$1`, [id]);
-            await client.query(`
-                UPDATE ap_payment_run SET status='Approved', approval_mode=$1, updated_at=NOW(), updated_by=$2 WHERE id=$3`,
-                [approvalMode, userName, id]);
-            await client.query('COMMIT');
-            return res.status(200).json({ message: 'ส่งอนุมัติสำเร็จ' });
-        }
-
-        await client.query(`
-            UPDATE ap_payment_run SET status='Submitted', approval_mode=$1, updated_at=NOW(), updated_by=$2 WHERE id=$3`,
-            [approvalMode, userName, id]);
-
-        await client.query(`DELETE FROM ap_payment_run_approval WHERE run_id=$1`, [id]);
-        for (const apr of approvers.rows) {
-            await client.query(`
-                INSERT INTO ap_payment_run_approval (run_id, approver_user_id, approver_user_name, sequence_no, status)
-                VALUES ($1,$2,$3,$4,'Pending')`,
-                [id, apr.approver_user_id, apr.user_name, apr.approval_level]);
-        }
+        const run = (await client.query(`SELECT * FROM ap_payment_run WHERE id=$1 FOR UPDATE`, [id])).rows[0];
+        if (!run) throw DA.httpErr(404, 'Not found');
+        await work(client, run, ctx);
         await client.query('COMMIT');
-        res.status(200).json({ message: 'ส่งอนุมัติสำเร็จ' });
+        res.status(200).json({ message: okMsg });
     } catch (error) {
         await client.query('ROLLBACK');
-        console.error('Error submitting ap_payment_run:', error);
-        res.status(500).json({ message: 'Internal server error' });
-    } finally {
-        client.release();
-    }
+        if (!error.status) console.error(`Error ${label} ap_payment_run:`, error);
+        res.status(error.status || 500).json({ message: error.status ? error.message : 'Internal server error' });
+    } finally { client.release(); }
 };
+
+const markApproved = (client, id, userName) => client.query(`
+    UPDATE ap_payment_run SET status='Approved', updated_at=NOW(), updated_by=$1 WHERE id=$2`, [userName, id]);
+
+// PUT submit (Draft → Submitted / ไม่มีผู้อนุมัติ + ให้ผ่าน → Approved)
+const submitRun = approvalAction('submitting', 'ส่งอนุมัติสำเร็จ', async (client, run, { menuId, userName }) => {
+    if (run.status !== 'Draft') throw DA.httpErr(400, 'ส่งอนุมัติได้เฉพาะเอกสาร Draft เท่านั้น');
+    const q = await DA.buildQueue(client, { kind: KIND, recordId: run.id, menuId });
+    await client.query(`
+        UPDATE ap_payment_run SET status='Submitted', approval_mode=$1, updated_at=NOW(), updated_by=$2 WHERE id=$3`,
+        [q.mode, userName, run.id]);
+    if (q.count === 0) await markApproved(client, run.id, userName);
+});
 
 // --- ถอย / ยกเลิก / ลบ: เงื่อนไข ---
 // ใบจ่ายชำระ (ap_transaction) ที่ส่งชำระสร้างจากรอบนี้และยังไม่ถูกยกเลิก/ลบ — ต้องจัดการในหน้าจอ AP ก่อน
@@ -387,7 +361,8 @@ const reverseRun = (req, res) => runAction(req, res, 'reverse_block', 'การ
         await client.query(`UPDATE ap_payment_run SET status='Approved', updated_at=NOW(), updated_by=$1 WHERE id=$2`, [userName, run.id]);
         return 'Approved';
     }
-    await client.query(`UPDATE ap_payment_run_approval SET status='Skipped' WHERE run_id=$1 AND status='Pending'`, [run.id]);
+    await DA.ensureDocApprovalSchema(client);
+    await DA.skipPending(client, KIND, run.id);
     await client.query(`UPDATE ap_payment_run SET status='Draft', updated_at=NOW(), updated_by=$1 WHERE id=$2`, [userName, run.id]);
     return 'Draft';
 });
@@ -407,117 +382,32 @@ const deleteRun = (req, res) => runAction(req, res, 'delete_block', 'การ�
     return 'Deleted';
 });
 
-// --- PUT approve (Submitted → Approved when all approve) ---
-const approveRun = async (req, res) => {
-    const { id } = req.params;
-    const { remarks } = req.body || {};
-    const userId = req.headers['userid'];
-    const userName = req.headers['username'] || null;
-    if (!userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
-    const client = await req.dbPool.connect();
-    try {
-        await client.query('BEGIN');
-        const run = await client.query(`SELECT status, approval_mode FROM ap_payment_run WHERE id=$1`, [id]);
-        if (run.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
-        if (run.rows[0].status !== 'Submitted') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'อนุมัติได้เฉพาะเอกสาร Submitted เท่านั้น' }); }
-        const isAnyMode = run.rows[0].approval_mode === 'ANY';
+// PUT approve (Submitted → Approved เมื่ออนุมัติครบตามลำดับ หรือคนใดคนหนึ่งถ้า ANY)
+const approveRun = approvalAction('approving', 'อนุมัติสำเร็จ', async (client, run, { userId, userName, remarks }) => {
+    if (run.status !== 'Submitted') throw DA.httpErr(400, 'อนุมัติได้เฉพาะเอกสาร Submitted เท่านั้น');
+    const done = await DA.approveStep(client, { kind: KIND, recordId: run.id, userId, mode: run.approval_mode, remarks });
+    if (done) await markApproved(client, run.id, userName);
+});
 
-        // โหมด ALL: ต้องไม่มีลำดับก่อนหน้ายัง Pending อยู่ / โหมด ANY: ใครอนุมัติก่อนก็จบเลย ไม่ต้องรอลำดับ
-        const myRecord = await client.query(`
-            SELECT a.id FROM ap_payment_run_approval a
-            WHERE a.run_id=$1 AND a.approver_user_id=$2 AND a.status='Pending'
-              AND ($3::boolean OR NOT EXISTS (
-                SELECT 1 FROM ap_payment_run_approval a2
-                WHERE a2.run_id=$1 AND a2.sequence_no < a.sequence_no AND a2.status='Pending'
-              ))`, [id, userId, isAnyMode]);
+// PUT reject (Submitted → Draft — ปฏิเสธ = ย้อนกลับไปเป็นร่างให้ผู้ส่งแก้ไขหรือลบทิ้งเองได้)
+const rejectRun = approvalAction('rejecting', 'ปฏิเสธและส่งกลับไปเป็นร่างสำเร็จ', async (client, run, { userId, userName, remarks }) => {
+    if (run.status !== 'Submitted') throw DA.httpErr(400, 'ปฏิเสธได้เฉพาะเอกสาร Submitted เท่านั้น');
+    await DA.rejectStep(client, { kind: KIND, recordId: run.id, userId, remarks });
+    await client.query(`UPDATE ap_payment_run SET status='Draft', updated_at=NOW(), updated_by=$1 WHERE id=$2`, [userName, run.id]);
+});
 
-        if (myRecord.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(403).json({ message: 'ไม่มีสิทธิ์อนุมัติ หรือยังรอการอนุมัติจากลำดับก่อนหน้า' });
-        }
-
-        await client.query(`
-            UPDATE ap_payment_run_approval SET status='Approved', remarks=$1, approved_at=NOW() WHERE id=$2`,
-            [remarks || null, myRecord.rows[0].id]);
-
-        if (isAnyMode) {
-            // คนใดคนหนึ่งอนุมัติก็พอ — แถวที่เหลือของคนอื่นเปลี่ยนเป็น Skipped แล้วจบทันที
-            await client.query(
-                `UPDATE ap_payment_run_approval SET status='Skipped' WHERE run_id=$1 AND status='Pending'`, [id]);
-            await client.query(
-                `UPDATE ap_payment_run SET status='Approved', updated_at=NOW(), updated_by=$1 WHERE id=$2`,
-                [userName, id]);
-        } else {
-            // โหมด ALL: ต้องอนุมัติครบทุกคนตามลำดับ
-            const remaining = await client.query(
-                `SELECT COUNT(*) FROM ap_payment_run_approval WHERE run_id=$1 AND status='Pending'`, [id]);
-            if (parseInt(remaining.rows[0].count) === 0) {
-                await client.query(
-                    `UPDATE ap_payment_run SET status='Approved', updated_at=NOW(), updated_by=$1 WHERE id=$2`,
-                    [userName, id]);
-            }
-        }
-        await client.query('COMMIT');
-        res.status(200).json({ message: 'อนุมัติสำเร็จ' });
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error('Error approving ap_payment_run:', error);
-        res.status(500).json({ message: 'Internal server error' });
-    } finally { client.release(); }
-};
-
-// --- PUT reject (Submitted → Rejected) ---
-const rejectRun = async (req, res) => {
-    const { id } = req.params;
-    const { remarks } = req.body || {};
-    const userId = req.headers['userid'];
-    const userName = req.headers['username'] || null;
-    if (!userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
-    const client = await req.dbPool.connect();
-    try {
-        await client.query('BEGIN');
-        const run = await client.query(`SELECT status FROM ap_payment_run WHERE id=$1`, [id]);
-        if (run.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
-        if (run.rows[0].status !== 'Submitted') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'ปฏิเสธได้เฉพาะเอกสาร Submitted เท่านั้น' }); }
-
-        const myRecord = await client.query(`
-            SELECT id FROM ap_payment_run_approval
-            WHERE run_id=$1 AND approver_user_id=$2 AND status='Pending'`, [id, userId]);
-        if (myRecord.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(403).json({ message: 'ไม่มีสิทธิ์ปฏิเสธหรืออนุมัติไปแล้ว' });
-        }
-
-        await client.query(`
-            UPDATE ap_payment_run_approval SET status='Rejected', remarks=$1, approved_at=NOW() WHERE id=$2`,
-            [remarks || null, myRecord.rows[0].id]);
-        // ปฏิเสธ = ย้อนกลับไปเป็น Draft ให้ผู้ส่งแก้ไขหรือลบทิ้งเองได้เลย ไม่ค้างเป็นสถานะปฏิเสธถาวร
-        await client.query(`
-            UPDATE ap_payment_run SET status='Draft', updated_at=NOW(), updated_by=$1 WHERE id=$2`,
-            [userName, id]);
-        await client.query('COMMIT');
-        res.status(200).json({ message: 'ปฏิเสธและส่งกลับไปเป็นร่างสำเร็จ' });
-    } catch (error) {
-        await client.query('ROLLBACK');
-        console.error('Error rejecting ap_payment_run:', error);
-        res.status(500).json({ message: 'Internal server error' });
-    } finally { client.release(); }
-};
-
-// --- GET runs pending current user's approval ---
+// --- GET runs pending current user's approval (ถึงคิวผู้ใช้นี้) ---
 const fetchMyPending = async (req, res) => {
-    const userId = req.headers['userid'];
+    const userId = Number(req.headers['userid']);
     if (!userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
     try {
+        try { await req.dbPool.query(`ALTER TABLE ap_payment_run ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL'`); } catch (_) {}
+        await DA.ensureDocApprovalSchema(req.dbPool);
         const result = await req.dbPool.query(`
             SELECT r.id, r.run_number, r.run_date, r.description, r.total_amount_lc, r.status, r.created_by
             FROM ap_payment_run r
-            WHERE r.status = 'Submitted'
-              AND EXISTS (
-                SELECT 1 FROM ap_payment_run_approval a
-                WHERE a.run_id = r.id AND a.approver_user_id = $1 AND a.status = 'Pending'
-              )
-            ORDER BY r.run_date DESC, r.id DESC`, [userId]);
+            WHERE r.status = 'Submitted' AND ${DA.myTurnSql('r', '$1', '$2')}
+            ORDER BY r.run_date DESC, r.id DESC`, [KIND, userId]);
         res.status(200).json(result.rows);
     } catch (error) {
         console.error('Error fetching pending approvals:', error);

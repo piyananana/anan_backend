@@ -5,7 +5,8 @@
 // (ref_mo_output_detail_id) — ดู validateMoComponentIssueQty/validateMoOutputReceiptQty/refreshMoStatus ด้านล่าง
 // และ postDetailLines ใน imTransactionController.js สำหรับฝั่งที่เรียกใช้จริงตอน Post
 //
-// workflow: Draft (แก้ไขได้ทั้งหมด) -> Released (ผูกพันแล้ว พร้อมให้ฝ่ายผลิตเริ่มเบิก/รับ)
+// workflow: Draft (แก้ไขได้ทั้งหมด) -> Submitted (ส่งขออนุมัติ — คิวผู้อนุมัติของเมนู utils/docApproval.js doc_kind 'MO';
+//   ไม่อนุมัติ = Rejected แก้ไขแล้วส่งใหม่ได้เหมือน Draft) -> Released (อนุมัติครบ — ผูกพันแล้ว พร้อมให้ฝ่ายผลิตเริ่มเบิก/รับ)
 //   -> InProgress (auto เมื่อมีการเบิก/รับครั้งแรก) -> Completed (auto เมื่อรับผลผลิตครบตามแผนทุกรายการ)
 //   Released -> Cancelled (ยกเลิกได้ถ้ายังไม่มีการเบิก/รับใดๆ อ้างอิงเข้ามาเลย ต้องมีเหตุผล)
 //   Completed -> Closed (ปิดพร้อม WIP true-up เข้าบัญชีผลต่าง)
@@ -24,6 +25,8 @@ const { ensureImLocationTable } = require('../im/imLocationController');
 const { ensureMoBomTable } = require('./moBomController');
 const { today } = require('../../utils/dateUtil');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
+const DA = require('../../utils/docApproval');
+const KIND = 'MO';
 
 const ensureMoHeaderTable = async (client) => {
     await ensureImItemTable(client);
@@ -71,6 +74,12 @@ const ensureMoHeaderTable = async (client) => {
     // Closed (ปิดใบสั่งผลิตพร้อม WIP true-up) — ดู closeTransaction ด้านล่าง
     await client.query(`ALTER TABLE mo_header ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ`).catch(() => {});
     await client.query(`ALTER TABLE mo_header ADD COLUMN IF NOT EXISTS closed_by VARCHAR(100)`).catch(() => {});
+    // คิวผู้อนุมัติ (utils/docApproval.js)
+    await client.query(`
+        ALTER TABLE mo_header
+            ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL',
+            ADD COLUMN IF NOT EXISTS submitted_at  TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS submitted_by  VARCHAR(100)`).catch(() => {});
     // ถอยสถานะ / ยกเลิกมีเหตุผล (sql/mo_header_reverse_to_draft.sql)
     await client.query(`
         ALTER TABLE mo_header
@@ -195,7 +204,11 @@ const fetchRowById = async (pool, id) => {
         pool.query(OUTPUT_SELECT, [id]),
         pool.query(OPERATION_SELECT, [id]),
     ]);
-    return { ...hRes.rows[0], components: components.rows, outputs: outputs.rows, operations: operations.rows };
+    await DA.ensureDocApprovalSchema(pool);
+    return {
+        ...hRes.rows[0], components: components.rows, outputs: outputs.rows, operations: operations.rows,
+        approvals: await DA.loadApprovals(pool, KIND, Number(id)),
+    };
 };
 
 // --- GET list ---
@@ -562,7 +575,7 @@ const updateTransaction = async (req, res) => {
         await client.query('BEGIN');
         const existing = await client.query(`SELECT status FROM mo_header WHERE id=$1 FOR UPDATE`, [id]);
         if (existing.rows.length === 0) throw new Error('Not found');
-        if (existing.rows[0].status !== 'Draft') throw new Error('แก้ไขได้เฉพาะเอกสาร Draft เท่านั้น');
+        if (!['Draft', 'Rejected'].includes(existing.rows[0].status)) throw new Error('แก้ไขได้เฉพาะเอกสาร Draft หรือ Rejected เท่านั้น');
 
         if (!header.warehouse_id) throw new Error('กรุณาระบุคลังปลายทาง');
         if (!header.order_qty || Number(header.order_qty) <= 0) throw new Error('กรุณาระบุจำนวนที่สั่งผลิตให้มากกว่า 0');
@@ -631,28 +644,80 @@ const updateTransaction = async (req, res) => {
     } finally { client.release(); }
 };
 
-// --- 3. Release (Draft -> Released — ผูกพันแล้ว พร้อมให้ฝ่ายผลิตเริ่มเบิก/รับ) ---
-const releaseTransaction = async (req, res) => {
+// --- 3. ส่งขออนุมัติ / อนุมัติ (= ปล่อยใบสั่งผลิต) / ไม่อนุมัติ — คิวผู้อนุมัติของเมนู (utils/docApproval.js) ---
+const approvalAction = (label, work) => async (req, res) => {
     const { id } = req.params;
-    const userName = req.headers.username || null;
+    const ctx = {
+        userId: Number(req.headers.userid) || null, userName: req.headers.username || null,
+        menuId: req.body?.menu_id, remarks: req.body?.remarks,
+    };
+    await DA.ensureDocApprovalSchema(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
-        const existing = await client.query(`SELECT status FROM mo_header WHERE id=$1 FOR UPDATE`, [id]);
-        if (existing.rows.length === 0) throw new Error('Not found');
-        if (existing.rows[0].status !== 'Draft') throw new Error('ปล่อยใบสั่งผลิตได้เฉพาะเอกสาร Draft เท่านั้น');
-        await client.query(`
-            UPDATE mo_header SET status='Released', released_at=NOW(), released_by=$1, updated_by=$1, updated_at=NOW()
-            WHERE id=$2
-        `, [userName, id]);
+        await ensureMoHeaderTable(client);
+        const mo = (await client.query(`SELECT * FROM mo_header WHERE id=$1 FOR UPDATE`, [id])).rows[0];
+        if (!mo) throw DA.httpErr(404, 'Not found');
+        await work(client, mo, ctx);
         await client.query('COMMIT');
-        const full = await fetchRowById(req.dbPool, id);
-        res.status(200).json(full);
+        res.status(200).json(await fetchRowById(req.dbPool, id));
     } catch (error) {
         await client.query('ROLLBACK');
-        console.error('Error releasing mo_header:', error);
-        res.status(error.message === 'Not found' ? 404 : 500).json({ message: error.message || 'Internal server error' });
+        if (!error.status) console.error(`Error ${label} mo_header:`, error);
+        res.status(error.status || 500).json({ message: error.message || 'Internal server error' });
     } finally { client.release(); }
+};
+
+// อนุมัติครบ = ปล่อยใบสั่งผลิต (ผูกพันแล้ว พร้อมให้ฝ่ายผลิตเริ่มเบิก/รับ)
+const markReleased = (client, id, userName) => client.query(`
+    UPDATE mo_header SET status='Released', released_at=NOW(), released_by=$1, updated_by=$1, updated_at=NOW()
+     WHERE id=$2`, [userName, id]);
+
+// PUT /:id/submit { menu_id } — Draft/Rejected -> Submitted / ไม่มีผู้อนุมัติ + ให้ผ่าน -> Released ทันที
+const submitTransaction = approvalAction('submitting', async (client, mo, { menuId, userName }) => {
+    if (!['Draft', 'Rejected'].includes(mo.status)) throw DA.httpErr(400, 'ส่งขออนุมัติได้เฉพาะเอกสาร Draft หรือ Rejected เท่านั้น');
+    const q = await DA.buildQueue(client, { kind: KIND, recordId: mo.id, menuId, docCode: mo.doc_code });
+    await client.query(`
+        UPDATE mo_header SET status='Submitted', approval_mode=$1, submitted_at=NOW(), submitted_by=$2,
+               updated_by=$2, updated_at=NOW() WHERE id=$3`, [q.mode, userName, mo.id]);
+    if (q.count === 0) await markReleased(client, mo.id, userName);
+});
+
+// PUT /:id/approve { remarks } (และ /:id/release เดิม) — Submitted -> Released เมื่ออนุมัติครบ (หรือคนใดคนหนึ่งถ้า ANY)
+const approveTransaction = approvalAction('approving', async (client, mo, { userId, userName, remarks }) => {
+    if (mo.status !== 'Submitted') throw DA.httpErr(400, 'อนุมัติได้เฉพาะใบสั่งผลิตที่ส่งขออนุมัติแล้ว (Submitted) เท่านั้น');
+    const done = await DA.approveStep(client, { kind: KIND, recordId: mo.id, userId, mode: mo.approval_mode, remarks });
+    if (done) await markReleased(client, mo.id, userName);
+});
+const releaseTransaction = approveTransaction;
+
+// PUT /:id/reject { remarks } — Submitted -> Rejected (แก้ไขแล้วส่งใหม่ได้)
+const rejectTransaction = approvalAction('rejecting', async (client, mo, { userId, userName, remarks }) => {
+    if (mo.status !== 'Submitted') throw DA.httpErr(400, 'ไม่อนุมัติได้เฉพาะใบสั่งผลิตที่ส่งขออนุมัติแล้ว (Submitted) เท่านั้น');
+    await DA.rejectStep(client, { kind: KIND, recordId: mo.id, userId, remarks });
+    await client.query(`UPDATE mo_header SET status='Rejected', updated_by=$1, updated_at=NOW() WHERE id=$2`, [userName, mo.id]);
+});
+
+// GET /mo_header/my_pending — ใบสั่งผลิตที่ถึงคิวผู้ใช้นี้อนุมัติ (กระดิ่งหน้า Home)
+const fetchMyPending = async (req, res) => {
+    const userId = Number(req.headers.userid);
+    if (!userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
+    try {
+        await DA.ensureDocApprovalSchema(req.dbPool);
+        const client = await req.dbPool.connect();
+        try { await ensureMoHeaderTable(client); } finally { client.release(); }
+        const r = await req.dbPool.query(`
+            SELECT h.id, h.doc_no, h.doc_date, i.item_name_th, h.submitted_by
+              FROM mo_header h
+              LEFT JOIN mo_bom_header b ON b.id = h.bom_header_id
+              LEFT JOIN im_item i ON i.id = b.parent_item_id
+             WHERE h.status = 'Submitted' AND ${DA.myTurnSql('h', '$1', '$2')}
+             ORDER BY h.doc_date DESC, h.id DESC`, [KIND, userId]);
+        res.status(200).json(r.rows);
+    } catch (error) {
+        console.error('Error fetching mo_header my_pending:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    }
 };
 
 // --- ถอยสถานะ / ยกเลิก / ลบ: เงื่อนไข ---
@@ -706,8 +771,10 @@ const computeMoBlocks = async (client, id) => {
                 out.reverse_block = blk('PERIOD_CLOSED', 'งวดบัญชีของรายการปรับ WIP และงวดบัญชีวันนี้ปิดแล้ว', gl?.doc_no || null);
             }
         }
-    } else if (mo.status === 'Draft') {
-        out.reverse_block = blk('NOT_REVERSIBLE', 'ถอยได้เฉพาะใบสั่งผลิตที่ปล่อยแล้ว (ยังไม่เริ่มผลิต) หรือปิดแล้ว');
+    } else if (mo.status === 'Submitted') {
+        // ถอนคำขออนุมัติ -> Draft ได้เสมอ
+    } else if (['Draft', 'Rejected'].includes(mo.status)) {
+        out.reverse_block = blk('NOT_REVERSIBLE', 'ถอยได้เฉพาะใบสั่งผลิตที่ส่งขออนุมัติ ปล่อยแล้ว (ยังไม่เริ่มผลิต) หรือปิดแล้ว');
     } else if (['InProgress', 'Completed'].includes(mo.status)) {
         out.reverse_block = blk('REF_DOCS', `ใบสั่งผลิตเริ่มผลิตแล้ว ถอยเอกสารเบิก/รับที่อ้างอิง (${refs || '-'}) ก่อน สถานะจะกลับเป็นปล่อยแล้วเอง`, refs);
     } else {
@@ -716,18 +783,18 @@ const computeMoBlocks = async (client, id) => {
 
     if (mo.status === 'Released') {
         if (refs) out.void_block = blk('REF_DOCS', `มีเอกสารเบิก/รับอ้างอิงใบสั่งผลิตนี้ (${refs}) ต้องถอยและลบเอกสารเหล่านั้นก่อน`, refs);
-    } else if (mo.status === 'Draft') {
-        out.void_block = blk('NOT_POSTED', 'ใบสั่งผลิตที่ยังเป็นร่างให้ลบแทนการยกเลิก');
+    } else if (['Draft', 'Rejected', 'Submitted'].includes(mo.status)) {
+        out.void_block = blk('NOT_POSTED', 'ใบสั่งผลิตที่ยังไม่อนุมัติให้ถอยเป็นร่างแล้วลบแทนการยกเลิก');
     } else if (['Cancelled', 'Deleted'].includes(mo.status)) {
         out.void_block = blk('VOIDED', 'ใบสั่งผลิตนี้ถูกยกเลิกหรือลบแล้ว');
     } else {
         out.void_block = blk('NOT_RELEASED', 'ยกเลิกได้เฉพาะใบสั่งผลิตที่ปล่อยแล้วและยังไม่เริ่มผลิต');
     }
 
-    if (mo.status !== 'Draft') {
+    if (!['Draft', 'Rejected'].includes(mo.status)) {
         out.delete_block = ['Cancelled', 'Deleted'].includes(mo.status)
             ? blk('VOIDED', 'ใบสั่งผลิตนี้ถูกยกเลิกหรือลบแล้ว')
-            : blk('NOT_DRAFT', 'ลบได้เฉพาะร่าง ใบสั่งผลิตที่ปล่อยแล้วต้องถอยเป็นร่างก่อน');
+            : blk('NOT_DRAFT', 'ลบได้เฉพาะร่างหรือใบที่ไม่อนุมัติ ใบที่ส่งขออนุมัติ/ปล่อยแล้วต้องถอยเป็นร่างก่อน');
     }
     return out;
 };
@@ -763,7 +830,8 @@ const cancelTransaction = async (req, res) => {
 };
 
 // --- ถอยสถานะ (ต้องมีเหตุผล) ---
-// Released -> Draft: ยังไม่มีเอกสารเบิก/รับ (รวมร่าง) บันทึกเวลา หรือใบสั่งผลิตย่อย — แก้ไขแล้วปล่อยใหม่ได้
+// Submitted -> Draft: ถอนคำขออนุมัติ (ผู้อนุมัติที่ยังไม่ตัดสินถูกข้าม)
+// Released -> Draft: ยังไม่มีเอกสารเบิก/รับ (รวมร่าง) บันทึกเวลา หรือใบสั่งผลิตย่อย — แก้ไขแล้วส่งขออนุมัติใหม่ได้
 // Closed -> Completed: ลบรายการปรับ WIP (เก็บเลขที่ไว้ใช้ตอนปิดใหม่) ถ้างวดของรายการยังเปิด ไม่เช่นนั้นลงรายการ
 //   กลับในวันนี้ แล้วคำนวณยอด WIP ใหม่ — หลังถอยแล้วถอยเอกสารเบิก/รับที่อ้างอิงได้อีกครั้ง
 const reverseTransaction = async (req, res) => {
@@ -781,10 +849,13 @@ const reverseTransaction = async (req, res) => {
         if (b) { await client.query('ROLLBACK'); return sendErr(res, 400, b.message, { code: b.code, ref: b.ref }); }
 
         let toStatus;
-        if (mo.status === 'Released') {
+        if (['Released', 'Submitted'].includes(mo.status)) {
             toStatus = 'Draft';
+            await DA.ensureDocApprovalSchema(client);
+            await DA.skipPending(client, KIND, Number(id));
             await client.query(`
-                UPDATE mo_header SET status='Draft', released_at=NULL, released_by=NULL, updated_by=$1, updated_at=NOW()
+                UPDATE mo_header SET status='Draft', released_at=NULL, released_by=NULL, submitted_at=NULL, submitted_by=NULL,
+                       updated_by=$1, updated_at=NOW()
                  WHERE id=$2`, [userName, id]);
         } else {
             toStatus = 'Completed';
@@ -1375,7 +1446,8 @@ const logOperationTime = async (req, res) => {
 
 module.exports = {
     ensureMoHeaderTable, fetchRows, fetchRow, createTransaction, updateTransaction,
-    releaseTransaction, cancelTransaction, closeTransaction, deleteTransaction, reverseTransaction,
+    releaseTransaction, submitTransaction, approveTransaction, rejectTransaction, fetchMyPending,
+    cancelTransaction, closeTransaction, deleteTransaction, reverseTransaction,
     validateMoComponentIssueQty, validateMoOutputReceiptQty, refreshMoStatus,
     computeMoReceiptUnitCost, logOperationTime, checkMaterialAvailability,
     fetchExplosionCandidates, explodeSubAssembly, fetchStatusReport, fetchCostVarianceReport,

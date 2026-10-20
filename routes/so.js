@@ -11,11 +11,14 @@ const soBulkCloseController = require('../controllers/so/soBulkCloseController')
 // ->Closed, กิ่ง Void แยกได้ แต่บล็อกถ้ามี DLN อ้างอิงแล้ว) deliverable_lines/closable_list ต้องมาก่อน /:id ด้านล่าง
 router.get('/so_transaction/deliverable_lines', soTransactionController.fetchDeliverableLines);
 router.get('/so_transaction/closable_list',     soBulkCloseController.fetchClosableList);
+router.get('/so_transaction/my_pending',        soTransactionController.fetchMyPending);
 router.get('/so_transaction',                   soTransactionController.fetchRows);
 router.get('/so_transaction/:id',               soTransactionController.fetchRow);
 router.post('/so_transaction',                  soTransactionController.createTransaction);
 router.put('/so_transaction/:id',               soTransactionController.updateTransaction);
+router.put('/so_transaction/:id/submit',        soTransactionController.submitTransaction);
 router.put('/so_transaction/:id/approve',       soTransactionController.approveTransaction);
+router.put('/so_transaction/:id/reject',        soTransactionController.rejectTransaction);
 router.put('/so_transaction/:id/close',         soTransactionController.closeTransaction);
 router.put('/so_transaction/:id/void',          soTransactionController.voidTransaction);
 router.put('/so_transaction/:id/reverse',      soTransactionController.reverseTransaction);

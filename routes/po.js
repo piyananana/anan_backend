@@ -12,11 +12,14 @@ const poBulkCloseController = require('../controllers/po/poBulkCloseController')
 // ->Closed, กิ่ง Void แยกได้ แต่บล็อกถ้ามี GRN อ้างอิงแล้ว) receivable_lines/closable_list ต้องมาก่อน /:id ด้านล่าง
 router.get('/po_transaction/receivable_lines', poTransactionController.fetchReceivableLines);
 router.get('/po_transaction/closable_list',    poBulkCloseController.fetchClosableList);
+router.get('/po_transaction/my_pending',       poTransactionController.fetchMyPending);
 router.get('/po_transaction',                  poTransactionController.fetchRows);
 router.get('/po_transaction/:id',              poTransactionController.fetchRow);
 router.post('/po_transaction',                 poTransactionController.createTransaction);
 router.put('/po_transaction/:id',              poTransactionController.updateTransaction);
+router.put('/po_transaction/:id/submit',       poTransactionController.submitTransaction);
 router.put('/po_transaction/:id/approve',      poTransactionController.approveTransaction);
+router.put('/po_transaction/:id/reject',       poTransactionController.rejectTransaction);
 router.put('/po_transaction/:id/close',        poTransactionController.closeTransaction);
 router.put('/po_transaction/:id/void',         poTransactionController.voidTransaction);
 router.put('/po_transaction/:id/reverse',      poTransactionController.reverseTransaction);
