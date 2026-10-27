@@ -83,6 +83,11 @@ const ensureSoTransactionTable = async (client) => {
             ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL',
             ADD COLUMN IF NOT EXISTS submitted_at  TIMESTAMPTZ,
             ADD COLUMN IF NOT EXISTS submitted_by  VARCHAR(100)`);
+    // เลขที่/วันที่ใบสั่งซื้อของลูกค้า — ส่งต่อไปใบส่งสินค้า (IM) และใบแจ้งหนี้ (AR), พิมพ์ในแบบฟอร์ม
+    await client.query(`
+        ALTER TABLE so_transaction
+            ADD COLUMN IF NOT EXISTS customer_po_no   VARCHAR(50),
+            ADD COLUMN IF NOT EXISTS customer_po_date DATE`);
 };
 
 // --- Fetch helpers ---
@@ -210,8 +215,8 @@ const createTransaction = async (req, res) => {
             INSERT INTO so_transaction
             (doc_id, doc_no, doc_code, doc_date, customer_id, customer_code, customer_name_th, warehouse_id,
              currency_id, currency_code, exchange_rate, due_date, description, ref_quote_id,
-             dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id, created_by, updated_by)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$21)
+             dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id, created_by, updated_by, customer_po_no, customer_po_date)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$21,$22,$23)
             RETURNING id
         `, [
             header.doc_id, docNo, docCode, header.doc_date, header.customer_id, customer.customer_code, customer.customer_name_th,
@@ -219,6 +224,7 @@ const createTransaction = async (req, res) => {
             header.due_date || null, header.description || null, header.ref_quote_id || null,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
             header.branch_id || null, header.created_by || null,
+            (header.customer_po_no || '').trim() || null, header.customer_po_date || null,
         ]);
         const headerId = hRes.rows[0].id;
 
@@ -294,7 +300,7 @@ const updateTransaction = async (req, res) => {
                 doc_date=$1, customer_id=$2, customer_code=$3, customer_name_th=$4, warehouse_id=$5,
                 currency_id=$6, currency_code=$7, exchange_rate=$8, due_date=$9, description=$10,
                 dim1_id=$11, dim2_id=$12, dim3_id=$13, dim4_id=$14, dim5_id=$15, branch_id=$16,
-                updated_by=$17, updated_at=NOW()
+                updated_by=$17, updated_at=NOW(), customer_po_no=$19, customer_po_date=$20
             WHERE id=$18
         `, [
             header.doc_date, header.customer_id, customer.customer_code, customer.customer_name_th, header.warehouse_id,
@@ -302,6 +308,7 @@ const updateTransaction = async (req, res) => {
             header.due_date || null, header.description || null,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
             header.branch_id || null, header.updated_by || null, id,
+            (header.customer_po_no || '').trim() || null, header.customer_po_date || null,
         ]);
 
         const { validateQuoteConvertibleQty, refreshQuoteStatus } = require('./soQuoteTransactionController');
@@ -596,6 +603,7 @@ const fetchDeliverableLines = async (req, res) => {
         const { customer_id, search } = req.query;
         let query = `
             SELECT t.id AS header_id, t.doc_no, t.doc_date, t.status, t.currency_code, t.exchange_rate,
+                   t.customer_po_no, to_char(t.customer_po_date, 'YYYY-MM-DD') AS customer_po_date,
                    dt.id AS detail_id, dt.line_no, dt.item_id, dt.item_code, dt.item_name, dt.uom_id, dt.qty_ordered, dt.unit_price_fc,
                    u.uom_code,
                    COALESCE((

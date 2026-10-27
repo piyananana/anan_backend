@@ -160,6 +160,13 @@ const ensureImTransactionTable = async (client) => {
     // ข้างบนทุกประการ ฝั่งขาย ดู validateSoDeliverableQty/refreshSoStatus ใน soTransactionController.js
     await client.query(`ALTER TABLE im_transaction ADD COLUMN IF NOT EXISTS ref_so_id INTEGER`).catch(() => {});
     await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS ref_so_detail_id INTEGER`).catch(() => {});
+    // เลขที่/วันที่ใบสั่งซื้อของลูกค้า (ฝั่งขาย) — ดึงจากใบสั่งขายที่อ้างอิงเป็นค่าเริ่มต้น แก้ไขได้, ส่งต่อไปใบแจ้งหนี้ AR
+    await client.query(`
+        ALTER TABLE im_transaction
+            ADD COLUMN IF NOT EXISTS customer_po_no   VARCHAR(50),
+            ADD COLUMN IF NOT EXISTS customer_po_date DATE`).catch(() => {});
+    // ใบแจ้งหนี้ AR ที่สร้างจากใบส่งสินค้า (postArBillFromDln) คัดลอกใบสั่งซื้อลูกค้าไปด้วย
+    await client.query(`ALTER TABLE ar_transaction ADD COLUMN IF NOT EXISTS customer_po_no VARCHAR(50), ADD COLUMN IF NOT EXISTS customer_po_date DATE`).catch(() => {});
 
     // สำหรับ '90' (เบิกวัตถุดิบเข้าผลิต) / '95' (รับสินค้าเข้าคลังจากการผลิต) ที่อ้างอิงใบสั่งผลิต (MO, sys_module=
     // '61') — มิเรอร์ ref_po_id/ref_po_detail_id ทุกประการ header ref_mo_id เก็บไว้เพื่อความสะดวกในการแสดงผล/กรอง
@@ -1089,14 +1096,15 @@ const postArBillFromDln = async (client, { header, details, docNo }) => {
         (doc_id, doc_no, doc_date, period_id, customer_id, customer_code, customer_name_th, ar_account_id,
          currency_code, exchange_rate, subtotal_fc, before_vat_fc, vat_amount_fc, total_amount_fc,
          subtotal_lc, before_vat_lc, vat_amount_lc, total_amount_lc, balance_amount_lc,
-         ref_no, ref_doc_id, ref_doc_no, description, status, created_by, updated_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'THB',1,$9,$9,$10,$11,$9,$9,$10,$11,$11,$12,$13,$14,$15,'Posted',$16,$16)
+         ref_no, ref_doc_id, ref_doc_no, description, status, created_by, updated_by, customer_po_no, customer_po_date)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'THB',1,$9,$9,$10,$11,$9,$9,$10,$11,$11,$12,$13,$14,$15,'Posted',$16,$16,$17,$18)
         RETURNING id
     `, [
         arDocId, arDocNo, header.doc_date, periodId, header.customer_id, customerRow.customer_code, customerRow.customer_name_th,
         arAccountId,
         totalSubtotal, totalVat, totalAmount,
         header.ref_no || null, header.doc_id, docNo, `ใบแจ้งหนี้จากการส่งสินค้า ${docNo}`, createdByUserId,
+        (header.customer_po_no || '').toString().trim() || null, header.customer_po_date || null,
     ]);
     const arTransactionId = arHeaderRes.rows[0].id;
 
@@ -1983,7 +1991,7 @@ const insertAndPostAdjustment = async (client, {
     refNo, refDocId, refDocNo, refImTransactionId, refPoId, refSoId, refMoId, description,
     currencyId, currencyCode, exchangeRate,
     dim1Id, dim2Id, dim3Id, dim4Id, dim5Id, branchId, createdBy,
-    lines, action, glDocNo, salespersons,
+    lines, action, glDocNo, salespersons, customerPoNo, customerPoDate,
 }) => {
     let resolvedDocId = docId;
     let resolvedDocCode = docCode;
@@ -2104,8 +2112,8 @@ const insertAndPostAdjustment = async (client, {
          vendor_id, vendor_code, vendor_name_th, customer_id, customer_code, customer_name_th,
          ref_no, ref_doc_id, ref_doc_no, ref_im_transaction_id, ref_po_id, ref_so_id, description, status,
          currency_id, currency_code, exchange_rate,
-         dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id, created_by, ref_mo_id)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32)
+         dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id, created_by, ref_mo_id, customer_po_no, customer_po_date)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34)
         RETURNING id
     `, [
         resolvedDocId, finalDocNo, resolvedDocCode, docDate, periodId, warehouseId, toWarehouseId || null,
@@ -2114,6 +2122,7 @@ const insertAndPostAdjustment = async (client, {
         currencyId || null, currencyCode || 'THB', exchangeRate || 1,
         dim1Id || null, dim2Id || null, dim3Id || null, dim4Id || null, dim5Id || null,
         branchId || null, createdBy || null, refMoId || null,
+        (customerPoNo || '').trim() || null, customerPoDate || null,
     ]);
     const newHeaderId = hRes.rows[0].id;
 
@@ -2148,6 +2157,7 @@ const insertAndPostAdjustment = async (client, {
             doc_id: resolvedDocId, doc_code: resolvedDocCode, doc_date: docDate, warehouse_id: warehouseId, to_warehouse_id: toWarehouseId || null,
             vendor_id: vendorId || null, customer_id: customerId || null,
             ref_no: refNo, description,
+            customer_po_no: customerPoNo || null, customer_po_date: customerPoDate || null,
             currency_code: currencyCode || 'THB', exchange_rate: exchangeRate || 1,
             dim1_id: dim1Id, dim2_id: dim2Id, dim3_id: dim3Id, dim4_id: dim4Id, dim5_id: dim5Id,
             branch_id: branchId, created_by: createdBy, updated_by: createdBy,
@@ -2184,6 +2194,7 @@ const createTransaction = async (req, res) => {
             dim1Id: header.dim1_id, dim2Id: header.dim2_id, dim3Id: header.dim3_id,
             dim4Id: header.dim4_id, dim5Id: header.dim5_id,
             branchId: header.branch_id, createdBy: header.created_by,
+            customerPoNo: header.customer_po_no, customerPoDate: header.customer_po_date,
             lines: details, action, salespersons: req.body.salespersons,
         });
 
@@ -2305,8 +2316,8 @@ const updateTransaction = async (req, res) => {
         // '32' (ส่งสินค้า รอตั้งหนี้) ที่อยู่สถานะ Delivered: แก้ได้แค่เลขที่อ้างอิง + ราคาขายรายบรรทัด — ไม่แตะ
         // จำนวน/สินค้า/คลัง เพราะส่งของจริงไปแล้ว ต้นทุนขายก็ Post ไปแล้วตอน Post IM — มิเรอร์ branch ของ '12'/Received
         if (existing.rows[0].status === 'Delivered' && existing.rows[0].sys_doc_type === '32') {
-            await client.query(`UPDATE im_transaction SET ref_no=$1, updated_by=$2, updated_at=NOW() WHERE id=$3`,
-                [header.ref_no || null, header.updated_by || null, id]);
+            await client.query(`UPDATE im_transaction SET ref_no=$1, updated_by=$2, updated_at=NOW(), customer_po_no=$4, customer_po_date=$5 WHERE id=$3`,
+                [header.ref_no || null, header.updated_by || null, id, (header.customer_po_no || '').trim() || null, header.customer_po_date || null]);
             for (const d of details || []) {
                 if (!d.id) continue;
                 await client.query(
@@ -2390,7 +2401,8 @@ const updateTransaction = async (req, res) => {
                 ref_no=$11, ref_doc_id=$12, ref_doc_no=$13, ref_im_transaction_id=$14, ref_po_id=$15, ref_so_id=$16, description=$17,
                 currency_id=$18, currency_code=$19, exchange_rate=$20,
                 dim1_id=$21, dim2_id=$22, dim3_id=$23, dim4_id=$24, dim5_id=$25,
-                branch_id=$26, updated_by=$27, updated_at=NOW(), ref_mo_id=$29
+                branch_id=$26, updated_by=$27, updated_at=NOW(), ref_mo_id=$29,
+                customer_po_no=$30, customer_po_date=$31
             WHERE id=$28
         `, [
             header.doc_date, periodId, header.warehouse_id, header.to_warehouse_id || null,
@@ -2401,6 +2413,7 @@ const updateTransaction = async (req, res) => {
             header.currency_id || null, header.currency_code || 'THB', header.exchange_rate || 1,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
             header.branch_id || null, header.updated_by || null, id, header.ref_mo_id || null,
+            (header.customer_po_no || '').trim() || null, header.customer_po_date || null,
         ]);
 
         await saveImSalespersons(client, id, req.body.salespersons);
@@ -2568,6 +2581,14 @@ const postBillingForDln = async (req, res) => {
         // บันทึกเลขที่อ้างอิง + ราคาขายรายบรรทัด (ถ้าส่งมาในคำขอนี้) ก่อน Post
         if (refNoBody) {
             await client.query(`UPDATE im_transaction SET ref_no=$1, updated_by=$2, updated_at=NOW() WHERE id=$3`, [refNoBody, userName, id]);
+        }
+        // ใบสั่งซื้อลูกค้าที่แก้ในหน้าจอพร้อมกับการออกใบแจ้งหนี้ (ส่งมาเมื่อมี key เท่านั้น)
+        const hasPoBody = Object.prototype.hasOwnProperty.call(req.body || {}, 'customer_po_no');
+        if (hasPoBody) {
+            tx.customer_po_no = (req.body.customer_po_no || '').trim() || null;
+            tx.customer_po_date = req.body.customer_po_date || null;
+            await client.query(`UPDATE im_transaction SET customer_po_no=$1, customer_po_date=$2 WHERE id=$3`,
+                [tx.customer_po_no, tx.customer_po_date, id]);
         }
         if (Array.isArray(lines)) {
             for (const l of lines) {

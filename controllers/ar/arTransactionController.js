@@ -1140,7 +1140,9 @@ const createTransaction = async (req, res) => {
         await client.query(`
             ALTER TABLE ar_transaction
             ADD COLUMN IF NOT EXISTS billing_date DATE,
-            ADD COLUMN IF NOT EXISTS expected_payment_date DATE
+            ADD COLUMN IF NOT EXISTS expected_payment_date DATE,
+            ADD COLUMN IF NOT EXISTS customer_po_no VARCHAR(50),
+            ADD COLUMN IF NOT EXISTS customer_po_date DATE
         `);
 
         // Insert header
@@ -1155,11 +1157,11 @@ const createTransaction = async (req, res) => {
              ref_no, ref_doc_id, ref_doc_no, description, status,
              dim1_id, dim2_id, dim3_id, dim4_id, dim5_id,
              branch_id, created_by,
-             billing_date, expected_payment_date)
+             billing_date, expected_payment_date, customer_po_no, customer_po_date)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
                     $13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
                     $25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,
-                    $37,$38)
+                    $37,$38,$39,$40)
             RETURNING id
         `;
         const hRes = await client.query(headerSql, [
@@ -1177,7 +1179,8 @@ const createTransaction = async (req, res) => {
             header.dim1_id || null, header.dim2_id || null,
             header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
             header.branch_id || null, header.created_by || null,
-            header.billing_date || null, header.expected_payment_date || null
+            header.billing_date || null, header.expected_payment_date || null,
+            (header.customer_po_no || '').trim() || null, header.customer_po_date || null,
         ]);
         const newHeaderId = hRes.rows[0].id;
         await saveDocSalespersons(client, 'ar_transaction_salesperson', 'header_id', newHeaderId, req.body.salespersons);
@@ -1330,7 +1333,9 @@ const updateTransaction = async (req, res) => {
         await client.query(`
             ALTER TABLE ar_transaction
             ADD COLUMN IF NOT EXISTS billing_date DATE,
-            ADD COLUMN IF NOT EXISTS expected_payment_date DATE
+            ADD COLUMN IF NOT EXISTS expected_payment_date DATE,
+            ADD COLUMN IF NOT EXISTS customer_po_no VARCHAR(50),
+            ADD COLUMN IF NOT EXISTS customer_po_date DATE
         `);
         await client.query(`
             UPDATE ar_transaction SET
@@ -1342,7 +1347,8 @@ const updateTransaction = async (req, res) => {
             ref_no=$19, ref_doc_id=$20, ref_doc_no=$21, description=$22, status=$23,
             dim1_id=$24, dim2_id=$25, dim3_id=$26, dim4_id=$27, dim5_id=$28,
             branch_id=$29, updated_by=$30, updated_at=NOW(),
-            billing_date=$31, expected_payment_date=$32
+            billing_date=$31, expected_payment_date=$32,
+            customer_po_no=$34, customer_po_date=$35
             WHERE id=$33
         `, [
             header.doc_date, header.due_date || null, periodId,
@@ -1358,7 +1364,8 @@ const updateTransaction = async (req, res) => {
             header.dim1_id || null, header.dim2_id || null,
             header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
             header.branch_id || null, header.updated_by || null,
-            header.billing_date || null, header.expected_payment_date || null, id
+            header.billing_date || null, header.expected_payment_date || null, id,
+            (header.customer_po_no || '').trim() || null, header.customer_po_date || null,
         ]);
 
         await saveDocSalespersons(client, 'ar_transaction_salesperson', 'header_id', id, req.body.salespersons);

@@ -23,6 +23,7 @@ const imStockCountRunningController = require('../controllers/im/imStockCountRun
 const imOpeningBalanceImportController = require('../controllers/im/imOpeningBalanceImportController');
 const imAccountingSettingController = require('../controllers/im/imAccountingSettingController');
 const imPeriodClosingController = require('../controllers/im/imPeriodClosingController');
+const imPrintFormController    = require('../controllers/im/imPrintFormController');
 const imGrBillingReportController = require('../controllers/im/imGrBillingReportController');
 const imDlnBillingReportController = require('../controllers/im/imDlnBillingReportController');
 const imResetController        = require('../controllers/im/imResetController');
@@ -221,5 +222,18 @@ router.post('/im_item_running',             imItemRunningController.saveConfig);
 // im_reset_transactions (เครื่องมือผู้พัฒนาระบบ — ล้างข้อมูลธุรกรรม/ข้อมูลหลักของ IM)
 router.get('/im_reset_transactions/counts', imResetController.getCounts);
 router.delete('/im_reset_transactions',     imResetController.resetTransactions);
+
+// imPrintFormController — แบบฟอร์มพิมพ์ (ออกแบบ + พิมพ์ + ประวัติการพิมพ์)
+router.get('/print_form_source',                 imPrintFormController.fetchSources);
+router.get('/print_form_source/:key/doc_types',  imPrintFormController.fetchDocTypes);
+router.get('/print_form_source/:key/docs',       imPrintFormController.fetchDocs);
+router.post('/print_form_source/:key/data',      imPrintFormController.fetchPrintData);
+router.get('/print_form_log',                    imPrintFormController.fetchPrintLog);
+router.get('/print_form',                        imPrintFormController.fetchForms);
+router.get('/print_form/:id',                    imPrintFormController.fetchFormById);
+router.post('/print_form',                       imPrintFormController.createForm);
+router.put('/print_form/:id',                    imPrintFormController.updateForm);
+router.post('/print_form/:id/duplicate',         imPrintFormController.duplicateForm);
+router.delete('/print_form/:id',                 imPrintFormController.deleteForm);
 
 module.exports = router;
