@@ -2,6 +2,11 @@
 // สร้างเอกสารวางบิลแบบกลุ่ม (Bulk Bill Collection)
 // สร้าง BC (sys_doc_type='70') ทีละหลายลูกค้าในคราวเดียว
 // BC 1 ใบต่อ 1 ลูกค้า โดย reference ใบแจ้งหนี้หลายใบได้
+// สกุลเงิน: ใบแจ้งหนี้ใน BC เดียวกันต้องสกุลเงินเดียวกัน (หน้าจอเตือนตอนเลือก + ตรวจซ้ำที่นี่)
+//   amount ที่ส่งมาเป็นสกุลเงินของใบแจ้งหนี้ — BC ใช้สกุลเงินนั้น, ยอดบาทคิดตามอัตราของใบแจ้งหนี้
+//   (วางบิลเต็มยอดคงค้าง = ใช้ยอดบาทคงค้างตรงๆ ไม่ปัดเศษซ้ำ) อัตราหัว BC = อัตราของใบแจ้งหนี้ (อัตราต่างกัน = ยอดบาทรวม ÷ ยอดสกุลเงินรวม)
+
+const round2 = (n) => Math.round(Number(n) * 100) / 100;
 
 // ─── copy from arTransactionController: generateDocNo ─────────────────────────
 const generateDocNo = async (client, docId, date, branchId = null) => {
@@ -122,10 +127,44 @@ const createBulkBilling = async (req, res) => {
         for (const cg of customer_groups) {
             if (!cg.invoices || cg.invoices.length === 0) continue;
 
-            const totalAmount = cg.invoices.reduce(
-                (s, i) => s + Number(i.amount || 0), 0
-            );
-            if (totalAmount <= 0) continue;
+            // ข้อมูลสกุลเงิน/ยอดคงค้างของใบแจ้งหนี้จากฐานข้อมูล (ไม่เชื่อค่าจากหน้าจอ)
+            const invIds = cg.invoices.map(i => parseInt(i.txn_id));
+            const invRes = await client.query(`
+                SELECT t.id, t.doc_no, t.customer_id, t.balance_amount_lc,
+                       t.currency_id, COALESCE(t.currency_code, base.currency_code) AS currency_code,
+                       COALESCE(cur.base_currency_flag, TRUE) AS is_base,
+                       COALESCE(t.revaluation_rate, t.exchange_rate) AS rate
+                  FROM ar_transaction t
+                  LEFT JOIN cd_currency cur ON cur.currency_code = t.currency_code
+                  LEFT JOIN LATERAL (SELECT currency_code FROM cd_currency WHERE base_currency_flag = TRUE LIMIT 1) base ON true
+                 WHERE t.id = ANY($1::int[])`, [invIds]);
+            const invMap = new Map(invRes.rows.map(r => [r.id, r]));
+            const lines = [];
+            for (const inv of cg.invoices) {
+                const amt = round2(inv.amount || 0);
+                if (amt <= 0) continue;
+                const r = invMap.get(parseInt(inv.txn_id));
+                if (!r || r.customer_id !== parseInt(cg.customer_id))
+                    throw new Error(`ไม่พบใบแจ้งหนี้ของลูกค้า ${cg.customer_code || cg.customer_id} (id ${inv.txn_id})`);
+                const rate = Number(r.rate) > 0 ? Number(r.rate) : 1;
+                const balLc = Number(r.balance_amount_lc) || 0;
+                const balFc = r.is_base ? balLc : round2(balLc / rate);
+                if (amt > balFc + 0.005)
+                    throw new Error(`ใบแจ้งหนี้ ${r.doc_no}: ยอดวางบิล ${amt} เกินยอดคงค้าง ${balFc} ${r.currency_code}`);
+                const lc = r.is_base ? amt : (Math.abs(amt - balFc) < 0.005 ? balLc : round2(amt * rate));
+                lines.push({ txn_id: r.id, fc: amt, lc, rate, currency_id: r.currency_id, currency_code: r.currency_code, is_base: r.is_base });
+            }
+            if (lines.length === 0) continue;
+            const codes = [...new Set(lines.map(l => l.currency_code))];
+            if (codes.length > 1)
+                throw new Error(`ลูกค้า ${cg.customer_code || cg.customer_id}: ใบแจ้งหนี้ที่เลือกมีหลายสกุลเงิน (${codes.join(', ')}) — ใบวางบิล 1 ใบต้องเป็นสกุลเงินเดียวกัน`);
+            const totalAmount = round2(lines.reduce((s, l) => s + l.fc, 0));
+            const totalLc = round2(lines.reduce((s, l) => s + l.lc, 0));
+            const isBase = lines[0].is_base;
+            const rates = [...new Set(lines.map(l => l.rate))];
+            const headRate = isBase ? 1 : rates.length === 1 ? rates[0] : Math.round(totalLc / totalAmount * 1e6) / 1e6;
+            const currencyId = lines.find(l => l.currency_id)?.currency_id
+                || (await client.query(`SELECT id FROM cd_currency WHERE currency_code = $1 LIMIT 1`, [codes[0]])).rows[0]?.id || null;
 
             // สร้างเลขที่เอกสารอัตโนมัติ
             const docNo = await generateDocNo(client, bcDocId, billing_date, null);
@@ -138,37 +177,36 @@ const createBulkBilling = async (req, res) => {
                 INSERT INTO ar_transaction
                 (doc_id, doc_no, doc_date, period_id,
                  customer_id, customer_code, customer_name_th,
-                 currency_code, exchange_rate,
+                 currency_id, currency_code, exchange_rate,
                  subtotal_fc, discount_amount_fc, before_vat_fc,
                  vat_amount_fc, total_amount_fc,
                  subtotal_lc, discount_amount_lc, before_vat_lc,
                  vat_amount_lc, total_amount_lc,
                  paid_amount_lc, balance_amount_lc,
                  billing_date, status, created_by, updated_by)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,'THB',1,
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$10,$11,$12,
                         $8,0,$8,0,$8,
-                        $8,0,$8,0,$8,
-                        0,$8,
+                        $13,0,$13,0,$13,
+                        0,$13,
                         $3,'Posted',$9,$9)
                 RETURNING id
             `, [
                 bcDocId, docNo, billing_date, periodId,
                 cg.customer_id, cg.customer_code || null, cg.customer_name_th || null,
                 totalAmount, userName,
+                currencyId, codes[0], headRate, totalLc,
             ]);
             const bcId = hRes.rows[0].id;
 
             // Insert apply records (bc_invoice ไม่กระทบ balance ของใบแจ้งหนี้)
-            for (const inv of cg.invoices) {
-                const amt = Number(inv.amount || 0);
-                if (amt <= 0) continue;
+            for (const l of lines) {
                 await client.query(`
                     INSERT INTO ar_transaction_apply
                     (transaction_id, applied_to_id,
                      applied_amount_lc, applied_amount_fc,
                      applied_date, apply_type, created_by)
-                    VALUES ($1,$2,$3,$3,$4,'bc_invoice',$5)
-                `, [bcId, inv.txn_id, amt, billing_date, userName]);
+                    VALUES ($1,$2,$3,$4,$5,'bc_invoice',$6)
+                `, [bcId, l.txn_id, l.lc, l.fc, billing_date, userName]);
             }
 
             created.push({
@@ -176,8 +214,10 @@ const createBulkBilling = async (req, res) => {
                 customer_id:      cg.customer_id,
                 customer_code:    cg.customer_code    || '',
                 customer_name_th: cg.customer_name_th || '',
-                invoice_count:    cg.invoices.length,
+                invoice_count:    lines.length,
+                currency_code:    codes[0],
                 total_amount:     totalAmount,
+                total_amount_lc:  totalLc,
             });
         }
 

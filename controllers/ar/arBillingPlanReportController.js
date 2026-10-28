@@ -68,6 +68,16 @@ const getBillingPlanReport = async (req, res) => {
                 t.customer_name_th,
                 t.total_amount_lc,
                 t.balance_amount_lc,
+                -- สกุลเงินของใบแจ้งหนี้ (ว่าง = สกุลเงินหลัก) + ยอดคงค้างตามสกุลเงินนั้น
+                -- ไม่มีคอลัมน์ balance_amount_fc — คิดจากยอดบาท ÷ อัตรา (สูตรเดียวกับ arFxRevaluationController)
+                COALESCE(t.currency_code, base.currency_code)   AS currency_code,
+                COALESCE(cur.base_currency_flag, TRUE)          AS is_base_currency,
+                CASE WHEN COALESCE(cur.base_currency_flag, TRUE) THEN t.total_amount_lc
+                     ELSE t.total_amount_fc END                 AS total_amount_fc,
+                CASE WHEN COALESCE(cur.base_currency_flag, TRUE) THEN t.balance_amount_lc
+                     WHEN COALESCE(t.revaluation_rate, t.exchange_rate) > 0
+                     THEN ROUND(t.balance_amount_lc / COALESCE(t.revaluation_rate, t.exchange_rate), 2)
+                     ELSE 0 END                                 AS balance_amount_fc,
                 t.ref_no,
                 d.doc_name_thai,
                 d.sys_doc_type,
@@ -76,6 +86,10 @@ const getBillingPlanReport = async (req, res) => {
             JOIN sa_module_document d    ON d.id  = t.doc_id
             LEFT JOIN ar_customer  c    ON c.id  = t.customer_id
             LEFT JOIN ar_collector coll ON coll.id = c.billing_collector_id
+            LEFT JOIN cd_currency  cur  ON cur.currency_code = t.currency_code
+            LEFT JOIN LATERAL (
+                SELECT currency_code FROM cd_currency WHERE base_currency_flag = TRUE LIMIT 1
+            ) base ON true
             -- เบอร์โทรติดต่อหลักของลูกค้า
             LEFT JOIN LATERAL (
                 SELECT COALESCE(cc.phone, cc.mobile) AS customer_phone
@@ -139,6 +153,10 @@ const getBillingPlanReport = async (req, res) => {
                     customer_phone:        row.customer_phone        || '',
                     total_amount_lc:       Number(row.total_amount_lc   || 0),
                     balance_amount_lc:     Number(row.balance_amount_lc || 0),
+                    currency_code:         row.currency_code         || '',
+                    is_base_currency:      row.is_base_currency !== false,
+                    total_amount_fc:       Number(row.total_amount_fc   || 0),
+                    balance_amount_fc:     Number(row.balance_amount_fc || 0),
                     ref_no:                row.ref_no                || '',
                     doc_name_thai:         row.doc_name_thai         || '',
                     sys_doc_type:          row.sys_doc_type,
