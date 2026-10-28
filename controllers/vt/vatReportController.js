@@ -18,6 +18,8 @@ const getVatReport = async (req, res) => {
         : vat_type === 'INPUT_VAT'
             ? ['INPUT_VAT']
             : [vat_type];
+    // VAT รอตัดบัญชี (บริการ) ที่รับรู้ตอนรับชำระ (AR) / จ่ายชำระ (AP) เก็บเป็น 'VAT_DEFERRED' — นับรวมในรายงานของฝั่งนั้น
+    const deferredModule = vat_type === 'OUTPUT_VAT' ? 'AR' : vat_type === 'INPUT_VAT' ? 'AP' : null;
 
     const client = await req.dbPool.connect();
     try {
@@ -36,7 +38,7 @@ const getVatReport = async (req, res) => {
                 SUM(vt.vat_amount_lc)                            AS vat_amount
             FROM vt_transaction vt
             WHERE vt.is_voided = FALSE
-              AND vt.vat_type = ANY($1::text[])
+              AND (vt.vat_type = ANY($1::text[]) OR (vt.vat_type = 'VAT_DEFERRED' AND vt.module_code = $4::text))
               AND vt.doc_date >= $2::date
               AND vt.doc_date <= $3::date
             GROUP BY
@@ -51,7 +53,7 @@ const getVatReport = async (req, res) => {
             ORDER BY
                 COALESCE(vt.tax_invoice_date, vt.doc_date),
                 COALESCE(vt.tax_invoice_no,   vt.doc_no)
-        `, [vatTypes, dateFrom, dateTo]);
+        `, [vatTypes, dateFrom, dateTo, deferredModule]);
 
         const rows = result.rows.map((r, i) => ({
             seq:                i + 1,

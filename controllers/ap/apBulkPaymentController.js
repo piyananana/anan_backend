@@ -2,6 +2,7 @@
 'use strict';
 const { checkCmPeriodOpen } = require('../cm/cmPeriodCheckHelper');
 const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
+const { computePaymentDeferredVat, insertDeferredVtRecordsForPayment } = require('./apTransactionController');
 
 // GET eligible AP invoices for bulk payment
 // Returns posted ap_transaction rows (Purchase Invoice / Debit Note) with an outstanding balance
@@ -201,7 +202,37 @@ const runBulkPayment = async (req, res) => {
         await client.query(`
             INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
             VALUES ($1,$2,$3,$4,0,$5,0,$5)`,
-            [glEntryId, lineNo, bankAcct.gl_account_id, `Bulk payment ${glDocNo}`, totalAmount]);
+            [glEntryId, lineNo++, bankAcct.gl_account_id, `Bulk payment ${glDocNo}`, totalAmount]);
+
+        // รับรู้ VAT รอตัดบัญชี (บริการ) ของใบแจ้งหนี้ตามสัดส่วนที่จ่าย — Dr ภาษีซื้อ / Cr ภาษีซื้อรอตัด + รายงานภาษีซื้อ
+        // (มิเรอร์การจ่ายชำระปกติใน apTransactionController — จ่ายแบบกลุ่มเป็นยอดบาท จึงใช้สัดส่วนยอดบาท)
+        let deferredTotal = 0;
+        for (const { doc: apDoc, amount: payAmt } of docs) {
+            const totalLc = Number(apDoc.total_amount_lc) || 0;
+            if (totalLc === 0) continue;
+            const deferred = await computePaymentDeferredVat(client, [{ invoiceId: apDoc.id, ratio: payAmt / totalLc }]);
+            if (deferred.vatLc === 0) continue;
+            if (!setup.vat_input_account_id || !setup.vat_pending_input_account_id) {
+                throw new Error(`ใบแจ้งหนี้ ${apDoc.doc_no} มี VAT รอตัดบัญชีที่ต้องรับรู้ — กรุณาตั้งค่าบัญชีภาษีซื้อและบัญชีภาษีซื้อรอตัดบัญชีในการตั้งค่าบัญชี AP ของเอกสารจ่ายชำระ`);
+            }
+            await client.query(`
+                INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
+                VALUES ($1,$2,$3,$4,$5,0,$5,0), ($1,$6,$7,$8,0,$5,0,$5)`,
+                [glEntryId, lineNo, setup.vat_input_account_id, `รับรู้ VAT รอตัดบัญชี ${apDoc.doc_no}`, deferred.vatLc,
+                 lineNo + 1, setup.vat_pending_input_account_id, `VAT รอตัดบัญชี ${apDoc.doc_no}`]);
+            lineNo += 2;
+            deferredTotal += deferred.vatLc;
+            await insertDeferredVtRecordsForPayment(client, apDoc.id, {
+                doc_id: setup.sys_doc_id, doc_no: glDocNo, doc_date: payment_date,
+                vendor_id: apDoc.vendor_id, vendor_name_th: apDoc.vendor_name_th, created_by: createdBy,
+            }, deferred);
+        }
+        if (deferredTotal) {
+            await client.query(`
+                UPDATE gl_entry_header SET total_debit_lc = total_debit_lc + $1, total_credit_lc = total_credit_lc + $1,
+                       total_debit_fc = total_debit_fc + $1, total_credit_fc = total_credit_fc + $1 WHERE id = $2`,
+                [deferredTotal, glEntryId]);
+        }
 
         await client.query('COMMIT');
         res.json({

@@ -118,6 +118,77 @@ const insertVtRecords = async (client, headerId, header, details, sysDocType) =>
     }
 };
 
+// --- Helper: VAT รอตัดบัญชี (บริการ) ที่ต้องรับรู้ตอนจ่ายชำระ ---
+// มิเรอร์ AR receipt: ตั้งหนี้บรรทัด is_deferred_vat ลง Dr ภาษีซื้อรอตัด แทนภาษีซื้อ แล้วรับรู้ตามสัดส่วนที่จ่าย
+// applies: [{ invoiceId, ratio }] — ratio = ยอดที่จ่าย / ยอดรวมใบแจ้งหนี้ (สกุลเงินเดียวกัน)
+// คืนรายการต่อบรรทัด (ยอดบาทที่อัตราใบแจ้งหนี้ เพื่อล้างยอดภาษีซื้อรอตัดได้พอดี) + ยอดรวม
+const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+const computePaymentDeferredVat = async (client, applies) => {
+    const lines = [];
+    for (const { invoiceId, ratio } of applies) {
+        if (!invoiceId || !(ratio > 0)) continue;
+        const dRes = await client.query(`
+            SELECT d.id, d.vat_rate, d.subtotal_lc, d.vat_amount_lc, d.subtotal_fc, d.vat_amount_fc,
+                   t.currency_id, t.exchange_rate
+              FROM ap_transaction_detail d JOIN ap_transaction t ON t.id = d.header_id
+             WHERE d.header_id = $1 AND d.is_deferred_vat = TRUE AND COALESCE(d.vat_type, 'NOVAT') <> 'NOVAT'`, [invoiceId]);
+        for (const d of dRes.rows) {
+            const vatLc = round2(Number(d.vat_amount_lc) * ratio);
+            if (vatLc === 0) continue;
+            lines.push({
+                detailId: d.id, vatRate: d.vat_rate,
+                baseLc: round2(Number(d.subtotal_lc) * ratio), vatLc,
+                baseFc: round2(Number(d.subtotal_fc) * ratio), vatFc: round2(Number(d.vat_amount_fc) * ratio),
+                currencyId: d.currency_id, exchangeRate: d.exchange_rate,
+            });
+        }
+    }
+    return {
+        lines,
+        vatLc: round2(lines.reduce((s, l) => s + l.vatLc, 0)),
+        vatFc: round2(lines.reduce((s, l) => s + l.vatFc, 0)),
+    };
+};
+
+// รายงานภาษีซื้อ: VAT รอตัดที่รับรู้ตอนจ่ายชำระ (vat_type 'VAT_DEFERRED' module 'AP' — รายงานภาษีซื้อรวมให้)
+const insertDeferredVtRecordsForPayment = async (client, sourceHeaderId, payment, deferred) => {
+    for (const l of deferred.lines) {
+        await client.query(`
+            INSERT INTO vt_transaction
+            (module_code, vat_type, doc_id, source_header_id, source_detail_id,
+             doc_no, doc_date, vat_rate,
+             base_amount_lc, vat_amount_lc, base_amount_fc, vat_amount_fc,
+             currency_id, exchange_rate,
+             vendor_id, entity_name, entity_tax_id, entity_branch_code,
+             created_by)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+                    COALESCE($17, (SELECT tax_id FROM ap_vendor WHERE id = $15)), ${branchCodeSql('ap_vendor', '$15')},$18)
+        `, [
+            'AP', 'VAT_DEFERRED', payment.doc_id, sourceHeaderId, l.detailId,
+            payment.doc_no, payment.doc_date, l.vatRate ?? 7,
+            l.baseLc, l.vatLc, l.baseFc, l.vatFc,
+            l.currencyId || null, l.exchangeRate || 1,
+            payment.vendor_id, payment.vendor_name_th || '',
+            payment.vendor_tax_id || null,
+            payment.created_by || null,
+        ]);
+    }
+};
+
+// ratio ต่อใบแจ้งหนี้ของเอกสารจ่ายชำระ (apply_type 'invoice') — ยอดสกุลเงินที่จ่าย / ยอดรวมสกุลเงินของใบแจ้งหนี้
+const paymentInvoiceRatios = async (client, applies) => {
+    const out = [];
+    for (const a of (applies || []).filter(x => (x.apply_type || 'invoice') === 'invoice')) {
+        const appliedFc = Number(a.applied_amount_fc) || 0;
+        if (!a.applied_to_id || appliedFc === 0) continue;
+        const r = (await client.query(`SELECT total_amount_fc FROM ap_transaction WHERE id = $1`, [a.applied_to_id])).rows[0];
+        const totalFc = Number(r?.total_amount_fc) || 0;
+        if (totalFc === 0) continue;
+        out.push({ invoiceId: a.applied_to_id, ratio: appliedFc / totalFc });
+    }
+    return out;
+};
+
 // --- Helper: Resolve payment GL account ---
 const resolvePaymentGlAccount = async (client, payment, setup, fallbackCashAccountId) => {
     if (payment.gl_account_id) return Number(payment.gl_account_id);
@@ -318,8 +389,20 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
                     });
                 }
             }
-            // VAT Input
-            if (Number(d.vat_amount_lc) !== 0 && vatAccountId) {
+            // VAT Input — บรรทัด VAT รอตัดบัญชี (บริการ) ลงภาษีซื้อรอตัด รับรู้เป็นภาษีซื้อตอนจ่ายชำระ
+            if (Number(d.vat_amount_lc) !== 0 && d.is_deferred_vat) {
+                if (!vatPendingAccountId) throw new Error('ยังไม่ได้ตั้งค่าบัญชีภาษีซื้อรอตัดบัญชี (Deferred VAT Input) ในการตั้งค่าบัญชี AP สำหรับประเภทเอกสารนี้');
+                const vatLc = Number(d.vat_amount_lc);
+                const vatFc = Number(d.vat_amount_fc);
+                glDetails.push({
+                    account_id: vatPendingAccountId,
+                    description: `VAT รอตัดบัญชี ${docNo}`,
+                    debit_lc: isCredit ? 0 : vatLc,
+                    credit_lc: isCredit ? vatLc : 0,
+                    debit_fc: isCredit ? 0 : vatFc,
+                    credit_fc: isCredit ? vatFc : 0,
+                });
+            } else if (Number(d.vat_amount_lc) !== 0 && vatAccountId) {
                 const vatLc = Number(d.vat_amount_lc);
                 const vatFc = Number(d.vat_amount_fc);
                 glDetails.push({
@@ -578,6 +661,24 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
                     debit_fc: 0, credit_fc: 0,
                 });
             }
+        }
+    }
+
+    // จ่ายชำระ: รับรู้ VAT รอตัดบัญชีของใบแจ้งหนี้ตามสัดส่วนที่จ่าย — Dr ภาษีซื้อ / Cr ภาษีซื้อรอตัด (มิเรอร์ AR receipt)
+    if (isPayment) {
+        const deferred = await computePaymentDeferredVat(client, await paymentInvoiceRatios(client, header._applies));
+        if (deferred.vatLc > 0) {
+            if (!vatAccountId || !vatPendingAccountId) {
+                throw new Error('มี VAT รอตัดบัญชีที่ต้องรับรู้ — กรุณาตั้งค่าบัญชีภาษีซื้อและบัญชีภาษีซื้อรอตัดบัญชีในการตั้งค่าบัญชี AP ของเอกสารจ่ายชำระ');
+            }
+            glDetails.push({
+                account_id: vatAccountId, description: `รับรู้ VAT รอตัดบัญชี ${docNo}`,
+                debit_lc: deferred.vatLc, credit_lc: 0, debit_fc: deferred.vatFc, credit_fc: 0,
+            });
+            glDetails.push({
+                account_id: vatPendingAccountId, description: `VAT รอตัดบัญชี ${docNo}`,
+                debit_lc: 0, credit_lc: deferred.vatLc, debit_fc: 0, credit_fc: deferred.vatFc,
+            });
         }
     }
 
@@ -1018,9 +1119,13 @@ const fetchOpenInvoices = async (req, res) => {
     try {
         const result = await req.dbPool.query(`
             SELECT t.id, t.doc_no, t.doc_date, t.due_date, t.ref_no,
-                   t.total_amount_lc, t.balance_amount_lc,
+                   t.total_amount_lc, t.balance_amount_lc, t.total_amount_fc,
                    t.currency_code, t.exchange_rate,
-                   d.doc_code, d.sys_doc_type
+                   d.doc_code, d.sys_doc_type,
+                   COALESCE((SELECT SUM(dd.vat_amount_lc) FROM ap_transaction_detail dd
+                             WHERE dd.header_id = t.id AND dd.is_deferred_vat = TRUE AND COALESCE(dd.vat_type, 'NOVAT') <> 'NOVAT'), 0) AS deferred_vat_amount_lc,
+                   COALESCE((SELECT SUM(dd.vat_amount_fc) FROM ap_transaction_detail dd
+                             WHERE dd.header_id = t.id AND dd.is_deferred_vat = TRUE AND COALESCE(dd.vat_type, 'NOVAT') <> 'NOVAT'), 0) AS deferred_vat_amount_fc
             FROM ap_transaction t
             JOIN sa_module_document d ON d.id = t.doc_id
             WHERE t.vendor_id = $1
@@ -1333,6 +1438,10 @@ const createTransaction = async (req, res) => {
                 const headerWithDocNo = { ...header, doc_no: finalDocNo, _applies: applies || [], _payments: payments || [], _whts: whts || [] };
                 glEntryId = await postGlEntry(client, newHeaderId, headerWithDocNo, details || [], finalDocNo);
                 await insertVtRecords(client, newHeaderId, headerWithDocNo, details || [], sysDocType1);
+                if (sysDocType1 === '80') {
+                    await insertDeferredVtRecordsForPayment(client, newHeaderId, headerWithDocNo,
+                        await computePaymentDeferredVat(client, await paymentInvoiceRatios(client, applies)));
+                }
                 if (glEntryId) {
                     await client.query(`UPDATE ap_transaction SET gl_entry_id=$1, gl_doc_no=(SELECT doc_no FROM gl_entry_header WHERE id=$1) WHERE id=$2`, [glEntryId, newHeaderId]);
                 }
@@ -1601,6 +1710,10 @@ const postTransaction = async (req, res) => {
             const headerWithDocNo = { ...tx, _applies: aRes.rows, _payments: pRes.rows, _whts: whtRes.rows };
             glEntryId = await postGlEntry(client, id, headerWithDocNo, dRes.rows, tx.doc_no, tx.gl_doc_no);
             await insertVtRecords(client, id, headerWithDocNo, dRes.rows, sysDocType1);
+            if (sysDocType1 === '80') {
+                await insertDeferredVtRecordsForPayment(client, id, headerWithDocNo,
+                    await computePaymentDeferredVat(client, await paymentInvoiceRatios(client, aRes.rows)));
+            }
             if (glEntryId) {
                 await client.query(`UPDATE ap_transaction SET gl_entry_id=$1, gl_doc_no=(SELECT doc_no FROM gl_entry_header WHERE id=$1) WHERE id=$2`, [glEntryId, id]);
             }
@@ -1863,6 +1976,7 @@ const deleteTransaction = async (req, res) => {
 };
 
 module.exports = {
+    computePaymentDeferredVat, insertDeferredVtRecordsForPayment,
     fetchRows, fetchRow, fetchMyPending,
     fetchOpenInvoices, fetchOpenAdvances,
     fetchOpenRemittanceAdvices, fetchRaInvoices,
