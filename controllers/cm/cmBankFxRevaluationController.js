@@ -1,5 +1,6 @@
 // controllers/cm/cmBankFxRevaluationController.js
 const { today: todayYmd, ymd } = require('../../utils/dateUtil');
+const { BASE_CURRENCY_CODE_SQL, getBaseCurrency } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 'use strict';
 
@@ -138,7 +139,7 @@ const getOutstandingCurrencies = async (req, res) => {
         const accRes = await client.query(`
             SELECT ba.id, ba.currency_code
             FROM cm_bank_account ba
-            WHERE ba.currency_code != 'THB' AND ba.is_active = TRUE AND ba.cm_type = 'BANK'
+            WHERE ba.currency_code != ${BASE_CURRENCY_CODE_SQL} AND ba.is_active = TRUE AND ba.cm_type = 'BANK'
               AND ba.gl_account_id IS NOT NULL
             ORDER BY ba.currency_code`);
 
@@ -169,7 +170,7 @@ const calcLines = async (client, revaluationDate, ratesMap, excludeRevalId = nul
         FROM cm_bank_account ba
         LEFT JOIN cd_bank     cb ON cb.id = ba.bank_id
         LEFT JOIN gl_account  ga ON ga.id = ba.gl_account_id
-        WHERE ba.currency_code != 'THB' AND ba.is_active = TRUE AND ba.cm_type = 'BANK'
+        WHERE ba.currency_code != ${BASE_CURRENCY_CODE_SQL} AND ba.is_active = TRUE AND ba.cm_type = 'BANK'
         ORDER BY ba.account_code`);
 
     const lines = [];
@@ -492,8 +493,7 @@ const postRow = async (req, res) => {
         if (!glDocNo) glDocNo = `FXRV-${id}`;
 
         // 5. Resolve base currency
-        const currRes = await client.query(`SELECT id FROM cd_currency WHERE currency_code = 'THB' LIMIT 1`);
-        const currencyId = currRes.rows[0]?.id || null;
+        const currencyId = (await getBaseCurrency(client)).id;
 
         // 6. Build GL detail lines (Gain: DR Bank / CR FX Gain — Loss: DR FX Loss / CR Bank)
         const glDetails = [];

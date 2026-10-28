@@ -1,5 +1,6 @@
 // controllers/ar/arFxRevaluationController.js
 const { today: todayYmd, ymd } = require('../../utils/dateUtil');
+const { BASE_CURRENCY_CODE_SQL } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { generateDocNo } = require('./arTransactionController');
 
@@ -48,7 +49,7 @@ const calcRevalDetails = async (client, revalDate, yearEndRates) => {
         WHERE d.sys_doc_type = ANY($1::text[])
           AND t.status = 'Posted'
           AND t.balance_amount_lc > 0.005
-          AND t.currency_code <> 'THB'
+          AND t.currency_code <> ${BASE_CURRENCY_CODE_SQL}
           AND t.doc_date <= $2::date
         ORDER BY c.customer_code, t.doc_date, t.doc_no
     `, [DR_TYPES, revalDate]);
@@ -203,7 +204,7 @@ const fetchOutstandingCurrencies = async (req, res) => {
             WHERE d.sys_doc_type = ANY($1::text[])
               AND t.status = 'Posted'
               AND t.balance_amount_lc > 0.005
-              AND t.currency_code <> 'THB'
+              AND t.currency_code <> ${BASE_CURRENCY_CODE_SQL}
               AND t.doc_date <= $2::date
             ORDER BY t.currency_code
         `, [DR_TYPES, reval_date]);

@@ -7,6 +7,7 @@
 const fs = require('fs');
 const path = require('path');
 const { bahtText, englishAmountText, thaiAddress } = require('./thaiText');
+const { getBaseCurrency } = require('./baseCurrency');
 
 const f = (key, th, en, group, type = 'text', scope = 'H') => ({ key, label_th: th, label_en: en, group, type, scope });
 
@@ -190,9 +191,8 @@ const loadCurrencies = async (db, codes) => {
   const rows = (await db.query(`SELECT currency_code, currency_name_th, currency_name_en FROM cd_currency WHERE currency_code = ANY($1::text[])`, [list])).rows;
   return new Map(rows.map(r => [r.currency_code, r]));
 };
-// สกุลเงินหลักของระบบ (cd_currency.base_currency_flag) — ไม่มีตั้งค่า = THB
-const loadBaseCurrency = async (db) =>
-  s((await db.query(`SELECT currency_code FROM cd_currency WHERE base_currency_flag = TRUE ORDER BY id LIMIT 1`)).rows[0]?.currency_code) || 'THB';
+// สกุลเงินหลักของระบบ (utils/baseCurrency.js)
+const loadBaseCurrency = async (db) => (await getBaseCurrency(db)).code;
 const currencyFields = (map, code) => {
   const c = map.get(s(code)) || {};
   return { currency_name: s(c.currency_name_th), currency_name_en: s(c.currency_name_en) || s(c.currency_name_th) };

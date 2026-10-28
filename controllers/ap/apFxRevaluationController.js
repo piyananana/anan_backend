@@ -1,5 +1,6 @@
 // controllers/ap/apFxRevaluationController.js
 const { today: todayYmd, ymd } = require('../../utils/dateUtil');
+const { BASE_CURRENCY_CODE_SQL } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { generateDocNo } = require('./apTransactionController');
 // FX Revaluation สำหรับเจ้าหนี้สกุลเงินต่างประเทศ ณ วันปิดปี
@@ -83,7 +84,7 @@ const calcRevalDetails = async (client, revalDate, yearEndRates) => {
         WHERE d.sys_doc_type = ANY($1::text[])
           AND t.status = 'Posted'
           AND t.balance_amount_lc > 0.005
-          AND t.currency_code <> 'THB'
+          AND t.currency_code <> ${BASE_CURRENCY_CODE_SQL}
           AND t.doc_date <= $2::date
         ORDER BY v.vendor_code, t.doc_date, t.doc_no
     `, [AP_TYPES, revalDate]);
@@ -239,7 +240,7 @@ const fetchOutstandingCurrencies = async (req, res) => {
             WHERE d.sys_doc_type = ANY($1::text[])
               AND t.status = 'Posted'
               AND t.balance_amount_lc > 0.005
-              AND t.currency_code <> 'THB'
+              AND t.currency_code <> ${BASE_CURRENCY_CODE_SQL}
               AND t.doc_date <= $2::date
             ORDER BY t.currency_code
         `, [AP_TYPES, reval_date]);

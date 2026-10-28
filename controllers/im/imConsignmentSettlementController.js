@@ -8,6 +8,7 @@
 //   2. ไม่มี VAT (มิเรอร์ '10' GRN ธรรมดาที่ไม่มี VAT ตอน Post — ถ้าใบกำกับจริงจากผู้ฝากขายมี VAT ผู้ใช้ปรับเพิ่มเองใน AP ภายหลัง)
 //   3. มาจากการตัด im_stock_layer หลายใบของหลายเอกสารขายมารวมเป็นบิลเดียว ไม่ใช่ 1:1 กับเอกสารรับเหมือน '11'/'12'
 const { generateDocNo } = require('./imTransactionController');
+const { getBaseCurrency } = require('../../utils/baseCurrency');
 const { today, ymd } = require('../../utils/dateUtil');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 
@@ -142,8 +143,9 @@ const postSettlement = async (req, res) => {
         }
         // ใบตั้งหนี้ AP มีสกุลเงินเดียวต่อเอกสาร — ถ้ารายการที่เลือกมาจากใบรับฝากขายคนละสกุลเงิน (เช่น ผู้ฝากขายเคย
         // ส่งของมาเป็น USD ครั้งหนึ่ง แล้วเปลี่ยนมาเป็น THB อีกครั้ง) ต้อง Settlement แยกชุดตามสกุลเงิน
-        const docCurrencyCode = rows[0].receipt_currency_code || 'THB';
-        const mixedCurrency = rows.find(r => (r.receipt_currency_code || 'THB') !== docCurrencyCode);
+        const { code: baseCode } = await getBaseCurrency(client);
+        const docCurrencyCode = rows[0].receipt_currency_code || baseCode;
+        const mixedCurrency = rows.find(r => (r.receipt_currency_code || baseCode) !== docCurrencyCode);
         if (mixedCurrency) {
             throw new Error('รายการที่เลือกมาจากใบรับฝากขายคนละสกุลเงิน กรุณา Settlement แยกตามสกุลเงิน');
         }

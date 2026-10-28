@@ -1,3 +1,4 @@
+const { getBaseCurrency } = require('../../utils/baseCurrency');
 // controllers/cm/cmDashboardController.js
 'use strict';
 
@@ -164,8 +165,10 @@ const getDashboard = async (req, res) => {
         }
 
         // ── 6. Totals ─────────────────────────────────────────────────────────
+        // ยอดรวมนับเฉพาะบัญชีสกุลเงินหลัก (ยอดสกุลเงินต่างประเทศรวมข้ามสกุลไม่ได้)
+        const { code: baseCode } = await getBaseCurrency(req.dbPool);
         const totalBankBalance = bankBalances
-            .filter(b => b.currency_code === 'THB')
+            .filter(b => b.currency_code === baseCode)
             .reduce((s, b) => s + b.balance, 0);
 
         res.json({
