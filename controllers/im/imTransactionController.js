@@ -836,6 +836,7 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
 const insertImVtLine = async (client, {
     moduleCode, vatType, vatRate, docId, headerId, detailId, docNo, docDate,
     baseLc, vatLc, entityIdField, entityId, entityName, entityTaxId, createdByUserId, vatSign,
+    baseFc = baseLc, vatFc = vatLc, currencyId = null, exchangeRate = 1,
 }) => {
     if (!vatType || vatType === 'NOVAT' || Number(vatLc) === 0) return;
     await client.query(`
@@ -844,13 +845,14 @@ const insertImVtLine = async (client, {
          doc_no, doc_date, vat_rate,
          base_amount_lc, vat_amount_lc, base_amount_fc, vat_amount_fc,
          currency_id, exchange_rate, ${entityIdField}, entity_name, entity_tax_id, entity_branch_code, created_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$9,$10,1,1,$11,$12,$13,
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$15,$16,$17,$18,$11,$12,$13,
                 ${branchCodeSql(entityIdField === 'customer_id' ? 'ar_customer' : 'ap_vendor', '$11')},$14)
     `, [
         moduleCode, vatType, docId, headerId, detailId,
         docNo, docDate, vatRate,
         baseLc * vatSign, vatLc * vatSign,
         entityId, entityName || '', entityTaxId || null, createdByUserId,
+        baseFc * vatSign, vatFc * vatSign, currencyId || 1, Number(exchangeRate) || 1,
     ]);
 };
 
@@ -1105,33 +1107,44 @@ const postArBillFromDln = async (client, { header, details, docNo }) => {
         if (userRes.rows.length > 0) createdByUserId = userRes.rows[0].id;
     }
 
+    // สกุลเงินของเอกสาร AR = สกุลเงินของเอกสาร IM (ราคาขาย unit_price อยู่ในสกุลเงินนั้น) — ยอด LC = FC × อัตรา
+    // ต่อบรรทัด ภาษีขายคิดจากฐานเงินบาท (subtotal LC × อัตราภาษี) ตามที่ต้องรายงานภาษี
+    const docCurrencyCode = header.currency_code || 'THB';
+    const docExchangeRate = Number(header.exchange_rate) || 1;
     const lineRows = [];
-    let totalSubtotal = 0, totalVat = 0;
+    let totalSubtotal = 0, totalVat = 0, totalSubtotalFc = 0, totalVatFc = 0;
     for (const d of details) {
         const revenueAccountId = await resolveRevenueAccount(client, d.item_id, arSetup.revenue_account_id);
         const qty = Math.abs(Number(d.qty) || 0); // qty ของ DLN ติดลบเสมอ (สต็อกลด) — ใบแจ้งหนี้ต้องเป็นจำนวนบวก
         const unitPrice = Number(d.unit_price) || 0;
-        const subtotal = round2(qty * unitPrice);
+        const subtotalFc = round2(qty * unitPrice);
         const vatType = d.vat_type || 'NOVAT';
         const vatRate = vatType === 'NOVAT' ? 0 : (Number(d.vat_rate) || 0);
+        const vatFc = round2(subtotalFc * vatRate / 100);
+        const subtotal = round2(subtotalFc * docExchangeRate);
         const vatAmount = round2(subtotal * vatRate / 100);
         lineRows.push({
             itemCode: d.item_code, itemName: d.item_name, quantity: qty, unitPriceFc: unitPrice,
             subtotal, vatType, vatRate, vatAmount, total: round2(subtotal + vatAmount), revenueAccountId,
+            subtotalFc, vatFc, totalFc: round2(subtotalFc + vatFc),
         });
         totalSubtotal += subtotal;
         totalVat += vatAmount;
+        totalSubtotalFc += subtotalFc;
+        totalVatFc += vatFc;
     }
     totalSubtotal = round2(totalSubtotal); totalVat = round2(totalVat);
     const totalAmount = round2(totalSubtotal + totalVat);
+    totalSubtotalFc = round2(totalSubtotalFc); totalVatFc = round2(totalVatFc);
+    const totalAmountFc = round2(totalSubtotalFc + totalVatFc);
 
     const arHeaderRes = await client.query(`
         INSERT INTO ar_transaction
         (doc_id, doc_no, doc_date, period_id, customer_id, customer_code, customer_name_th, ar_account_id,
          currency_code, exchange_rate, subtotal_fc, before_vat_fc, vat_amount_fc, total_amount_fc,
          subtotal_lc, before_vat_lc, vat_amount_lc, total_amount_lc, balance_amount_lc,
-         ref_no, ref_doc_id, ref_doc_no, description, status, created_by, updated_by, customer_po_no, customer_po_date)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'THB',1,$9,$9,$10,$11,$9,$9,$10,$11,$11,$12,$13,$14,$15,'Posted',$16,$16,$17,$18)
+         ref_no, ref_doc_id, ref_doc_no, description, status, created_by, updated_by, customer_po_no, customer_po_date, currency_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$20,$21,$22,$22,$23,$24,$9,$9,$10,$11,$11,$12,$13,$14,$15,'Posted',$16,$16,$17,$18,$19)
         RETURNING id
     `, [
         arDocId, arDocNo, header.doc_date, periodId, header.customer_id, customerRow.customer_code, customerRow.customer_name_th,
@@ -1139,6 +1152,7 @@ const postArBillFromDln = async (client, { header, details, docNo }) => {
         totalSubtotal, totalVat, totalAmount,
         header.ref_no || null, header.doc_id, docNo, `ใบแจ้งหนี้จากการส่งสินค้า ${docNo}`, createdByUserId,
         (header.customer_po_no || '').toString().trim() || null, header.customer_po_date || null,
+        header.currency_id || null, docCurrencyCode, docExchangeRate, totalSubtotalFc, totalVatFc, totalAmountFc,
     ]);
     const arTransactionId = arHeaderRes.rows[0].id;
 
@@ -1148,56 +1162,63 @@ const postArBillFromDln = async (client, { header, details, docNo }) => {
             INSERT INTO ar_transaction_detail
             (header_id, line_no, description, quantity, unit_price_fc, subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
              revenue_account_id, subtotal_lc, vat_amount_lc, total_amount_lc)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$6,$9,$10)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
             RETURNING id
-        `, [arTransactionId, lineNo++, l.itemName || l.itemCode, l.quantity, l.unitPriceFc, l.subtotal, l.vatType, l.vatRate, l.vatAmount, l.total, l.revenueAccountId]);
+        `, [arTransactionId, lineNo++, l.itemName || l.itemCode, l.quantity, l.unitPriceFc, l.subtotalFc, l.vatType, l.vatRate, l.vatFc, l.totalFc, l.revenueAccountId,
+            l.subtotal, l.vatAmount, l.total]);
         await insertImVtLine(client, {
             moduleCode: 'AR', vatType: l.vatType, vatRate: l.vatRate, docId: arDocId, headerId: arTransactionId,
             detailId: detailRes.rows[0].id, docNo: arDocNo, docDate: header.doc_date,
             baseLc: l.subtotal, vatLc: l.vatAmount, entityIdField: 'customer_id', entityId: header.customer_id,
+            baseFc: l.subtotalFc, vatFc: l.vatFc, currencyId: header.currency_id, exchangeRate: docExchangeRate,
             entityName: customerRow.customer_name_th, entityTaxId: customerRow.tax_id, createdByUserId, vatSign: 1,
         });
     }
 
-    const revCreditByAccount = {};
+    const revCreditByAccount = {}, revCreditFcByAccount = {};
     for (const l of lineRows) {
         revCreditByAccount[l.revenueAccountId] = (revCreditByAccount[l.revenueAccountId] || 0) + l.subtotal;
+        revCreditFcByAccount[l.revenueAccountId] = (revCreditFcByAccount[l.revenueAccountId] || 0) + l.subtotalFc;
     }
     const arGlDetails = [];
     for (const [accId, amt] of Object.entries(revCreditByAccount)) {
         if (amt === 0) continue;
-        arGlDetails.push({ account_id: Number(accId), description: `ใบแจ้งหนี้ ${arDocNo}`, debit_lc: 0, credit_lc: round2(amt) });
+        arGlDetails.push({ account_id: Number(accId), description: `ใบแจ้งหนี้ ${arDocNo}`, debit_lc: 0, credit_lc: round2(amt),
+            debit_fc: 0, credit_fc: round2(revCreditFcByAccount[accId]) });
     }
     if (totalVat !== 0) {
         if (!vatAccountId) throw new Error('ยังไม่ได้ตั้งค่าบัญชีภาษีขาย (vat_output_account_id) ใน im_gl_account_setup หรือ ar_gl_account_setup');
-        arGlDetails.push({ account_id: vatAccountId, description: `ภาษีขาย ${arDocNo}`, debit_lc: 0, credit_lc: totalVat });
+        arGlDetails.push({ account_id: vatAccountId, description: `ภาษีขาย ${arDocNo}`, debit_lc: 0, credit_lc: totalVat, debit_fc: 0, credit_fc: totalVatFc });
     }
     if (totalAmount !== 0) {
-        arGlDetails.push({ account_id: arAccountId, description: `ใบแจ้งหนี้ ${arDocNo}`, debit_lc: totalAmount, credit_lc: 0 });
+        arGlDetails.push({ account_id: arAccountId, description: `ใบแจ้งหนี้ ${arDocNo}`, debit_lc: totalAmount, credit_lc: 0, debit_fc: totalAmountFc, credit_fc: 0 });
     }
 
     if (arGlDetails.length > 0) {
         const totalDebit = round2(arGlDetails.reduce((s, l) => s + l.debit_lc, 0));
         const totalCredit = round2(arGlDetails.reduce((s, l) => s + l.credit_lc, 0));
+        const totalDebitFc = round2(arGlDetails.reduce((s, l) => s + l.debit_fc, 0));
+        const totalCreditFc = round2(arGlDetails.reduce((s, l) => s + l.credit_fc, 0));
         const arGlHeaderRes = await client.query(`
             INSERT INTO gl_entry_header
             (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
              currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
              created_by, ref_doc_id, ref_doc_no, external_source_id, ref_doc_date)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'Posted',$9,$10,0,0,$11,$12,$13,$14,$3)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$15,'Posted',$9,$10,$16,$17,$11,$12,$13,$14,$3)
             RETURNING id
         `, [
             arSetup.gl_doc_id, `GL-${arDocNo}`, header.doc_date, header.doc_date, periodId,
             header.ref_no || null, `ใบแจ้งหนี้จากการส่งสินค้า ${docNo}`,
-            1, totalDebit, totalCredit, createdByUserId, arDocId, arDocNo, arTransactionId,
+            header.currency_id || 1, totalDebit, totalCredit, createdByUserId, arDocId, arDocNo, arTransactionId,
+            docExchangeRate, totalDebitFc, totalCreditFc,
         ]);
         const arGlEntryId = arGlHeaderRes.rows[0].id;
         let glLineNo = 1;
         for (const l of arGlDetails) {
             await client.query(`
                 INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
-                VALUES ($1,$2,$3,$4,$5,$6,0,0)
-            `, [arGlEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc]);
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            `, [arGlEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc, l.debit_fc || 0, l.credit_fc || 0]);
         }
         await client.query(`UPDATE ar_transaction SET gl_entry_id = $1 WHERE id = $2`, [arGlEntryId, arTransactionId]);
     }
@@ -1475,25 +1496,36 @@ const postArCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
         if (userRes.rows.length > 0) createdByUserId = userRes.rows[0].id;
     }
 
+    // สกุลเงินของเอกสาร AR = สกุลเงินของเอกสาร IM (ราคาขาย unit_price อยู่ในสกุลเงินนั้น) — ยอด LC = FC × อัตรา
+    // ต่อบรรทัด ภาษีขายคิดจากฐานเงินบาท (subtotal LC × อัตราภาษี) ตามที่ต้องรายงานภาษี
+    const docCurrencyCode = header.currency_code || 'THB';
+    const docExchangeRate = Number(header.exchange_rate) || 1;
     const lineRows = [];
-    let totalSubtotal = 0, totalVat = 0;
+    let totalSubtotal = 0, totalVat = 0, totalSubtotalFc = 0, totalVatFc = 0;
     for (const d of details) {
         const revenueAccountId = await resolveRevenueAccount(client, d.item_id, arSetup.revenue_account_id);
         const qty = Math.abs(Number(d.qty) || 0); // qty ติดลบสำหรับ DN (สต็อกลด) บวกสำหรับ CN — ใบแจ้งหนี้ต้องเป็นจำนวนบวก
         const unitPrice = Number(d.unit_price) || 0;
-        const subtotal = round2(qty * unitPrice);
+        const subtotalFc = round2(qty * unitPrice);
         const vatType = d.vat_type || 'NOVAT';
         const vatRate = vatType === 'NOVAT' ? 0 : (Number(d.vat_rate) || 0);
+        const vatFc = round2(subtotalFc * vatRate / 100);
+        const subtotal = round2(subtotalFc * docExchangeRate);
         const vatAmount = round2(subtotal * vatRate / 100);
         lineRows.push({
             itemCode: d.item_code, itemName: d.item_name, quantity: qty, unitPriceFc: unitPrice,
             subtotal, vatType, vatRate, vatAmount, total: round2(subtotal + vatAmount), revenueAccountId,
+            subtotalFc, vatFc, totalFc: round2(subtotalFc + vatFc),
         });
         totalSubtotal += subtotal;
         totalVat += vatAmount;
+        totalSubtotalFc += subtotalFc;
+        totalVatFc += vatFc;
     }
     totalSubtotal = round2(totalSubtotal); totalVat = round2(totalVat);
     const totalAmount = round2(totalSubtotal + totalVat);
+    totalSubtotalFc = round2(totalSubtotalFc); totalVatFc = round2(totalVatFc);
+    const totalAmountFc = round2(totalSubtotalFc + totalVatFc);
 
     const label = isCredit ? 'ใบลดหนี้ลูกค้า' : 'ใบเพิ่มหนี้ลูกค้า';
     const arHeaderRes = await client.query(`
@@ -1501,14 +1533,15 @@ const postArCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
         (doc_id, doc_no, doc_date, period_id, customer_id, customer_code, customer_name_th, ar_account_id,
          currency_code, exchange_rate, subtotal_fc, before_vat_fc, vat_amount_fc, total_amount_fc,
          subtotal_lc, before_vat_lc, vat_amount_lc, total_amount_lc, balance_amount_lc,
-         ref_no, ref_doc_id, ref_doc_no, description, status, created_by, updated_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'THB',1,$9,$9,$10,$11,$9,$9,$10,$11,$11,$12,$13,$14,$15,'Posted',$16,$16)
+         ref_no, ref_doc_id, ref_doc_no, description, status, created_by, updated_by, currency_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$18,$19,$20,$20,$21,$22,$9,$9,$10,$11,$11,$12,$13,$14,$15,'Posted',$16,$16,$17)
         RETURNING id
     `, [
         arDocId, arDocNo, header.doc_date, periodId, header.customer_id, customerRow.customer_code, customerRow.customer_name_th,
         arAccountId,
         totalSubtotal, totalVat, totalAmount,
         header.ref_no || null, header.doc_id, docNo, `${label} (${docNo})`, createdByUserId,
+        header.currency_id || null, docCurrencyCode, docExchangeRate, totalSubtotalFc, totalVatFc, totalAmountFc,
     ]);
     const arTransactionId = arHeaderRes.rows[0].id;
 
@@ -1518,29 +1551,34 @@ const postArCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
             INSERT INTO ar_transaction_detail
             (header_id, line_no, description, quantity, unit_price_fc, subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
              revenue_account_id, subtotal_lc, vat_amount_lc, total_amount_lc)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$6,$9,$10)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
             RETURNING id
-        `, [arTransactionId, lineNo++, l.itemName || l.itemCode, l.quantity, l.unitPriceFc, l.subtotal, l.vatType, l.vatRate, l.vatAmount, l.total, l.revenueAccountId]);
+        `, [arTransactionId, lineNo++, l.itemName || l.itemCode, l.quantity, l.unitPriceFc, l.subtotalFc, l.vatType, l.vatRate, l.vatFc, l.totalFc, l.revenueAccountId,
+            l.subtotal, l.vatAmount, l.total]);
         await insertImVtLine(client, {
             moduleCode: 'AR', vatType: l.vatType, vatRate: l.vatRate, docId: arDocId, headerId: arTransactionId,
             detailId: detailRes.rows[0].id, docNo: arDocNo, docDate: header.doc_date,
             baseLc: l.subtotal, vatLc: l.vatAmount, entityIdField: 'customer_id', entityId: header.customer_id,
+            baseFc: l.subtotalFc, vatFc: l.vatFc, currencyId: header.currency_id, exchangeRate: docExchangeRate,
             entityName: customerRow.customer_name_th, entityTaxId: customerRow.tax_id, createdByUserId,
             vatSign: isCredit ? -1 : 1, // CN ลดยอดภาษีขาย (ตรงข้ามใบแจ้งหนี้ปกติ) มิเรอร์ AR's own insertVtRecords
         });
     }
 
-    const revByAccount = {};
+    const revByAccount = {}, revFcByAccount = {};
     for (const l of lineRows) {
         revByAccount[l.revenueAccountId] = (revByAccount[l.revenueAccountId] || 0) + l.subtotal;
+        revFcByAccount[l.revenueAccountId] = (revFcByAccount[l.revenueAccountId] || 0) + l.subtotalFc;
     }
     const arGlDetails = [];
     for (const [accId, amt] of Object.entries(revByAccount)) {
         if (amt === 0) continue;
         // DN: Cr รายได้ (เหมือน postArBillFromDln) — CN: Dr รายได้ (กลับรายการ)
+        const amtFc = round2(revFcByAccount[accId]);
         arGlDetails.push({
             account_id: Number(accId), description: `${label} ${arDocNo}`,
             debit_lc: isCredit ? round2(amt) : 0, credit_lc: isCredit ? 0 : round2(amt),
+            debit_fc: isCredit ? amtFc : 0, credit_fc: isCredit ? 0 : amtFc,
         });
     }
     if (totalVat !== 0) {
@@ -1548,37 +1586,42 @@ const postArCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
         arGlDetails.push({
             account_id: vatAccountId, description: `ภาษีขาย ${arDocNo}`,
             debit_lc: isCredit ? totalVat : 0, credit_lc: isCredit ? 0 : totalVat,
+            debit_fc: isCredit ? totalVatFc : 0, credit_fc: isCredit ? 0 : totalVatFc,
         });
     }
     if (totalAmount !== 0) {
         arGlDetails.push({
             account_id: arAccountId, description: `${label} ${arDocNo}`,
             debit_lc: isCredit ? 0 : totalAmount, credit_lc: isCredit ? totalAmount : 0,
+            debit_fc: isCredit ? 0 : totalAmountFc, credit_fc: isCredit ? totalAmountFc : 0,
         });
     }
 
     if (arGlDetails.length > 0) {
         const totalDebit = round2(arGlDetails.reduce((s, l) => s + l.debit_lc, 0));
         const totalCredit = round2(arGlDetails.reduce((s, l) => s + l.credit_lc, 0));
+        const totalDebitFc = round2(arGlDetails.reduce((s, l) => s + l.debit_fc, 0));
+        const totalCreditFc = round2(arGlDetails.reduce((s, l) => s + l.credit_fc, 0));
         const arGlHeaderRes = await client.query(`
             INSERT INTO gl_entry_header
             (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
              currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
              created_by, ref_doc_id, ref_doc_no, external_source_id, ref_doc_date)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'Posted',$9,$10,0,0,$11,$12,$13,$14,$3)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$15,'Posted',$9,$10,$16,$17,$11,$12,$13,$14,$3)
             RETURNING id
         `, [
             arSetup.gl_doc_id, `GL-${arDocNo}`, header.doc_date, header.doc_date, periodId,
             header.ref_no || null, `${label} (${docNo})`,
-            1, totalDebit, totalCredit, createdByUserId, arDocId, arDocNo, arTransactionId,
+            header.currency_id || 1, totalDebit, totalCredit, createdByUserId, arDocId, arDocNo, arTransactionId,
+            docExchangeRate, totalDebitFc, totalCreditFc,
         ]);
         const arGlEntryId = arGlHeaderRes.rows[0].id;
         let glLineNo = 1;
         for (const l of arGlDetails) {
             await client.query(`
                 INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
-                VALUES ($1,$2,$3,$4,$5,$6,0,0)
-            `, [arGlEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc]);
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            `, [arGlEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc, l.debit_fc || 0, l.credit_fc || 0]);
         }
         await client.query(`UPDATE ar_transaction SET gl_entry_id = $1 WHERE id = $2`, [arGlEntryId, arTransactionId]);
     }
@@ -2246,7 +2289,7 @@ const insertAndPostAdjustment = async (client, {
             vendor_id: vendorId || null, customer_id: customerId || null,
             ref_no: refNo, description,
             customer_po_no: customerPoNo || null, customer_po_date: customerPoDate || null,
-            currency_code: currencyCode || 'THB', exchange_rate: exchangeRate || 1,
+            currency_id: currencyId || null, currency_code: currencyCode || 'THB', exchange_rate: exchangeRate || 1,
             dim1_id: dim1Id, dim2_id: dim2Id, dim3_id: dim3Id, dim4_id: dim4Id, dim5_id: dim5Id,
             branch_id: branchId, created_by: createdBy, updated_by: createdBy,
             gl_doc_no: glDocNo || null,
@@ -2682,6 +2725,15 @@ const postBillingForDln = async (req, res) => {
             tx.customer_po_date = req.body.customer_po_date || null;
             await client.query(`UPDATE im_transaction SET customer_po_no=$1, customer_po_date=$2 WHERE id=$3`,
                 [tx.customer_po_no, tx.customer_po_date, id]);
+        }
+        // อัตราแลกเปลี่ยน ณ วันออกใบแจ้งหนี้ (เฉพาะสกุลเงินต่างประเทศ) — สกุลเงินคงเดิมตามที่ส่งสินค้า แก้ได้แค่อัตรา
+        const bodyRate = Number(req.body?.exchange_rate);
+        if (bodyRate > 0 && tx.currency_code) {
+            const baseRes = await client.query(`SELECT base_currency_flag FROM cd_currency WHERE currency_code = $1 LIMIT 1`, [tx.currency_code]);
+            if (baseRes.rows[0] && !baseRes.rows[0].base_currency_flag) {
+                tx.exchange_rate = bodyRate;
+                await client.query(`UPDATE im_transaction SET exchange_rate=$1 WHERE id=$2`, [bodyRate, id]);
+            }
         }
         if (Array.isArray(lines)) {
             for (const l of lines) {
