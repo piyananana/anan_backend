@@ -6,6 +6,8 @@
 //   - ยอดคงค้าง = ใบแจ้งหนี้/เพิ่มหนี้ที่โพสต์แล้วคงเหลือ − ใบลดหนี้/เงินมัดจำที่ยังไม่ได้ตัด
 //                 + ใบส่งสินค้ารอตั้งหนี้ (IM 32) ที่ส่งแล้วยังไม่ออกใบแจ้งหนี้
 //     ไม่นับ: IM 30 (ส่งสินค้าไม่ตั้งหนี้ — ตรวจตอนโพสต์ แต่ไม่นับซ้ำ เพราะจะออกใบแจ้งหนี้ AR เองภายหลัง), ใบสั่งขาย
+//   - วงเงินและยอดคงค้างเป็นสกุลเงินหลัก (บาท): AR ใช้ยอด *_lc; IM ราคาขายอยู่ในสกุลเงินเอกสาร → × exchange_rate
+//     ภาษีคิดจากยอดบาทรายบรรทัด (ตรงกับใบแจ้งหนี้ AR ที่ IM สร้าง)
 //   - ผู้อนุมัติ = คิวผู้อนุมัติของเมนูเอกสารนั้น (sa_module_approver ตาม menu_id + doc_type=doc_code) เหมือนการอนุมัติอื่น
 //     ไม่มีผู้อนุมัติในคิว = ตามตัวเลือกของเมนู sa_menu.no_approver_action: ALLOW = อนุมัติให้อัตโนมัติ (ค่าเริ่มต้น),
 //     BLOCK = ขออนุมัติไม่ได้ (โพสต์เกินวงเงินไม่ได้จนกว่าจะตั้งผู้อนุมัติ)
@@ -58,11 +60,12 @@ const customerExposure = async (db, customerId, { excludeArId = 0, excludeImId =
                 AND t.balance_amount_lc > 0
            ), 0)::float AS ar_outstanding,
            COALESCE((
-             SELECT SUM(ROUND(ABS(dt.qty) * COALESCE(dt.unit_price, 0)
-                              * (1 + CASE WHEN COALESCE(dt.vat_type, 'NOVAT') = 'NOVAT' THEN 0 ELSE COALESCE(dt.vat_rate, 0) END / 100), 2))
+             SELECT SUM(x.lc + ROUND(x.lc * x.vat / 100, 2))
+               FROM (SELECT ROUND(ABS(dt.qty) * COALESCE(dt.unit_price, 0) * COALESCE(NULLIF(i.exchange_rate, 0), 1), 2) AS lc,
+                            CASE WHEN COALESCE(dt.vat_type, 'NOVAT') = 'NOVAT' THEN 0 ELSE COALESCE(dt.vat_rate, 0) END AS vat
                FROM im_transaction i JOIN sa_module_document d ON d.id = i.doc_id
                JOIN im_transaction_detail dt ON dt.header_id = i.id
-              WHERE i.customer_id = c.id AND i.status = 'Delivered' AND d.sys_doc_type = '32' AND i.id <> $3
+              WHERE i.customer_id = c.id AND i.status = 'Delivered' AND d.sys_doc_type = '32' AND i.id <> $3) x
            ), 0)::float AS unbilled_delivery
       FROM ar_customer c WHERE c.id = $1`, [customerId, excludeArId || 0, excludeImId || 0])).rows[0];
   if (!r) return null;
@@ -90,12 +93,14 @@ const evaluate = (exp, amount) => {
 const arDocAmount = (sysDocType, totalAmountLc) =>
   round2((AR_CREDIT_TYPES.includes(sysDocType) ? -1 : 1) * Math.abs(Number(totalAmountLc) || 0));
 
-// IM: จำนวน = counted − system (หรือ qty หลังโพสต์) × ราคาขาย × (1 + VAT)
-const imDocAmount = (sysDocType, details) => {
+// IM: จำนวน = counted − system (หรือ qty หลังโพสต์) × ราคาขาย × อัตราแลกเปลี่ยน (เป็นบาท) + VAT จากยอดบาท
+const imDocAmount = (sysDocType, details, exchangeRate = 1) => {
+  const rate = Number(exchangeRate) > 0 ? Number(exchangeRate) : 1;
   const sum = (details || []).reduce((s, d) => {
     const q = d.qty != null && Number(d.qty) !== 0 ? Number(d.qty) : (Number(d.counted_qty) || 0) - (Number(d.system_qty) || 0);
     const vat = !d.vat_type || d.vat_type === 'NOVAT' ? 0 : (Number(d.vat_rate) || 0);
-    return s + round2(Math.abs(q) * (Number(d.unit_price) || 0) * (1 + vat / 100));
+    const lc = round2(Math.abs(q) * (Number(d.unit_price) || 0) * rate);
+    return s + lc + round2(lc * vat / 100);
   }, 0);
   return round2((IM_CREDIT_TYPES.includes(sysDocType) ? -1 : 1) * sum);
 };

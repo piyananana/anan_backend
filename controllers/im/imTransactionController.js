@@ -17,11 +17,11 @@ const { branchCodeSql } = require('../../utils/taxBranch');
 const { IM_CHECK_TYPES, ensureCreditSchema, imDocAmount, assertCreditForPost, loadCreditApprovals } = require('../../utils/creditCheck');
 
 // ตรวจวงเงินเครดิตก่อนโพสต์เอกสารฝั่งขาย (ส่งสินค้า/รับคืน/ลดหนี้/เพิ่มหนี้ลูกหนี้) — เกินและยังไม่ได้รับอนุมัติ = throw
-const checkImCreditForPost = async (client, { docId, customerId, details, id, row }) => {
+const checkImCreditForPost = async (client, { docId, customerId, details, id, row, exchangeRate }) => {
     const d = (await client.query(`SELECT sys_doc_type FROM sa_module_document WHERE id=$1`, [docId])).rows[0];
     if (!d || !IM_CHECK_TYPES.includes(d.sys_doc_type)) return;
     await assertCreditForPost(client, {
-        customerId, amount: imDocAmount(d.sys_doc_type, details), excludeImId: id || 0, row,
+        customerId, amount: imDocAmount(d.sys_doc_type, details, exchangeRate), excludeImId: id || 0, row,
     });
 };
 const sendImError = (res, error) => res.status(error.status || 500).json({
@@ -2310,7 +2310,7 @@ const createTransaction = async (req, res) => {
         await ensureImTransactionTable(client);
         // เอกสารใหม่ยังไม่มีคำขออนุมัติ — เกินวงเงินต้องบันทึกร่างแล้วขออนุมัติก่อน
         if ((action || 'Post') === 'Post') {
-            await checkImCreditForPost(client, { docId: header.doc_id, customerId: header.customer_id, details, id: 0, row: null });
+            await checkImCreditForPost(client, { docId: header.doc_id, customerId: header.customer_id, details, id: 0, row: null, exchangeRate: header.exchange_rate });
         }
 
         const newHeaderId = await insertAndPostAdjustment(client, {
@@ -2599,7 +2599,7 @@ const postTransaction = async (req, res) => {
             return res.status(400).json({ message: 'Post ได้เฉพาะเอกสาร Draft เท่านั้น' });
         }
         const draftLines = (await client.query(`SELECT * FROM im_transaction_detail WHERE header_id=$1`, [id])).rows;
-        await checkImCreditForPost(client, { docId: tx.doc_id, customerId: tx.customer_id, details: draftLines, id: Number(id), row: tx });
+        await checkImCreditForPost(client, { docId: tx.doc_id, customerId: tx.customer_id, details: draftLines, id: Number(id), row: tx, exchangeRate: tx.exchange_rate });
         const headerForPost = { ...tx, doc_code: tx.doc_code || tx.d_doc_code, updated_by: userName };
         await postDetailLines(client, id, headerForPost, tx.doc_no);
 

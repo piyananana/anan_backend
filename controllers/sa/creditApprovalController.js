@@ -20,11 +20,11 @@ const DOCS = {
     checkTypes: C.IM_CHECK_TYPES,
     load: async (db, id) => {
       const r = (await db.query(`
-        SELECT t.id, t.status, t.customer_id, t.credit_status, t.credit_amount, d.sys_doc_type, d.doc_code
+        SELECT t.id, t.status, t.customer_id, t.credit_status, t.credit_amount, t.exchange_rate, d.sys_doc_type, d.doc_code
           FROM im_transaction t JOIN sa_module_document d ON d.id = t.doc_id WHERE t.id = $1`, [id])).rows[0];
       if (r) {
         const details = (await db.query(`SELECT * FROM im_transaction_detail WHERE header_id=$1`, [id])).rows;
-        r.amount = C.imDocAmount(r.sys_doc_type, details);
+        r.amount = C.imDocAmount(r.sys_doc_type, details, r.exchange_rate);
       }
       return r;
     },
