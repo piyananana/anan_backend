@@ -190,8 +190,11 @@ const loadCurrencies = async (db, codes) => {
   const rows = (await db.query(`SELECT currency_code, currency_name_th, currency_name_en FROM cd_currency WHERE currency_code = ANY($1::text[])`, [list])).rows;
   return new Map(rows.map(r => [r.currency_code, r]));
 };
+// สกุลเงินหลักของระบบ (cd_currency.base_currency_flag) — ไม่มีตั้งค่า = THB
+const loadBaseCurrency = async (db) =>
+  s((await db.query(`SELECT currency_code FROM cd_currency WHERE base_currency_flag = TRUE ORDER BY id LIMIT 1`)).rows[0]?.currency_code) || 'THB';
 const currencyFields = (map, code) => {
-  const c = map.get(s(code) || 'THB') || {};
+  const c = map.get(s(code)) || {};
   return { currency_name: s(c.currency_name_th), currency_name_en: s(c.currency_name_en) || s(c.currency_name_th) };
 };
 
@@ -209,12 +212,21 @@ const loadSalespersonNames = async (db, table, ids) => {
   return new Map(rows.map(r => [r.header_id, r]));
 };
 
-// ยอดรวม + จำนวนเงินตัวอักษร
-const totalsFields = (t, currency) => ({
+// จำนวนเงินตัวอักษร — บาทใช้คำอ่านภาษาไทย (บาทถ้วน) สกุลอื่นใช้คำอ่านภาษาอังกฤษพร้อมรหัสสกุลเงิน
+const amountWords = (amount, currency) => (currency === 'THB' ? bahtText(amount) : englishAmountText(amount, currency));
+
+// ยอดรวม + จำนวนเงินตัวอักษร — t = ยอดตามสกุลเงินเอกสาร, lc = ยอดสกุลเงินหลัก (ใบกำกับภาษีเงินตราต่างประเทศ
+// ต้องแสดงมูลค่า/ภาษีเป็นเงินบาทด้วย — เอกสารสกุลเงินหลัก lc = t)
+const totalsFields = (t, currency, base, lc) => ({
   subtotal: round2(t.subtotal), discount_amount: round2(t.discount), before_vat: round2(t.beforeVat),
   vat_rate: t.vatRate, vat_amount: round2(t.vat), total_amount: round2(t.total), total_qty: t.qty,
-  amount_text: (!currency || currency === 'THB') ? bahtText(t.total) : `${englishAmountText(t.total, currency)}`,
-  amount_text_en: englishAmountText(t.total, currency || 'THB'),
+  amount_text: amountWords(t.total, currency),
+  amount_text_en: englishAmountText(t.total, currency),
+  base_currency_code: base,
+  subtotal_lc: round2(lc.subtotal), discount_amount_lc: round2(lc.discount), before_vat_lc: round2(lc.beforeVat),
+  vat_amount_lc: round2(lc.vat), total_amount_lc: round2(lc.total),
+  amount_text_lc: amountWords(lc.total, base),
+  amount_text_lc_en: englishAmountText(lc.total, base),
 });
 
 // อัตรา VAT ที่พิมพ์หัวเอกสาร — อัตราสูงสุดของรายการที่มี VAT (ปกติทุกรายการอัตราเดียวกัน)
@@ -293,6 +305,14 @@ const SALES_INVOICE = {
     f('total_qty', 'จำนวนรวม', 'Total quantity', 'total', 'qty'),
     f('amount_text', 'จำนวนเงินตัวอักษร (บาทถ้วน)', 'Amount in words (Thai)', 'total'),
     f('amount_text_en', 'จำนวนเงินตัวอักษร (อังกฤษ)', 'Amount in words (EN)', 'total'),
+    f('base_currency_code', 'สกุลเงินหลัก', 'Base currency', 'total'),
+    f('subtotal_lc', 'รวมเงิน (สกุลเงินหลัก)', 'Subtotal (base currency)', 'total', 'money'),
+    f('discount_amount_lc', 'ส่วนลด (สกุลเงินหลัก)', 'Discount (base currency)', 'total', 'money'),
+    f('before_vat_lc', 'มูลค่าก่อนภาษี (สกุลเงินหลัก)', 'Amount before VAT (base currency)', 'total', 'money'),
+    f('vat_amount_lc', 'ภาษีมูลค่าเพิ่ม (สกุลเงินหลัก)', 'VAT amount (base currency)', 'total', 'money'),
+    f('total_amount_lc', 'จำนวนเงินรวมทั้งสิ้น (สกุลเงินหลัก)', 'Grand total (base currency)', 'total', 'money'),
+    f('amount_text_lc', 'จำนวนเงินตัวอักษร (สกุลเงินหลัก)', 'Amount in words (base currency)', 'total'),
+    f('amount_text_lc_en', 'จำนวนเงินตัวอักษร (สกุลเงินหลัก อังกฤษ)', 'Amount in words (base currency, EN)', 'total'),
     f('line_count', 'จำนวนรายการ', 'Line count', 'total', 'number'),
     ...PRINT_FIELDS,
     f('line_no', 'ลำดับ', 'No.', 'line', 'number', 'L'),
@@ -312,6 +332,9 @@ const SALES_INVOICE = {
     f('vat_rate', 'อัตราภาษี (%)', 'VAT rate (%)', 'line', 'number', 'L'),
     f('vat_amount', 'ภาษี', 'VAT', 'line', 'money', 'L'),
     f('line_total', 'จำนวนเงินรวมภาษี', 'Amount incl. VAT', 'line', 'money', 'L'),
+    f('amount_lc', 'จำนวนเงิน (สกุลเงินหลัก)', 'Amount (base currency)', 'line', 'money', 'L'),
+    f('vat_amount_lc', 'ภาษี (สกุลเงินหลัก)', 'VAT (base currency)', 'line', 'money', 'L'),
+    f('line_total_lc', 'จำนวนเงินรวมภาษี (สกุลเงินหลัก)', 'Amount incl. VAT (base currency)', 'line', 'money', 'L'),
     f('free_label', 'ของแถม', 'Free item', 'line', 'text', 'L'),
     f('free_label_en', 'ของแถม (อังกฤษ)', 'Free item (EN)', 'line', 'text', 'L'),
   ],
@@ -340,16 +363,21 @@ const SALES_INVOICE = {
                (SELECT COALESCE(SUM(ROUND(ABS(x.qty) * COALESCE(x.unit_price, 0), 2)
                         + CASE WHEN COALESCE(x.vat_type, 'NOVAT') = 'NOVAT' THEN 0
                                ELSE ROUND(ROUND(ABS(x.qty) * COALESCE(x.unit_price, 0), 2) * COALESCE(x.vat_rate, 0) / 100, 2) END), 0)
-                  FROM im_transaction_detail x WHERE x.header_id = t.id)::float AS total_amount
+                  FROM im_transaction_detail x WHERE x.header_id = t.id)::float AS total_amount,
+               t.currency_code
           FROM im_transaction t JOIN sa_module_document d ON d.id = t.doc_id
          WHERE t.doc_id = ANY($1::int[]) AND t.status = 'Posted' ${c1}
         UNION ALL
         SELECT 'AR:' || t.id, 'AR', t.id, d.doc_code, t.doc_no, ${ymdSql('t.doc_date')},
-               t.customer_code, t.customer_name_th, t.total_amount_fc::float
+               t.customer_code, t.customer_name_th, t.total_amount_fc::float, t.currency_code
           FROM ar_transaction t JOIN sa_module_document d ON d.id = t.doc_id
          WHERE t.doc_id = ANY($1::int[]) AND t.status = 'Posted' ${cond('t', 'AR')}
       ) z ORDER BY z.doc_date, z.doc_no${keys ? '' : ' LIMIT 2000'}`;
-    return (await db.query(sql, p)).rows;
+    // currency_code ว่าง = สกุลเงินหลัก; is_base_currency ให้หน้าจอแสดงรหัสเฉพาะสกุลเงินต่างประเทศ
+    const base = await loadBaseCurrency(db);
+    return (await db.query(sql, p)).rows.map(r => ({
+      ...r, currency_code: s(r.currency_code) || base, is_base_currency: (s(r.currency_code) || base) === base,
+    }));
   },
 
   // ข้อมูลพิมพ์ต่อเอกสาร: Map(key → { header, lines })
@@ -386,6 +414,8 @@ const SALES_INVOICE = {
                t.customer_id, t.customer_code, t.customer_name_th, t.branch_id,
                t.subtotal_fc::float AS subtotal_fc, t.discount_amount_fc::float AS discount_amount_fc,
                t.before_vat_fc::float AS before_vat_fc, t.vat_amount_fc::float AS vat_amount_fc, t.total_amount_fc::float AS total_amount_fc,
+               t.subtotal_lc::float AS subtotal_lc, t.discount_amount_lc::float AS discount_amount_lc,
+               t.before_vat_lc::float AS before_vat_lc, t.vat_amount_lc::float AS vat_amount_lc, t.total_amount_lc::float AS total_amount_lc,
                d.doc_code, d.doc_name_thai, d.doc_name_eng, c.credit_term_days,
                (t.due_date - t.doc_date) AS due_days,
                im.id AS im_id, im.doc_no AS im_doc_no, ${ymdSql('im.doc_date')} AS im_doc_date,
@@ -428,7 +458,9 @@ const SALES_INVOICE = {
       ...approverFields(appr, ''),
       ...approverFields(h.so_id ? soAppr.get(h.so_id) : null, 'so_'),
     });
-    const currencies = await loadCurrencies(db, [...imHeads, ...arHeads].map(h => s(h.currency_code) || 'THB'));
+    const base = await loadBaseCurrency(db);
+    const curOf = (h) => s(h.currency_code) || base;
+    const currencies = await loadCurrencies(db, [...imHeads, ...arHeads].map(curOf));
     const imSp = await loadSalespersonNames(db, 'im_transaction_salesperson', imIds);
     const arSp = await loadSalespersonNames(db, 'ar_transaction_salesperson', arIds);
 
@@ -447,6 +479,8 @@ const SALES_INVOICE = {
                COALESCE(dt.discount_percent, 0)::float AS discount_percent, COALESCE(dt.discount_amount_fc, 0)::float AS discount_amount,
                dt.subtotal_fc::float AS amount, COALESCE(dt.vat_rate, 0)::float AS vat_rate,
                COALESCE(dt.vat_amount_fc, 0)::float AS vat_amount, dt.total_amount_fc::float AS line_total,
+               COALESCE(dt.subtotal_lc, 0)::float AS amount_lc, COALESCE(dt.vat_amount_lc, 0)::float AS vat_amount_lc,
+               COALESCE(dt.total_amount_lc, 0)::float AS line_total_lc,
                it.item_name_en
           FROM ar_transaction_detail dt
           LEFT JOIN LATERAL (SELECT x.item_name_en FROM im_item x WHERE x.item_code = dt.item_code AND dt.item_code <> '' LIMIT 1) it ON TRUE
@@ -486,17 +520,23 @@ const SALES_INVOICE = {
     });
 
     for (const h of imHeads) {
+      const rate = curOf(h) === base ? 1 : (num(h.exchange_rate) || 1);
       const lines = imLines.filter(l => l.header_id === h.id).map((l, i) => {
         const amount = round2(l.qty * l.unit_price);
         const vat = l.vat_type === 'NOVAT' ? 0 : round2(amount * l.vat_rate / 100);
+        const amountLc = round2(amount * rate);
+        const vatLc = l.vat_type === 'NOVAT' ? 0 : round2(amountLc * l.vat_rate / 100);
         return {
           ...lineCommon(l, i), qty: l.qty, unit_price: l.unit_price, discount_percent: 0, discount_amount: 0,
           amount, vat_rate: l.vat_type === 'NOVAT' ? 0 : l.vat_rate, vat_amount: vat, line_total: round2(amount + vat),
+          amount_lc: amountLc, vat_amount_lc: vatLc, line_total_lc: round2(amountLc + vatLc),
           free_label: l.is_free ? 'ของแถม' : '', free_label_en: l.is_free ? 'Free' : '',
         };
       });
       const sub = lines.reduce((a, l) => a + l.amount, 0);
       const vat = lines.reduce((a, l) => a + l.vat_amount, 0);
+      const subLc = lines.reduce((a, l) => a + l.amount_lc, 0);
+      const vatLc = lines.reduce((a, l) => a + l.vat_amount_lc, 0);
       const sp = imSp.get(h.id) || {};
       const days = h.credit_term_days || 0;
       out.set(`IM:${h.id}`, {
@@ -514,12 +554,12 @@ const SALES_INVOICE = {
           ...docRefFields(h, imAppr.get(h.id)),
           description: s(h.description), salespersons: s(sp.th), salespersons_en: s(sp.en), salesperson_codes: s(sp.codes),
           warehouse_name: s(h.warehouse_name_th), warehouse_name_en: s(h.warehouse_name_en) || s(h.warehouse_name_th),
-          ...currencyFields(currencies, h.currency_code), currency_code: s(h.currency_code) || 'THB', exchange_rate: h.exchange_rate || 1,
+          ...currencyFields(currencies, curOf(h)), currency_code: curOf(h), exchange_rate: rate,
           line_count: lines.length,
           ...totalsFields({
             subtotal: sub, discount: 0, beforeVat: sub, vat, total: sub + vat, vatRate: headerVatRate(lines),
             qty: lines.reduce((a, l) => a + l.qty, 0),
-          }, s(h.currency_code) || 'THB'),
+          }, curOf(h), base, { subtotal: subLc, discount: 0, beforeVat: subLc, vat: vatLc, total: subLc + vatLc }),
         },
         lines,
       });
@@ -531,6 +571,7 @@ const SALES_INVOICE = {
         ...lineCommon(fillFromIm(l, srcLines[i]), i), qty: l.qty, unit_price: l.unit_price, discount_percent: l.discount_percent,
         discount_amount: l.discount_amount, amount: l.amount, vat_rate: l.vat_amount ? l.vat_rate : 0,
         vat_amount: l.vat_amount, line_total: l.line_total, free_label: '', free_label_en: '',
+        amount_lc: l.amount_lc, vat_amount_lc: l.vat_amount_lc, line_total_lc: l.line_total_lc,
       }));
       const sp = arSp.get(h.id) || {};
       const days = h.due_days ?? h.credit_term_days ?? 0;
@@ -547,12 +588,14 @@ const SALES_INVOICE = {
           ...docRefFields(h, arAppr.get(h.id)),
           description: s(h.description), salespersons: s(sp.th), salespersons_en: s(sp.en), salesperson_codes: s(sp.codes),
           warehouse_name: '', warehouse_name_en: '',
-          ...currencyFields(currencies, h.currency_code), currency_code: s(h.currency_code) || 'THB', exchange_rate: h.exchange_rate || 1,
+          ...currencyFields(currencies, curOf(h)), currency_code: curOf(h), exchange_rate: h.exchange_rate || 1,
           line_count: lines.length,
           ...totalsFields({
             subtotal: h.subtotal_fc, discount: h.discount_amount_fc, beforeVat: h.before_vat_fc, vat: h.vat_amount_fc,
             total: h.total_amount_fc, vatRate: headerVatRate(lines), qty: lines.reduce((a, l) => a + l.qty, 0),
-          }, s(h.currency_code) || 'THB'),
+          }, curOf(h), base, {
+            subtotal: h.subtotal_lc, discount: h.discount_amount_lc, beforeVat: h.before_vat_lc, vat: h.vat_amount_lc, total: h.total_amount_lc,
+          }),
         },
         lines,
       });
