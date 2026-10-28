@@ -860,6 +860,17 @@ const insertImVtLine = async (client, {
 // ตามธรรมเนียมเดียวกับ postCmPaymentHelper/postCmReceiptsHelper ใน ap/arTransactionController.js: INSERT ตรงเข้า
 // ตารางของอีกโมดูลด้วย client เดียวกัน ไม่เรียกผ่าน createTransaction ของ AP (จัดการ BEGIN/COMMIT เอง เรียกข้าม
 // transaction ที่เปิดอยู่ไม่ได้) — v1: ไม่มี VAT/WHT, ผู้ใช้ AP แก้ไขเพิ่มเติมได้เองภายหลังถ้าจำเป็น
+// currency_id ของเอกสาร IM (ใช้กับเอกสาร AP/AR/GL ที่สร้างอัตโนมัติ) — ไม่มี id ให้หาจาก currency_code
+// แล้วค่อยเป็นสกุลเงินหลัก (ไม่ hardcode id ของบาท)
+const resolveDocCurrencyId = async (client, header) => {
+    if (header.currency_id) return Number(header.currency_id);
+    const r = await client.query(`
+        SELECT id FROM cd_currency
+         WHERE ($1::text IS NOT NULL AND currency_code = $1) OR ($1::text IS NULL AND base_currency_flag = TRUE)
+         ORDER BY id LIMIT 1`, [header.currency_code || null]);
+    return r.rows[0]?.id || null;
+};
+
 const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoiceNo, mode }) => {
     if (!header.vendor_id) throw new Error('ต้องระบุผู้ขายสำหรับเอกสารประเภทนี้');
     if (!vendorInvoiceNo) throw new Error('ต้องระบุเลขที่ใบกำกับสินค้าผู้ขายสำหรับเอกสารประเภทนี้');
@@ -927,6 +938,7 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
     // ตอนบันทึก GRN) ส่วน unit_cost_fc (ถ้ามี) คือราคาจริงในสกุลเงินผู้ขาย ใช้เติม subtotal_fc ให้ตรงกับใบกำกับจริง
     const docCurrencyCode = header.currency_code || 'THB';
     const docExchangeRate = Number(header.exchange_rate) || 1;
+    const docCurrencyId = await resolveDocCurrencyId(client, header);
     const lineRows = [];
     let totalAmountLc = 0, totalVatLc = 0, totalAmountFc = 0, totalVatFc = 0;
     for (const d of details) {
@@ -959,15 +971,15 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
         (doc_id, doc_no, doc_date, period_id, vendor_id, vendor_code, vendor_name_th, ap_account_id, gl_doc_id,
          currency_code, exchange_rate, subtotal_fc, before_vat_fc, vat_amount_fc, total_amount_fc,
          subtotal_lc, before_vat_lc, vat_amount_lc, total_amount_lc,
-         balance_amount_lc, ref_no, ref_doc_id, ref_doc_no, description, status, created_by, updated_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12,$13,$14,$15,$15,$16,$17,$17,$18,$19,$20,$21,'Posted',$22,$22)
+         balance_amount_lc, ref_no, ref_doc_id, ref_doc_no, description, status, created_by, updated_by, currency_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12,$13,$14,$15,$15,$16,$17,$17,$18,$19,$20,$21,'Posted',$22,$22,$23)
         RETURNING id
     `, [
         apDocId, apDocNo, header.doc_date, periodId, header.vendor_id, vendorCode, vendorNameTh, apAccountId, apSetup.gl_doc_id,
         docCurrencyCode, docExchangeRate,
         totalAmountFc, totalVatFc, grandTotalFc,
         totalAmountLc, totalVatLc, grandTotalLc,
-        vendorInvoiceNo, header.doc_id, docNo, `ใบกำกับสินค้าจากการรับสินค้า ${docNo}`, createdByUserId,
+        vendorInvoiceNo, header.doc_id, docNo, `ใบกำกับสินค้าจากการรับสินค้า ${docNo}`, createdByUserId, docCurrencyId,
     ]);
     const apTransactionId = apHeaderRes.rows[0].id;
 
@@ -985,22 +997,27 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
             detailId: detailRes.rows[0].id, docNo: apDocNo, docDate: header.doc_date,
             baseLc: l.amountLc, vatLc: l.vatAmountLc, entityIdField: 'vendor_id', entityId: header.vendor_id,
             entityName: vendorNameTh, entityTaxId: vendorTaxId, createdByUserId, vatSign: 1,
+            baseFc: l.amountFc, vatFc: l.vatAmountFc, currencyId: docCurrencyId, exchangeRate: docExchangeRate,
         });
     }
 
-    // GL posting (Dr ค่าใช้จ่าย/VAT ซื้อ, Cr เจ้าหนี้) เป็น LC เสมอ ไม่แตะ — มิเรอร์ postGlEntry ทุกประการ (ดู plan:
-    // ไม่เปลี่ยน GL posting logic เลย เพราะ amountLc ถูกแปลงมาถูกต้องแล้วตั้งแต่ตอนบันทึก GRN)
+    // GL posting (Dr ค่าใช้จ่าย/VAT ซื้อ, Cr เจ้าหนี้) — ยอดบาทตาม amountLc ที่แปลงไว้แล้วตั้งแต่ตอนบันทึก GRN
+    // ยอดสกุลเงินต่างประเทศ (debit_fc/credit_fc): สินค้า = ยอดตามใบกำกับ, VAT, เจ้าหนี้ — ผลต่างต้นทุนเป็นบาทล้วน (fc 0)
+    // จึงสมดุลทั้งบาทและสกุลเงินต่างประเทศ (สินค้า fc + VAT fc = เจ้าหนี้ fc)
     const expDebitByAccount = {};
+    const expDebitFcByAccount = {};
     let varianceLc = 0; // ราคาตามใบกำกับ - มูลค่าสต็อกตอนรับ (บวก = ใบกำกับแพงกว่า → Dr ผลต่าง)
     for (const l of lineRows) {
         expDebitByAccount[l.expenseAccountId] = (expDebitByAccount[l.expenseAccountId] || 0) + l.stockValueLc;
+        expDebitFcByAccount[l.expenseAccountId] = (expDebitFcByAccount[l.expenseAccountId] || 0) + l.amountFc;
         varianceLc += l.amountLc - l.stockValueLc;
     }
     varianceLc = round2(varianceLc);
     const apGlDetails = [];
     for (const [accId, amt] of Object.entries(expDebitByAccount)) {
-        if (amt === 0) continue;
-        apGlDetails.push({ account_id: Number(accId), description: `ใบกำกับสินค้า ${apDocNo}`, debit_lc: round2(amt), credit_lc: 0 });
+        const amtFc = round2(expDebitFcByAccount[accId] || 0);
+        if (amt === 0 && amtFc === 0) continue;
+        apGlDetails.push({ account_id: Number(accId), description: `ใบกำกับสินค้า ${apDocNo}`, debit_lc: round2(amt), credit_lc: 0, debit_fc: amtFc, credit_fc: 0 });
     }
     if (varianceLc !== 0) {
         const varRes = await client.query(`SELECT variance_account_id FROM im_gl_account_setup WHERE doc_code = $1`, [header.doc_code]);
@@ -1015,34 +1032,37 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
     }
     if (totalVatLc !== 0) {
         if (!vatAccountId) throw new Error('ยังไม่ได้ตั้งค่าบัญชี VAT ซื้อ (vat_input_account_id) ใน im_gl_account_setup หรือ ap_gl_account_setup');
-        apGlDetails.push({ account_id: vatAccountId, description: `VAT ซื้อ ${apDocNo}`, debit_lc: totalVatLc, credit_lc: 0 });
+        apGlDetails.push({ account_id: vatAccountId, description: `VAT ซื้อ ${apDocNo}`, debit_lc: totalVatLc, credit_lc: 0, debit_fc: totalVatFc, credit_fc: 0 });
     }
     if (grandTotalLc !== 0) {
-        apGlDetails.push({ account_id: apAccountId, description: `ใบกำกับสินค้า ${apDocNo}`, debit_lc: 0, credit_lc: grandTotalLc });
+        apGlDetails.push({ account_id: apAccountId, description: `ใบกำกับสินค้า ${apDocNo}`, debit_lc: 0, credit_lc: grandTotalLc, debit_fc: 0, credit_fc: grandTotalFc });
     }
 
     if (apGlDetails.length > 0) {
         const totalDebit = round2(apGlDetails.reduce((s, l) => s + l.debit_lc, 0));
         const totalCredit = round2(apGlDetails.reduce((s, l) => s + l.credit_lc, 0));
+        const totalDebitFc = round2(apGlDetails.reduce((s, l) => s + (l.debit_fc || 0), 0));
+        const totalCreditFc = round2(apGlDetails.reduce((s, l) => s + (l.credit_fc || 0), 0));
         const apGlHeaderRes = await client.query(`
             INSERT INTO gl_entry_header
             (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
              currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
              created_by, ref_doc_id, ref_doc_no, external_source_id, ref_doc_date)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'Posted',$9,$10,0,0,$11,$12,$13,$14,$3)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$15,'Posted',$9,$10,$16,$17,$11,$12,$13,$14,$3)
             RETURNING id
         `, [
             apSetup.gl_doc_id, `GL-${apDocNo}`, header.doc_date, header.doc_date, periodId,
             vendorInvoiceNo, `ใบกำกับสินค้าจากการรับสินค้า ${docNo}`,
-            1, totalDebit, totalCredit, createdByUserId, apDocId, apDocNo, apTransactionId,
+            docCurrencyId, totalDebit, totalCredit, createdByUserId, apDocId, apDocNo, apTransactionId,
+            docExchangeRate, totalDebitFc, totalCreditFc,
         ]);
         const apGlEntryId = apGlHeaderRes.rows[0].id;
         let glLineNo = 1;
         for (const l of apGlDetails) {
             await client.query(`
                 INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
-                VALUES ($1,$2,$3,$4,$5,$6,0,0)
-            `, [apGlEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc]);
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            `, [apGlEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc, l.debit_fc || 0, l.credit_fc || 0]);
         }
         await client.query(`UPDATE ap_transaction SET gl_entry_id = $1 WHERE id = $2`, [apGlEntryId, apTransactionId]);
     }
@@ -1209,7 +1229,7 @@ const postArBillFromDln = async (client, { header, details, docNo }) => {
         `, [
             arSetup.gl_doc_id, `GL-${arDocNo}`, header.doc_date, header.doc_date, periodId,
             header.ref_no || null, `ใบแจ้งหนี้จากการส่งสินค้า ${docNo}`,
-            header.currency_id || 1, totalDebit, totalCredit, createdByUserId, arDocId, arDocNo, arTransactionId,
+            await resolveDocCurrencyId(client, header), totalDebit, totalCredit, createdByUserId, arDocId, arDocNo, arTransactionId,
             docExchangeRate, totalDebitFc, totalCreditFc,
         ]);
         const arGlEntryId = arGlHeaderRes.rows[0].id;
@@ -1301,6 +1321,7 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, mod
     // มิเรอร์ postApBillFromGrn ทุกประการ — ดู comment เดียวกันที่นั่นเรื่อง docCurrencyCode/docExchangeRate
     const docCurrencyCode = header.currency_code || 'THB';
     const docExchangeRate = Number(header.exchange_rate) || 1;
+    const docCurrencyId = await resolveDocCurrencyId(client, header);
     const lineRows = [];
     let totalAmountLc = 0, totalVatLc = 0, totalAmountFc = 0, totalVatFc = 0;
     for (const d of details) {
@@ -1335,15 +1356,15 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, mod
         (doc_id, doc_no, doc_date, period_id, vendor_id, vendor_code, vendor_name_th, ap_account_id, gl_doc_id,
          currency_code, exchange_rate, subtotal_fc, before_vat_fc, vat_amount_fc, total_amount_fc,
          subtotal_lc, before_vat_lc, vat_amount_lc, total_amount_lc,
-         balance_amount_lc, ref_no, ref_doc_id, ref_doc_no, description, status, created_by, updated_by)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12,$13,$14,$15,$15,$16,$17,$17,$18,$19,$20,$21,'Posted',$22,$22)
+         balance_amount_lc, ref_no, ref_doc_id, ref_doc_no, description, status, created_by, updated_by, currency_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12,$13,$14,$15,$15,$16,$17,$17,$18,$19,$20,$21,'Posted',$22,$22,$23)
         RETURNING id
     `, [
         apDocId, apDocNo, header.doc_date, periodId, header.vendor_id, vendorCode, vendorNameTh, apAccountId, apSetup.gl_doc_id,
         docCurrencyCode, docExchangeRate,
         totalAmountFc, totalVatFc, grandTotalFc,
         totalAmountLc, totalVatLc, grandTotalLc,
-        header.ref_no || null, header.doc_id, docNo, `${label} (${docNo})`, createdByUserId,
+        header.ref_no || null, header.doc_id, docNo, `${label} (${docNo})`, createdByUserId, docCurrencyId,
     ]);
     const apTransactionId = apHeaderRes.rows[0].id;
 
@@ -1362,23 +1383,29 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, mod
             baseLc: l.amountLc, vatLc: l.vatAmountLc, entityIdField: 'vendor_id', entityId: header.vendor_id,
             entityName: vendorNameTh, entityTaxId: vendorTaxId, createdByUserId,
             vatSign: isCredit ? -1 : 1, // CN ลดยอดภาษีซื้อ (ตรงข้ามใบกำกับปกติ) มิเรอร์ AP's own insertVtRecords
+            baseFc: l.amountFc, vatFc: l.vatAmountFc, currencyId: docCurrencyId, exchangeRate: docExchangeRate,
         });
     }
 
+    // ยอดสกุลเงินต่างประเทศ: สินค้า = ยอดตามเอกสาร, VAT, เจ้าหนี้ — ผลต่างต้นทุนเป็นบาทล้วน (มิเรอร์ postApBillFromGrn)
     const invByAccount = {};
+    const invFcByAccount = {};
     let varianceLc = 0; // ราคาเอกสาร - มูลค่าสต็อก (บวก = ราคาเอกสารสูงกว่าต้นทุนสต็อก)
     for (const l of lineRows) {
         invByAccount[l.expenseAccountId] = (invByAccount[l.expenseAccountId] || 0) + l.stockValueLc;
+        invFcByAccount[l.expenseAccountId] = (invFcByAccount[l.expenseAccountId] || 0) + l.amountFc;
         varianceLc += l.amountLc - l.stockValueLc;
     }
     varianceLc = round2(varianceLc);
     const apGlDetails = [];
     for (const [accId, amt] of Object.entries(invByAccount)) {
-        if (amt === 0) continue;
+        const amtFc = round2(invFcByAccount[accId] || 0);
+        if (amt === 0 && amtFc === 0) continue;
         // CN: Dr AP / Cr คลัง — DN: Dr คลัง / Cr AP (มิเรอร์ postApBillFromGrn โดยกลับทิศทางเมื่อ isCredit)
         apGlDetails.push({
             account_id: Number(accId), description: `${label} ${apDocNo}`,
             debit_lc: isCredit ? 0 : round2(amt), credit_lc: isCredit ? round2(amt) : 0,
+            debit_fc: isCredit ? 0 : amtFc, credit_fc: isCredit ? amtFc : 0,
         });
     }
     if (varianceLc !== 0) {
@@ -1401,37 +1428,42 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, mod
         apGlDetails.push({
             account_id: vatAccountId, description: `VAT ซื้อ ${apDocNo}`,
             debit_lc: isCredit ? 0 : totalVatLc, credit_lc: isCredit ? totalVatLc : 0,
+            debit_fc: isCredit ? 0 : totalVatFc, credit_fc: isCredit ? totalVatFc : 0,
         });
     }
     if (grandTotalLc !== 0) {
         apGlDetails.push({
             account_id: apAccountId, description: `${label} ${apDocNo}`,
             debit_lc: isCredit ? grandTotalLc : 0, credit_lc: isCredit ? 0 : grandTotalLc,
+            debit_fc: isCredit ? grandTotalFc : 0, credit_fc: isCredit ? 0 : grandTotalFc,
         });
     }
 
     if (apGlDetails.length > 0) {
         const totalDebit = round2(apGlDetails.reduce((s, l) => s + l.debit_lc, 0));
         const totalCredit = round2(apGlDetails.reduce((s, l) => s + l.credit_lc, 0));
+        const totalDebitFc = round2(apGlDetails.reduce((s, l) => s + (l.debit_fc || 0), 0));
+        const totalCreditFc = round2(apGlDetails.reduce((s, l) => s + (l.credit_fc || 0), 0));
         const apGlHeaderRes = await client.query(`
             INSERT INTO gl_entry_header
             (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
              currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
              created_by, ref_doc_id, ref_doc_no, external_source_id, ref_doc_date)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,'Posted',$9,$10,0,0,$11,$12,$13,$14,$3)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$15,'Posted',$9,$10,$16,$17,$11,$12,$13,$14,$3)
             RETURNING id
         `, [
             apSetup.gl_doc_id, `GL-${apDocNo}`, header.doc_date, header.doc_date, periodId,
             header.ref_no || null, `${label} (${docNo})`,
-            1, totalDebit, totalCredit, createdByUserId, apDocId, apDocNo, apTransactionId,
+            docCurrencyId, totalDebit, totalCredit, createdByUserId, apDocId, apDocNo, apTransactionId,
+            docExchangeRate, totalDebitFc, totalCreditFc,
         ]);
         const apGlEntryId = apGlHeaderRes.rows[0].id;
         let glLineNo = 1;
         for (const l of apGlDetails) {
             await client.query(`
                 INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
-                VALUES ($1,$2,$3,$4,$5,$6,0,0)
-            `, [apGlEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc]);
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            `, [apGlEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc, l.debit_fc || 0, l.credit_fc || 0]);
         }
         await client.query(`UPDATE ap_transaction SET gl_entry_id = $1 WHERE id = $2`, [apGlEntryId, apTransactionId]);
     }
@@ -1612,7 +1644,7 @@ const postArCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
         `, [
             arSetup.gl_doc_id, `GL-${arDocNo}`, header.doc_date, header.doc_date, periodId,
             header.ref_no || null, `${label} (${docNo})`,
-            header.currency_id || 1, totalDebit, totalCredit, createdByUserId, arDocId, arDocNo, arTransactionId,
+            await resolveDocCurrencyId(client, header), totalDebit, totalCredit, createdByUserId, arDocId, arDocNo, arTransactionId,
             docExchangeRate, totalDebitFc, totalCreditFc,
         ]);
         const arGlEntryId = arGlHeaderRes.rows[0].id;
