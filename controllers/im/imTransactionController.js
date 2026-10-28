@@ -884,8 +884,11 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
 
     // บัญชี VAT ซื้อ — ดูที่ im_gl_account_setup ของ doc_code เอกสาร IM นี้ก่อน (ให้ override ได้ต่อ doc_code
     // เหมือน resolveInventoryAccount) แล้วค่อย fallback ไปที่บัญชี VAT ของใบกำกับสินค้า AP เอง
-    const imSetupVatRes = await client.query(`SELECT vat_input_account_id FROM im_gl_account_setup WHERE doc_code = $1`, [header.doc_code]);
+    const imSetupVatRes = await client.query(`SELECT vat_input_account_id, inventory_account_id FROM im_gl_account_setup WHERE doc_code = $1`, [header.doc_code]);
     const vatAccountId = Number(imSetupVatRes.rows[0]?.vat_input_account_id) || Number(apSetup.vat_input_account_id) || null;
+    // บัญชีสินค้าคงคลัง (Perpetual): คลัง → สินค้า → บัญชีสินค้าคงคลังของ im_gl_account_setup (doc_code นี้ — ตรงกับ
+    // ตัวอย่างรายการบัญชีบนหน้าจอ) → บัญชีค่าใช้จ่ายของเอกสาร AP เป็นลำดับสุดท้าย
+    const invFallbackAccountId = Number(imSetupVatRes.rows[0]?.inventory_account_id) || apSetup.expense_account_id;
 
     let purchasesAccountId = null;
     if (mode === 'PERIODIC') {
@@ -926,7 +929,7 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
     let totalAmountLc = 0, totalVatLc = 0, totalAmountFc = 0, totalVatFc = 0;
     for (const d of details) {
         const expenseAccountId = purchasesAccountId
-            || await resolveInventoryAccount(client, d.item_id, header.warehouse_id, apSetup.expense_account_id);
+            || await resolveInventoryAccount(client, d.item_id, header.warehouse_id, invFallbackAccountId);
         const qty = Number(d.qty);
         const unitCostLc = Number(d.unit_cost);
         const unitCostFc = d.unit_cost_fc != null ? Number(d.unit_cost_fc) : unitCostLc;
@@ -1238,8 +1241,11 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, mod
 
     // บัญชี VAT ซื้อ — ดูที่ im_gl_account_setup ของ doc_code เอกสาร IM นี้ก่อน แล้วค่อย fallback ไปที่
     // บัญชี VAT ของ AP เอง (มิเรอร์ postApBillFromGrn ทุกประการ)
-    const imSetupVatRes = await client.query(`SELECT vat_input_account_id FROM im_gl_account_setup WHERE doc_code = $1`, [header.doc_code]);
+    const imSetupVatRes = await client.query(`SELECT vat_input_account_id, inventory_account_id FROM im_gl_account_setup WHERE doc_code = $1`, [header.doc_code]);
     const vatAccountId = Number(imSetupVatRes.rows[0]?.vat_input_account_id) || Number(apSetup.vat_input_account_id) || null;
+    // บัญชีสินค้าคงคลัง (Perpetual): คลัง → สินค้า → บัญชีสินค้าคงคลังของ im_gl_account_setup (doc_code นี้ — ตรงกับ
+    // ตัวอย่างรายการบัญชีบนหน้าจอ) → บัญชีค่าใช้จ่ายของเอกสาร AP เป็นลำดับสุดท้าย
+    const invFallbackAccountId = Number(imSetupVatRes.rows[0]?.inventory_account_id) || apSetup.expense_account_id;
 
     let purchasesAccountId = null;
     if (mode === 'PERIODIC') {
@@ -1278,7 +1284,7 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, mod
     let totalAmountLc = 0, totalVatLc = 0, totalAmountFc = 0, totalVatFc = 0;
     for (const d of details) {
         const expenseAccountId = purchasesAccountId
-            || await resolveInventoryAccount(client, d.item_id, header.warehouse_id, apSetup.expense_account_id);
+            || await resolveInventoryAccount(client, d.item_id, header.warehouse_id, invFallbackAccountId);
         const qty = Math.abs(Number(d.qty) || 0); // qty ติดลบสำหรับ CN (สต็อกลด) บวกสำหรับ DN — เอกสาร AP ต้องเป็นจำนวนบวกเสมอ
         // ยอดใบลดหนี้/เพิ่มหนี้ = ราคาที่ผู้ใช้กรอก (unit_cost_fc × อัตราแลกเปลี่ยน) ไม่ใช่ต้นทุนที่ตัดจากสต็อก —
         // d.unit_cost ถูก postDetailLines เขียนทับเป็นต้นทุนสต็อกจริงแล้ว (ใช้เป็นมูลค่าสินค้าคงคลังด้านล่าง)
@@ -1745,6 +1751,19 @@ const postDetailLines = async (client, headerId, header, docNo) => {
     // ตอนปิดงวดใน imPeriodClosingController.js แทน — ดู pattern_im_periodic_accounting_mode — ยกเว้น '10' (GRN ไม่มี
     // เลขที่อ้างอิง) ที่ต้อง Post เสมอทั้งสองโหมด เพราะ GR/IR ต้องขยับทันทีที่รับของจริง (ดู postGlEntry) และ '11'
     // (GRN Billing) ที่ไม่ Post ผ่านทางนี้เลยไม่ว่าโหมดใด เพราะ ap_transaction ที่สร้างอัตโนมัติมี entry ของตัวเองแล้ว
+    // '15'/'20'/'25' (AP CN/DN) และ '40'/'45' (AR CN/DN อิสระ) ต้องมีราคา ไม่งั้นได้ใบลดหนี้/เพิ่มหนี้ยอด 0 ทั้งที่สต็อก
+    // เคลื่อนไหวจริง (ของแถมยกเว้น) — '35' ไม่บังคับ เพราะราคามาจากใบส่งสินค้าต้นฉบับ ('30' ไม่มีราคา)
+    if (['15', '20', '25', '40', '45'].includes(sysDocType)) {
+        const isAp = ['15', '20', '25'].includes(sysDocType);
+        for (const d of updatedDetails) {
+            if (d.is_free) continue;
+            const price = Number(isAp ? (d.unit_cost_fc ?? d.entered_unit_cost) : d.unit_price) || 0;
+            if (price <= 0) {
+                const codeRes = await client.query(`SELECT item_code FROM im_item WHERE id = $1`, [d.item_id]);
+                throw new Error(`${codeRes.rows[0]?.item_code || d.item_id}: กรุณาระบุ${isAp ? 'ราคาต่อหน่วย' : 'ราคาขายต่อหน่วย'}สำหรับ${isAp ? 'ใบลดหนี้/เพิ่มหนี้ AP' : 'ใบลดหนี้/เพิ่มหนี้ AR'}`);
+            }
+        }
+    }
     const mode = await fetchMode(client);
     let glEntryId = null;
     let linkedApTransactionId = null;
