@@ -2,6 +2,7 @@
 // อย่าลืม แก้ไข module.exports ในไฟล์นี้เพื่อให้สามารถเข้าถึงฟังก์ชันได้
 
 const xlsx = require('xlsx'); // Import xlsx
+const { getBaseCurrency, clearBaseCurrencyCache } = require('../../utils/baseCurrency');
 
 // Helper function to handle locking
 const lock = async (req, id, userId, userName) => {
@@ -88,6 +89,7 @@ const addRow = async (req, res) => {
             [currency_code.toUpperCase(), currency_name_th, currency_name_en, base_rate, 
             base_currency_flag, symbol, num_of_decimal, userName]
         );
+        clearBaseCurrencyCache();
         res.status(201).json(result.rows[0]);
     } catch (error) {
         console.error('Error creating:', error);
@@ -130,6 +132,7 @@ const updateRow = async (req, res) => {
             [currency_code.toUpperCase(), currency_name_th, currency_name_en, base_rate, 
             base_currency_flag, symbol, num_of_decimal, is_active, userId, id]
         );
+        clearBaseCurrencyCache();
 
         await unlock(req, id, userId);
 
@@ -293,7 +296,38 @@ const exportDataExcel = async (req, res) => {
     }
 };
 
+// GET /cd_currency/base_change_impact — ข้อมูลประกอบคำเตือนก่อนเปลี่ยนสกุลเงินหลัก (หน้าจอแสดงก่อนยืนยัน)
+// ยอด *_lc ที่บันทึกไปแล้วทั้งหมดเป็นสกุลเงินหลักเดิม — ระบบไม่แปลงย้อนหลังให้
+const baseChangeImpact = async (req, res) => {
+    const db = req.dbPool;
+    // นับเฉพาะตารางที่มีในฐานข้อมูลนี้ (บางโมดูลอาจยังไม่ได้ใช้)
+    const count = async (table, where = 'TRUE') => {
+        const ok = (await db.query(`SELECT to_regclass($1) IS NOT NULL AS ok`, [table])).rows[0].ok;
+        if (!ok) return 0;
+        return Number((await db.query(`SELECT COUNT(*)::int AS n FROM ${table} WHERE ${where}`)).rows[0].n);
+    };
+    try {
+        const base = await getBaseCurrency(db);
+        res.json({
+            base_currency_code: base.code,
+            has_base_currency: !!base.id,
+            gl_entries: await count('gl_entry_header', `status = 'Posted'`),
+            ar_documents: await count('ar_transaction', `status = 'Posted'`),
+            ap_documents: await count('ap_transaction', `status = 'Posted'`),
+            open_ar_documents: await count('ar_transaction', `status = 'Posted' AND balance_amount_lc > 0`),
+            open_ap_documents: await count('ap_transaction', `status = 'Posted' AND balance_amount_lc > 0`),
+            im_documents: await count('im_transaction', `status <> 'Draft'`),
+            customers_with_credit_limit: await count('ar_customer', `COALESCE(credit_limit, 0) > 0`),
+            other_currencies: await count('cd_currency', `is_active IS TRUE AND base_currency_flag IS NOT TRUE`),
+        });
+    } catch (error) {
+        console.error('Error base change impact:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    }
+};
+
 module.exports = {
+    baseChangeImpact,
     lock,
     unlock,
     fetchRows,

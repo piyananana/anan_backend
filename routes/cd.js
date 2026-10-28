@@ -46,6 +46,7 @@ router.get('/cd_business_unit/export', cdBusinessUnitController.exportDataExcel)
 // Router สำหรับจัดการข้อมูลสกุลเงิน
 router.get('/cd_currency', cdCurrencyController.fetchRows);
 router.get('/cd_currency/active', cdCurrencyController.fetchActiveRows);
+router.get('/cd_currency/base_change_impact', cdCurrencyController.baseChangeImpact);
 // router.get('/cd_currency/:id', cdCurrencyController.fetchRowById);
 router.post('/cd_currency', cdCurrencyController.addRow);
 router.put('/cd_currency/:id', cdCurrencyController.updateRow);

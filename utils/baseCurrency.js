@@ -26,4 +26,7 @@ const getBaseCurrencyCode = async (db) => {
     return code;
 };
 
-module.exports = { BASE_CURRENCY_CODE_SQL, getBaseCurrency, getBaseCurrencyCode };
+// เรียกหลังแก้สกุลเงินหลัก (cd_currency) ให้ค่าใหม่มีผลทันที
+const clearBaseCurrencyCache = () => codeCache.clear();
+
+module.exports = { BASE_CURRENCY_CODE_SQL, getBaseCurrency, getBaseCurrencyCode, clearBaseCurrencyCache };
