@@ -10,8 +10,20 @@ const getBaseCurrency = async (db) => {
     const r = (await db.query(`
         SELECT id, currency_code FROM cd_currency
          WHERE base_currency_flag = TRUE OR currency_code = $1
-         ORDER BY base_currency_flag DESC, id LIMIT 1`, [FALLBACK_BASE_CODE])).rows[0];
+         ORDER BY (base_currency_flag IS TRUE) DESC, id LIMIT 1`, [FALLBACK_BASE_CODE])).rows[0];
     return { id: r?.id || null, code: r?.currency_code || FALLBACK_BASE_CODE };
 };
 
-module.exports = { BASE_CURRENCY_CODE_SQL, getBaseCurrency };
+// รหัสสกุลเงินหลัก สำหรับค่าเริ่มต้นตอนบันทึก (currency_code ว่าง) — cache 60 วินาทีต่อฐานข้อมูล
+// เพราะถูกเรียกต่อแถวในการนำเข้าไฟล์ (สกุลเงินหลักแทบไม่เปลี่ยนหลังเริ่มใช้งาน)
+const codeCache = new Map();
+const getBaseCurrencyCode = async (db) => {
+    const key = db.options?.database || db.database || db.connectionParameters?.database || '';
+    const hit = key && codeCache.get(key);
+    if (hit && hit.at > Date.now() - 60000) return hit.code;
+    const { code } = await getBaseCurrency(db);
+    if (key) codeCache.set(key, { code, at: Date.now() });
+    return code;
+};
+
+module.exports = { BASE_CURRENCY_CODE_SQL, getBaseCurrency, getBaseCurrencyCode };

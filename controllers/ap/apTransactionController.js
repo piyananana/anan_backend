@@ -1,4 +1,5 @@
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
+const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { branchCodeSql } = require('../../utils/taxBranch');
 const { today: todayYmd } = require('../../utils/dateUtil');
 // controllers/ap/apTransactionController.js
@@ -877,7 +878,7 @@ const postCmPaymentHelper = async (client, apTransactionId, glEntryId) => {
                 h.vendor_name_th || null,
                 pm.amount_lc   || 0,
                 pm.amount_fc   || 0,
-                h.currency_code || 'THB',
+                h.currency_code || await getBaseCurrencyCode(client),
                 h.exchange_rate || 1,
                 isCheck ? (pm.ref_no || null) : null,
                 isCheck ? (pm.payment_date || h.doc_date) : null,
@@ -1219,7 +1220,7 @@ const createTransaction = async (req, res) => {
         `, [
             header.doc_id, finalDocNo, header.doc_date, header.due_date || null, periodId,
             header.vendor_id, header.vendor_code || null, header.vendor_name_th || null,
-            header.ap_account_id || null, header.currency_id || null, header.currency_code || 'THB',
+            header.ap_account_id || null, header.currency_id || null, header.currency_code || await getBaseCurrencyCode(client),
             header.exchange_rate || 1,
             header.subtotal_fc || 0, header.discount_amount_fc || 0,
             header.before_vat_fc || 0, header.vat_amount_fc || 0, header.total_amount_fc || 0,
@@ -1397,7 +1398,7 @@ const updateTransaction = async (req, res) => {
         `, [
             header.doc_date, header.due_date || null, periodId,
             header.vendor_id, header.vendor_code || null, header.vendor_name_th || null,
-            header.ap_account_id || null, header.currency_id || null, header.currency_code || 'THB',
+            header.ap_account_id || null, header.currency_id || null, header.currency_code || await getBaseCurrencyCode(client),
             header.exchange_rate || 1,
             header.subtotal_fc || 0, header.discount_amount_fc || 0, header.before_vat_fc || 0,
             header.vat_amount_fc || 0, header.total_amount_fc || 0,

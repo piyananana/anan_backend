@@ -1,3 +1,4 @@
+const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 // controllers/ap/apVendorGroupController.js
 
 const formatGroupCode = (g) => {
@@ -105,7 +106,7 @@ const addRow = async (req, res) => {
                 (group_code || '').trim().toUpperCase(),
                 group_name_thai || '', group_name_eng || '', description || null,
                 credit_term_months ?? 0, credit_term_days ?? 30,
-                currency_code || 'THB',
+                currency_code || await getBaseCurrencyCode(req.dbPool),
                 ap_account_id || null,
                 is_auto_number ?? false,
                 (running_prefix || 'VEND').trim(),
@@ -162,7 +163,7 @@ const updateRow = async (req, res) => {
             [
                 group_name_thai || '', group_name_eng || '', description || null,
                 credit_term_months ?? 0, credit_term_days ?? 30,
-                currency_code || 'THB',
+                currency_code || await getBaseCurrencyCode(req.dbPool),
                 ap_account_id || null,
                 is_auto_number ?? false,
                 (running_prefix || 'VEND').trim(),

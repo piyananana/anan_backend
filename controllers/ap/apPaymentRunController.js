@@ -1,6 +1,7 @@
 // controllers/ap/apPaymentRunController.js
 
 const { generateNextRunNumber } = require('./apPaymentRunRunningController');
+const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 // คิวผู้อนุมัติเก็บที่ตารางกลาง doc_approval (utils/docApproval.js, doc_kind 'AP_PAYRUN') — ตาราง ap_payment_run_approval เดิมเลิกใช้แล้ว
 const DA = require('../../utils/docApproval');
 const KIND = 'AP_PAYRUN';
@@ -166,7 +167,7 @@ const createRun = async (req, res) => {
                  l.bank_name || null, l.bank_branch_name || null, l.account_number || null, l.account_name || null,
                  l.invoice_no, l.invoice_date || null, l.due_date || null,
                  l.invoice_amount_lc, l.payment_amount_lc,
-                 l.currency_code || 'THB', l.exchange_rate || 1, i]);
+                 l.currency_code || await getBaseCurrencyCode(client), l.exchange_rate || 1, i]);
         }
         await client.query('COMMIT');
         const full = await req.dbPool.query(`
@@ -227,7 +228,7 @@ const updateRun = async (req, res) => {
                  l.bank_name || null, l.bank_branch_name || null, l.account_number || null, l.account_name || null,
                  l.invoice_no, l.invoice_date || null, l.due_date || null,
                  l.invoice_amount_lc, l.payment_amount_lc,
-                 l.currency_code || 'THB', l.exchange_rate || 1, i]);
+                 l.currency_code || await getBaseCurrencyCode(client), l.exchange_rate || 1, i]);
         }
         await client.query('COMMIT');
         const full = await req.dbPool.query(`
@@ -516,7 +517,7 @@ const finalizeRun = async (req, res) => {
                 const vendor = vRes.rows[0];
                 if (!vendor) { errors.push({ vendor_id: vendorId, message: 'ไม่พบเจ้าหนี้' }); continue; }
 
-                const currencyCode = vLines[0].currency_code || 'THB';
+                const currencyCode = vLines[0].currency_code || await getBaseCurrencyCode(req.dbPool);
                 const currencyRes = await req.dbPool.query(
                     `SELECT id FROM cd_currency WHERE currency_code=$1 LIMIT 1`, [currencyCode]);
                 const totalLc = vLines.reduce((s, l) => s + parseFloat(l.payment_amount_lc || 0), 0);

@@ -4,6 +4,7 @@
 'use strict';
 
 const { ensureImItemTable } = require('./imItemController');
+const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { ensureImWarehouseTable } = require('./imWarehouseController');
 const { ensureImLocationTable } = require('./imLocationController');
 const { ensureImUomTable } = require('./imUomController');
@@ -936,7 +937,7 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
     // สกุลเงินของใบกำกับ AP ที่สร้างอัตโนมัติ ต้องตรงกับสกุลเงินจริงของ GRN ต้นทาง (header.currency_code/exchange_rate)
     // ไม่ hardcode 'THB'/1 อีกต่อไป — unit_cost (LC) ยังคงเป็นค่าที่ใช้จริงสำหรับ GL/subtotal_lc เสมอ (คำนวณไว้แล้ว
     // ตอนบันทึก GRN) ส่วน unit_cost_fc (ถ้ามี) คือราคาจริงในสกุลเงินผู้ขาย ใช้เติม subtotal_fc ให้ตรงกับใบกำกับจริง
-    const docCurrencyCode = header.currency_code || 'THB';
+    const docCurrencyCode = header.currency_code || await getBaseCurrencyCode(client);
     const docExchangeRate = Number(header.exchange_rate) || 1;
     const docCurrencyId = await resolveDocCurrencyId(client, header);
     const lineRows = [];
@@ -1129,7 +1130,7 @@ const postArBillFromDln = async (client, { header, details, docNo }) => {
 
     // สกุลเงินของเอกสาร AR = สกุลเงินของเอกสาร IM (ราคาขาย unit_price อยู่ในสกุลเงินนั้น) — ยอด LC = FC × อัตรา
     // ต่อบรรทัด ภาษีขายคิดจากฐานเงินบาท (subtotal LC × อัตราภาษี) ตามที่ต้องรายงานภาษี
-    const docCurrencyCode = header.currency_code || 'THB';
+    const docCurrencyCode = header.currency_code || await getBaseCurrencyCode(client);
     const docExchangeRate = Number(header.exchange_rate) || 1;
     const lineRows = [];
     let totalSubtotal = 0, totalVat = 0, totalSubtotalFc = 0, totalVatFc = 0;
@@ -1172,7 +1173,7 @@ const postArBillFromDln = async (client, { header, details, docNo }) => {
         totalSubtotal, totalVat, totalAmount,
         header.ref_no || null, header.doc_id, docNo, `ใบแจ้งหนี้จากการส่งสินค้า ${docNo}`, createdByUserId,
         (header.customer_po_no || '').toString().trim() || null, header.customer_po_date || null,
-        header.currency_id || null, docCurrencyCode, docExchangeRate, totalSubtotalFc, totalVatFc, totalAmountFc,
+        await resolveDocCurrencyId(client, header), docCurrencyCode, docExchangeRate, totalSubtotalFc, totalVatFc, totalAmountFc,
     ]);
     const arTransactionId = arHeaderRes.rows[0].id;
 
@@ -1319,7 +1320,7 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, mod
     }
 
     // มิเรอร์ postApBillFromGrn ทุกประการ — ดู comment เดียวกันที่นั่นเรื่อง docCurrencyCode/docExchangeRate
-    const docCurrencyCode = header.currency_code || 'THB';
+    const docCurrencyCode = header.currency_code || await getBaseCurrencyCode(client);
     const docExchangeRate = Number(header.exchange_rate) || 1;
     const docCurrencyId = await resolveDocCurrencyId(client, header);
     const lineRows = [];
@@ -1530,7 +1531,7 @@ const postArCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
 
     // สกุลเงินของเอกสาร AR = สกุลเงินของเอกสาร IM (ราคาขาย unit_price อยู่ในสกุลเงินนั้น) — ยอด LC = FC × อัตรา
     // ต่อบรรทัด ภาษีขายคิดจากฐานเงินบาท (subtotal LC × อัตราภาษี) ตามที่ต้องรายงานภาษี
-    const docCurrencyCode = header.currency_code || 'THB';
+    const docCurrencyCode = header.currency_code || await getBaseCurrencyCode(client);
     const docExchangeRate = Number(header.exchange_rate) || 1;
     const lineRows = [];
     let totalSubtotal = 0, totalVat = 0, totalSubtotalFc = 0, totalVatFc = 0;
@@ -1573,7 +1574,7 @@ const postArCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
         arAccountId,
         totalSubtotal, totalVat, totalAmount,
         header.ref_no || null, header.doc_id, docNo, `${label} (${docNo})`, createdByUserId,
-        header.currency_id || null, docCurrencyCode, docExchangeRate, totalSubtotalFc, totalVatFc, totalAmountFc,
+        await resolveDocCurrencyId(client, header), docCurrencyCode, docExchangeRate, totalSubtotalFc, totalVatFc, totalAmountFc,
     ]);
     const arTransactionId = arHeaderRes.rows[0].id;
 
@@ -2282,7 +2283,7 @@ const insertAndPostAdjustment = async (client, {
         resolvedDocId, finalDocNo, resolvedDocCode, docDate, periodId, warehouseId, toWarehouseId || null,
         vendorId || null, vendorCode, vendorNameTh, customerId || null, customerCode, customerNameTh,
         refNo || null, refDocId || null, refDocNo || null, refImTransactionId || null, refPoId || null, refSoId || null, description || null, 'Draft',
-        currencyId || null, currencyCode || 'THB', exchangeRate || 1,
+        currencyId || null, currencyCode || await getBaseCurrencyCode(client), exchangeRate || 1,
         dim1Id || null, dim2Id || null, dim3Id || null, dim4Id || null, dim5Id || null,
         branchId || null, createdBy || null, refMoId || null,
         (customerPoNo || '').trim() || null, customerPoDate || null,
@@ -2321,7 +2322,7 @@ const insertAndPostAdjustment = async (client, {
             vendor_id: vendorId || null, customer_id: customerId || null,
             ref_no: refNo, description,
             customer_po_no: customerPoNo || null, customer_po_date: customerPoDate || null,
-            currency_id: currencyId || null, currency_code: currencyCode || 'THB', exchange_rate: exchangeRate || 1,
+            currency_id: currencyId || null, currency_code: currencyCode || await getBaseCurrencyCode(client), exchange_rate: exchangeRate || 1,
             dim1_id: dim1Id, dim2_id: dim2Id, dim3_id: dim3Id, dim4_id: dim4Id, dim5_id: dim5Id,
             branch_id: branchId, created_by: createdBy, updated_by: createdBy,
             gl_doc_no: glDocNo || null,
@@ -2573,7 +2574,7 @@ const updateTransaction = async (req, res) => {
             header.customer_id || null, customerCode, customerNameTh,
             header.ref_no || null, header.ref_doc_id || null, header.ref_doc_no || null,
             header.ref_im_transaction_id || null, header.ref_po_id || null, header.ref_so_id || null, header.description || null,
-            header.currency_id || null, header.currency_code || 'THB', header.exchange_rate || 1,
+            header.currency_id || null, header.currency_code || await getBaseCurrencyCode(client), header.exchange_rate || 1,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
             header.branch_id || null, header.updated_by || null, id, header.ref_mo_id || null,
             (header.customer_po_no || '').trim() || null, header.customer_po_date || null,

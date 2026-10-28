@@ -11,6 +11,7 @@
 'use strict';
 
 const { generateDocNo, ensureImTransactionTable } = require('../im/imTransactionController');
+const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { reasonOf, userIdOf, sendErr, blk } = require('../../utils/docAction');
 const { ensureSalespersonTable, saveDocSalespersons, loadSalespersons } = require('../../utils/docSalesperson');
@@ -220,7 +221,7 @@ const createTransaction = async (req, res) => {
             RETURNING id
         `, [
             header.doc_id, docNo, docCode, header.doc_date, header.customer_id, customer.customer_code, customer.customer_name_th,
-            header.warehouse_id, header.currency_id || null, header.currency_code || 'THB', header.exchange_rate || 1,
+            header.warehouse_id, header.currency_id || null, header.currency_code || await getBaseCurrencyCode(client), header.exchange_rate || 1,
             header.due_date || null, header.description || null, header.ref_quote_id || null,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
             header.branch_id || null, header.created_by || null,
@@ -304,7 +305,7 @@ const updateTransaction = async (req, res) => {
             WHERE id=$18
         `, [
             header.doc_date, header.customer_id, customer.customer_code, customer.customer_name_th, header.warehouse_id,
-            header.currency_id || null, header.currency_code || 'THB', header.exchange_rate || 1,
+            header.currency_id || null, header.currency_code || await getBaseCurrencyCode(client), header.exchange_rate || 1,
             header.due_date || null, header.description || null,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
             header.branch_id || null, header.updated_by || null, id,

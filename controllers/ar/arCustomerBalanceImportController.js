@@ -1,5 +1,6 @@
 // controllers/ar/arCustomerBalanceImportController.js
 const XLSX = require('xlsx');
+const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const multer = require('multer');
 
 const upload = multer({ storage: multer.memoryStorage() });
@@ -19,7 +20,7 @@ const TEMPLATE_SHEET = {
     { key: 'doc_no', label: 'เลขที่เอกสาร (ไม่เกิน 30 ตัวอักษร)', required: true, example: 'INV-2025-001234' },
     { key: 'doc_date', label: 'วันที่เอกสาร (YYYY-MM-DD)', required: true, example: '2025-12-15' },
     { key: 'due_date', label: 'วันครบกำหนด (ว่าง = คำนวณจากเครดิตของลูกหนี้)', required: false, example: '2026-01-14' },
-    { key: 'currency_code', label: 'สกุลเงิน (ว่าง = THB)', required: false, example: 'THB' },
+    { key: 'currency_code', label: 'สกุลเงิน (ว่าง = สกุลเงินหลัก)', required: false, example: 'THB' },
     { key: 'exchange_rate', label: 'อัตราแลกเปลี่ยน (ว่าง = 1)', required: false, example: '1' },
     { key: 'amount', label: 'ยอดคงเหลือ', required: true, example: '50000' },
     { key: 'description', label: 'คำอธิบาย/หมายเหตุ', required: false, example: 'ยอดยกมาจากระบบเดิม' },
@@ -216,7 +217,7 @@ const validateFile = [
 
         // currency_code
         const currencyCodeRaw = getStr('currency_code').toUpperCase();
-        const currencyCode = currencyCodeRaw || 'THB';
+        const currencyCode = currencyCodeRaw || await getBaseCurrencyCode(req.dbPool);
         let currencyId = null;
         const resolvedCurrency = currencyMap[currencyCode];
         if (resolvedCurrency) {
@@ -389,7 +390,7 @@ const confirmImport = async (req, res) => {
           [
             r.doc_id, trunc(r.doc_no, 30), r.doc_date, r.due_date || null, periodId,
             r.customer_id, trunc(r.customer_code, 20), trunc(r.customer_name_th, 200),
-            r.ar_account_id || null, r.currency_id || null, trunc(r.currency_code, 10) || 'THB', exchangeRate,
+            r.ar_account_id || null, r.currency_id || null, trunc(r.currency_code, 10) || await getBaseCurrencyCode(client), exchangeRate,
             amount,
             amountLc,
             trunc(r.description, 500),

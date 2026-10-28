@@ -1,5 +1,6 @@
 // controllers/gl/glOpeningBalanceImportController.js
 const XLSX = require('xlsx');
+const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const multer = require('multer');
 
 const upload = multer({ storage: multer.memoryStorage() });
@@ -55,7 +56,7 @@ const HEADER_COLUMNS = [
   { key: 'ref_no',        label: 'เลขที่อ้างอิง/หมายเหตุอ้างอิง',                     required: false, example: 'เปิดยอดระบบใหม่' },
   { key: 'description',   label: 'คำอธิบาย',                                          required: false, example: 'ยอดยกมา ณ 1 ม.ค. 2569' },
   { key: 'branch_code',   label: 'รหัสสาขา (ว่าง = ไม่ระบุ)',                          required: false, example: '00' },
-  { key: 'currency_code', label: 'สกุลเงิน (ว่าง = THB)',                              required: false, example: 'THB' },
+  { key: 'currency_code', label: 'สกุลเงิน (ว่าง = สกุลเงินหลัก)',                              required: false, example: 'THB' },
   { key: 'exchange_rate', label: 'อัตราแลกเปลี่ยน (ว่าง = base rate ของสกุลเงิน)',     required: false, example: '1' },
 ];
 
@@ -464,7 +465,7 @@ const validateFile = [
 
         // currency_code
         const currencyCodeRaw = get('currency_code');
-        const currencyCode = (currencyCodeRaw || 'THB').toUpperCase();
+        const currencyCode = (currencyCodeRaw || await getBaseCurrencyCode(req.dbPool)).toUpperCase();
         const currency = currencyMap[currencyCode];
         let currencyId = null;
         if (!currency) {

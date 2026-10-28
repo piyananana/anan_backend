@@ -1,6 +1,7 @@
 // controllers/cm/cmPostDatedCheckController.js
 'use strict';
 const { checkCmPeriodOpen } = require('./cmPeriodCheckHelper');
+const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { ymd, today } = require('../../utils/dateUtil');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 
@@ -171,7 +172,7 @@ const createRow = async (req, res) => {
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'Holding',$11,$12)
             RETURNING *`,
             [direction, check_no, check_date, bank_id || null, payee_payer_name || null,
-             amount, currency_code || 'THB', our_bank_account_id || null,
+             amount, currency_code || await getBaseCurrencyCode(client), our_bank_account_id || null,
              linked_receipt_id || null, linked_payment_id || null, notes || null, createdBy]);
         res.status(201).json(r.rows[0]);
     } catch (err) { res.status(500).json({ error: err.message }); }

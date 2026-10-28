@@ -1,5 +1,6 @@
 // controllers/gl/glAccountImportController.js
 const XLSX = require('xlsx');
+const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const multer = require('multer');
 
 const upload = multer({ storage: multer.memoryStorage() });
@@ -16,7 +17,7 @@ const TEMPLATE_COLUMNS = [
   { key: 'normal_balance',       label: 'ยอดดุลปกติ (DR/CR)',                                          required: true,  example: 'DR' },
   { key: 'is_normal_account',    label: 'หัวบัญชี (Y/N, ว่าง=Y; N=บัญชีรวม/หัวข้อ ลงรายการไม่ได้)',     required: false, example: 'Y' },
   { key: 'is_control_account',   label: 'บัญชีคุมยอด (Y/N, ว่าง=N)',                                   required: false, example: 'N' },
-  { key: 'currency_code',        label: 'สกุลเงิน (ว่าง=THB)',                                         required: false, example: 'THB' },
+  { key: 'currency_code',        label: 'สกุลเงิน (ว่าง = สกุลเงินหลัก)',                                         required: false, example: 'THB' },
   { key: 'branch_required',      label: 'บังคับระบุสาขา (Y/N, ว่าง=N)',                                required: false, example: 'N' },
   { key: 'is_active',            label: 'ใช้งาน (Y/N, ว่าง=Y)',                                        required: false, example: 'Y' },
   { key: 'dim_required_types',   label: 'มิติที่บังคับกรอก คั่นด้วย , (รหัสจาก gl_dimension_type)',     required: false, example: 'BU,PROJECT' },
@@ -221,7 +222,7 @@ const validateFile = [
 
         // currency_code
         const currencyCodeRaw = get('currency_code').toUpperCase();
-        const currencyCode = currencyCodeRaw || 'THB';
+        const currencyCode = currencyCodeRaw || await getBaseCurrencyCode(req.dbPool);
         if (currencyCodeRaw && !currencySet.has(currencyCodeRaw)) {
           rowErrors.push({ column: 'currency_code', message: `ไม่พบสกุลเงิน "${currencyCodeRaw}"` });
         }
@@ -357,7 +358,7 @@ const confirmImport = async (req, res) => {
               trunc(r.account_code, 50), trunc(r.account_name_thai, 255), trunc(r.account_name_eng, 255),
               parentId, r.account_type,
               r.normal_balance, r.is_normal_account ?? true, r.is_control_account ?? false,
-              trunc(r.currency_code, 3) || 'THB',
+              trunc(r.currency_code, 3) || await getBaseCurrencyCode(client),
               r.branch_required ?? false,
               r.is_active ?? true, userName,
             ]

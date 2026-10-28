@@ -1,3 +1,4 @@
+const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 // controllers/cm/cmBankAccountController.js
 //
 // DDL:
@@ -99,7 +100,7 @@ const createRow = async (req, res) => {
         account_code, account_name_th, account_name_en || null,
         bank_id || null, account_number || null,
         account_type || 'SAVING',
-        cm_type || 'BANK', currency_code || 'THB', is_check_account ?? false,
+        cm_type || 'BANK', currency_code || await getBaseCurrencyCode(req.dbPool), is_check_account ?? false,
         gl_account_id || null, is_active ?? true, remark || null, userId
       ]
     );
@@ -135,7 +136,7 @@ const updateRow = async (req, res) => {
         account_code, account_name_th, account_name_en || null,
         bank_id || null, account_number || null,
         account_type || 'SAVING',
-        cm_type || 'BANK', currency_code || 'THB', is_check_account ?? false,
+        cm_type || 'BANK', currency_code || await getBaseCurrencyCode(req.dbPool), is_check_account ?? false,
         gl_account_id || null, is_active ?? true, remark || null, userId, id
       ]
     );

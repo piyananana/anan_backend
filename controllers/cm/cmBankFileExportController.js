@@ -1,5 +1,6 @@
 // controllers/cm/cmBankFileExportController.js
 const { ymd } = require('../../utils/dateUtil');
+const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 'use strict';
 
 // GET: payments available to export for a bank account
@@ -74,7 +75,8 @@ const generateFile = async (req, res) => {
             lines.push(headerParts.join(delimiter));
         }
 
-        // Data rows
+        // Data rows — สกุลเงินว่าง = สกุลเงินหลัก (โหลดครั้งเดียวก่อนวน เพราะ columns.map ไม่ใช่ async)
+        const baseCode = await getBaseCurrencyCode(client);
         for (const p of payments) {
             const parts = columns.map(col => {
                 let val = '';
@@ -92,7 +94,7 @@ const generateFile = async (req, res) => {
                     case 'ap_doc_no':        val = p.ap_doc_no || ''; break;
                     case 'bank_code':        val = p.bank_code_ref || ''; break;
                     case 'bank_short_name':  val = p.bank_short_name || ''; break;
-                    case 'currency_code':    val = p.currency_code || 'THB'; break;
+                    case 'currency_code':    val = p.currency_code || baseCode; break;
                     case 'bank_account_code': val = p.bank_account_code || ''; break;
                     case 'bank_own_account_no': val = p.bank_own_account_no || ''; break;
                     default: val = p[field] !== undefined && p[field] !== null ? String(p[field]) : '';

@@ -1,6 +1,7 @@
 // controllers/ap/apBulkPaymentController.js
 'use strict';
 const { checkCmPeriodOpen } = require('../cm/cmPeriodCheckHelper');
+const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 
 // GET eligible AP invoices for bulk payment
 // Returns posted ap_transaction rows (Purchase Invoice / Debit Note) with an outstanding balance
@@ -180,7 +181,7 @@ const runBulkPayment = async (req, res) => {
                 RETURNING id`,
                 [payment_date, bank_account_id, payment_method || 'TRANSFER', apDoc.doc_no,
                  apDoc.vendor_id, apDoc.v_vendor_code, apDoc.vendor_name_th,
-                 payAmt, apDoc.currency_code || 'THB', glEntryId, createdByUserId]);
+                 payAmt, apDoc.currency_code || await getBaseCurrencyCode(client), glEntryId, createdByUserId]);
 
             await client.query(`
                 UPDATE ap_transaction SET

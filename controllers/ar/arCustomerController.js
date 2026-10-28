@@ -1,5 +1,6 @@
 // controllers/ar/arCustomerController.js
 const { generateNextCode } = require('./arCustomerRunningController');
+const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { generateNextCodeForGroup } = require('./arCustomerGroupController');
 // price_list_id แยกจาก customer_group_id (นโยบายบัญชี/เครดิต) โดยสิ้นเชิง — คือรหัสตารางราคา (im_price_list) ที่
 // ลูกค้ารายนี้ใช้ ลูกค้าแต่ละรายใช้ได้รหัสเดียวเท่านั้น (ดู resolveItemPrice ใน imPriceListController.js) — ไม่ใช่
@@ -301,7 +302,7 @@ const addRow = async (req, res) => {
         business_type_id || null, customer_group_id || null, price_list_id || null,
         credit_term_months ?? 0, credit_term_days ?? 30,
         credit_limit ?? 0, discount_percent ?? 0,
-        currency_code || 'THB',
+        currency_code || await getBaseCurrencyCode(client),
         is_active !== undefined ? is_active : true,
         remark || null,
         requires_billing ?? false,
@@ -406,7 +407,7 @@ const updateRow = async (req, res) => {
         business_type_id || null, customer_group_id || null, price_list_id || null,
         credit_term_months ?? 0, credit_term_days ?? 30,
         credit_limit ?? 0, discount_percent ?? 0,
-        currency_code || 'THB', is_active,
+        currency_code || await getBaseCurrencyCode(client), is_active,
         remark || null,
         requires_billing ?? false,
         ar_account_id ?? null,

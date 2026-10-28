@@ -1,5 +1,6 @@
 // controllers/ap/apVendorController.js
 const { generateNextCode } = require('./apVendorRunningController');
+const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 // price_list_id แยกจาก vendor_group_id (นโยบายบัญชี/เครดิต) โดยสิ้นเชิง — คือรหัสตารางราคา (im_price_list) ที่
 // ผู้ขายรายนี้ใช้ ผู้ขายแต่ละรายใช้ได้รหัสเดียวเท่านั้น (ดู resolveItemPrice ใน imPriceListController.js) มิเรอร์
 // ar_customer price_list_id ทุกประการ
@@ -235,7 +236,7 @@ const addRow = async (req, res) => {
         business_type_id || null,
         vendor_type || null,
         credit_term_months ?? 0, credit_term_days ?? 30, credit_limit ?? 0,
-        currency_code || 'THB',
+        currency_code || await getBaseCurrencyCode(client),
         is_active !== undefined ? is_active : true,
         remark || null,
         ap_account_id ?? null,
@@ -336,7 +337,7 @@ const updateRow = async (req, res) => {
         vendor_type || null,
         credit_term_months ?? 0, credit_term_days ?? 30,
         credit_limit ?? 0,
-        currency_code || 'THB', is_active,
+        currency_code || await getBaseCurrencyCode(client), is_active,
         remark || null,
         ap_account_id ?? null,
         payment_method_id ?? null,

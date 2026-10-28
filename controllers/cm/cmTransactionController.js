@@ -9,6 +9,7 @@
 // postCmPaymentHelper ใน apTransactionController.js) จึงไม่ผ่าน createTransaction/postGlEntry เลย
 
 const { today: todayYmd } = require('../../utils/dateUtil');
+const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 
 // --- Helper: Generate Document Number (คัดลอกจาก apTransactionController.js) ---
@@ -667,7 +668,7 @@ const createTransaction = async (req, res) => {
             header.from_bank_account_id || null, header.to_bank_account_id || null,
             header.bank_account_id || null, header.gl_account_id || null,
             header.charge_type || null, header.counterparty_name || null,
-            header.currency_id || null, header.currency_code || 'THB', header.exchange_rate || 1,
+            header.currency_id || null, header.currency_code || await getBaseCurrencyCode(client), header.exchange_rate || 1,
             header.total_amount_fc || 0, header.total_amount_lc || 0,
             0, header.total_amount_lc || 0,
             header.ref_no || null, header.ref_doc_id || null, header.ref_doc_no || null,
@@ -775,7 +776,7 @@ const updateTransaction = async (req, res) => {
             header.from_bank_account_id || null, header.to_bank_account_id || null,
             header.bank_account_id || null, header.gl_account_id || null,
             header.charge_type || null, header.counterparty_name || null,
-            header.currency_id || null, header.currency_code || 'THB', header.exchange_rate || 1,
+            header.currency_id || null, header.currency_code || await getBaseCurrencyCode(client), header.exchange_rate || 1,
             header.total_amount_fc || 0, header.total_amount_lc || 0,
             header.ref_no || null, header.ref_doc_id || null, header.ref_doc_no || null, header.description || null,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null,

@@ -1,5 +1,6 @@
 // controllers/cm/cmPaymentController.js
 const { today } = require('../../utils/dateUtil');
+const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { checkCmPeriodOpen } = require('./cmPeriodCheckHelper');
 'use strict';
@@ -210,7 +211,7 @@ const createPayment = async (req, res) => {
                 body.payee_name_th || null,
                 body.amount_lc    || 0,
                 body.amount_fc    || 0,
-                body.currency_code || 'THB',
+                body.currency_code || await getBaseCurrencyCode(client),
                 body.exchange_rate || 1,
                 checkNo,
                 body.check_date || null,

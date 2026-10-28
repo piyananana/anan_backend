@@ -1,5 +1,6 @@
 // controllers/ar/arTransactionController.js
 const { today: todayYmd } = require('../../utils/dateUtil');
+const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { branchCodeSql } = require('../../utils/taxBranch');
 const { ensureSalespersonTable, saveDocSalespersons, loadSalespersons } = require('../../utils/docSalesperson');
@@ -304,7 +305,7 @@ const postCmReceiptsHelper = async (client, arTransactionId, glEntryId) => {
                 h.customer_name_th || null,
                 pm.amount_lc   || 0,
                 pm.amount_fc   || 0,
-                h.currency_code || 'THB',
+                h.currency_code || await getBaseCurrencyCode(client),
                 h.exchange_rate || 1,
                 isCheck ? (pm.ref_no || null) : null,
                 isCheck ? (pm.payment_date || h.doc_date) : null,
@@ -1167,7 +1168,7 @@ const createTransaction = async (req, res) => {
         const hRes = await client.query(headerSql, [
             header.doc_id, finalDocNo, header.doc_date, header.due_date || null, periodId,
             header.customer_id, header.customer_code || null, header.customer_name_th || null,
-            header.ar_account_id || null, header.currency_id || null, header.currency_code || 'THB',
+            header.ar_account_id || null, header.currency_id || null, header.currency_code || await getBaseCurrencyCode(client),
             header.exchange_rate || 1,
             header.subtotal_fc || 0, header.discount_amount_fc || 0,
             header.before_vat_fc || 0, header.vat_amount_fc || 0, header.total_amount_fc || 0,
@@ -1352,7 +1353,7 @@ const updateTransaction = async (req, res) => {
             WHERE id=$33
         `, [
             header.doc_date, header.due_date || null, periodId,
-            header.ar_account_id || null, header.currency_id || null, header.currency_code || 'THB',
+            header.ar_account_id || null, header.currency_id || null, header.currency_code || await getBaseCurrencyCode(client),
             header.exchange_rate || 1,
             header.subtotal_fc || 0, header.discount_amount_fc || 0,
             header.before_vat_fc || 0, header.vat_amount_fc || 0, header.total_amount_fc || 0,

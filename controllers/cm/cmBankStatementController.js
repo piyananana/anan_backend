@@ -1,6 +1,7 @@
 // controllers/cm/cmBankStatementController.js
 'use strict';
 const { ymd } = require('../../utils/dateUtil');
+const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 
 const ensureTables = async (client) => {
@@ -196,7 +197,7 @@ const createRow = async (req, res) => {
                 body.statement_date_to,
                 body.opening_balance || 0,
                 body.closing_balance || 0,
-                body.currency_code  || 'THB',
+                body.currency_code  || await getBaseCurrencyCode(client),
                 body.file_name      || null,
                 body.notes          || null,
                 createdBy,

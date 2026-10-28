@@ -10,6 +10,7 @@
 'use strict';
 
 const { generateDocNo } = require('../im/imTransactionController');
+const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { reasonOf, userIdOf, sendErr, blk } = require('../../utils/docAction');
 const DA = require('../../utils/docApproval');
@@ -215,7 +216,7 @@ const createTransaction = async (req, res) => {
         `, [
             header.doc_id, docNo, docCode, header.doc_date, header.requested_by || userId || null,
             header.vendor_id || null, vendorCode, vendorNameTh, header.warehouse_id || null,
-            header.currency_id || null, header.currency_code || 'THB', header.exchange_rate || 1,
+            header.currency_id || null, header.currency_code || await getBaseCurrencyCode(client), header.exchange_rate || 1,
             header.description || null,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
             header.branch_id || null, userName,
@@ -280,7 +281,7 @@ const updateTransaction = async (req, res) => {
         `, [
             header.doc_date, header.vendor_id || null, vendorCode, vendorNameTh, header.warehouse_id || null,
             header.description || null,
-            header.currency_id || null, header.currency_code || 'THB', header.exchange_rate || 1,
+            header.currency_id || null, header.currency_code || await getBaseCurrencyCode(client), header.exchange_rate || 1,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
             header.branch_id || null, userName, id,
         ]);

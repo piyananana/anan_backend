@@ -1,5 +1,6 @@
 // controllers/ar/arCustomerImportController.js
 const XLSX = require('xlsx');
+const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const multer = require('multer');
 const { generateNextCode } = require('./arCustomerRunningController');
 const { generateNextCodeForGroup } = require('./arCustomerGroupController');
@@ -31,7 +32,7 @@ const TEMPLATE_SHEETS = [
       { key: 'credit_term_days',   label: 'เครดิต (วัน)',                           required: false, example: '30' },
       { key: 'credit_limit',       label: 'วงเงินเครดิต',                          required: false, example: '100000' },
       { key: 'discount_percent',   label: 'ส่วนลด %',                              required: false, example: '5' },
-      { key: 'currency_code',      label: 'สกุลเงิน',                              required: false, example: 'THB' },
+      { key: 'currency_code',      label: 'สกุลเงิน (ว่าง = สกุลเงินหลัก)',                              required: false, example: 'THB' },
       { key: 'is_active',          label: 'ใช้งาน (Y/N)',                          required: false, example: 'Y' },
       { key: 'requires_billing',   label: 'ต้องวางบิลก่อนรับชำระ (Y/N)',           required: false, example: 'N' },
       { key: 'remark',             label: 'หมายเหตุ',                              required: false, example: '' },
@@ -352,7 +353,7 @@ const validateFile = [
 
         // currency_code (ถ้าระบุ ต้องมีในระบบ)
         const currencyCodeRaw = get('currency_code').toUpperCase();
-        const currencyCode = currencyCodeRaw || 'THB';
+        const currencyCode = currencyCodeRaw || await getBaseCurrencyCode(req.dbPool);
         if (currencyCodeRaw && currencySet.size > 0 && !currencySet.has(currencyCodeRaw)) {
           rowErrors.push({ column: 'currency_code', message: `ไม่พบสกุลเงิน "${currencyCodeRaw}"` });
         }
@@ -815,7 +816,7 @@ const confirmImport = async (req, res) => {
             r.business_type_id || null, r.customer_group_id || null,
             r.credit_term_months ?? 0, r.credit_term_days ?? 30,
             r.credit_limit ?? 0, r.discount_percent ?? 0,
-            trunc(r.currency_code, 10) || 'THB',
+            trunc(r.currency_code, 10) || await getBaseCurrencyCode(client),
             r.is_active !== undefined ? r.is_active : true,
             trunc(r.remark, 500),
             r.requires_billing ?? false,
