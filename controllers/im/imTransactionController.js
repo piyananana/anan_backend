@@ -680,6 +680,8 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
         // GRN — รับสินค้า (ไม่มีเลขที่อ้างอิง) / '13' รับฝากขาย: Dr คลัง (Perpetual) หรือ Dr ซื้อสินค้า (Periodic) /
         // Cr พักรอใบกำกับ (GR/IR) หรือ Cr เจ้าหนี้ฝากขาย แล้วแต่ sys_doc_type (ดู resolveCounterAccount) ทั้งสองโหมด
         // Post ที่นี่เสมอ (ต่างจาก AJS/ISS/TRF ที่ถูกระงับใน Periodic) เพราะเป็นการรับของจริงที่ต้องขยับทันที
+        // บัญชีคู่ (GR/IR / เจ้าหนี้ฝากขาย) ตั้งตามราคาซื้อที่กรอก (entered_unit_cost) เพื่อให้ล้างกับใบตั้งหนี้ AP ได้พอดี
+        // ส่วนคลังใช้มูลค่าสต็อก (STANDARD = ต้นทุนมาตรฐาน) — ส่วนต่างลงบัญชีผลต่างต้นทุน (Periodic: Dr ซื้อ = ราคาซื้อ ไม่มีผลต่าง)
         const { accountId: counterAccountId, label: counterLabel } = resolveCounterAccount(sysDocType, setup);
         let purchasesAccountId = null;
         if (mode === 'PERIODIC') {
@@ -689,12 +691,23 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
             }
             purchasesAccountId = Number(setting.purchases_account_id);
         }
-        let totalValue = 0;
+        let totalValue = 0, grirVarianceLc = 0;
         for (const d of details) {
             const invAcc = purchasesAccountId || await resolveInventoryAccount(client, d.item_id, header.warehouse_id, setup.inventory_account_id);
-            const value = round2(Number(d.qty) * Number(d.unit_cost));
-            invDebitByAccount[invAcc] = (invDebitByAccount[invAcc] || 0) + value;
+            const priceLc = d.is_free ? 0 : Number(d.entered_unit_cost ?? d.unit_cost);
+            const value = round2(Number(d.qty) * priceLc);
+            const stockValue = purchasesAccountId ? value : round2(Number(d.qty) * Number(d.unit_cost));
+            invDebitByAccount[invAcc] = (invDebitByAccount[invAcc] || 0) + stockValue;
             totalValue += value;
+            grirVarianceLc += value - stockValue;
+        }
+        grirVarianceLc = round2(grirVarianceLc);
+        if (grirVarianceLc !== 0) {
+            if (!setup.variance_account_id) {
+                throw new Error(`ราคาซื้อต่างจากต้นทุนสต็อก ${grirVarianceLc.toFixed(2)} บาท — กรุณาตั้งค่าบัญชีผลต่างต้นทุน (variance_account_id) ใน im_gl_account_setup สำหรับ ${header.doc_code}`);
+            }
+            const vAcc = Number(setup.variance_account_id);
+            invDebitByAccount[vAcc] = (invDebitByAccount[vAcc] || 0) + grirVarianceLc;
         }
         for (const [accId, amt] of Object.entries(invDebitByAccount)) {
             if (amt === 0) continue;
@@ -919,11 +932,15 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
         const unitCostFc = d.unit_cost_fc != null ? Number(d.unit_cost_fc) : unitCostLc;
         const amountLc = round2(qty * unitCostLc);
         const amountFc = round2(qty * unitCostFc);
+        // '12' Post AP/GL: d.unit_cost = ราคาตามใบกำกับ, d.stock_unit_cost = ต้นทุนที่ตีมูลค่าสต็อกไปแล้วตอนรับ —
+        // Dr สินค้าคงคลังที่มูลค่าสต็อกจริงเพื่อให้ GL ตรงกับ IM ส่วนต่างลงบัญชีผลต่าง ('11' ไม่ส่งมา = ไม่มีผลต่าง;
+        // Periodic ลงบัญชีซื้อตามใบกำกับเต็มจำนวนเพราะไม่มีการตีมูลค่าสต็อกต่อธุรกรรม)
+        const stockValueLc = (purchasesAccountId || d.stock_unit_cost == null) ? amountLc : round2(qty * Number(d.stock_unit_cost));
         const vatType = d.vat_type || 'NOVAT';
         const vatRate = vatType === 'NOVAT' ? 0 : (Number(d.vat_rate) || 0);
         const vatAmountLc = round2(amountLc * vatRate / 100);
         const vatAmountFc = round2(amountFc * vatRate / 100);
-        lineRows.push({ itemCode: d.item_code, itemName: d.item_name, quantity: qty, unitPriceFc: unitCostFc, amountLc, amountFc, expenseAccountId, vatType, vatRate, vatAmountLc, vatAmountFc });
+        lineRows.push({ itemCode: d.item_code, itemName: d.item_name, quantity: qty, unitPriceFc: unitCostFc, amountLc, amountFc, stockValueLc, expenseAccountId, vatType, vatRate, vatAmountLc, vatAmountFc });
         totalAmountLc += amountLc; totalVatLc += vatAmountLc;
         totalAmountFc += amountFc; totalVatFc += vatAmountFc;
     }
@@ -969,13 +986,27 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
     // GL posting (Dr ค่าใช้จ่าย/VAT ซื้อ, Cr เจ้าหนี้) เป็น LC เสมอ ไม่แตะ — มิเรอร์ postGlEntry ทุกประการ (ดู plan:
     // ไม่เปลี่ยน GL posting logic เลย เพราะ amountLc ถูกแปลงมาถูกต้องแล้วตั้งแต่ตอนบันทึก GRN)
     const expDebitByAccount = {};
+    let varianceLc = 0; // ราคาตามใบกำกับ - มูลค่าสต็อกตอนรับ (บวก = ใบกำกับแพงกว่า → Dr ผลต่าง)
     for (const l of lineRows) {
-        expDebitByAccount[l.expenseAccountId] = (expDebitByAccount[l.expenseAccountId] || 0) + l.amountLc;
+        expDebitByAccount[l.expenseAccountId] = (expDebitByAccount[l.expenseAccountId] || 0) + l.stockValueLc;
+        varianceLc += l.amountLc - l.stockValueLc;
     }
+    varianceLc = round2(varianceLc);
     const apGlDetails = [];
     for (const [accId, amt] of Object.entries(expDebitByAccount)) {
         if (amt === 0) continue;
         apGlDetails.push({ account_id: Number(accId), description: `ใบกำกับสินค้า ${apDocNo}`, debit_lc: round2(amt), credit_lc: 0 });
+    }
+    if (varianceLc !== 0) {
+        const varRes = await client.query(`SELECT variance_account_id FROM im_gl_account_setup WHERE doc_code = $1`, [header.doc_code]);
+        const varianceAccountId = Number(varRes.rows[0]?.variance_account_id) || null;
+        if (!varianceAccountId) {
+            throw new Error(`ราคาตามใบกำกับต่างจากต้นทุนตอนรับสินค้า ${varianceLc.toLocaleString('en-US', { minimumFractionDigits: 2 })} บาท — กรุณาตั้งค่าบัญชีผลต่างต้นทุน (variance_account_id) ใน ตั้งค่าบัญชี IM สำหรับประเภทเอกสาร ${header.doc_code}`);
+        }
+        apGlDetails.push({
+            account_id: varianceAccountId, description: `ผลต่างราคาใบกำกับ/ต้นทุนรับสินค้า ${apDocNo}`,
+            debit_lc: varianceLc > 0 ? varianceLc : 0, credit_lc: varianceLc < 0 ? -varianceLc : 0,
+        });
     }
     if (totalVatLc !== 0) {
         if (!vatAccountId) throw new Error('ยังไม่ได้ตั้งค่าบัญชี VAT ซื้อ (vat_input_account_id) ใน im_gl_account_setup หรือ ap_gl_account_setup');
@@ -1249,15 +1280,20 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, mod
         const expenseAccountId = purchasesAccountId
             || await resolveInventoryAccount(client, d.item_id, header.warehouse_id, apSetup.expense_account_id);
         const qty = Math.abs(Number(d.qty) || 0); // qty ติดลบสำหรับ CN (สต็อกลด) บวกสำหรับ DN — เอกสาร AP ต้องเป็นจำนวนบวกเสมอ
-        const unitCostLc = Number(d.unit_cost);
-        const unitCostFc = d.unit_cost_fc != null ? Number(d.unit_cost_fc) : unitCostLc;
+        // ยอดใบลดหนี้/เพิ่มหนี้ = ราคาที่ผู้ใช้กรอก (unit_cost_fc × อัตราแลกเปลี่ยน) ไม่ใช่ต้นทุนที่ตัดจากสต็อก —
+        // d.unit_cost ถูก postDetailLines เขียนทับเป็นต้นทุนสต็อกจริงแล้ว (ใช้เป็นมูลค่าสินค้าคงคลังด้านล่าง)
+        const stockCostLc = Number(d.unit_cost) || 0;
+        const unitCostFc = d.unit_cost_fc != null ? Number(d.unit_cost_fc) : stockCostLc;
+        const unitCostLc = d.unit_cost_fc != null ? Number(d.unit_cost_fc) * docExchangeRate : stockCostLc;
         const amountLc = round2(qty * unitCostLc);
         const amountFc = round2(qty * unitCostFc);
+        // Periodic: บัญชีซื้อรับรู้ตามราคาเอกสาร ไม่มีการตีมูลค่าสต็อกต่อธุรกรรม จึงไม่มีผลต่าง
+        const stockValueLc = purchasesAccountId ? amountLc : round2(qty * stockCostLc);
         const vatType = d.vat_type || 'NOVAT';
         const vatRate = vatType === 'NOVAT' ? 0 : (Number(d.vat_rate) || 0);
         const vatAmountLc = round2(amountLc * vatRate / 100);
         const vatAmountFc = round2(amountFc * vatRate / 100);
-        lineRows.push({ itemCode: d.item_code, itemName: d.item_name, quantity: qty, unitPriceFc: unitCostFc, amountLc, amountFc, expenseAccountId, vatType, vatRate, vatAmountLc, vatAmountFc });
+        lineRows.push({ itemCode: d.item_code, itemName: d.item_name, quantity: qty, unitPriceFc: unitCostFc, amountLc, amountFc, stockValueLc, expenseAccountId, vatType, vatRate, vatAmountLc, vatAmountFc });
         totalAmountLc += amountLc; totalVatLc += vatAmountLc;
         totalAmountFc += amountFc; totalVatFc += vatAmountFc;
     }
@@ -1303,9 +1339,12 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, mod
     }
 
     const invByAccount = {};
+    let varianceLc = 0; // ราคาเอกสาร - มูลค่าสต็อก (บวก = ราคาเอกสารสูงกว่าต้นทุนสต็อก)
     for (const l of lineRows) {
-        invByAccount[l.expenseAccountId] = (invByAccount[l.expenseAccountId] || 0) + l.amountLc;
+        invByAccount[l.expenseAccountId] = (invByAccount[l.expenseAccountId] || 0) + l.stockValueLc;
+        varianceLc += l.amountLc - l.stockValueLc;
     }
+    varianceLc = round2(varianceLc);
     const apGlDetails = [];
     for (const [accId, amt] of Object.entries(invByAccount)) {
         if (amt === 0) continue;
@@ -1313,6 +1352,20 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, mod
         apGlDetails.push({
             account_id: Number(accId), description: `${label} ${apDocNo}`,
             debit_lc: isCredit ? 0 : round2(amt), credit_lc: isCredit ? round2(amt) : 0,
+        });
+    }
+    if (varianceLc !== 0) {
+        // ผลต่างระหว่างราคาตามเอกสารกับต้นทุนสต็อกที่ตัด/รับจริง (เช่น คืนสินค้า FIFO ที่ตัด layer เก่าราคาต่างจากใบรับ)
+        // ลงบัญชีผลต่างต้นทุนของประเภทเอกสาร IM นี้ — ทิศทางเดียวกับฝั่งสินค้าคงคลัง (CN = Cr, DN = Dr เมื่อเป็นบวก)
+        const varRes = await client.query(`SELECT variance_account_id FROM im_gl_account_setup WHERE doc_code = $1`, [header.doc_code]);
+        const varianceAccountId = Number(varRes.rows[0]?.variance_account_id) || null;
+        if (!varianceAccountId) {
+            throw new Error(`ราคาตามเอกสารต่างจากต้นทุนสต็อก ${varianceLc.toLocaleString('en-US', { minimumFractionDigits: 2 })} บาท — กรุณาตั้งค่าบัญชีผลต่างต้นทุน (variance_account_id) ใน ตั้งค่าบัญชี IM สำหรับประเภทเอกสาร ${header.doc_code}`);
+        }
+        const signed = isCredit ? varianceLc : -varianceLc; // บวก = Cr
+        apGlDetails.push({
+            account_id: varianceAccountId, description: `ผลต่างราคาเอกสาร/ต้นทุนสต็อก ${apDocNo}`,
+            debit_lc: signed < 0 ? -signed : 0, credit_lc: signed > 0 ? signed : 0,
         });
     }
     if (totalVatLc !== 0) {
@@ -1670,7 +1723,8 @@ const postDetailLines = async (client, headerId, header, docNo) => {
         `, [varianceQty, actualUnitCost, balanceQtyBefore, balanceAvgCostBefore, valueLc, d.id]);
         totalQty += varianceQty;
         totalValue += valueLc;
-        updatedDetails.push({ ...d, qty: varianceQty, unit_cost: actualUnitCost, total_value_lc: valueLc });
+        // entered_unit_cost = ราคาที่ผู้ใช้กรอก (LC) ก่อนถูกเขียนทับด้วยต้นทุนสต็อกจริง — '11' ใช้ตั้งหนี้ AP
+        updatedDetails.push({ ...d, qty: varianceQty, unit_cost: actualUnitCost, entered_unit_cost: d.unit_cost, total_value_lc: valueLc });
     }
     // '12' (รับสินค้า รอตั้งหนี้): Post IM อย่างเดียว — อัปเดต subledger ตามปกติ แต่ไม่แตะ GL/AP เลย จนกว่าจะ Post
     // AP/GL แยกต่างหากทีหลัง (postApBillingForGrn) เมื่อได้ใบกำกับจริงจากผู้ขาย — สถานะจึงเป็น 'Received' ไม่ใช่ 'Posted'
@@ -1696,8 +1750,15 @@ const postDetailLines = async (client, headerId, header, docNo) => {
     let linkedApTransactionId = null;
     let linkedArTransactionId = null;
     if (sysDocType === '11') {
+        // ตั้งหนี้ตามราคาที่กรอก ไม่ใช่ต้นทุนสต็อก (สินค้า STANDARD ตีมูลค่าสต็อกที่ต้นทุนมาตรฐาน) — ส่วนต่างระหว่าง
+        // ราคาซื้อกับมูลค่าสต็อกลงบัญชีผลต่างต้นทุนใน postApBillFromGrn (กลไกเดียวกับ '12' ตอน Post AP/GL)
+        const billDetails = updatedDetails.map((d) => ({
+            ...d,
+            unit_cost: d.entered_unit_cost != null ? Number(d.entered_unit_cost) : d.unit_cost,
+            stock_unit_cost: d.unit_cost,
+        }));
         linkedApTransactionId = await postApBillFromGrn(client, {
-            header, details: updatedDetails, docNo, vendorInvoiceNo: header.ref_no, mode,
+            header, details: billDetails, docNo, vendorInvoiceNo: header.ref_no, mode,
         });
     } else if (['15', '20'].includes(sysDocType)) {
         // คืนสินค้าผู้ขาย ('15') / ลดหนี้เจ้าหนี้ ('20') — ทั้งคู่โพสต์ AP CN เดียวกัน ('15' มีการอ้างอิงเอกสารต้นฉบับ
@@ -1790,6 +1851,8 @@ const fetchRowById = async (pool, id) => {
                tw.warehouse_code AS to_warehouse_code, tw.warehouse_name_th AS to_warehouse_name_th,
                b.branch_code, b.branch_name_thai,
                reft.doc_no AS ref_im_transaction_doc_no,
+               reft.status AS ref_im_transaction_status,
+               (SELECT rd.sys_doc_type FROM sa_module_document rd WHERE rd.id = reft.doc_id) AS ref_im_sys_doc_type,
                refpo.doc_no AS ref_po_doc_no,
                refso.doc_no AS ref_so_doc_no,
                refmo.doc_no AS ref_mo_doc_no,
@@ -1919,7 +1982,8 @@ const fetchReturnableDocs = async (req, res) => {
         const statuses = isDln ? ['Posted', 'Delivered'] : ['Posted', 'Received'];
         let query = `
             SELECT t.id, t.doc_no, t.doc_date, t.status, t.vendor_id, t.vendor_code, t.vendor_name_th,
-                   t.customer_id, t.customer_code, t.customer_name_th, d.doc_code, d.sys_doc_type
+                   t.customer_id, t.customer_code, t.customer_name_th, d.doc_code, d.sys_doc_type,
+                   t.currency_id, t.currency_code, t.exchange_rate
             FROM im_transaction t
             JOIN sa_module_document d ON d.id = t.doc_id
             WHERE d.sys_doc_type = ANY($1::text[]) AND t.status = ANY($2::text[])`;
@@ -1945,10 +2009,15 @@ const fetchReturnableLines = async (req, res) => {
     try {
         await ensureImTransactionTable(client);
         const { id } = req.params;
+        // return_price_fc: ราคาซื้อต่อหน่วยในสกุลเงินของเอกสารต้นฉบับ ('15' ใช้เป็นราคาเริ่มต้นของใบลดหนี้ AP) —
+        // ราคาตามใบกำกับจริงก่อน ('12' ที่ตั้งหนี้แล้ว) แล้วจึงราคาที่กรอกตอนรับ แถวเก่าที่ไม่มี _fc แปลงกลับจากบาท
         const detailsRes = await client.query(`
             SELECT dt.id, dt.line_no, dt.item_id, dt.item_code, dt.item_name, dt.location_id, dt.lot_no, dt.serial_no,
-                   dt.uom_id, dt.qty, dt.unit_cost, l.location_code, u.uom_code
+                   dt.uom_id, dt.qty, dt.unit_cost, dt.unit_price, dt.vat_type, dt.vat_rate, l.location_code, u.uom_code,
+                   COALESCE(dt.billed_unit_cost_fc, dt.billed_unit_cost / NULLIF(h.exchange_rate, 0),
+                            dt.unit_cost_fc, dt.unit_cost / NULLIF(h.exchange_rate, 0), dt.unit_cost) AS return_price_fc
             FROM im_transaction_detail dt
+            JOIN im_transaction h ON h.id = dt.header_id
             LEFT JOIN im_location l ON l.id = dt.location_id
             LEFT JOIN im_uom u      ON u.id  = dt.uom_id
             WHERE dt.header_id = $1 ORDER BY dt.line_no
@@ -2530,7 +2599,12 @@ const postBillingForGrn = async (req, res) => {
 
         const detailsRes = await client.query(`SELECT * FROM im_transaction_detail WHERE header_id=$1 ORDER BY line_no`, [id]);
         const billedDetails = detailsRes.rows.map((d) => ({
-            ...d, unit_cost: d.billed_unit_cost ?? d.unit_cost, unit_cost_fc: d.billed_unit_cost_fc ?? d.unit_cost_fc,
+            // ไม่กรอกต้นทุนตามใบกำกับ = ใช้ราคาที่กรอกตอนรับ (unit_cost_fc × อัตรา) ไม่ใช่ unit_cost ที่ถูกเขียนทับเป็น
+            // ต้นทุนสต็อกแล้ว (สินค้า STANDARD = ต้นทุนมาตรฐาน)
+            ...d,
+            unit_cost: d.billed_unit_cost ?? (d.unit_cost_fc != null ? Number(d.unit_cost_fc) * (Number(tx.exchange_rate) || 1) : d.unit_cost),
+            unit_cost_fc: d.billed_unit_cost_fc ?? d.unit_cost_fc,
+            stock_unit_cost: d.unit_cost, // มูลค่าสต็อกตอนรับ — ส่วนต่างกับราคาใบกำกับลงบัญชีผลต่าง (ดู postApBillFromGrn)
         }));
 
         const mode = await fetchMode(client);
