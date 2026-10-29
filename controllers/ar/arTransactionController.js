@@ -5,6 +5,7 @@ const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { branchCodeSql } = require('../../utils/taxBranch');
 const { ensureSalespersonTable, saveDocSalespersons, loadSalespersons } = require('../../utils/docSalesperson');
 const { AR_CHECK_TYPES, ensureCreditSchema, arDocAmount, assertCreditForPost, loadCreditApprovals } = require('../../utils/creditCheck');
+const { resolveArAccountId, postedArAccountId, postedArAccountSql } = require('../../utils/arAccount');
 
 // ตรวจวงเงินเครดิตก่อนโพสต์ (ตั้งหนี้/เพิ่มหนี้/ลดหนี้) — เกินวงเงินและยังไม่ได้รับอนุมัติที่ครอบคลุมยอด = throw CREDIT_LIMIT
 const checkArCreditForPost = async (client, header, id, row) => {
@@ -339,48 +340,15 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
     const isAdvanceRefund  = sysDocType === '65';
     const isRevenueBased   = ['10', '30', '35', '50', '55'].includes(sysDocType);
 
-    // --- Resolve AR account (priority: ar_gl_account_setup > customer_group > customer) ---
+    // --- บัญชีลูกหนี้: ลูกค้า > กลุ่มลูกค้า > ประเภทเอกสาร (utils/arAccount.js) ---
+    // หาใหม่ทุกครั้งตอนโพสต์ ไม่ใช้ header.ar_account_id ที่ค้างในร่าง แล้วเก็บบัญชีที่ใช้จริงไว้ที่เอกสาร
     // ไม่ต้องใช้บัญชีลูกหนี้สำหรับ รับเงินมัดจำ (60) และ คืนเงินมัดจำ (65)
     let arAccountId = null;
     if (!isAdvanceReceipt && !isAdvanceRefund) {
-        arAccountId = Number(header.ar_account_id) || null;
-
-        // 1. ar_gl_account_setup.ar_account_id (ตามประเภทเอกสาร)
-        if (!arAccountId && header.doc_id) {
-            const arSetupRes = await client.query(
-                `SELECT s.ar_account_id FROM ar_gl_account_setup s
-                 JOIN sa_module_document d ON d.doc_code = s.doc_code
-                 WHERE d.id = $1 LIMIT 1`,
-                [header.doc_id]
-            );
-            if (arSetupRes.rows.length > 0 && arSetupRes.rows[0].ar_account_id)
-                arAccountId = arSetupRes.rows[0].ar_account_id;
-        }
-
-        // 2. ar_customer_group.gl_account_id (กลุ่มลูกค้า)
-        if (!arAccountId && header.customer_id) {
-            const groupRes = await client.query(
-                `SELECT g.gl_account_id FROM ar_customer c
-                 JOIN ar_customer_group g ON g.id = c.customer_group_id
-                 WHERE c.id = $1 LIMIT 1`,
-                [header.customer_id]
-            );
-            if (groupRes.rows.length > 0 && groupRes.rows[0].gl_account_id)
-                arAccountId = groupRes.rows[0].gl_account_id;
-        }
-
-        // 3. ar_customer.ar_account_id (ลูกค้า)
-        if (!arAccountId && header.customer_id) {
-            const custRes = await client.query(
-                `SELECT ar_account_id FROM ar_customer WHERE id = $1 LIMIT 1`,
-                [header.customer_id]
-            );
-            if (custRes.rows.length > 0 && custRes.rows[0].ar_account_id)
-                arAccountId = custRes.rows[0].ar_account_id;
-        }
-
-        if (!arAccountId) throw new Error('ไม่พบบัญชีลูกหนี้สำหรับการลงบัญชี กรุณาตั้งค่าใน ar_gl_account_setup, กลุ่มลูกค้า หรือลูกค้า');
+        arAccountId = await resolveArAccountId(client, { customerId: header.customer_id, docId: header.doc_id });
+        if (!arAccountId) throw new Error('ไม่พบบัญชีลูกหนี้สำหรับการลงบัญชี กรุณาตั้งค่าที่ลูกค้า กลุ่มลูกค้า หรือการตั้งค่ารหัสบัญชีของประเภทเอกสาร');
     }
+    if (arAccountId) await client.query(`UPDATE ar_transaction SET ar_account_id = $1 WHERE id = $2`, [arAccountId, headerId]);
 
     // --- Query ar_gl_account_setup เพื่อดึงบัญชีที่ต้องใช้ใน GL ---
     const setupRes = await client.query(
@@ -739,6 +707,7 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
         }
 
         // CR: AR Account — ใช้ยอด LC ที่อัตรา invoice (เพื่อล้างยอด AR ให้ถูกต้อง)
+        // ล้างเข้าบัญชีลูกหนี้ที่ใบแจ้งหนี้/ใบลดหนี้แต่ละใบลงไว้ (ไม่มีใบอ้างอิงใช้บัญชีของใบรับชำระ)
         const arCreditLc = totalInvoiceAtInvRate > 0
             ? (totalInvoiceAtInvRate - totalCnAtInvRate)
             : totalDebit;
@@ -746,14 +715,35 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
             ? (totalInvoiceAppliedFc - totalCnDeductedFc)
             : (Number(header.total_amount_fc) || 0);
         if (arAccountId && arCreditLc > 0) {
-            glDetails.push({
-                account_id: arAccountId,
-                description: `ชำระหนี้ ${docNo}`,
-                debit_lc: 0,
-                credit_lc: arCreditLc,
-                debit_fc: 0,
-                credit_fc: arCreditFc,
-            });
+            const byAccount = new Map(); // account_id → { lc, fc }
+            const addTo = (acc, lc, fc) => {
+                const cur = byAccount.get(acc) || { lc: 0, fc: 0 };
+                byAccount.set(acc, { lc: cur.lc + lc, fc: cur.fc + fc });
+            };
+            if (totalInvoiceAtInvRate > 0) {
+                for (const [list, sign] of [[invoiceApplies, 1], [cnDeductions, -1]]) {
+                    for (const a of list) {
+                        const fc = Number(a.applied_amount_fc) || 0;
+                        if (!fc) continue;
+                        const acc = (a.applied_to_id && await postedArAccountId(client, a.applied_to_id)) || arAccountId;
+                        addTo(acc, sign * fc * (invoiceRateMap[a.applied_to_id] || 1), sign * fc);
+                    }
+                }
+            } else {
+                addTo(arAccountId, arCreditLc, arCreditFc);
+            }
+            for (const [acc, amt] of byAccount) {
+                if (Math.abs(amt.lc) < 0.005 && Math.abs(amt.fc) < 0.005) continue;
+                // ใบลดหนี้มากกว่าใบแจ้งหนี้ในบัญชีเดียวกัน → เดบิตบัญชีนั้น
+                glDetails.push({
+                    account_id: acc,
+                    description: `ชำระหนี้ ${docNo}`,
+                    debit_lc: amt.lc < 0 ? -amt.lc : 0,
+                    credit_lc: amt.lc > 0 ? amt.lc : 0,
+                    debit_fc: amt.fc < 0 ? -amt.fc : 0,
+                    credit_fc: amt.fc > 0 ? amt.fc : 0,
+                });
+            }
         }
 
         // FX Gain/Loss — ผลต่างจากอัตราแลกเปลี่ยนที่เปลี่ยนไประหว่าง invoice และ receipt
@@ -1887,7 +1877,8 @@ const fetchOpenInvoices = async (req, res) => {
                              WHERE dd.header_id = t.id AND dd.is_deferred_vat = TRUE AND dd.vat_type != 'NOVAT'), 0) AS deferred_vat_amount_lc,
                    COALESCE((SELECT SUM(dd.vat_amount_fc) FROM ar_transaction_detail dd
                              WHERE dd.header_id = t.id AND dd.is_deferred_vat = TRUE AND dd.vat_type != 'NOVAT'), 0) AS deferred_vat_amount_fc,
-                   d.doc_name_thai, d.sys_doc_type
+                   d.doc_name_thai, d.sys_doc_type,
+                   ${postedArAccountSql('t')} AS ar_account_id
             FROM ar_transaction t
             JOIN sa_module_document d ON t.doc_id = d.id
             WHERE t.customer_id = $1
@@ -1957,7 +1948,8 @@ const fetchOpenCreditNotes = async (req, res) => {
         const result = await req.dbPool.query(`
             SELECT t.id, t.doc_no, t.doc_date, t.due_date,
                    t.total_amount_lc, t.paid_amount_lc, t.balance_amount_lc,
-                   d.doc_name_thai, d.sys_doc_type
+                   d.doc_name_thai, d.sys_doc_type,
+                   ${postedArAccountSql('t')} AS ar_account_id
             FROM ar_transaction t
             JOIN sa_module_document d ON t.doc_id = d.id
             WHERE t.customer_id = $1

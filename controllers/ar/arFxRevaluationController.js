@@ -4,6 +4,7 @@ const { BASE_CURRENCY_CODE_SQL } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { generateDocNo } = require('./arTransactionController');
 const { describeJournalLines, fetchPostedJournalLines } = require('../../utils/glJournalPreview');
+const { postedArAccountId } = require('../../utils/arAccount');
 
 // คอลัมน์สำหรับถอยเป็นร่าง / ยกเลิก (sql/ar_fx_revaluation_reverse_to_draft.sql) — ตารางหลักสร้างจาก sql/ar_year_end_closing.sql
 const ensureRevalColumns = async (db) => {
@@ -89,12 +90,8 @@ const calcRevalDetails = async (client, revalDate, yearEndRates) => {
 };
 
 // ── Helper: ดึง AR Control account สำหรับแต่ละ invoice ────────────────────────
-const getArControlAccount = async (client, invoiceId) => {
-    const r = await client.query(
-        `SELECT ar_account_id FROM ar_transaction WHERE id=$1`, [invoiceId]
-    );
-    return r.rows[0]?.ar_account_id || null;
-};
+// เอกสารเก่าที่ไม่ได้เก็บบัญชีไว้ ใช้ลำดับเดิมตอนโพสต์ (utils/arAccount.js) — ไม่ข้ามใบแจ้งหนี้เงียบ ๆ
+const getArControlAccount = (client, invoiceId) => postedArAccountId(client, invoiceId);
 
 // ── Helper: บรรทัดรายการบัญชีของ revaluation (ใช้ทั้ง preview และโพสต์จริง) ──
 // รวม gain/loss ตามบัญชี AR ของแต่ละ invoice

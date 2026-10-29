@@ -136,7 +136,9 @@ const validateFile = [
         req.dbPool.query(`SELECT id, customer_code, customer_name_th, ar_account_id, customer_group_id, credit_term_months, credit_term_days FROM ar_customer WHERE is_active = true`),
         req.dbPool.query(`SELECT id, gl_account_id FROM ar_customer_group`),
         req.dbPool.query(`SELECT id, currency_code FROM cd_currency WHERE is_active = true`),
-        req.dbPool.query(`SELECT id, doc_code, sys_doc_type FROM sa_module_document WHERE sys_module = '11' AND sys_doc_type = ANY($1) AND is_active = true AND is_doc_type = true`, [DR_DOC_TYPES]),
+        req.dbPool.query(`SELECT d.id, d.doc_code, d.sys_doc_type, s.ar_account_id AS setup_ar_account_id
+                          FROM sa_module_document d LEFT JOIN ar_gl_account_setup s ON s.doc_code = d.doc_code
+                         WHERE d.sys_module = '11' AND d.sys_doc_type = ANY($1) AND d.is_active = true AND d.is_doc_type = true`, [DR_DOC_TYPES]),
         req.dbPool.query(`SELECT id FROM gl_posting_period WHERE CURRENT_DATE BETWEEN period_start_date AND period_end_date AND gl_status = 'OPEN' LIMIT 1`),
       ]);
 
@@ -249,12 +251,13 @@ const validateFile = [
           }
         }
 
-        // ar_account_id
+        // ar_account_id — ลูกค้า > กลุ่มลูกค้า > ประเภทเอกสาร (ลำดับเดียวกับ utils/arAccount.js)
         let arAccountId = null;
         if (customer) {
-          arAccountId = customer.ar_account_id || (groupMap[customer.customer_group_id]?.gl_account_id) || null;
+          arAccountId = customer.ar_account_id || (groupMap[customer.customer_group_id]?.gl_account_id)
+              || docType?.setup_ar_account_id || null;
           if (!arAccountId) {
-            rowErrors.push({ column: 'customer_code', message: `ไม่พบบัญชีลูกหนี้ (ar_account) สำหรับลูกหนี้ "${customerCode}" — กรุณาตั้งค่าที่หน้าข้อมูลลูกหนี้หรือกลุ่มลูกค้า` });
+            rowErrors.push({ column: 'customer_code', message: `ไม่พบบัญชีลูกหนี้ (ar_account) สำหรับลูกหนี้ "${customerCode}" — กรุณาตั้งค่าที่หน้าข้อมูลลูกหนี้ กลุ่มลูกค้า หรือการตั้งค่ารหัสบัญชีของประเภทเอกสาร` });
           }
         }
 

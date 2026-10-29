@@ -16,6 +16,7 @@ const { today: todayYmd, ymd } = require('../../utils/dateUtil');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { branchCodeSql } = require('../../utils/taxBranch');
 const { IM_CHECK_TYPES, ensureCreditSchema, imDocAmount, assertCreditForPost, loadCreditApprovals } = require('../../utils/creditCheck');
+const { resolveArAccountId } = require('../../utils/arAccount');
 
 // ตรวจวงเงินเครดิตก่อนโพสต์เอกสารฝั่งขาย (ส่งสินค้า/รับคืน/ลดหนี้/เพิ่มหนี้ลูกหนี้) — เกินและยังไม่ได้รับอนุมัติ = throw
 const checkImCreditForPost = async (client, { docId, customerId, details, id, row, exchangeRate }) => {
@@ -1105,12 +1106,9 @@ const postArBillFromDln = async (client, { header, details, docNo }) => {
     const customerRow = customerRes.rows[0];
     if (!customerRow) throw new Error('ไม่พบลูกค้าที่ระบุ');
 
-    // บัญชีลูกหนี้ — มิเรอร์ 3 ระดับเดียวกับ postGlEntry ของ arTransactionController.js เอง: ar_gl_account_setup >
-    // กลุ่มลูกค้า > ลูกค้า (ต่างจาก AP ที่มีแค่ 2 ระดับ เพราะ ap_vendor ไม่มีแนวคิดกลุ่มผู้ขาย)
-    let arAccountId = arSetup.ar_account_id ? Number(arSetup.ar_account_id) : null;
-    if (!arAccountId) arAccountId = customerRow.group_ar_account_id ? Number(customerRow.group_ar_account_id) : null;
-    if (!arAccountId) arAccountId = customerRow.ar_account_id ? Number(customerRow.ar_account_id) : null;
-    if (!arAccountId) throw new Error('ไม่พบบัญชีลูกหนี้สำหรับการลงบัญชี กรุณาตั้งค่าใน ar_gl_account_setup, กลุ่มลูกค้า หรือลูกค้า');
+    // บัญชีลูกหนี้ — ลำดับเดียวกับ postGlEntry ของ AR: ลูกค้า > กลุ่มลูกค้า > ประเภทเอกสาร AR (utils/arAccount.js)
+    const arAccountId = await resolveArAccountId(client, { customerId: header.customer_id, docId: arDocId });
+    if (!arAccountId) throw new Error('ไม่พบบัญชีลูกหนี้สำหรับการลงบัญชี กรุณาตั้งค่าที่ลูกค้า กลุ่มลูกค้า หรือการตั้งค่ารหัสบัญชีของประเภทเอกสาร');
 
     const periodRes = await client.query(
         `SELECT id FROM gl_posting_period WHERE $1::date BETWEEN period_start_date AND period_end_date AND gl_status='OPEN' LIMIT 1`,
@@ -1508,10 +1506,9 @@ const postArCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
     const customerRow = customerRes.rows[0];
     if (!customerRow) throw new Error('ไม่พบลูกค้าที่ระบุ');
 
-    let arAccountId = arSetup.ar_account_id ? Number(arSetup.ar_account_id) : null;
-    if (!arAccountId) arAccountId = customerRow.group_ar_account_id ? Number(customerRow.group_ar_account_id) : null;
-    if (!arAccountId) arAccountId = customerRow.ar_account_id ? Number(customerRow.ar_account_id) : null;
-    if (!arAccountId) throw new Error('ไม่พบบัญชีลูกหนี้สำหรับการลงบัญชี กรุณาตั้งค่าใน ar_gl_account_setup, กลุ่มลูกค้า หรือลูกค้า');
+    // บัญชีลูกหนี้ — ลำดับเดียวกับ postGlEntry ของ AR: ลูกค้า > กลุ่มลูกค้า > ประเภทเอกสาร AR (utils/arAccount.js)
+    const arAccountId = await resolveArAccountId(client, { customerId: header.customer_id, docId: arDocId });
+    if (!arAccountId) throw new Error('ไม่พบบัญชีลูกหนี้สำหรับการลงบัญชี กรุณาตั้งค่าที่ลูกค้า กลุ่มลูกค้า หรือการตั้งค่ารหัสบัญชีของประเภทเอกสาร');
 
     const periodRes = await client.query(
         `SELECT id FROM gl_posting_period WHERE $1::date BETWEEN period_start_date AND period_end_date AND gl_status='OPEN' LIMIT 1`,
