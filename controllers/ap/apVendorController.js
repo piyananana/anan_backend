@@ -30,6 +30,9 @@ const fetchRowById = async (pool, id) => {
         cbt.business_type_name_thai,
         ga.account_code    AS ap_account_code,
         ga.account_name_thai AS ap_account_name_thai,
+        vg.ap_account_id   AS group_ap_account_id,
+        gag.account_code   AS group_ap_account_code,
+        gag.account_name_thai AS group_ap_account_name_thai,
         pm.method_code     AS payment_method_code,
         pm.method_name_th  AS payment_method_name_thai,
         pm.method_name_en  AS payment_method_name_eng,
@@ -39,6 +42,7 @@ const fetchRowById = async (pool, id) => {
       LEFT JOIN ap_vendor_group    vg  ON v.vendor_group_id  = vg.id
       LEFT JOIN cd_business_type cbt ON v.business_type_id = cbt.id
       LEFT JOIN gl_account       ga  ON v.ap_account_id    = ga.id
+      LEFT JOIN gl_account       gag ON vg.ap_account_id   = gag.id
       LEFT JOIN cm_payment_method pm ON v.payment_method_id = pm.id
       LEFT JOIN im_price_list   ipl ON v.price_list_id     = ipl.id
       WHERE v.id = $1`, [id]),
@@ -84,6 +88,8 @@ const fetchRows = async (req, res) => {
         v.business_type_id,  cbt.business_type_code, cbt.business_type_name_thai,
         v.ap_account_id,     ga.account_code  AS ap_account_code,
                              ga.account_name_thai AS ap_account_name_thai,
+        vg.ap_account_id AS group_ap_account_id, gag.account_code AS group_ap_account_code,
+                             gag.account_name_thai AS group_ap_account_name_thai,
         v.payment_method_id, pm.method_code   AS payment_method_code,
                              pm.method_name_th AS payment_method_name_thai,
                              pm.method_name_en AS payment_method_name_eng
@@ -92,6 +98,7 @@ const fetchRows = async (req, res) => {
       LEFT JOIN im_price_list     ipl  ON v.price_list_id    = ipl.id
       LEFT JOIN cd_business_type cbt ON v.business_type_id = cbt.id
       LEFT JOIN gl_account       ga  ON v.ap_account_id    = ga.id
+      LEFT JOIN gl_account       gag ON vg.ap_account_id   = gag.id
       LEFT JOIN cm_payment_method pm ON v.payment_method_id = pm.id
       WHERE 1=1`;
     const params = [];

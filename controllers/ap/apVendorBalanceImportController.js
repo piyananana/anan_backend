@@ -130,8 +130,9 @@ const validateFile = [
         req.dbPool.query(`SELECT id, ap_account_id FROM ap_vendor_group`),
         req.dbPool.query(`SELECT id, currency_code FROM cd_currency WHERE is_active = true`),
         req.dbPool.query(
-          `SELECT id, doc_code, sys_doc_type FROM sa_module_document
-           WHERE sys_module = '21' AND sys_doc_type = ANY($1) AND is_active = true AND is_doc_type = true`,
+          `SELECT d.id, d.doc_code, d.sys_doc_type, s.ap_account_id AS setup_ap_account_id
+             FROM sa_module_document d LEFT JOIN ap_gl_account_setup s ON s.doc_code = d.doc_code
+            WHERE d.sys_module = '21' AND d.sys_doc_type = ANY($1) AND d.is_active = true AND d.is_doc_type = true`,
           [AP_BILL_DOC_TYPES]
         ),
         req.dbPool.query(
@@ -238,11 +239,13 @@ const validateFile = [
           }
         }
 
+        // ap_account_id — เจ้าหนี้ > กลุ่มเจ้าหนี้ > ประเภทเอกสาร (ลำดับเดียวกับ utils/apAccount.js)
         let apAccountId = null;
         if (vendor) {
-          apAccountId = vendor.ap_account_id || (groupMap[vendor.vendor_group_id]?.ap_account_id) || null;
+          apAccountId = vendor.ap_account_id || (groupMap[vendor.vendor_group_id]?.ap_account_id)
+              || docType?.setup_ap_account_id || null;
           if (!apAccountId) {
-            rowErrors.push({ column: 'vendor_code', message: `ไม่พบบัญชีเจ้าหนี้ (ap_account) สำหรับเจ้าหนี้ "${vendorCode}" — กรุณาตั้งค่าที่หน้าข้อมูลเจ้าหนี้หรือกลุ่มเจ้าหนี้` });
+            rowErrors.push({ column: 'vendor_code', message: `ไม่พบบัญชีเจ้าหนี้ (ap_account) สำหรับเจ้าหนี้ "${vendorCode}" — กรุณาตั้งค่าที่หน้าข้อมูลเจ้าหนี้ กลุ่มเจ้าหนี้ หรือการตั้งค่ารหัสบัญชีของประเภทเอกสาร` });
           }
         }
 

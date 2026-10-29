@@ -17,6 +17,7 @@ const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { branchCodeSql } = require('../../utils/taxBranch');
 const { IM_CHECK_TYPES, ensureCreditSchema, imDocAmount, assertCreditForPost, loadCreditApprovals } = require('../../utils/creditCheck');
 const { resolveArAccountId } = require('../../utils/arAccount');
+const { resolveApAccountId } = require('../../utils/apAccount');
 
 // ตรวจวงเงินเครดิตก่อนโพสต์เอกสารฝั่งขาย (ส่งสินค้า/รับคืน/ลดหนี้/เพิ่มหนี้ลูกหนี้) — เกินและยังไม่ได้รับอนุมัติ = throw
 const checkImCreditForPost = async (client, { docId, customerId, details, id, row, exchangeRate }) => {
@@ -890,12 +891,9 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
     const apSetup = apSetupRes.rows[0] || null;
     if (!apSetup?.gl_doc_id) throw new Error('ยังไม่ได้ตั้งค่า GL Document Type ใน ap_gl_account_setup สำหรับใบกำกับสินค้า');
 
-    let apAccountId = apSetup.ap_account_id ? Number(apSetup.ap_account_id) : null;
-    if (!apAccountId) {
-        const vendorAcctRes = await client.query(`SELECT ap_account_id FROM ap_vendor WHERE id = $1`, [header.vendor_id]);
-        apAccountId = vendorAcctRes.rows[0]?.ap_account_id ? Number(vendorAcctRes.rows[0].ap_account_id) : null;
-    }
-    if (!apAccountId) throw new Error('ไม่พบบัญชีเจ้าหนี้สำหรับการลงบัญชี กรุณาตั้งค่าใน ap_gl_account_setup หรือผู้ขาย');
+    // บัญชีเจ้าหนี้ — ลำดับเดียวกับ postGlEntry ของ AP: เจ้าหนี้ > กลุ่มเจ้าหนี้ > ประเภทเอกสาร AP (utils/apAccount.js)
+    const apAccountId = await resolveApAccountId(client, { vendorId: header.vendor_id, docId: apDocId });
+    if (!apAccountId) throw new Error('ไม่พบบัญชีเจ้าหนี้สำหรับการลงบัญชี กรุณาตั้งค่าที่เจ้าหนี้ กลุ่มเจ้าหนี้ หรือการตั้งค่ารหัสบัญชีของประเภทเอกสาร');
 
     // บัญชี VAT ซื้อ — ดูที่ im_gl_account_setup ของ doc_code เอกสาร IM นี้ก่อน (ให้ override ได้ต่อ doc_code
     // เหมือน resolveInventoryAccount) แล้วค่อย fallback ไปที่บัญชี VAT ของใบกำกับสินค้า AP เอง
@@ -1272,12 +1270,9 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, mod
     const apSetup = apSetupRes.rows[0] || null;
     if (!apSetup?.gl_doc_id) throw new Error(`ยังไม่ได้ตั้งค่า GL Document Type ใน ap_gl_account_setup สำหรับ${isCredit ? 'ใบลดหนี้' : 'ใบเพิ่มหนี้'}จากผู้ขาย`);
 
-    let apAccountId = apSetup.ap_account_id ? Number(apSetup.ap_account_id) : null;
-    if (!apAccountId) {
-        const vendorAcctRes = await client.query(`SELECT ap_account_id FROM ap_vendor WHERE id = $1`, [header.vendor_id]);
-        apAccountId = vendorAcctRes.rows[0]?.ap_account_id ? Number(vendorAcctRes.rows[0].ap_account_id) : null;
-    }
-    if (!apAccountId) throw new Error('ไม่พบบัญชีเจ้าหนี้สำหรับการลงบัญชี กรุณาตั้งค่าใน ap_gl_account_setup หรือผู้ขาย');
+    // บัญชีเจ้าหนี้ — ลำดับเดียวกับ postGlEntry ของ AP: เจ้าหนี้ > กลุ่มเจ้าหนี้ > ประเภทเอกสาร AP (utils/apAccount.js)
+    const apAccountId = await resolveApAccountId(client, { vendorId: header.vendor_id, docId: apDocId });
+    if (!apAccountId) throw new Error('ไม่พบบัญชีเจ้าหนี้สำหรับการลงบัญชี กรุณาตั้งค่าที่เจ้าหนี้ กลุ่มเจ้าหนี้ หรือการตั้งค่ารหัสบัญชีของประเภทเอกสาร');
 
     // บัญชี VAT ซื้อ — ดูที่ im_gl_account_setup ของ doc_code เอกสาร IM นี้ก่อน แล้วค่อย fallback ไปที่
     // บัญชี VAT ของ AP เอง (มิเรอร์ postApBillFromGrn ทุกประการ)

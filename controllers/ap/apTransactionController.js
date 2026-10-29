@@ -2,6 +2,7 @@ const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { branchCodeSql } = require('../../utils/taxBranch');
 const { today: todayYmd } = require('../../utils/dateUtil');
+const { resolveApAccountId, postedApAccountId, postedApAccountSql } = require('../../utils/apAccount');
 // controllers/ap/apTransactionController.js
 
 // --- Helper: Generate Document Number ---
@@ -243,29 +244,16 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
 
     if (isRa) return null;
 
-    // --- Resolve AP account ---
+    // --- บัญชีเจ้าหนี้: เจ้าหนี้ > กลุ่มเจ้าหนี้ > ประเภทเอกสาร (utils/apAccount.js) ---
+    // หาใหม่ทุกครั้งตอนโพสต์ ไม่ใช้ header.ap_account_id ที่ค้างในร่าง แล้วเก็บบัญชีที่ใช้จริงไว้ที่เอกสาร
+    // จ่ายชำระ (80) ล้างเจ้าหนี้ด้วยบัญชีของใบตั้งหนี้แต่ละใบ — บัญชีนี้ใช้เมื่อจ่ายโดยไม่อ้างอิงใบตั้งหนี้
     let apAccountId = null;
     if (!isAdvancePayment && !isAdvanceRefund) {
-        apAccountId = Number(header.ap_account_id) || null;
-        if (!apAccountId && header.doc_id) {
-            const apSetupRes = await client.query(
-                `SELECT s.ap_account_id FROM ap_gl_account_setup s
-                 JOIN sa_module_document d ON d.doc_code = s.doc_code
-                 WHERE d.id = $1 LIMIT 1`,
-                [header.doc_id]
-            );
-            if (apSetupRes.rows.length > 0 && apSetupRes.rows[0].ap_account_id)
-                apAccountId = apSetupRes.rows[0].ap_account_id;
-        }
-        if (!apAccountId && header.vendor_id) {
-            const vendorRes = await client.query(
-                `SELECT ap_account_id FROM ap_vendor WHERE id = $1 LIMIT 1`, [header.vendor_id]
-            );
-            if (vendorRes.rows.length > 0 && vendorRes.rows[0].ap_account_id)
-                apAccountId = vendorRes.rows[0].ap_account_id;
-        }
-        if (!apAccountId && !isPayment)
-            throw new Error('ไม่พบบัญชีเจ้าหนี้สำหรับการลงบัญชี กรุณาตั้งค่าใน ap_gl_account_setup หรือเจ้าหนี้');
+        apAccountId = await resolveApAccountId(client, { vendorId: header.vendor_id, docId: header.doc_id });
+        const paysInvoices = isPayment && (header._applies || []).some(a => (a.apply_type || 'invoice') === 'invoice' && a.applied_to_id);
+        if (!apAccountId && !paysInvoices)
+            throw new Error('ไม่พบบัญชีเจ้าหนี้สำหรับการลงบัญชี กรุณาตั้งค่าที่เจ้าหนี้ กลุ่มเจ้าหนี้ หรือการตั้งค่ารหัสบัญชีของประเภทเอกสาร');
+        if (apAccountId) await client.query(`UPDATE ap_transaction SET ap_account_id = $1 WHERE id = $2`, [apAccountId, headerId]);
     }
 
     // --- Fetch AP GL account setup ---
@@ -578,15 +566,35 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
         const apDebitFc = totalInvoiceAtInvRate > 0
             ? totalInvoiceAppliedFc
             : (Number(header.total_amount_fc) || 0) + totalWhtLc / exchangeRate;
-        if (apAccountId && apDebitLc > 0) {
-            glDetails.push({
-                account_id: apAccountId,
-                description: `ชำระเจ้าหนี้ ${docNo}`,
-                debit_lc: apDebitLc,
-                credit_lc: 0,
-                debit_fc: apDebitFc,
-                credit_fc: 0,
-            });
+        // ล้างเข้าบัญชีเจ้าหนี้ที่ใบตั้งหนี้แต่ละใบลงไว้ (ไม่มีใบอ้างอิงใช้บัญชีของใบจ่ายชำระ)
+        if (apDebitLc > 0) {
+            const byAccount = new Map(); // account_id → { lc, fc }
+            const addTo = (acc, lc, fc) => {
+                const cur = byAccount.get(acc) || { lc: 0, fc: 0 };
+                byAccount.set(acc, { lc: cur.lc + lc, fc: cur.fc + fc });
+            };
+            if (totalInvoiceAtInvRate > 0) {
+                for (const a of invoiceApplies) {
+                    const fc = Number(a.applied_amount_fc) || 0;
+                    if (!fc) continue;
+                    const acc = (a.applied_to_id && await postedApAccountId(client, a.applied_to_id)) || apAccountId;
+                    if (!acc) throw new Error('ไม่พบบัญชีเจ้าหนี้ของใบตั้งหนี้ที่จ่ายชำระ กรุณาตั้งค่าที่เจ้าหนี้ กลุ่มเจ้าหนี้ หรือการตั้งค่ารหัสบัญชีของประเภทเอกสาร');
+                    addTo(acc, fc * (invoiceRateMap[a.applied_to_id] || 1), fc);
+                }
+            } else {
+                addTo(apAccountId, apDebitLc, apDebitFc);
+            }
+            for (const [acc, amt] of byAccount) {
+                if (Math.abs(amt.lc) < 0.005) continue;
+                glDetails.push({
+                    account_id: acc,
+                    description: `ชำระเจ้าหนี้ ${docNo}`,
+                    debit_lc: amt.lc,
+                    credit_lc: 0,
+                    debit_fc: amt.fc,
+                    credit_fc: 0,
+                });
+            }
         }
 
         // CR: Cash/Bank (payment methods)
@@ -1125,7 +1133,8 @@ const fetchOpenInvoices = async (req, res) => {
                    COALESCE((SELECT SUM(dd.vat_amount_lc) FROM ap_transaction_detail dd
                              WHERE dd.header_id = t.id AND dd.is_deferred_vat = TRUE AND COALESCE(dd.vat_type, 'NOVAT') <> 'NOVAT'), 0) AS deferred_vat_amount_lc,
                    COALESCE((SELECT SUM(dd.vat_amount_fc) FROM ap_transaction_detail dd
-                             WHERE dd.header_id = t.id AND dd.is_deferred_vat = TRUE AND COALESCE(dd.vat_type, 'NOVAT') <> 'NOVAT'), 0) AS deferred_vat_amount_fc
+                             WHERE dd.header_id = t.id AND dd.is_deferred_vat = TRUE AND COALESCE(dd.vat_type, 'NOVAT') <> 'NOVAT'), 0) AS deferred_vat_amount_fc,
+                   ${postedApAccountSql('t')} AS ap_account_id
             FROM ap_transaction t
             JOIN sa_module_document d ON d.id = t.doc_id
             WHERE t.vendor_id = $1

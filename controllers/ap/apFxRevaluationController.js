@@ -4,6 +4,7 @@ const { BASE_CURRENCY_CODE_SQL } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { generateDocNo } = require('./apTransactionController');
 const { describeJournalLines, fetchPostedJournalLines } = require('../../utils/glJournalPreview');
+const { postedApAccountId } = require('../../utils/apAccount');
 // FX Revaluation สำหรับเจ้าหนี้สกุลเงินต่างประเทศ ณ วันปิดปี
 //
 // ทิศทาง GL ตรงข้ามกับ AR:
@@ -124,12 +125,8 @@ const calcRevalDetails = async (client, revalDate, yearEndRates) => {
 };
 
 // ── Helper: ดึง AP Control account ───────────────────────────────────────────
-const getApControlAccount = async (client, invoiceId) => {
-    const r = await client.query(
-        `SELECT ap_account_id FROM ap_transaction WHERE id=$1`, [invoiceId]
-    );
-    return r.rows[0]?.ap_account_id || null;
-};
+// เอกสารเก่าที่ไม่ได้เก็บบัญชีไว้ ใช้ลำดับเดิมตอนโพสต์ (utils/apAccount.js) — ไม่ข้ามใบตั้งหนี้เงียบ ๆ
+const getApControlAccount = (client, invoiceId) => postedApAccountId(client, invoiceId);
 
 // ── Helper: สร้าง GL Entry สำหรับ AP revaluation ─────────────────────────────
 // AP accounting (opposite of AR):

@@ -4,6 +4,7 @@ const { checkCmPeriodOpen } = require('../cm/cmPeriodCheckHelper');
 const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { computePaymentDeferredVat, insertDeferredVtRecordsForPayment } = require('./apTransactionController');
 const { describeJournalLines } = require('../../utils/glJournalPreview');
+const { postedApAccountId } = require('../../utils/apAccount');
 
 // GET eligible AP invoices for bulk payment
 // Returns posted ap_transaction rows (Purchase Invoice / Debit Note) with an outstanding balance
@@ -97,16 +98,16 @@ const prepareBulkPayment = async (client, { bank_account_id, payment_date, items
     const docs = [];
     for (const item of items) {
         const apRes = await client.query(`
-            SELECT t.*, v.vendor_code AS v_vendor_code, v.vendor_name_th, v.vendor_name_en,
-                   v.ap_account_id AS vendor_ap_account_id
+            SELECT t.*, v.vendor_code AS v_vendor_code, v.vendor_name_th, v.vendor_name_en
             FROM ap_transaction t JOIN ap_vendor v ON v.id = t.vendor_id
             WHERE t.id = $1`, [item.ap_document_id]);
         if (!apRes.rows.length) throw new BulkPayError(404, `AP transaction id=${item.ap_document_id} not found`);
         const payAmt = parseFloat(item.amount || 0);
         if (payAmt <= 0) throw new BulkPayError(400, 'Payment amount must be greater than zero');
         const apDoc = apRes.rows[0];
-        const apAccountId = apDoc.vendor_ap_account_id || setup.ap_account_id;
-        if (!apAccountId) throw new BulkPayError(400, `No AP account configured for vendor ${apDoc.v_vendor_code}`);
+        // ล้างเข้าบัญชีเจ้าหนี้ที่ใบตั้งหนี้ลงไว้ (utils/apAccount.js)
+        const apAccountId = await postedApAccountId(client, apDoc.id);
+        if (!apAccountId) throw new BulkPayError(400, `ไม่พบบัญชีเจ้าหนี้ของใบตั้งหนี้ ${apDoc.doc_no} กรุณาตั้งค่าที่เจ้าหนี้ กลุ่มเจ้าหนี้ หรือการตั้งค่ารหัสบัญชีของประเภทเอกสาร`);
         docs.push({ doc: apDoc, amount: payAmt, apAccountId });
     }
 
