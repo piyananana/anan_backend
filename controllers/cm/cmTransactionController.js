@@ -182,9 +182,15 @@ const ensureTables = async (pool) => {
 };
 
 // --- Helper: resolve GL account for a payment row ---
-// priority: payment.gl_account_id (client-resolved) -> cm_bank_account.gl_account_id -> null
+// priority (เหมือน AR/AP): cm_payment_method.gl_account_id -> cm_bank_account.gl_account_id -> null
+// อ่านจากฐานข้อมูลทุกครั้ง ไม่ใช้ gl_account_id ที่ค้างในแถวร่าง
 const resolvePaymentGlAccount = async (client, payment) => {
-    if (payment.gl_account_id) return Number(payment.gl_account_id);
+    if (payment.payment_method_id) {
+        const pmRes = await client.query(
+            `SELECT gl_account_id FROM cm_payment_method WHERE id = $1`, [payment.payment_method_id]
+        );
+        if (pmRes.rows[0]?.gl_account_id) return Number(pmRes.rows[0].gl_account_id);
+    }
     if (payment.cm_bank_account_id) {
         const baRes = await client.query(
             `SELECT gl_account_id FROM cm_bank_account WHERE id = $1`, [payment.cm_bank_account_id]
@@ -238,6 +244,15 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
         });
     };
 
+    // บัญชีเงินสดย่อย (30/40): บัญชี GL ของกองเงินสดย่อยที่เลือก -> บัญชีพักเบิกเงินสดย่อยในการตั้งค่า
+    const pettyCashAccountId = async () => {
+        if (header.bank_account_id) {
+            const r = await client.query(`SELECT gl_account_id FROM cm_bank_account WHERE id = $1`, [header.bank_account_id]);
+            if (r.rows[0]?.gl_account_id) return Number(r.rows[0].gl_account_id);
+        }
+        return setup.petty_cash_payable_account_id;
+    };
+
     if (sysDocType === '10') {
         // รายรับ: Dr [บัญชีตามช่องทางรับเงิน] / Cr บัญชีรายได้
         const revenueAccountId = header.gl_account_id || setup.revenue_account_id;
@@ -256,7 +271,7 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
         }
     } else if (sysDocType === '30') {
         // เติมเงินสดย่อย: Dr บัญชีพักเบิกเงินสดย่อย (ล้างยอดใบเบิกที่ apply) / Cr [บัญชีตามช่องทางจ่ายเงิน]
-        pushLine(setup.petty_cash_payable_account_id, `เติมเงินสดย่อย ${docNo}`, totalAmountLc, 0, totalAmountFc, 0);
+        pushLine(await pettyCashAccountId(), `เติมเงินสดย่อย ${docNo}`, totalAmountLc, 0, totalAmountFc, 0);
         for (const p of payments) {
             const acc = await resolvePaymentGlAccount(client, p);
             pushLine(acc, `เติมเงินสดย่อย ${p.payment_method_code || ''} ${docNo}`, 0, Number(p.amount_lc) || 0, 0, Number(p.amount_fc) || 0);
@@ -266,19 +281,25 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
         for (const d of details) {
             pushLine(d.expense_account_id, d.description || `เบิกเงินสดย่อย ${docNo}`, Number(d.amount_lc) || 0, 0, Number(d.amount_fc) || 0, 0);
         }
-        pushLine(setup.petty_cash_payable_account_id, `เบิกเงินสดย่อย ${docNo}`, 0, totalAmountLc, 0, totalAmountFc);
+        pushLine(await pettyCashAccountId(), `เบิกเงินสดย่อย ${docNo}`, 0, totalAmountLc, 0, totalAmountFc);
     } else if (sysDocType === '50') {
         // โอนเงินระหว่างบัญชี: Dr บัญชีปลายทาง / Cr บัญชีต้นทาง
-        const fromRes = await client.query(`SELECT gl_account_id FROM cm_bank_account WHERE id = $1`, [header.from_bank_account_id]);
-        const toRes   = await client.query(`SELECT gl_account_id FROM cm_bank_account WHERE id = $1`, [header.to_bank_account_id]);
+        const fromRes = await client.query(`SELECT gl_account_id, currency_code FROM cm_bank_account WHERE id = $1`, [header.from_bank_account_id]);
+        const toRes   = await client.query(`SELECT gl_account_id, currency_code FROM cm_bank_account WHERE id = $1`, [header.to_bank_account_id]);
+        // ยังไม่รองรับโอนข้ามสกุลเงิน (ยอดเงินตราต่างประเทศสองฝั่งไม่เท่ากัน + กำไร/ขาดทุนอัตราแลกเปลี่ยน)
+        const fromCcy = fromRes.rows[0]?.currency_code, toCcy = toRes.rows[0]?.currency_code;
+        if (fromCcy && toCcy && fromCcy !== toCcy) {
+            throw new Error(`ยังไม่รองรับการโอนเงินระหว่างบัญชีต่างสกุลเงิน (${fromCcy} → ${toCcy})`);
+        }
         pushLine(toRes.rows[0]?.gl_account_id, `รับโอนเข้า ${docNo}`, totalAmountLc, 0, totalAmountFc, 0);
         pushLine(fromRes.rows[0]?.gl_account_id, `โอนออก ${docNo}`, 0, totalAmountLc, 0, totalAmountFc);
     } else if (['70', '90'].includes(sysDocType)) {
         // ค่าธรรมเนียมธนาคาร / ดอกเบี้ย: ทิศทาง Dr/Cr กลับกันถ้าเป็นดอกเบี้ยรับ
         const bankRes = await client.query(`SELECT gl_account_id FROM cm_bank_account WHERE id = $1`, [header.bank_account_id]);
         const bankAccountId = bankRes.rows[0]?.gl_account_id;
-        const offsetAccountId = header.gl_account_id || setup.expense_account_id;
         const isIncome = header.charge_type === 'INTEREST_INCOME';
+        // ดอกเบี้ยรับใช้บัญชีรายได้ ดอกเบี้ยจ่าย/ค่าธรรมเนียมใช้บัญชีค่าใช้จ่าย (ถ้าไม่ได้เลือกบัญชีบนเอกสาร)
+        const offsetAccountId = header.gl_account_id || (isIncome ? setup.revenue_account_id : setup.expense_account_id);
         const label = sysDocType === '90'
             ? (isIncome ? 'ดอกเบี้ยรับ' : 'ดอกเบี้ยจ่าย')
             : 'ค่าธรรมเนียมธนาคาร';
