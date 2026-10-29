@@ -3,6 +3,7 @@
 const { checkCmPeriodOpen } = require('../cm/cmPeriodCheckHelper');
 const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { computePaymentDeferredVat, insertDeferredVtRecordsForPayment } = require('./apTransactionController');
+const { describeJournalLines } = require('../../utils/glJournalPreview');
 
 // GET eligible AP invoices for bulk payment
 // Returns posted ap_transaction rows (Purchase Invoice / Debit Note) with an outstanding balance
@@ -64,6 +65,91 @@ const generateGlDocNo = async (client, glDocId, date) => {
     return docNo;
 };
 
+// ข้อผิดพลาดที่ส่งกลับผู้ใช้พร้อม HTTP status
+class BulkPayError extends Error {
+    constructor(status, message) { super(message); this.status = status; }
+}
+
+// ตรวจข้อมูลและสร้างบรรทัดรายการบัญชีของการจ่ายแบบกลุ่ม — ใช้ทั้ง preview และ run (ไม่เขียนข้อมูล)
+// บรรทัด: Dr เจ้าหนี้ทีละใบ, Cr ธนาคารยอดรวม, แล้ว Dr ภาษีซื้อ / Cr ภาษีซื้อรอตัด ของใบที่มี VAT รอตัดบัญชี
+const prepareBulkPayment = async (client, { bank_account_id, payment_date, items }) => {
+    if (!bank_account_id || !payment_date || !items || !items.length)
+        throw new BulkPayError(400, 'bank_account_id, payment_date and items are required');
+
+    // Paying bank account
+    const baRes = await client.query(`SELECT * FROM cm_bank_account WHERE id=$1`, [bank_account_id]);
+    if (!baRes.rows.length) throw new BulkPayError(404, 'Bank account not found');
+    const bankAcct = baRes.rows[0];
+    if (!bankAcct.gl_account_id) throw new BulkPayError(400, 'Selected bank account has no GL account configured');
+
+    // GL setup for AP Payment document type (sys_doc_type = '80')
+    const setupRes = await client.query(`
+        SELECT s.*, d.id AS sys_doc_id
+        FROM sa_module_document d
+        LEFT JOIN ap_gl_account_setup s ON s.doc_code = d.doc_code
+        WHERE d.sys_module = '21' AND d.sys_doc_type = '80' AND d.is_doc_type = true
+        LIMIT 1`);
+    if (!setupRes.rows.length || !setupRes.rows[0].gl_doc_id)
+        throw new BulkPayError(400, 'AP GL Account Setup for the Payment document type is not configured');
+    const setup = setupRes.rows[0];
+
+    // Load + validate every selected AP transaction up front
+    const docs = [];
+    for (const item of items) {
+        const apRes = await client.query(`
+            SELECT t.*, v.vendor_code AS v_vendor_code, v.vendor_name_th, v.vendor_name_en,
+                   v.ap_account_id AS vendor_ap_account_id
+            FROM ap_transaction t JOIN ap_vendor v ON v.id = t.vendor_id
+            WHERE t.id = $1`, [item.ap_document_id]);
+        if (!apRes.rows.length) throw new BulkPayError(404, `AP transaction id=${item.ap_document_id} not found`);
+        const payAmt = parseFloat(item.amount || 0);
+        if (payAmt <= 0) throw new BulkPayError(400, 'Payment amount must be greater than zero');
+        const apDoc = apRes.rows[0];
+        const apAccountId = apDoc.vendor_ap_account_id || setup.ap_account_id;
+        if (!apAccountId) throw new BulkPayError(400, `No AP account configured for vendor ${apDoc.v_vendor_code}`);
+        docs.push({ doc: apDoc, amount: payAmt, apAccountId });
+    }
+
+    const totalAmount = docs.reduce((s, d) => s + d.amount, 0);
+
+    const lines = docs.map(({ doc, amount, apAccountId }) =>
+        ({ account_id: apAccountId, description: `Payment ${doc.doc_no}`, debit: amount, credit: 0 }));
+    lines.push({ account_id: bankAcct.gl_account_id, description: 'Bulk payment', debit: 0, credit: totalAmount, isBank: true });
+
+    // รับรู้ VAT รอตัดบัญชี (บริการ) ของใบแจ้งหนี้ตามสัดส่วนที่จ่าย — Dr ภาษีซื้อ / Cr ภาษีซื้อรอตัด
+    // (มิเรอร์การจ่ายชำระปกติใน apTransactionController — จ่ายแบบกลุ่มเป็นยอดบาท จึงใช้สัดส่วนยอดบาท)
+    const deferredByDoc = [];
+    let deferredTotal = 0;
+    for (const { doc: apDoc, amount: payAmt } of docs) {
+        const totalLc = Number(apDoc.total_amount_lc) || 0;
+        if (totalLc === 0) continue;
+        const deferred = await computePaymentDeferredVat(client, [{ invoiceId: apDoc.id, ratio: payAmt / totalLc }]);
+        if (deferred.vatLc === 0) continue;
+        if (!setup.vat_input_account_id || !setup.vat_pending_input_account_id) {
+            throw new BulkPayError(400, `ใบแจ้งหนี้ ${apDoc.doc_no} มี VAT รอตัดบัญชีที่ต้องรับรู้ — กรุณาตั้งค่าบัญชีภาษีซื้อและบัญชีภาษีซื้อรอตัดบัญชีในการตั้งค่าบัญชี AP ของเอกสารจ่ายชำระ`);
+        }
+        lines.push(
+            { account_id: setup.vat_input_account_id, description: `รับรู้ VAT รอตัดบัญชี ${apDoc.doc_no}`, debit: deferred.vatLc, credit: 0 },
+            { account_id: setup.vat_pending_input_account_id, description: `VAT รอตัดบัญชี ${apDoc.doc_no}`, debit: 0, credit: deferred.vatLc });
+        deferredByDoc.push({ apDoc, deferred });
+        deferredTotal += deferred.vatLc;
+    }
+
+    return { setup, bankAcct, docs, totalAmount, lines, deferredByDoc, deferredTotal };
+};
+
+// POST preview bulk payment — รายการบัญชีที่จะเกิด (ไม่บันทึกอะไร)
+// Body: เหมือน run
+const previewBulkPayment = async (req, res) => {
+    const client = await req.dbPool.connect();
+    try {
+        const { lines } = await prepareBulkPayment(client, req.body);
+        res.json({ journal: await describeJournalLines(client, lines) });
+    } catch (err) {
+        res.status(err.status || 500).json({ error: err.message });
+    } finally { client.release(); }
+};
+
 // POST run bulk payment — pays multiple ap_transaction rows in one combined GL entry
 // Body: { bank_account_id, payment_date, payment_method, items: [{ap_document_id, amount}] }
 const runBulkPayment = async (req, res) => {
@@ -80,30 +166,14 @@ const runBulkPayment = async (req, res) => {
 
         await client.query('BEGIN');
 
-        // Paying bank account
-        const baRes = await client.query(`SELECT * FROM cm_bank_account WHERE id=$1`, [bank_account_id]);
-        if (!baRes.rows.length) {
+        let prepared;
+        try {
+            prepared = await prepareBulkPayment(client, req.body);
+        } catch (err) {
             await client.query('ROLLBACK');
-            return res.status(404).json({ error: 'Bank account not found' });
+            return res.status(err.status || 500).json({ error: err.message });
         }
-        const bankAcct = baRes.rows[0];
-        if (!bankAcct.gl_account_id) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'Selected bank account has no GL account configured' });
-        }
-
-        // GL setup for AP Payment document type (sys_doc_type = '80')
-        const setupRes = await client.query(`
-            SELECT s.*, d.id AS sys_doc_id
-            FROM sa_module_document d
-            LEFT JOIN ap_gl_account_setup s ON s.doc_code = d.doc_code
-            WHERE d.sys_module = '21' AND d.sys_doc_type = '80' AND d.is_doc_type = true
-            LIMIT 1`);
-        if (!setupRes.rows.length || !setupRes.rows[0].gl_doc_id) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ error: 'AP GL Account Setup for the Payment document type is not configured' });
-        }
-        const setup = setupRes.rows[0];
+        const { setup, docs, totalAmount, lines, deferredByDoc, deferredTotal } = prepared;
 
         // Open GL period
         const periodRes = await client.query(`
@@ -116,34 +186,6 @@ const runBulkPayment = async (req, res) => {
         }
         const periodId = periodRes.rows[0].id;
 
-        // Load + validate every selected AP transaction up front
-        const docs = [];
-        for (const item of items) {
-            const apRes = await client.query(`
-                SELECT t.*, v.vendor_code AS v_vendor_code, v.vendor_name_th, v.vendor_name_en,
-                       v.ap_account_id AS vendor_ap_account_id
-                FROM ap_transaction t JOIN ap_vendor v ON v.id = t.vendor_id
-                WHERE t.id = $1`, [item.ap_document_id]);
-            if (!apRes.rows.length) {
-                await client.query('ROLLBACK');
-                return res.status(404).json({ error: `AP transaction id=${item.ap_document_id} not found` });
-            }
-            const payAmt = parseFloat(item.amount || 0);
-            if (payAmt <= 0) {
-                await client.query('ROLLBACK');
-                return res.status(400).json({ error: 'Payment amount must be greater than zero' });
-            }
-            const apDoc = apRes.rows[0];
-            const apAccountId = apDoc.vendor_ap_account_id || setup.ap_account_id;
-            if (!apAccountId) {
-                await client.query('ROLLBACK');
-                return res.status(400).json({ error: `No AP account configured for vendor ${apDoc.v_vendor_code}` });
-            }
-            docs.push({ doc: apDoc, amount: payAmt, apAccountId });
-        }
-
-        const totalAmount = docs.reduce((s, d) => s + d.amount, 0);
-
         let glDocNo = await generateGlDocNo(client, setup.gl_doc_id, payment_date);
         if (!glDocNo) glDocNo = `BULKPAY-${payment_date}-${Date.now()}`;
 
@@ -151,6 +193,7 @@ const runBulkPayment = async (req, res) => {
         const createdByUserId = userRes.rows[0]?.id || null;
 
         // One combined GL entry for the whole batch
+        const totalGl = totalAmount + deferredTotal;
         const glHeaderRes = await client.query(`
             INSERT INTO gl_entry_header
               (doc_id, doc_no, doc_date, posting_date, period_id,
@@ -161,17 +204,19 @@ const runBulkPayment = async (req, res) => {
             VALUES ($1,$2,$3,$3,$4,$5,$6,1,1,'Posted',$7,$7,$7,$7,$8)
             RETURNING id`,
             [setup.gl_doc_id, glDocNo, payment_date, periodId, glDocNo,
-             `Bulk Payment ${glDocNo}`, totalAmount, createdByUserId]);
+             `Bulk Payment ${glDocNo}`, totalGl, createdByUserId]);
         const glEntryId = glHeaderRes.rows[0].id;
 
         let lineNo = 1;
-        const created = [];
-        for (const { doc: apDoc, amount: payAmt, apAccountId } of docs) {
+        for (const l of lines) {
             await client.query(`
                 INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
-                VALUES ($1,$2,$3,$4,$5,0,$5,0)`,
-                [glEntryId, lineNo++, apAccountId, `Payment ${apDoc.doc_no}`, payAmt]);
+                VALUES ($1,$2,$3,$4,$5,$6,$5,$6)`,
+                [glEntryId, lineNo++, l.account_id, l.isBank ? `Bulk payment ${glDocNo}` : l.description, l.debit, l.credit]);
+        }
 
+        const created = [];
+        for (const { doc: apDoc, amount: payAmt } of docs) {
             const pmtRes = await client.query(`
                 INSERT INTO cm_payment
                     (payment_date, bank_account_id, payment_method_type, ap_doc_no,
@@ -198,40 +243,12 @@ const runBulkPayment = async (req, res) => {
             created.push({ payment_id: pmtRes.rows[0].id, doc_no: apDoc.doc_no, amount: payAmt });
         }
 
-        // Credit line — total paid from the bank account
-        await client.query(`
-            INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
-            VALUES ($1,$2,$3,$4,0,$5,0,$5)`,
-            [glEntryId, lineNo++, bankAcct.gl_account_id, `Bulk payment ${glDocNo}`, totalAmount]);
-
-        // รับรู้ VAT รอตัดบัญชี (บริการ) ของใบแจ้งหนี้ตามสัดส่วนที่จ่าย — Dr ภาษีซื้อ / Cr ภาษีซื้อรอตัด + รายงานภาษีซื้อ
-        // (มิเรอร์การจ่ายชำระปกติใน apTransactionController — จ่ายแบบกลุ่มเป็นยอดบาท จึงใช้สัดส่วนยอดบาท)
-        let deferredTotal = 0;
-        for (const { doc: apDoc, amount: payAmt } of docs) {
-            const totalLc = Number(apDoc.total_amount_lc) || 0;
-            if (totalLc === 0) continue;
-            const deferred = await computePaymentDeferredVat(client, [{ invoiceId: apDoc.id, ratio: payAmt / totalLc }]);
-            if (deferred.vatLc === 0) continue;
-            if (!setup.vat_input_account_id || !setup.vat_pending_input_account_id) {
-                throw new Error(`ใบแจ้งหนี้ ${apDoc.doc_no} มี VAT รอตัดบัญชีที่ต้องรับรู้ — กรุณาตั้งค่าบัญชีภาษีซื้อและบัญชีภาษีซื้อรอตัดบัญชีในการตั้งค่าบัญชี AP ของเอกสารจ่ายชำระ`);
-            }
-            await client.query(`
-                INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
-                VALUES ($1,$2,$3,$4,$5,0,$5,0), ($1,$6,$7,$8,0,$5,0,$5)`,
-                [glEntryId, lineNo, setup.vat_input_account_id, `รับรู้ VAT รอตัดบัญชี ${apDoc.doc_no}`, deferred.vatLc,
-                 lineNo + 1, setup.vat_pending_input_account_id, `VAT รอตัดบัญชี ${apDoc.doc_no}`]);
-            lineNo += 2;
-            deferredTotal += deferred.vatLc;
+        // รายงานภาษีซื้อของ VAT รอตัดที่รับรู้
+        for (const { apDoc, deferred } of deferredByDoc) {
             await insertDeferredVtRecordsForPayment(client, apDoc.id, {
                 doc_id: setup.sys_doc_id, doc_no: glDocNo, doc_date: payment_date,
                 vendor_id: apDoc.vendor_id, vendor_name_th: apDoc.vendor_name_th, created_by: createdBy,
             }, deferred);
-        }
-        if (deferredTotal) {
-            await client.query(`
-                UPDATE gl_entry_header SET total_debit_lc = total_debit_lc + $1, total_credit_lc = total_credit_lc + $1,
-                       total_debit_fc = total_debit_fc + $1, total_credit_fc = total_credit_fc + $1 WHERE id = $2`,
-                [deferredTotal, glEntryId]);
         }
 
         await client.query('COMMIT');
@@ -247,4 +264,4 @@ const runBulkPayment = async (req, res) => {
     } finally { client.release(); }
 };
 
-module.exports = { getEligibleInvoices, runBulkPayment };
+module.exports = { getEligibleInvoices, previewBulkPayment, runBulkPayment };

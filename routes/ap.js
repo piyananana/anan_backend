@@ -146,6 +146,7 @@ router.get('/ap_remittance_advice/:payment_id',     apRemittanceAdviceController
 
 // ── AP Bulk Payment ────────────────────────────────────────────────────────────
 router.get('/ap_bulk_payment/eligible',             apBulkPaymentController.getEligibleInvoices);
+router.post('/ap_bulk_payment/preview',             apBulkPaymentController.previewBulkPayment);
 router.post('/ap_bulk_payment/run',                 apBulkPaymentController.runBulkPayment);
 
 module.exports = router;

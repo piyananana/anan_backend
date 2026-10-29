@@ -3,6 +3,7 @@ const { today: todayYmd, ymd } = require('../../utils/dateUtil');
 const { BASE_CURRENCY_CODE_SQL } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { generateDocNo } = require('./arTransactionController');
+const { describeJournalLines, fetchPostedJournalLines } = require('../../utils/glJournalPreview');
 
 // คอลัมน์สำหรับถอยเป็นร่าง / ยกเลิก (sql/ar_fx_revaluation_reverse_to_draft.sql) — ตารางหลักสร้างจาก sql/ar_year_end_closing.sql
 const ensureRevalColumns = async (db) => {
@@ -95,31 +96,21 @@ const getArControlAccount = async (client, invoiceId) => {
     return r.rows[0]?.ar_account_id || null;
 };
 
-// ── Helper: สร้าง GL Entry สำหรับ revaluation ────────────────────────────────
-const postRevalGlEntry = async (client, setup, details, revalDate, isUnrealized, docNo, createdBy) => {
+// ── Helper: บรรทัดรายการบัญชีของ revaluation (ใช้ทั้ง preview และโพสต์จริง) ──
+// รวม gain/loss ตามบัญชี AR ของแต่ละ invoice
+// DR: AR Control (ถ้า gain) / CR: FX Gain
+// DR: FX Loss / CR: AR Control (ถ้า loss)
+const buildRevalJournalLines = async (client, setup, details, isUnrealized) => {
     const gainAccountId = isUnrealized
-        ? setup.unrealized_fx_gain_account_id
-        : setup.fx_gain_account_id;
+        ? setup?.unrealized_fx_gain_account_id
+        : setup?.fx_gain_account_id;
     const lossAccountId = isUnrealized
-        ? setup.unrealized_fx_loss_account_id
-        : setup.fx_loss_account_id;
+        ? setup?.unrealized_fx_loss_account_id
+        : setup?.fx_loss_account_id;
 
     if (!gainAccountId || !lossAccountId)
         throw new Error('ยังไม่ได้ตั้งค่าบัญชี FX สำหรับปิดสิ้นปี');
 
-    // หา period
-    const periodRes = await client.query(
-        `SELECT id FROM gl_posting_period
-         WHERE $1::date BETWEEN period_start_date AND period_end_date
-         AND gl_status = 'OPEN' LIMIT 1`, [revalDate]
-    );
-    if (periodRes.rows.length === 0)
-        throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่ ${revalDate}`);
-    const periodId = periodRes.rows[0].id;
-
-    // รวม gain/loss ตามบัญชี AR ของแต่ละ invoice
-    // DR: AR Control (ถ้า gain) / CR: FX Gain
-    // DR: FX Loss / CR: AR Control (ถ้า loss)
     let totalGain = 0, totalLoss = 0;
     const arAdjMap = {}; // arAccountId → net adjustment (+ = DR, - = CR)
 
@@ -131,6 +122,43 @@ const postRevalGlEntry = async (client, setup, details, revalDate, isUnrealized,
         if (fxGl > 0) totalGain += fxGl;
         else totalLoss += Math.abs(fxGl);
     }
+
+    const lines = [];
+    for (const [arAccId, netAdj] of Object.entries(arAdjMap)) {
+        if (Math.abs(netAdj) < 0.005) continue;
+        lines.push({ account_id: parseInt(arAccId), debit: netAdj > 0 ? netAdj : 0, credit: netAdj < 0 ? -netAdj : 0 });
+    }
+    if (totalGain > 0.005) lines.push({ account_id: gainAccountId, debit: 0, credit: totalGain });
+    if (totalLoss > 0.005) lines.push({ account_id: lossAccountId, debit: totalLoss, credit: 0 });
+    return { lines, totalGain, totalLoss };
+};
+
+// รายการบัญชีที่จะเกิด (ร่าง/preview) หรือที่โพสต์แล้ว — ตั้งค่าบัญชีไม่ครบให้ข้อความแทน ไม่ทำให้ทั้งคำขอล้ม
+const revalJournal = async (db, { glEntryId, details, isUnrealized }) => {
+    try {
+        if (glEntryId) return { journal: await fetchPostedJournalLines(db, glEntryId), journal_posted: true };
+        const setup = (await db.query('SELECT * FROM ar_year_end_setup LIMIT 1')).rows[0];
+        if (!setup) return { journal: [], journal_error: 'ยังไม่ได้ตั้งค่าบัญชีปิดสิ้นปี AR' };
+        const { lines } = await buildRevalJournalLines(db, setup, details, isUnrealized);
+        return { journal: await describeJournalLines(db, lines), journal_posted: false };
+    } catch (err) {
+        return { journal: [], journal_error: err.message };
+    }
+};
+
+// ── Helper: สร้าง GL Entry สำหรับ revaluation ────────────────────────────────
+const postRevalGlEntry = async (client, setup, details, revalDate, isUnrealized, docNo, createdBy) => {
+    const { lines, totalGain, totalLoss } = await buildRevalJournalLines(client, setup, details, isUnrealized);
+
+    // หา period
+    const periodRes = await client.query(
+        `SELECT id FROM gl_posting_period
+         WHERE $1::date BETWEEN period_start_date AND period_end_date
+         AND gl_status = 'OPEN' LIMIT 1`, [revalDate]
+    );
+    if (periodRes.rows.length === 0)
+        throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่ ${revalDate}`);
+    const periodId = periodRes.rows[0].id;
 
     const totalDebitLc  = Math.round((totalGain + totalLoss) * 100) / 100;
     const totalCreditLc = totalDebitLc;
@@ -154,36 +182,14 @@ const postRevalGlEntry = async (client, setup, details, revalDate, isUnrealized,
         totalDebitLc, totalCreditLc, createdBy]);
     const glEntryId = hdrRes.rows[0].id;
 
+    // AR Control (ต่อบัญชี) แล้ว FX Gain / FX Loss
     let lineNo = 1;
-
-    // AR Control lines (per account)
-    for (const [arAccId, netAdj] of Object.entries(arAdjMap)) {
-        if (Math.abs(netAdj) < 0.005) continue;
-        const debitLc  = netAdj > 0 ? netAdj  : 0;   // gain → DR AR
-        const creditLc = netAdj < 0 ? -netAdj : 0;   // loss → CR AR
+    for (const l of lines) {
         await client.query(`
             INSERT INTO gl_entry_detail
             (header_id, line_no, account_id, debit_lc, credit_lc, debit_fc, credit_fc)
             VALUES ($1,$2,$3,$4,$5,$4,$5)
-        `, [glEntryId, lineNo++, parseInt(arAccId), debitLc, creditLc]);
-    }
-
-    // FX Gain line
-    if (totalGain > 0.005) {
-        await client.query(`
-            INSERT INTO gl_entry_detail
-            (header_id, line_no, account_id, debit_lc, credit_lc, debit_fc, credit_fc)
-            VALUES ($1,$2,$3,0,$4,0,$4)
-        `, [glEntryId, lineNo++, gainAccountId, totalGain]);
-    }
-
-    // FX Loss line
-    if (totalLoss > 0.005) {
-        await client.query(`
-            INSERT INTO gl_entry_detail
-            (header_id, line_no, account_id, debit_lc, credit_lc, debit_fc, credit_fc)
-            VALUES ($1,$2,$3,$4,0,$4,0)
-        `, [glEntryId, lineNo++, lossAccountId, totalLoss]);
+        `, [glEntryId, lineNo++, l.account_id, l.debit, l.credit]);
     }
 
     return glEntryId;
@@ -260,6 +266,9 @@ const fetchRow = async (req, res) => {
 
         res.json({
             header: hdr.rows[0], details: dtl.rows, ...(await computeRevalBlocks(req.dbPool, id)),
+            ...(await revalJournal(req.dbPool, {
+                glEntryId: hdr.rows[0].gl_entry_id, details: dtl.rows, isUnrealized: hdr.rows[0].method === 'reversing',
+            })),
             reverse_history: await getReverseHistory(req.dbPool, 'ar_fx_revaluation', id),
         });
     } catch (err) {
@@ -269,14 +278,17 @@ const fetchRow = async (req, res) => {
 
 // ── POST /api/ar/ar_fx_revaluation/preview ───────────────────────────────────
 const previewReval = async (req, res) => {
-    const { reval_date, year_end_rates } = req.body;
+    const { reval_date, year_end_rates, method } = req.body;
     if (!reval_date || !year_end_rates)
         return res.status(400).json({ error: 'reval_date and year_end_rates required' });
     const client = await req.dbPool.connect();
     try {
         const details = await calcRevalDetails(client, reval_date, year_end_rates);
         const totalGainLoss = details.reduce((s, d) => s + d.fx_gain_loss, 0);
-        res.json({ details, total_fx_gain_loss: Math.round(totalGainLoss * 100) / 100 });
+        res.json({
+            details, total_fx_gain_loss: Math.round(totalGainLoss * 100) / 100,
+            ...(await revalJournal(client, { details, isUnrealized: method !== 'realized' })),
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     } finally {
