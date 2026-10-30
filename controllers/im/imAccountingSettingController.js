@@ -2,7 +2,7 @@
 // accounting mode (PERPETUAL vs PERIODIC). Hybrid design: the stock subledger
 // (im_stock_balance/im_stock_layer) always tracks qty/cost in real time regardless of
 // mode — only whether postDetailLines posts a GL entry per-transaction is switchable.
-// See imPeriodClosingController.js for the periodic period-end closing entry.
+// Item/category/warehouse can override it (utils/imAccountingMode.js). See imPeriodClosingController.js for the closing entry.
 'use strict';
 
 const { logModeChange } = require('../../utils/imAccountingMode');
@@ -56,46 +56,6 @@ const fetchSettingRow = async (client) => {
     return res.rows[0] || null;
 };
 
-// ตั้งใจไม่ require imPeriodClosingController.js ที่นี่ (จะเกิด circular require กับที่นั่นซึ่ง require
-// fetchSettingRow กลับมา — ฟังก์ชันที่ destructure ตอน module load จะได้ reference ที่ยังไม่สมบูรณ์) จึง
-// inline DDL+seed แบบย่อไว้ตรงนี้แทน — โครงสร้างตารางต้องตรงกับ ensureImPeriodClosingTable ในไฟล์นั้นเสมอ
-const seedBeginningValueForModeSwitch = async (client, effectivePeriodId, userName) => {
-    await client.query(`
-        CREATE TABLE IF NOT EXISTS im_period_closing (
-            id              SERIAL PRIMARY KEY,
-            period_id       INTEGER NOT NULL UNIQUE REFERENCES gl_posting_period(id),
-            status          VARCHAR(20) NOT NULL DEFAULT 'Draft',
-            beginning_value NUMERIC(18,4), purchases_value NUMERIC(18,4), ending_value NUMERIC(18,4), cogs_value NUMERIC(18,4),
-            gl_entry_id     INTEGER REFERENCES gl_entry_header(id),
-            calculated_at   TIMESTAMPTZ, posted_at TIMESTAMPTZ, created_by VARCHAR(100), posted_by VARCHAR(100)
-        )
-    `);
-    const effRes = await client.query(`SELECT period_start_date FROM gl_posting_period WHERE id = $1`, [effectivePeriodId]);
-    if (effRes.rows.length === 0) return;
-    const prevPeriodRes = await client.query(
-        `SELECT id FROM gl_posting_period WHERE period_start_date < $1 ORDER BY period_start_date DESC LIMIT 1`,
-        [effRes.rows[0].period_start_date]
-    );
-    if (prevPeriodRes.rows.length === 0) return; // งวดแรกสุดของระบบ ไม่มีงวดก่อนหน้าให้ seed
-    const prevPeriodId = prevPeriodRes.rows[0].id;
-
-    const snapshotRes = await client.query(`SELECT COALESCE(SUM(qty_on_hand * avg_unit_cost), 0) AS total FROM im_stock_balance`);
-    const snapshotValue = Number(snapshotRes.rows[0].total) || 0;
-
-    const existing = await client.query(`SELECT id, status FROM im_period_closing WHERE period_id = $1`, [prevPeriodId]);
-    if (existing.rows.length > 0 && existing.rows[0].status === 'Posted') return; // ปิดจริงไปแล้ว ไม่ทับ
-    if (existing.rows.length > 0) {
-        await client.query(`
-            UPDATE im_period_closing SET status='Posted', ending_value=$1, calculated_at=NOW(), posted_at=NOW(), posted_by=$2 WHERE id=$3
-        `, [snapshotValue, userName, existing.rows[0].id]);
-    } else {
-        await client.query(`
-            INSERT INTO im_period_closing (period_id, status, ending_value, calculated_at, posted_at, created_by, posted_by)
-            VALUES ($1,'Posted',$2,NOW(),NOW(),$3,$3)
-        `, [prevPeriodId, snapshotValue, userName]);
-    }
-};
-
 const getSetting = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
@@ -126,24 +86,8 @@ const upsertSetting = async (req, res) => {
         const current = existing.rows[0] || null;
         const isSwitchingMode = !current || current.inventory_accounting_mode !== inventory_accounting_mode;
 
-        // สลับโหมดได้เฉพาะไปยังงวดที่ยังไม่มีธุรกรรม IM ที่ Posted แล้ว — กันไม่ให้ตัวเลขงวดที่ผ่านมาแล้วถูกตีความใหม่ย้อนหลัง
-        if (isSwitchingMode && mode_effective_period_id) {
-            const postedCheck = await client.query(
-                `SELECT COUNT(*) FROM im_transaction WHERE period_id = $1 AND status = 'Posted'`,
-                [mode_effective_period_id]
-            );
-            if (Number(postedCheck.rows[0].count) > 0) {
-                return res.status(400).json({
-                    message: 'งวดที่เลือกมีธุรกรรม IM ที่ Post ไปแล้ว ไม่สามารถกำหนดให้เป็นงวดที่เริ่มใช้โหมดใหม่ได้ — กรุณาเลือกงวดที่ยังไม่มีการ Post',
-                });
-            }
-        }
-
-        // สลับเข้าสู่ PERIODIC — seed มูลค่าสต็อกปัจจุบันเป็น "ปลายงวด" ของงวดก่อนหน้า effective period ทันที
-        // เพื่อให้การปิดงวดจริงครั้งแรกหา "ต้นงวด" เจอ (ไม่งั้นจะเป็น 0 ทั้งที่จริงมีสต็อกสะสมจากตอน perpetual)
-        if (isSwitchingMode && inventory_accounting_mode === 'PERIODIC' && mode_effective_period_id) {
-            await seedBeginningValueForModeSwitch(client, mode_effective_period_id, userName);
-        }
+        // ไม่ต้องจำกัดงวดหรือตั้งยอดต้นงวดตอนเปลี่ยนโหมดแล้ว — โหมดที่ใช้จริงบันทึกต่อบรรทัดตอน Post และการปิดงวด
+        // ปรับยอด GL ให้ตรงกับมูลค่าสต็อกเสมอ (ดู imPeriodClosingController.js) — mode_effective_period_id เก็บไว้เป็นข้อมูลเดิม
 
         let result;
         if (current) {
