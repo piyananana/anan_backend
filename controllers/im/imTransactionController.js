@@ -4,7 +4,7 @@
 'use strict';
 
 const { ensureImItemTable } = require('./imItemController');
-const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
+const { getBaseCurrencyCode, getBaseCurrency } = require('../../utils/baseCurrency');
 const { ensureImWarehouseTable } = require('./imWarehouseController');
 const { ensureImLocationTable } = require('./imLocationController');
 const { ensureImUomTable } = require('./imUomController');
@@ -336,33 +336,51 @@ const recomputeBalanceFromLayers = async (client, { itemId, warehouseId, locatio
     return { qty: Number(qty), avgCost: Number(avg_cost) };
 };
 
-// บัญชีสต็อกที่จะใช้ Dr/Cr: ดูที่คลัง (im_warehouse.inventory_account_id) ก่อน ถ้าไม่ได้ตั้งค่อย fallback ไปที่สินค้า (im_item)
-// แล้วค่อย fallback ไปที่ default ของ im_gl_account_setup — วันนี้ im_warehouse ยังไม่มีการตั้งค่าที่ไหนเลย จึง behavior
-// เหมือนเดิมทุกประการสำหรับ AJS/ISS; เผื่อไว้สำหรับวันที่ผังบัญชีถูกแยกตามคลัง (ใช้จริงกับ TRF)
-const resolveInventoryAccount = async (client, itemId, warehouseId, fallbackAccountId) => {
+// บัญชีของสินค้าตามลำดับ (user-approved 2026-10-30): คลัง (เฉพาะบัญชีสต็อก) → สินค้า → หมวดสินค้า → ค่าตั้งต้นของประเภทเอกสาร
+// ใช้ร่วมทั้งตอน Post และตัวอย่างรายการบัญชี (fetchGlAccounts) เพื่อให้ตรงกันเสมอ
+const fetchItemAccountRow = async (client, itemId, warehouseId = null) => {
     const res = await client.query(`
-        SELECT i.inventory_account_id AS item_account, w.inventory_account_id AS warehouse_account, i.item_code
+        SELECT i.item_code,
+               w.inventory_account_id AS warehouse_inventory,
+               i.inventory_account_id AS item_inventory, c.inventory_account_id AS category_inventory,
+               i.cogs_account_id      AS item_cogs,      c.cogs_account_id      AS category_cogs,
+               i.revenue_account_id   AS item_revenue,   c.revenue_account_id   AS category_revenue
         FROM im_item i
+        LEFT JOIN im_item_category c ON c.id = i.category_id
         LEFT JOIN im_warehouse w ON w.id = $2
         WHERE i.id = $1
     `, [itemId, warehouseId]);
-    const row = res.rows[0];
-    if (!row) throw new Error(`ไม่พบสินค้า item_id=${itemId}`);
-    const accountId = Number(row.warehouse_account) || Number(row.item_account) || Number(fallbackAccountId) || 0;
-    if (!accountId) throw new Error(`ไม่พบบัญชีสต็อกสำหรับ ${row.item_code} (ตั้งค่าที่ im_item, im_warehouse หรือ im_gl_account_setup)`);
+    if (!res.rows[0]) throw new Error(`ไม่พบสินค้า item_id=${itemId}`);
+    return res.rows[0];
+};
+const pickAccount = (...ids) => ids.map(Number).find(n => n > 0) || null;
+
+// บัญชีสต็อก: คลัง → สินค้า → หมวดสินค้า → default ของ im_gl_account_setup
+const resolveInventoryAccount = async (client, itemId, warehouseId, fallbackAccountId) => {
+    const row = await fetchItemAccountRow(client, itemId, warehouseId);
+    const accountId = pickAccount(row.warehouse_inventory, row.item_inventory, row.category_inventory, fallbackAccountId);
+    if (!accountId) throw new Error(`ไม่พบบัญชีสต็อกสำหรับ ${row.item_code} (ตั้งค่าที่คลัง สินค้า หมวดสินค้า หรือการตั้งค่าบัญชี IM)`);
     return accountId;
 };
 
-// บัญชีรายได้ที่ใช้ Cr ตอนสร้างใบแจ้งหนี้ลูกหนี้จาก DLN ('31'/'32'): ดูที่สินค้า (im_item.revenue_account_id) ก่อน
-// แล้วค่อย fallback ไปที่ default ของ ar_gl_account_setup (บัญชีเดียวกับที่ AR เองใช้เป็น default เวลาเอกสารไม่มีรายบรรทัด)
-const resolveRevenueAccount = async (client, itemId, fallbackAccountId) => {
-    const res = await client.query(`SELECT revenue_account_id, item_code FROM im_item WHERE id = $1`, [itemId]);
-    const row = res.rows[0];
-    if (!row) throw new Error(`ไม่พบสินค้า item_id=${itemId}`);
-    const accountId = Number(row.revenue_account_id) || Number(fallbackAccountId) || 0;
-    if (!accountId) throw new Error(`ไม่พบบัญชีรายได้สำหรับ ${row.item_code} (ตั้งค่าที่ im_item หรือ ar_gl_account_setup)`);
+// บัญชีต้นทุนขาย/เบิกใช้ ('30'-'45', '60'): สินค้า → หมวดสินค้า → default ของ im_gl_account_setup
+const resolveCogsAccount = async (client, itemId, fallbackAccountId) => {
+    const row = await fetchItemAccountRow(client, itemId);
+    const accountId = pickAccount(row.item_cogs, row.category_cogs, fallbackAccountId);
+    if (!accountId) throw new Error(`ไม่พบบัญชีต้นทุนสำหรับ ${row.item_code} (ตั้งค่าที่สินค้า หมวดสินค้า หรือการตั้งค่าบัญชี IM)`);
     return accountId;
 };
+
+// บัญชีรายได้ของเอกสาร AR ที่สร้างอัตโนมัติ ('31'/'32'/'35'/'40'/'45'): สินค้า → หมวดสินค้า → default ของ ar_gl_account_setup
+const resolveRevenueAccount = async (client, itemId, fallbackAccountId) => {
+    const row = await fetchItemAccountRow(client, itemId);
+    const accountId = pickAccount(row.item_revenue, row.category_revenue, fallbackAccountId);
+    if (!accountId) throw new Error(`ไม่พบบัญชีรายได้สำหรับ ${row.item_code} (ตั้งค่าที่สินค้า หมวดสินค้า หรือการตั้งค่าบัญชี AR)`);
+    return accountId;
+};
+
+// ประเภทเอกสาร IM ที่บัญชีคู่เป็นต้นทุน — แยกบรรทัดตามบัญชีต้นทุนของแต่ละสินค้า
+const COGS_COUNTER_TYPES = ['30', '31', '32', '35', '40', '45', '60'];
 
 // countedQty คือยอดที่นับได้จริง (ไม่ใช่ variance) — varianceQty คำนวณสดจากยอดคงเหลือ ณ ตอน Post เสมอ
 // เพื่อรับประกันว่า qty_on_hand หลัง Post จะเท่ากับ countedQty เป๊ะ ไม่ผูกกับ system_qty ที่ผู้ใช้เห็นตอนเพิ่มบรรทัด (อาจ stale)
@@ -608,11 +626,8 @@ const resolveCounterAccount = (sysDocType, setup) => {
                 throw new Error(`ยังไม่ได้ตั้งค่าบัญชีผลต่างต้นทุน (variance_account_id) ใน im_gl_account_setup สำหรับประเภทเอกสารนี้`);
             }
             return { accountId: Number(setup.variance_account_id), label: 'ผลต่างจากการนับสต็อก' };
-        case '60': // ISS — เบิกสินค้า: รับรู้เป็นต้นทุน
-            if (!setup.cogs_account_id) {
-                throw new Error(`ยังไม่ได้ตั้งค่าบัญชีต้นทุน (cogs_account_id) ใน im_gl_account_setup สำหรับประเภทเอกสารนี้`);
-            }
-            return { accountId: Number(setup.cogs_account_id), label: 'เบิกใช้สินค้า' };
+        case '60': // ISS — เบิกสินค้า: รับรู้เป็นต้นทุน (บัญชีจริงต่อบรรทัด: สินค้า → หมวดสินค้า → setup ดู resolveCogsAccount)
+            return { accountId: Number(setup.cogs_account_id) || null, label: 'เบิกใช้สินค้า' };
         case '90': // MOI — เบิกวัตถุดิบเข้าผลิต: พักไว้ที่งานระหว่างผลิต (WIP)
         case '95': // MOR — รับสินค้าเข้าคลังจากการผลิต: ตัดออกจากงานระหว่างผลิต (WIP) — ทิศทาง Dr/Cr มาจากเครื่องหมาย
             // ของ qty ใน postGlEntry เอง ('90' ติดลบ=ลดสต็อก/เพิ่ม WIP, '95' บวก=เพิ่มสต็อก/ลด WIP) เหมือน '30'/'35'/'40' ข้างบน
@@ -636,11 +651,8 @@ const resolveCounterAccount = (sysDocType, setup) => {
         case '32':
         case '35': // รับคืนสินค้า (RTC) / ลดหนี้ลูกหนี้ (CNC) / เพิ่มหนี้ลูกหนี้ (DNC) — กลับรายการต้นทุนขายเดียวกัน
         case '40': // (บวก=คืนของ ลด COGS, ลบ=ส่งเพิ่ม เพิ่ม COGS — ทิศทางมาจากเครื่องหมายของ qty ใน postGlEntry เอง)
-        case '45':
-            if (!setup.cogs_account_id) {
-                throw new Error(`ยังไม่ได้ตั้งค่าบัญชีต้นทุนขาย (cogs_account_id) ใน im_gl_account_setup สำหรับประเภทเอกสารนี้`);
-            }
-            return { accountId: Number(setup.cogs_account_id), label: 'ต้นทุนขาย (ส่งสินค้า)' };
+        case '45': // บัญชีจริงต่อบรรทัด: สินค้า → หมวดสินค้า → setup (ดู resolveCogsAccount)
+            return { accountId: Number(setup.cogs_account_id) || null, label: 'ต้นทุนขาย (ส่งสินค้า)' };
         default:
             throw new Error(`ยังไม่รองรับการ Post บัญชีสำหรับประเภทเอกสารนี้ (sys_doc_type='${sysDocType}')`);
     }
@@ -769,12 +781,14 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
         }
     } else {
         const { accountId: counterAccountId, label: counterLabel } = resolveCounterAccount(sysDocType, setup);
-        let totalValue = 0;
+        const perItemCogs = COGS_COUNTER_TYPES.includes(sysDocType);
+        const counterByAccount = {}; // account_id -> มูลค่าสต็อกที่เปลี่ยน (บวก=Cr คู่บัญชี, ลบ=Dr คู่บัญชี)
         for (const d of details) {
             const invAcc = await resolveInventoryAccount(client, d.item_id, header.warehouse_id, setup.inventory_account_id);
             const value = round2(Number(d.qty) * Number(d.unit_cost));
             invDebitByAccount[invAcc] = (invDebitByAccount[invAcc] || 0) + value;
-            totalValue += value;
+            const cAcc = perItemCogs ? await resolveCogsAccount(client, d.item_id, counterAccountId) : counterAccountId;
+            counterByAccount[cAcc] = (counterByAccount[cAcc] || 0) + value;
         }
         for (const [accId, amt] of Object.entries(invDebitByAccount)) {
             if (amt === 0) continue;
@@ -783,10 +797,11 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
                 debit_lc: amt > 0 ? round2(amt) : 0, credit_lc: amt < 0 ? round2(-amt) : 0, debit_fc: 0, credit_fc: 0,
             });
         }
-        if (totalValue !== 0) {
+        for (const [accId, amt] of Object.entries(counterByAccount)) {
+            if (round2(amt) === 0) continue;
             glDetails.push({
-                account_id: counterAccountId, description: `${counterLabel} ${docNo}`,
-                debit_lc: totalValue < 0 ? round2(-totalValue) : 0, credit_lc: totalValue > 0 ? round2(totalValue) : 0, debit_fc: 0, credit_fc: 0,
+                account_id: Number(accId), description: `${counterLabel} ${docNo}`,
+                debit_lc: amt < 0 ? round2(-amt) : 0, credit_lc: amt > 0 ? round2(amt) : 0, debit_fc: 0, credit_fc: 0,
             });
         }
     }
@@ -814,7 +829,7 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
     `, [
         setup.gl_doc_id, glDocNo, header.doc_date, header.doc_date, periodId,
         header.ref_no || null, header.description || null,
-        1, totalDebit, totalCredit, createdByUserId, header.doc_id, docNo, headerId,
+        (await getBaseCurrency(client)).id, totalDebit, totalCredit, createdByUserId, header.doc_id, docNo, headerId,
     ]);
     const glEntryId = glHeaderRes.rows[0].id;
 
@@ -3127,8 +3142,69 @@ const deleteTransaction = async (req, res) => {
     } finally { client.release(); }
 };
 
+// GET-like (POST เพราะส่งรายการสินค้า) — บัญชีที่ตอน Post จะใช้ต่อสินค้า สำหรับตัวอย่างรายการบัญชีบนหน้าจอ
+// body: { doc_code, warehouse_id, to_warehouse_id, item_ids: [] } → { mode, purchases, items: { [item_id]: {...} } }
+// ใช้ resolver ชุดเดียวกับ postGlEntry/postApBillFromGrn/postArBillFromDln (ไม่ throw — บัญชีที่หาไม่เจอส่ง null)
+const AR_DOC_FOR_IM = { '31': '10', '32': '10', '35': '50', '40': '50', '45': '30' };
+const AP_DOC_FOR_IM = { '11': '10', '12': '10', '15': '30', '20': '30', '25': '50' };
+const fetchGlAccounts = async (req, res) => {
+    const client = await req.dbPool.connect();
+    try {
+        const { doc_code, warehouse_id, to_warehouse_id } = req.body || {};
+        const itemIds = [...new Set((req.body?.item_ids || []).map(Number).filter(Boolean))];
+        const sdRes = await client.query(
+            `SELECT sys_doc_type FROM sa_module_document WHERE doc_code = $1 AND sys_module = '31' LIMIT 1`, [doc_code]);
+        const sysDocType = sdRes.rows[0]?.sys_doc_type || '';
+        const setup = (await fetchSetupByDocCode(client, doc_code)) || {};
+        const mode = await fetchMode(client);
+        const setting = await fetchSettingRow(client);
+
+        const setupOf = async (table, module, sysType) => {
+            if (!sysType) return null;
+            const r = await client.query(`
+                SELECT s.* FROM ${table} s JOIN sa_module_document d ON d.doc_code = s.doc_code
+                 WHERE d.sys_module = $1 AND d.sys_doc_type = $2 AND d.is_doc_type = true AND d.is_active = true
+                 ORDER BY d.sort_order LIMIT 1`, [module, sysType]);
+            return r.rows[0] || null;
+        };
+        const arSetup = await setupOf('ar_gl_account_setup', '11', AR_DOC_FOR_IM[sysDocType]);
+        const apSetup = await setupOf('ap_gl_account_setup', '21', AP_DOC_FOR_IM[sysDocType]);
+        // เอกสาร AP อัตโนมัติ: บัญชีสต็อก fallback สุดท้ายเป็นบัญชีค่าใช้จ่ายของเอกสาร AP (มิเรอร์ postApBillFromGrn)
+        const invFallback = pickAccount(setup.inventory_account_id, apSetup?.expense_account_id);
+
+        const items = {};
+        const ids = new Set();
+        for (const itemId of itemIds) {
+            const row = await fetchItemAccountRow(client, itemId, warehouse_id || null);
+            const dst = to_warehouse_id ? await fetchItemAccountRow(client, itemId, to_warehouse_id) : null;
+            const a = {
+                inventory: pickAccount(row.warehouse_inventory, row.item_inventory, row.category_inventory, invFallback),
+                to_inventory: dst ? pickAccount(dst.warehouse_inventory, dst.item_inventory, dst.category_inventory, invFallback) : null,
+                cogs: pickAccount(row.item_cogs, row.category_cogs, setup.cogs_account_id),
+                revenue: pickAccount(row.item_revenue, row.category_revenue, arSetup?.revenue_account_id),
+            };
+            Object.values(a).forEach(v => v && ids.add(v));
+            items[itemId] = a;
+        }
+        const purchases = mode === 'PERIODIC' ? pickAccount(setting?.purchases_account_id) : null;
+        if (purchases) ids.add(purchases);
+
+        const accRes = ids.size ? await client.query(
+            `SELECT id, account_code, account_name_thai, account_name_eng FROM gl_account WHERE id = ANY($1::int[])`, [[...ids]]) : { rows: [] };
+        const acc = Object.fromEntries(accRes.rows.map(r => [r.id, r]));
+        const describe = (id) => id ? { id, code: acc[id]?.account_code || '', name_th: acc[id]?.account_name_thai || '', name_en: acc[id]?.account_name_eng || '' } : null;
+        for (const a of Object.values(items)) for (const k of Object.keys(a)) a[k] = describe(a[k]);
+        res.json({ sys_doc_type: sysDocType, mode, purchases: describe(purchases), items });
+    } catch (err) {
+        console.error('Error fetching IM GL accounts:', err);
+        res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
+    }
+};
+
 module.exports = {
-    ensureImTransactionTable,
+    ensureImTransactionTable, fetchGlAccounts,
     fetchRows, fetchRow, fetchSystemQty, fetchReturnableDocs, fetchReturnableLines,
     createTransaction, createMoReceipt, updateTransaction, postTransaction, postBillingForGrn, postBillingForDln, voidTransaction, reverseToDraft, deleteTransaction,
     computeImBlocks, voidImDocument, removeSystemImDocument, reasonOf, userIdOf,

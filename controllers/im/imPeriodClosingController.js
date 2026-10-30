@@ -6,6 +6,7 @@
 'use strict';
 
 const { fetchSettingRow } = require('./imAccountingSettingController');
+const { getBaseCurrency } = require('../../utils/baseCurrency');
 
 // คัดลอกจาก imTransactionController.js — เป็นธรรมเนียมของโปรเจกต์นี้ให้แต่ละ controller มีสำเนาของตัวเอง
 // (เหมือน ap/ar/cm/gl) แทนที่จะ require ข้ามกัน เพื่อเลี่ยง circular require กับ imAccountingSettingController.js
@@ -243,9 +244,10 @@ const confirmClose = async (req, res) => {
                 INSERT INTO gl_entry_header
                 (doc_id, doc_no, doc_date, posting_date, period_id, description,
                  currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc, created_by)
-                VALUES ($1,$2,$3,$4,$5,$6,1,1,'Posted',$7,$8,0,0,$9)
+                VALUES ($1,$2,$3,$4,$5,$6,$10,1,'Posted',$7,$8,0,0,$9)
                 RETURNING id
-            `, [setting.closing_gl_doc_id, docNo, docDate, docDate, periodId, description, totalDebit, totalCredit, createdByUserId]);
+            `, [setting.closing_gl_doc_id, docNo, docDate, docDate, periodId, description, totalDebit, totalCredit, createdByUserId,
+                (await getBaseCurrency(client)).id]); // สกุลเงินหลัก ไม่ใช่ id 1 ตายตัว
             glEntryId = glHeaderRes.rows[0].id;
 
             let lineNo = 1;

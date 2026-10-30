@@ -9,6 +9,7 @@
 //   3. มาจากการตัด im_stock_layer หลายใบของหลายเอกสารขายมารวมเป็นบิลเดียว ไม่ใช่ 1:1 กับเอกสารรับเหมือน '11'/'12'
 const { generateDocNo } = require('./imTransactionController');
 const { getBaseCurrency } = require('../../utils/baseCurrency');
+const { resolveApAccountId } = require('../../utils/apAccount');
 const { today, ymd } = require('../../utils/dateUtil');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 
@@ -98,11 +99,12 @@ const postSettlementGl = async (client, apTransactionId, userId) => {
         (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
          currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
          created_by, ref_doc_id, ref_doc_no, external_source_id, ref_doc_date)
-        VALUES ($1,$2,$3,$3,$4,$5,$6,1,1,'Posted',$7,$7,0,0,$8,$9,$10,$11,$3)
+        VALUES ($1,$2,$3,$3,$4,$5,$6,$12,1,'Posted',$7,$7,0,0,$8,$9,$10,$11,$3)
         RETURNING id
     `, [
         tx.gl_doc_id, glDocNo, tx.doc_date, tx.period_id, tx.ref_no, tx.description,
         total, userId, tx.doc_id, tx.doc_no, apTransactionId,
+        (await getBaseCurrency(client)).id, // ยอดเป็นบาทล้วน (fc 0) — สกุลเงินหลัก ไม่ใช่ id 1 ตายตัว
     ]);
     const glEntryId = glRes.rows[0].id;
     let glLineNo = 1;
@@ -164,12 +166,9 @@ const postSettlement = async (req, res) => {
         const apSetup = apSetupRes.rows[0] || null;
         if (!apSetup?.gl_doc_id) throw new Error('ยังไม่ได้ตั้งค่า GL Document Type ใน ap_gl_account_setup สำหรับใบกำกับสินค้า');
 
-        let apAccountId = apSetup.ap_account_id ? Number(apSetup.ap_account_id) : null;
-        if (!apAccountId) {
-            const vendorAcctRes = await client.query(`SELECT ap_account_id FROM ap_vendor WHERE id = $1`, [vendor_id]);
-            apAccountId = vendorAcctRes.rows[0]?.ap_account_id ? Number(vendorAcctRes.rows[0].ap_account_id) : null;
-        }
-        if (!apAccountId) throw new Error('ไม่พบบัญชีเจ้าหนี้สำหรับการลงบัญชี กรุณาตั้งค่าใน ap_gl_account_setup หรือผู้ขาย');
+        // บัญชีเจ้าหนี้ — ลำดับเดียวกับ AP: เจ้าหนี้ > กลุ่มเจ้าหนี้ > ประเภทเอกสาร AP (utils/apAccount.js)
+        const apAccountId = await resolveApAccountId(client, { vendorId: vendor_id, docId: apDocId });
+        if (!apAccountId) throw new Error('ไม่พบบัญชีเจ้าหนี้สำหรับการลงบัญชี กรุณาตั้งค่าที่เจ้าหนี้ กลุ่มเจ้าหนี้ หรือการตั้งค่ารหัสบัญชีของประเภทเอกสาร');
 
         const vendorRow = rows[0];
         const periodId = await openPeriodId(client, settleDate);

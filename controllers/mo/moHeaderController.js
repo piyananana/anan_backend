@@ -24,6 +24,7 @@ const { ensureImWarehouseTable } = require('../im/imWarehouseController');
 const { ensureImLocationTable } = require('../im/imLocationController');
 const { ensureMoBomTable } = require('./moBomController');
 const { today } = require('../../utils/dateUtil');
+const { getBaseCurrency } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const DA = require('../../utils/docApproval');
 const KIND = 'MO';
@@ -969,11 +970,12 @@ const closeTransaction = async (req, res) => {
                 (doc_id, doc_no, doc_date, posting_date, period_id, description,
                  currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
                  created_by, ref_doc_id, ref_doc_no, ref_doc_date)
-                VALUES ($1,$2,$3,$3,$4,$5,1,1,'Posted',$6,$6,0,0,$7,$8,$9,$10)
+                VALUES ($1,$2,$3,$3,$4,$5,$11,1,'Posted',$6,$6,0,0,$7,$8,$9,$10)
                 RETURNING id
             `, [
                 setup.gl_doc_id, glDocNo, closeDate, periodId, description,
                 amount, createdByUserId, mo.doc_id, mo.doc_no, mo.doc_date,
+                (await getBaseCurrency(client)).id, // สกุลเงินหลัก ไม่ใช่ id 1 ตายตัว
             ]);
             glEntryId = glHeaderRes.rows[0].id;
 

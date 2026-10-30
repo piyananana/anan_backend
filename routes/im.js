@@ -95,6 +95,7 @@ router.get('/im_stock_layer',   imStockLayerController.fetchRows);
 
 // im_transaction (v1: doc_code='AJS' — ตั้งยอดสินค้าด้วยการนับสต็อค; ISS/TRF/GRN/DLN family เพิ่มทีหลังในหน้าจอเดียวกัน)
 router.get('/im_transaction/system_qty', imTransactionController.fetchSystemQty);
+router.post('/im_transaction/gl_accounts', imTransactionController.fetchGlAccounts); // บัญชีต่อสินค้าสำหรับตัวอย่างรายการบัญชี
 router.get('/im_transaction/returnable_docs', imTransactionController.fetchReturnableDocs);
 router.get('/im_transaction/gr_billing_report', imGrBillingReportController.getGrBillingReport);
 router.get('/im_transaction/dln_billing_report', imDlnBillingReportController.getDlnBillingReport);
