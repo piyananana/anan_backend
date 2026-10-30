@@ -4,6 +4,8 @@ const router = express.Router();
 const moBomController = require('../controllers/mo/moBomController');
 const moWorkCenterController = require('../controllers/mo/moWorkCenterController');
 const moHeaderController = require('../controllers/mo/moHeaderController');
+const moGlAccountSetupController = require('../controllers/mo/moGlAccountSetupController');
+const { rejectHeaderAccounts } = require('../utils/glAccountGuard');
 
 // mo_bom (mo_bom_header + mo_bom_detail) — ย้ายมาจาก /api/im/im_bom
 router.get('/mo_bom',        moBomController.fetchRows);
@@ -38,6 +40,7 @@ router.put('/mo_header/:id/approve', moHeaderController.approveTransaction);
 router.put('/mo_header/:id/reject',  moHeaderController.rejectTransaction);
 router.put('/mo_header/:id/cancel',  moHeaderController.cancelTransaction);
 router.put('/mo_header/:id/close',   moHeaderController.closeTransaction);
+router.get('/mo_header/:id/close_preview', moHeaderController.closePreview);
 router.put('/mo_header/:id/reverse', moHeaderController.reverseTransaction);
 router.get('/mo_header/:id/availability', moHeaderController.checkMaterialAvailability);
 router.get('/mo_header/:id/explosion_candidates', moHeaderController.fetchExplosionCandidates);
@@ -45,5 +48,11 @@ router.post('/mo_header/:id/explode', moHeaderController.explodeSubAssembly);
 router.delete('/mo_header/:id',      moHeaderController.deleteTransaction);
 // บันทึกเวลาปฏิบัติงาน (เฉพาะ MO costing_mode='ROUTING') — ไม่ใช่ im_transaction ไม่มีผล GL/สต็อก
 router.put('/mo_header/:moId/operations/:opId/log_time', moHeaderController.logOperationTime);
+router.get('/mo_header/:moId/time_logs', moHeaderController.fetchTimeLogs);
+router.put('/mo_header/:moId/time_logs/:logId/reverse', moHeaderController.reverseTimeLog);
+
+// mo_gl_account_setup (บัญชีของประเภทเอกสารใบสั่งผลิต — WIP/ผลต่าง/ค่าแรงและโสหุ้ยที่ปันเข้างาน)
+router.get('/mo_gl_account_setup', moGlAccountSetupController.fetchRows);
+router.post('/mo_gl_account_setup/:doc_code', rejectHeaderAccounts, moGlAccountSetupController.upsertRow);
 
 module.exports = router;

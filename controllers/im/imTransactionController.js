@@ -13,6 +13,7 @@ const { ensureImStockLayerTable } = require('./imStockLayerController');
 const { fetchSetupByDocCode, resolveTargetDoc } = require('./imGlAccountSetupController');
 const { fetchMode } = require('./imAccountingSettingController');
 const { resolveItemModes } = require('../../utils/imAccountingMode');
+const { fetchMoGlSetup } = require('../mo/moGlAccountSetupController');
 const { today: todayYmd, ymd } = require('../../utils/dateUtil');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { branchCodeSql } = require('../../utils/taxBranch');
@@ -191,6 +192,8 @@ const ensureImTransactionTable = async (client) => {
     // MO ที่ใช้ costing_method='ACTUAL' (unit_cost ก็คือต้นทุนจริงอยู่แล้ว ไม่มีผลต่างให้คำนวณ) ดู
     // computeMoReceiptUnitCost/createMoReceipt ด้านล่าง และ postGlEntry (sysDocType==='95' branch)
     await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS mo_actual_unit_cost NUMERIC(18,4)`).catch(() => {});
+    // MOR ของใบสั่งผลิตที่คิดโสหุ้ยเป็น % — ส่วนโสหุ้ยต่อหน่วยที่ปันเข้างานตอนรับ (Dr WIP / Cr โสหุ้ยที่ปันเข้างาน)
+    await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS mo_applied_overhead_unit_cost NUMERIC(18,4)`).catch(() => {});
 
     // VAT ต่อบรรทัด — ใช้เฉพาะประเภทเอกสารที่สร้าง/อ้างอิงใบกำกับ AP/AR อัตโนมัติ ('11'/'12'/'15'/'20'/'25'/'31'/
     // '32'/'35'/'40'/'45') อ้างอิง cd_vat_rate เดียวกับที่ AR/AP ใช้ (vat_type=vat_code, vat_rate=snapshot ณ ตอนโพสต์
@@ -713,9 +716,16 @@ const postGlEntry = async (client, headerId, header, allDetails, docNo, sysDocTy
     if (periodRes.rows.length === 0) throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่ ${header.doc_date}`);
     const periodId = periodRes.rows[0].id;
 
-    const setup = await fetchSetupByDocCode(client, header.doc_code);
+    let setup = await fetchSetupByDocCode(client, header.doc_code);
     if (!setup) throw new Error(`ยังไม่ได้ตั้งค่าบัญชีใน im_gl_account_setup สำหรับ ${header.doc_code}`);
     if (!setup.gl_doc_id) throw new Error('ยังไม่ได้ตั้งค่า GL Document Type ใน im_gl_account_setup สำหรับประเภทเอกสารนี้');
+    // MOI/MOR ที่อ้างอิงใบสั่งผลิต: WIP/ผลต่าง/โสหุ้ยที่ปันเข้างาน ใช้ชุดบัญชีของประเภทเอกสารใบสั่งผลิต (mo_gl_account_setup)
+    // WIP ของใบสั่งผลิตจึงอยู่บัญชีเดียวเสมอ — MOI/MOR ที่ไม่อ้างอิงใบสั่งผลิตใช้บัญชีของประเภทเอกสาร IM เหมือนเดิม
+    let moSetup = null;
+    if (['90', '95'].includes(sysDocType) && header.ref_mo_id) {
+        moSetup = await fetchMoGlSetup(client, header.ref_mo_id, ['wip_account_id']);
+        setup = { ...setup, wip_account_id: moSetup.wip_account_id, variance_account_id: moSetup.variance_account_id };
+    }
 
     const invDebitByAccount = {}; // account_id -> net value (บวก=debit สุทธิ, ลบ=credit สุทธิ)
     const glDetails = [];
@@ -810,10 +820,28 @@ const postGlEntry = async (client, headerId, header, allDetails, docNo, sysDocTy
                 debit_lc: totalWipValue < 0 ? round2(-totalWipValue) : 0, credit_lc: totalWipValue > 0 ? round2(totalWipValue) : 0, debit_fc: 0, credit_fc: 0,
             });
         }
+        // โสหุ้ยแบบ % ของใบสั่งผลิต: ปันเข้างานตอนรับ (Dr WIP / Cr โสหุ้ยที่ปันเข้างาน) เท่ากับส่วนโสหุ้ยในต้นทุนที่ตัดออกจาก WIP
+        // ข้างบน WIP จึงไม่ติดลบ (ใบสั่งผลิตแบบชั่วโมงปันเข้างานตอนบันทึกเวลาแล้ว — ไม่มีค่านี้)
+        const appliedOverhead = round2(details.reduce((t, d) => t + Number(d.qty) * Number(d.mo_applied_overhead_unit_cost || 0), 0));
+        if (Math.abs(appliedOverhead) >= 0.005) {
+            if (!moSetup?.applied_overhead_account_id) {
+                throw new Error('ยังไม่ได้ตั้งค่าบัญชีโสหุ้ยการผลิตที่ปันเข้างาน ของประเภทเอกสารใบสั่งผลิต — ตั้งค่าที่หน้าตั้งค่าบัญชีใบสั่งผลิต');
+            }
+            glDetails.push({
+                account_id: wipAccountId, description: `โสหุ้ยการผลิตที่ปันเข้างาน ${docNo}`,
+                debit_lc: appliedOverhead > 0 ? appliedOverhead : 0, credit_lc: appliedOverhead < 0 ? -appliedOverhead : 0, debit_fc: 0, credit_fc: 0,
+            });
+            glDetails.push({
+                account_id: Number(moSetup.applied_overhead_account_id), description: `โสหุ้ยการผลิตที่ปันเข้างาน ${docNo}`,
+                debit_lc: appliedOverhead < 0 ? -appliedOverhead : 0, credit_lc: appliedOverhead > 0 ? appliedOverhead : 0, debit_fc: 0, credit_fc: 0,
+            });
+        }
         const standardVsActual = round2(totalInvValue - totalWipValue);
         if (Math.abs(standardVsActual) > 0.0001) {
             if (!setup.variance_account_id) {
-                throw new Error('ยังไม่ได้ตั้งค่าบัญชีผลต่างต้นทุนการผลิต (variance_account_id) ใน im_gl_account_setup สำหรับประเภทเอกสารนี้');
+                throw new Error(moSetup
+                    ? 'ยังไม่ได้ตั้งค่าบัญชีผลต่างต้นทุนการผลิต ของประเภทเอกสารใบสั่งผลิต — ตั้งค่าที่หน้าตั้งค่าบัญชีใบสั่งผลิต'
+                    : 'ยังไม่ได้ตั้งค่าบัญชีผลต่างต้นทุนการผลิต (variance_account_id) ใน im_gl_account_setup สำหรับประเภทเอกสารนี้');
             }
             glDetails.push({
                 account_id: Number(setup.variance_account_id), description: `ผลต่างต้นทุนมาตรฐาน/จริง ${docNo}`,
@@ -2292,6 +2320,12 @@ const insertAndPostAdjustment = async (client, {
         }
     }
 
+    // MOI/MOR ที่อ้างอิงใบสั่งผลิตและไม่ได้ระบุมิติ — ใช้มิติของใบสั่งผลิต ให้รายการบัญชีวิเคราะห์ต้นทุนการผลิตตามมิติได้
+    if (refMoId && ![dim1Id, dim2Id, dim3Id, dim4Id, dim5Id].some(Boolean)) {
+        const md = (await client.query(`SELECT dim1_id, dim2_id, dim3_id, dim4_id, dim5_id FROM mo_header WHERE id = $1`, [refMoId])).rows[0];
+        if (md) ({ dim1_id: dim1Id, dim2_id: dim2Id, dim3_id: dim3Id, dim4_id: dim4Id, dim5_id: dim5Id } = md);
+    }
+
     const hRes = await client.query(`
         INSERT INTO im_transaction
         (doc_id, doc_no, doc_code, doc_date, period_id, warehouse_id, to_warehouse_id,
@@ -2323,8 +2357,8 @@ const insertAndPostAdjustment = async (client, {
             INSERT INTO im_transaction_detail
             (header_id, line_no, item_id, item_code, item_name, location_id, to_location_id, lot_no, serial_no, uom_id,
              system_qty, counted_qty, unit_cost, unit_cost_fc, unit_price, vat_type, vat_rate, ref_im_transaction_detail_id, ref_po_detail_id, ref_so_detail_id, description, is_free,
-             ref_mo_component_detail_id, ref_mo_output_detail_id, mo_actual_unit_cost)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+             ref_mo_component_detail_id, ref_mo_output_detail_id, mo_actual_unit_cost, mo_applied_overhead_unit_cost)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
         `, [
             newHeaderId, lineNo++, d.item_id, d.item_code || null, d.item_name || null,
             d.location_id || null, d.to_location_id || null, d.lot_no || null, d.serial_no || null, d.uom_id || null,
@@ -2332,6 +2366,7 @@ const insertAndPostAdjustment = async (client, {
             d.vat_type || null, d.vat_rate ?? null,
             d.ref_im_transaction_detail_id || null, d.ref_po_detail_id || null, d.ref_so_detail_id || null, d.description || null, d.is_free === true,
             d.ref_mo_component_detail_id || null, d.ref_mo_output_detail_id || null, d.mo_actual_unit_cost ?? null,
+            d.mo_applied_overhead_unit_cost ?? null,
         ]);
     }
 
@@ -2347,7 +2382,7 @@ const insertAndPostAdjustment = async (client, {
             currency_id: currencyId || null, currency_code: currencyCode || await getBaseCurrencyCode(client), exchange_rate: exchangeRate || 1,
             dim1_id: dim1Id, dim2_id: dim2Id, dim3_id: dim3Id, dim4_id: dim4Id, dim5_id: dim5Id,
             branch_id: branchId, created_by: createdBy, updated_by: createdBy,
-            gl_doc_no: glDocNo || null,
+            gl_doc_no: glDocNo || null, ref_mo_id: refMoId || null,
         };
         await postDetailLines(client, newHeaderId, headerForPost, finalDocNo);
     }
@@ -2426,7 +2461,7 @@ const createMoReceipt = async (req, res) => {
             );
             if (outRes.rows.length === 0) throw new Error('ไม่พบรายการผลผลิตของใบสั่งผลิตที่อ้างอิง');
             const outputDetail = outRes.rows[0];
-            const { unitCost, actualUnitCost } = await computeMoReceiptUnitCost(client, { moHeader: mo, outputDetail });
+            const { unitCost, actualUnitCost, appliedOverheadUnitCost } = await computeMoReceiptUnitCost(client, { moHeader: mo, outputDetail });
 
             const balRes = await client.query(
                 `SELECT qty_on_hand FROM im_stock_balance WHERE ${STOCK_BALANCE_KEY}`,
@@ -2439,6 +2474,7 @@ const createMoReceipt = async (req, res) => {
                 uom_id: outputDetail.uom_id, system_qty: systemQty, counted_qty: systemQty + qty, unit_cost: unitCost,
                 ref_mo_output_detail_id: outputDetail.id,
                 mo_actual_unit_cost: mo.costing_method === 'STANDARD' ? actualUnitCost : null,
+                mo_applied_overhead_unit_cost: appliedOverheadUnitCost || null,
             });
         }
         if (builtLines.length === 0) throw new Error('ไม่มีรายการที่จะรับเข้าคลัง');

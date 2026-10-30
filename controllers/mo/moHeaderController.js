@@ -17,7 +17,8 @@
 'use strict';
 
 const { generateDocNo } = require('../im/imTransactionController');
-const { fetchSetupByDocCode } = require('../im/imGlAccountSetupController');
+const { fetchMoGlSetup, ensureMoGlAccountSetupTable, MO_GL_LABELS, MO_GL_LABELS_EN } = require('./moGlAccountSetupController');
+const { describeJournalLines } = require('../../utils/glJournalPreview');
 const { ensureImItemTable } = require('../im/imItemController');
 const { ensureImUomTable } = require('../im/imUomController');
 const { ensureImWarehouseTable } = require('../im/imWarehouseController');
@@ -138,6 +139,30 @@ const ensureMoHeaderTable = async (client) => {
         )
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_mo_operation_detail_header ON mo_operation_detail(header_id)`);
+    // บันทึกเวลาแต่ละครั้ง + รายการบัญชีที่ปันค่าแรง/โสหุ้ยเข้า WIP (Dr WIP / Cr ค่าแรงและโสหุ้ยที่ปันเข้างาน)
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS mo_operation_time_log (
+            id              SERIAL PRIMARY KEY,
+            header_id       INTEGER NOT NULL REFERENCES mo_header(id) ON DELETE CASCADE,
+            operation_id    INTEGER NOT NULL REFERENCES mo_operation_detail(id) ON DELETE CASCADE,
+            log_date        DATE NOT NULL,
+            labor_hours     NUMERIC(10,4) NOT NULL DEFAULT 0,
+            machine_hours   NUMERIC(10,4) NOT NULL DEFAULT 0,
+            labor_cost      NUMERIC(18,4) NOT NULL DEFAULT 0,
+            overhead_cost   NUMERIC(18,4) NOT NULL DEFAULT 0,
+            gl_entry_id     INTEGER REFERENCES gl_entry_header(id),
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            created_by      VARCHAR(100)
+        )
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_mo_operation_time_log_header ON mo_operation_time_log(header_id)`);
+    // กลับรายการบันทึกเวลา: งวดยังเปิด = ลบรายการบัญชีเดิม (เก็บเลขที่ไว้ใน gl_doc_no) ไม่งั้นลงรายการกลับวันนี้ (reversal_gl_entry_id)
+    for (const col of ['gl_doc_no VARCHAR(50)', 'reversed_at TIMESTAMPTZ', 'reversed_by VARCHAR(100)', 'reverse_reason TEXT',
+        'reversal_gl_entry_id INTEGER REFERENCES gl_entry_header(id)']) {
+        await client.query(`ALTER TABLE mo_operation_time_log ADD COLUMN IF NOT EXISTS ${col}`).catch(() => {});
+    }
+    // refreshMoStatus อ่านคอลัมน์นี้ (สร้างโดย ensureImTransactionTable) — กันกรณีบันทึกเวลาก่อนเคยเปิดหน้าจอ IM
+    await client.query(`ALTER TABLE IF EXISTS im_transaction_detail ADD COLUMN IF NOT EXISTS mo_applied_overhead_unit_cost NUMERIC(18,4)`).catch(() => {});
 
     // parent_mo_detail_id — บรรทัดส่วนประกอบของ MO แม่ที่ MO ลูกนี้ถูกสร้างมาเพื่อผลิตให้ (ดู process "สร้างใบสั่ง
     // ผลิตย่อย") ต้องเพิ่มทีหลังสุด เพราะ mo_component_detail เพิ่งถูกสร้างขึ้นด้านบนนี้เอง (วน FK ไป-กลับกับ
@@ -434,26 +459,28 @@ const fetchWipValuationReport = async (req, res) => {
         query += ` ORDER BY h.doc_date DESC, h.id DESC`;
         const result = await client.query(query, params);
 
-        const setup = await fetchSetupByDocCode(client, 'MOR');
+        // บัญชี WIP ทั้งหมดที่ใบสั่งผลิตใช้ (ตั้งค่าบัญชีใบสั่งผลิต) + ของ MOI/MOR ที่ไม่อ้างอิงใบสั่งผลิต (ตั้งค่าบัญชี IM)
+        // ยอด GL ณ วันสิ้นสุดที่กรอง (ไม่กรอง = วันนี้) ให้เทียบกับยอดใบสั่งผลิตได้ตรงช่วงเวลาเดียวกัน
+        await ensureMoGlAccountSetupTable(client);
+        const accRes = await client.query(`
+            SELECT DISTINCT a.id, a.account_code, a.account_name_thai, a.account_name_eng FROM gl_account a
+             WHERE a.id IN (SELECT wip_account_id FROM mo_gl_account_setup
+                            UNION SELECT s.wip_account_id FROM im_gl_account_setup s
+                              JOIN sa_module_document d ON d.doc_code = s.doc_code
+                             WHERE d.sys_module = '31' AND d.sys_doc_type IN ('90', '95'))
+             ORDER BY a.account_code`);
+        const wipIds = accRes.rows.map(r => r.id);
+        const wipAccountCode = accRes.rows.map(r => r.account_code).join(', ') || null;
+        const wipAccountName = accRes.rows.map(r => r.account_name_thai).join(', ') || null;
         let glBalance = null;
-        let wipAccountCode = null;
-        let wipAccountName = null;
-        if (setup?.wip_account_id) {
-            const accRes = await client.query(`SELECT account_code, account_name_thai, account_name_eng FROM gl_account WHERE id = $1`, [setup.wip_account_id]);
-            if (accRes.rows.length > 0) {
-                wipAccountCode = accRes.rows[0].account_code;
-                wipAccountName = accRes.rows[0].account_name_thai;
-            }
-            // gl_balance_accum ไม่ใช่แหล่งข้อมูลที่เชื่อถือได้ที่นี่ — มันถูกอัปเดตเฉพาะตอน Post ผ่าน
-            // glEntryController.js (รายการบัญชีที่สร้างตรงจากโมดูล GL เอง) เท่านั้น ธุรกรรม IM ('90'/'95'/Close MO)
-            // insert ตรงเข้า gl_entry_header/gl_entry_detail โดยไม่เคยเรียก updateBalanceAccum เลย จึงต้องรวมยอด
-            // จาก gl_entry_detail ตรงๆ ซึ่งเป็นแหล่งข้อมูลจริงที่ทุก module ใช้ร่วมกันเสมอ
+        if (wipIds.length) {
+            // รวมจาก gl_entry_detail ตรงๆ (ทุกโมดูลเขียนที่นี่) ณ วันที่ที่ใช้เทียบ
             const balRes = await client.query(`
                 SELECT COALESCE(SUM(ged.debit_lc - ged.credit_lc), 0) AS balance
                 FROM gl_entry_detail ged
                 JOIN gl_entry_header geh ON geh.id = ged.header_id
-                WHERE ged.account_id = $1 AND geh.status = 'Posted' AND geh.posting_date <= CURRENT_DATE
-            `, [setup.wip_account_id]);
+                WHERE ged.account_id = ANY($1::int[]) AND geh.status = 'Posted' AND geh.posting_date <= $2::date
+            `, [wipIds, date_to || today()]);
             glBalance = Number(balRes.rows[0].balance);
         }
 
@@ -734,6 +761,39 @@ const openPeriodId = async (client, date) => (await client.query(
        AND gl_status = 'OPEN' AND im_status = 'OPEN' LIMIT 1`, [date])).rows[0]?.id || null;
 
 // รายการปรับ WIP ตอนปิด — MO ที่ปิดก่อนมีคอลัมน์ close_gl_entry_id หาจากเลขที่อ้างอิง
+// ลงรายการบัญชีของใบสั่งผลิตเอง (บันทึกเวลา / ปิดใบสั่งผลิต) — lines: [{ account_id, debit, credit }]
+// ทุกบรรทัดใช้มิติของใบสั่งผลิต อ้างอิงเลขที่ใบสั่งผลิต และใช้สกุลเงินหลัก
+const postMoGlEntry = async (client, { mo, glDocId, date, description, lines, docNo, createdByUserId }) => {
+    const periodId = await openPeriodId(client, date);
+    if (!periodId) throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน (GL และ IM) สำหรับวันที่ ${date}`);
+    let glDocNo = docNo || await generateDocNo(client, glDocId, date, mo.branch_id || null);
+    if (!glDocNo) glDocNo = `GL-${mo.doc_no}-${Date.now()}`;
+    const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+    const rows = lines.map(l => ({ ...l, debit: r2(l.debit), credit: r2(l.credit) })).filter(l => l.debit || l.credit);
+    const totalDebit = r2(rows.reduce((t, l) => t + l.debit, 0));
+    const totalCredit = r2(rows.reduce((t, l) => t + l.credit, 0));
+    if (Math.abs(totalDebit - totalCredit) >= 0.005) throw new Error(`รายการบัญชีไม่สมดุล (Dr ${totalDebit} / Cr ${totalCredit})`);
+    const glEntryId = (await client.query(`
+        INSERT INTO gl_entry_header
+        (doc_id, doc_no, doc_date, posting_date, period_id, description,
+         currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
+         created_by, ref_doc_id, ref_doc_no, ref_doc_date)
+        VALUES ($1,$2,$3,$3,$4,$5,$6,1,'Posted',$7,$8,0,0,$9,$10,$11,$12)
+        RETURNING id
+    `, [glDocId, glDocNo, date, periodId, description, (await getBaseCurrency(client)).id,
+        totalDebit, totalCredit, createdByUserId || null, mo.doc_id, mo.doc_no, mo.doc_date])).rows[0].id;
+    let lineNo = 1;
+    for (const l of rows) {
+        await client.query(`
+            INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc,
+                                         dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+            VALUES ($1,$2,$3,$4,$5,$6,0,0,$7,$8,$9,$10,$11)
+        `, [glEntryId, lineNo++, l.account_id, description, l.debit, l.credit,
+            mo.dim1_id || null, mo.dim2_id || null, mo.dim3_id || null, mo.dim4_id || null, mo.dim5_id || null]);
+    }
+    return glEntryId;
+};
+
 const findCloseGlEntryId = async (client, mo) => {
     if (mo.close_gl_entry_id) return mo.close_gl_entry_id;
     const r = await client.query(`
@@ -783,7 +843,9 @@ const computeMoBlocks = async (client, id) => {
     }
 
     if (mo.status === 'Released') {
+        const timeGl = (await client.query(`SELECT 1 FROM mo_operation_time_log WHERE header_id = $1 AND gl_entry_id IS NOT NULL AND reversed_at IS NULL LIMIT 1`, [id])).rows.length > 0;
         if (refs) out.void_block = blk('REF_DOCS', `มีเอกสารเบิก/รับอ้างอิงใบสั่งผลิตนี้ (${refs}) ต้องถอยและลบเอกสารเหล่านั้นก่อน`, refs);
+        else if (timeGl) out.void_block = blk('TIME_LOGGED', 'มีการบันทึกเวลาปฏิบัติงานที่ลงบัญชีค่าแรง/โสหุ้ยเข้างานแล้ว');
     } else if (['Draft', 'Rejected', 'Submitted'].includes(mo.status)) {
         out.void_block = blk('NOT_POSTED', 'ใบสั่งผลิตที่ยังไม่อนุมัติให้ถอยเป็นร่างแล้วลบแทนการยกเลิก');
     } else if (['Cancelled', 'Deleted'].includes(mo.status)) {
@@ -884,8 +946,9 @@ const reverseTransaction = async (req, res) => {
                         RETURNING id`, [gl.doc_id, revNo, date, periodId, description, gl.currency_id,
                         gl.total_credit_lc, gl.total_debit_lc, userIdOf(req), mo.doc_id, mo.doc_no, mo.doc_date])).rows[0].id;
                     await client.query(`
-                        INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
-                        SELECT $1, line_no, account_id, $2, credit_lc, debit_lc, 0, 0
+                        INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc,
+                                                     dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+                        SELECT $1, line_no, account_id, $2, credit_lc, debit_lc, 0, 0, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id
                           FROM gl_entry_detail WHERE header_id = $3 ORDER BY line_no`, [revId, description, glId]);
                 }
             }
@@ -909,13 +972,44 @@ const reverseTransaction = async (req, res) => {
 };
 
 // --- ปิดใบสั่งผลิต (Close MO / WIP True-up) — Completed -> Closed เท่านั้น ---
-// wip_balance_lc ที่เหลืออยู่ตอนนี้คือต้นทุนแปรรูป (overhead%/routing hours) ที่ถูก "พักไว้ที่ WIP" ตอนรับสินค้า
-// เข้าคลัง (Dr สินค้า / Cr WIP เต็มมูลค่ารวมต้นทุนแปรรูป) แต่ไม่มี leg ใดเคย Dr WIP ด้วยต้นทุนแปรรูปนี้มาก่อนเลย
-// (ดู comment ที่ computeMoReceiptUnitCost — เป็น simplification ที่ตั้งใจไว้แต่แรก) Close MO จึงต้อง Post GL อีก
-// รายการเพื่อเกลี่ย WIP ของ MO นี้ให้เป็น 0 โดยอีกฝั่งลงที่ variance_account_id (ใช้ชุดบัญชีเดียวกับ MOR เพราะเป็น
-// บัญชีผลต่างต้นทุนการผลิตชุดเดียวกัน ไม่แยกตั้งค่าใหม่) หลังจาก Closed แล้ว Issue/Receipt/Time Log ทั้งหมดจะถูก
+// ต้นทุนแปรรูปลงเข้า WIP แล้วตอนบันทึกเวลา (แบบชั่วโมง) หรือตอน MOR (แบบ %) — wip_balance_lc ที่เหลือตอนนี้จึงเป็นผลต่าง
+// จริง (เช่น เบิกวัตถุดิบเพิ่มหลังรับสินค้าบางส่วน ชั่วโมงที่บันทึกหลังรับครบ) Close MO ลงรายการปรับ WIP ของใบสั่งผลิตให้เป็น 0
+// อีกฝั่งลงบัญชีผลต่างต้นทุนการผลิต — บัญชีทั้งหมดจากประเภทเอกสารใบสั่งผลิต (mo_gl_account_setup) หลังจาก Closed แล้ว Issue/Receipt/Time Log ทั้งหมดจะถูก
 // ปฏิเสธอัตโนมัติอยู่แล้วเพราะ validateMoComponentIssueQty/validateMoOutputReceiptQty/logOperationTime ข้างบน
 // ทั้งหมดเช็ค mo_header.status ต้องเป็น Released/InProgress เท่านั้น — ไม่ต้องเพิ่ม guard ซ้ำที่นี่
+// รายการปรับ WIP ตอนปิด — residual > 0 = WIP ค้าง: Dr ผลต่าง / Cr WIP; residual < 0 = WIP ถูกตัดออกเกิน: Dr WIP / Cr ผลต่าง
+// ใช้ร่วมกันระหว่างการปิดจริงและตัวอย่างรายการบัญชี (closePreview) เพื่อให้ตรงกันเสมอ
+const closeJournalLines = (residual, setup) => {
+    const amount = Math.abs(residual);
+    return [
+        { account_id: setup.wip_account_id, debit: residual < 0 ? amount : 0, credit: residual > 0 ? amount : 0 },
+        { account_id: setup.variance_account_id, debit: residual > 0 ? amount : 0, credit: residual < 0 ? amount : 0 },
+    ];
+};
+
+// ตัวอย่างรายการบัญชีก่อนปิดใบสั่งผลิต — บัญชีจากประเภทเอกสารใบสั่งผลิต ยอด = WIP คงเหลือของใบสั่งผลิต
+const closePreview = async (req, res) => {
+    const { id } = req.params;
+    const client = await req.dbPool.connect();
+    try {
+        await ensureMoHeaderTable(client);
+        const mo = (await client.query(`SELECT * FROM mo_header WHERE id = $1`, [id])).rows[0];
+        if (!mo) return sendErr(res, 404, 'Not found');
+        const residual = Number(mo.wip_balance_lc) || 0;
+        const setup = await fetchMoGlSetup(client, id);
+        const missing = Math.abs(residual) > 0.0001
+            ? ['wip_account_id', 'variance_account_id', 'gl_doc_id'].filter(k => !setup[k]) : [];
+        const lines = Math.abs(residual) > 0.0001 && !missing.length
+            ? await describeJournalLines(client, closeJournalLines(residual, setup).map(l => ({
+                ...l, description: `ปิดใบสั่งผลิต ${mo.doc_no} - ปรับปรุงยอดคงเหลือ WIP` })))
+            : [];
+        res.status(200).json({ residual, lines, missing: missing.map(k => MO_GL_LABELS[k]), missing_en: missing.map(k => MO_GL_LABELS_EN[k]) });
+    } catch (error) {
+        console.error('Error building MO close preview:', error);
+        sendErr(res, 500, error.message || 'Internal server error');
+    } finally { client.release(); }
+};
+
 const closeTransaction = async (req, res) => {
     const { id } = req.params;
     const { close_date } = req.body || {};
@@ -935,58 +1029,13 @@ const closeTransaction = async (req, res) => {
         let glEntryId = null;
 
         if (Math.abs(residual) > 0.0001) {
-            const setup = await fetchSetupByDocCode(client, 'MOR');
-            if (!setup || !setup.wip_account_id || !setup.variance_account_id || !setup.gl_doc_id) {
-                throw new Error('ยังไม่ได้ตั้งค่าบัญชีงานระหว่างผลิต (wip_account_id) และบัญชีผลต่างต้นทุนการผลิต (variance_account_id) ใน im_gl_account_setup ของ MOR ให้ครบก่อนปิดใบสั่งผลิตได้');
-            }
-
-            const periodRes = await client.query(
-                `SELECT id FROM gl_posting_period WHERE $1::date BETWEEN period_start_date AND period_end_date AND gl_status = 'OPEN' AND im_status = 'OPEN' LIMIT 1`,
-                [closeDate]
-            );
-            if (periodRes.rows.length === 0) throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่ปิด ${closeDate}`);
-            const periodId = periodRes.rows[0].id;
-
-            let createdByUserId = null;
-            if (userName) {
-                const userRes = await client.query(`SELECT id FROM sa_user WHERE user_name = $1 LIMIT 1`, [userName]);
-                if (userRes.rows.length > 0) createdByUserId = userRes.rows[0].id;
-            }
-
-            let glDocNo = mo.kept_close_gl_doc_no || await generateDocNo(client, setup.gl_doc_id, closeDate, mo.branch_id || null);
-            if (!glDocNo) glDocNo = `GL-CLOSE-${mo.doc_no}-${Date.now()}`;
-
-            const amount = Math.abs(residual);
-            // residual < 0 = WIP ถูก Cr ไปมากกว่าที่เคย Dr (ต้นทุนแปรรูปที่ไม่เคยเข้า WIP) -> Dr WIP / Cr ผลต่าง
-            // residual > 0 = WIP ยังเหลือค้าง (เบิกเข้าแล้วแต่ยังไม่ได้ตัดออกเท่าที่ควร) -> Dr ผลต่าง / Cr WIP
-            const wipDebit = residual < 0 ? amount : 0;
-            const wipCredit = residual > 0 ? amount : 0;
-            const varianceDebit = residual > 0 ? amount : 0;
-            const varianceCredit = residual < 0 ? amount : 0;
-            const description = `ปิดใบสั่งผลิต ${mo.doc_no} - ปรับปรุงยอดคงเหลือ WIP`;
-
-            const glHeaderRes = await client.query(`
-                INSERT INTO gl_entry_header
-                (doc_id, doc_no, doc_date, posting_date, period_id, description,
-                 currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-                 created_by, ref_doc_id, ref_doc_no, ref_doc_date)
-                VALUES ($1,$2,$3,$3,$4,$5,$11,1,'Posted',$6,$6,0,0,$7,$8,$9,$10)
-                RETURNING id
-            `, [
-                setup.gl_doc_id, glDocNo, closeDate, periodId, description,
-                amount, createdByUserId, mo.doc_id, mo.doc_no, mo.doc_date,
-                (await getBaseCurrency(client)).id, // สกุลเงินหลัก ไม่ใช่ id 1 ตายตัว
-            ]);
-            glEntryId = glHeaderRes.rows[0].id;
-
-            await client.query(`
-                INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
-                VALUES ($1,1,$2,$3,$4,$5,0,0)
-            `, [glEntryId, setup.wip_account_id, description, wipDebit, wipCredit]);
-            await client.query(`
-                INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
-                VALUES ($1,2,$2,$3,$4,$5,0,0)
-            `, [glEntryId, setup.variance_account_id, description, varianceDebit, varianceCredit]);
+            const setup = await fetchMoGlSetup(client, id, ['gl_doc_id', 'wip_account_id', 'variance_account_id']);
+            glEntryId = await postMoGlEntry(client, {
+                mo, glDocId: setup.gl_doc_id, date: closeDate, docNo: mo.kept_close_gl_doc_no || null,
+                description: `ปิดใบสั่งผลิต ${mo.doc_no} - ปรับปรุงยอดคงเหลือ WIP`,
+                createdByUserId: userIdOf(req),
+                lines: closeJournalLines(residual, setup),
+            });
         }
 
         await client.query(`
@@ -1320,7 +1369,18 @@ const refreshMoStatus = async (client, moHeaderId) => {
                   AND imd.ref_mo_output_detail_id IS NOT NULL AND imt.status = 'Posted'
             ), 0) AS received_value
     `, [moHeaderId]);
-    const wipBalance = Number(wipRes.rows[0].issued_value) - Number(wipRes.rows[0].received_value);
+    // ต้นทุนแปรรูปที่ลงเข้า WIP แล้ว: บันทึกเวลา (แบบชั่วโมง) + โสหุ้ยแบบ % ที่ปันเข้างานตอน MOR
+    const appliedRes = await client.query(`
+        SELECT
+            COALESCE((SELECT SUM(labor_cost + overhead_cost) FROM mo_operation_time_log WHERE header_id = $1 AND gl_entry_id IS NOT NULL AND reversed_at IS NULL), 0) AS time_cost,
+            COALESCE((
+                SELECT SUM(ABS(imd.qty) * imd.mo_applied_overhead_unit_cost) FROM im_transaction_detail imd
+                JOIN im_transaction imt ON imt.id = imd.header_id
+                WHERE imt.ref_mo_id = $1 AND imd.ref_mo_output_detail_id IS NOT NULL AND imt.status = 'Posted'
+            ), 0) AS receipt_overhead
+    `, [moHeaderId]);
+    const wipBalance = Number(wipRes.rows[0].issued_value) - Number(wipRes.rows[0].received_value)
+        + Number(appliedRes.rows[0].time_cost) + Number(appliedRes.rows[0].receipt_overhead);
 
     const sumRes = await client.query(`
         SELECT
@@ -1384,6 +1444,9 @@ const computeMoReceiptUnitCost = async (client, { moHeader, outputDetail }) => {
 
     const plannedQty = Number(outputDetail.planned_qty);
     const actualUnitCost = plannedQty > 0 ? allocatedCost / plannedQty : 0;
+    // โสหุ้ยแบบ % ปันเข้างานตอนรับ (Dr WIP / Cr โสหุ้ยที่ปันเข้างาน ใน postGlEntry '95') — แบบชั่วโมงปันไปแล้วตอนบันทึกเวลา
+    const appliedOverheadUnitCost = moHeader.costing_mode === 'ROUTING' || plannedQty <= 0
+        ? 0 : conversionCost * outputShare / plannedQty;
 
     if (moHeader.costing_method === 'STANDARD') {
         const itemRes = await client.query(`SELECT standard_cost, item_code FROM im_item WHERE id = $1`, [outputDetail.output_item_id]);
@@ -1392,9 +1455,9 @@ const computeMoReceiptUnitCost = async (client, { moHeader, outputDetail }) => {
         if (standardCost <= 0) {
             throw new Error(`กรุณาตั้งค่าต้นทุนมาตรฐาน (standard_cost) ของสินค้า ${itemRes.rows[0].item_code} ก่อนรับเข้าคลังจากการผลิตแบบ STANDARD`);
         }
-        return { unitCost: standardCost, actualUnitCost };
+        return { unitCost: standardCost, actualUnitCost, appliedOverheadUnitCost };
     }
-    return { unitCost: actualUnitCost, actualUnitCost };
+    return { unitCost: actualUnitCost, actualUnitCost, appliedOverheadUnitCost };
 };
 
 // บันทึกเวลาปฏิบัติงาน (Operation Time Log) — ใช้เฉพาะ MO ที่ costing_mode='ROUTING' เท่านั้น ไม่ใช่ธุรกรรม
@@ -1403,13 +1466,14 @@ const computeMoReceiptUnitCost = async (client, { moHeader, outputDetail }) => {
 // ตั้งค่าทับ เพราะฝ่ายผลิตอาจบันทึกเวลาหลายรอบระหว่างทำงานขั้นตอนเดียวกัน (เช้า/บ่าย) ก่อนจะกดเสร็จสิ้นครั้งเดียว
 const logOperationTime = async (req, res) => {
     const { moId, opId } = req.params;
-    const { labor_hours, machine_hours, mark_done } = req.body;
+    const { labor_hours, machine_hours, mark_done, log_date } = req.body;
+    const userName = req.headers.username || null;
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
         await ensureMoHeaderTable(client);
 
-        const moRes = await client.query(`SELECT status, costing_mode FROM mo_header WHERE id = $1 FOR UPDATE`, [moId]);
+        const moRes = await client.query(`SELECT * FROM mo_header WHERE id = $1 FOR UPDATE`, [moId]);
         if (moRes.rows.length === 0) throw new Error('ไม่พบใบสั่งผลิต');
         if (!['Released', 'InProgress'].includes(moRes.rows[0].status)) {
             throw new Error('ใบสั่งผลิตต้องอยู่สถานะ Released หรือ InProgress เท่านั้นจึงจะบันทึกเวลาปฏิบัติงานได้');
@@ -1418,7 +1482,10 @@ const logOperationTime = async (req, res) => {
             throw new Error('ใบสั่งผลิตนี้ไม่ได้ใช้การคิดต้นทุนแบบ Routing จึงไม่ต้องบันทึกเวลาปฏิบัติงาน');
         }
 
-        const opRes = await client.query(`SELECT status FROM mo_operation_detail WHERE id = $1 AND header_id = $2`, [opId, moId]);
+        const opRes = await client.query(`
+            SELECT op.status, op.operation_name, wc.work_center_code, wc.labor_rate_per_hour, wc.machine_rate_per_hour, wc.overhead_rate_per_hour
+              FROM mo_operation_detail op JOIN mo_work_center wc ON wc.id = op.work_center_id
+             WHERE op.id = $1 AND op.header_id = $2`, [opId, moId]);
         if (opRes.rows.length === 0) throw new Error('ไม่พบขั้นตอนการผลิตที่ระบุ');
         if (opRes.rows[0].status === 'Done') throw new Error('ขั้นตอนนี้บันทึกเสร็จสิ้นแล้ว ไม่สามารถบันทึกเพิ่มได้');
 
@@ -1436,6 +1503,38 @@ const logOperationTime = async (req, res) => {
             WHERE id = $4
         `, [laborDelta, machineDelta, newStatus, opId]);
 
+        // ปันค่าแรง/โสหุ้ยเข้างานทันทีที่บันทึกเวลา (user-approved 2026-10-30): Dr WIP / Cr ค่าแรงที่ปันเข้างาน (ชั่วโมงแรงงาน
+        // x อัตราค่าแรง) + Cr โสหุ้ยที่ปันเข้างาน (ชั่วโมงเครื่องจักร x อัตราเครื่องจักร+โสหุ้ย) — สูตรเดียวกับต้นทุนแปรรูปที่
+        // computeMoReceiptUnitCost ใช้ตีมูลค่าตอนรับสินค้า WIP จึงไม่ติดลบตอน MOR ตัดต้นทุนแปรรูปออก
+        const op = opRes.rows[0];
+        const laborCost = Math.round(laborDelta * Number(op.labor_rate_per_hour || 0) * 100) / 100;
+        const overheadCost = Math.round(machineDelta * (Number(op.machine_rate_per_hour || 0) + Number(op.overhead_rate_per_hour || 0)) * 100) / 100;
+        const logDate = log_date || today();
+        let glEntryId = null;
+        if (laborCost + overheadCost > 0) {
+            const required = ['gl_doc_id', 'wip_account_id'];
+            if (laborCost > 0) required.push('applied_labor_account_id');
+            if (overheadCost > 0) required.push('applied_overhead_account_id');
+            const setup = await fetchMoGlSetup(client, moId, required);
+            const mo = moRes.rows[0];
+            glEntryId = await postMoGlEntry(client, {
+                mo, glDocId: setup.gl_doc_id, date: logDate, createdByUserId: userIdOf(req),
+                description: `บันทึกเวลา ${mo.doc_no} ${op.operation_name || op.work_center_code || ''}`.trim(),
+                lines: [
+                    { account_id: setup.wip_account_id, debit: laborCost + overheadCost, credit: 0 },
+                    { account_id: setup.applied_labor_account_id, debit: 0, credit: laborCost },
+                    { account_id: setup.applied_overhead_account_id, debit: 0, credit: overheadCost },
+                ],
+            });
+        }
+        if (laborDelta || machineDelta) {
+            await client.query(`
+                INSERT INTO mo_operation_time_log (header_id, operation_id, log_date, labor_hours, machine_hours, labor_cost, overhead_cost, gl_entry_id, created_by, gl_doc_no)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,(SELECT doc_no FROM gl_entry_header WHERE id = $8))
+            `, [moId, opId, logDate, laborDelta, machineDelta, laborCost, overheadCost, glEntryId, userName]);
+            await refreshMoStatus(client, moId); // wip_balance_lc รวมต้นทุนแปรรูปที่ลงเข้า WIP แล้ว
+        }
+
         await client.query('COMMIT');
         const full = await fetchRowById(req.dbPool, moId);
         res.status(200).json(full);
@@ -1446,10 +1545,95 @@ const logOperationTime = async (req, res) => {
     } finally { client.release(); }
 };
 
+// รายการบันทึกเวลาของใบสั่งผลิต (ทุกขั้นตอน) — ล่าสุดก่อน
+const fetchTimeLogs = async (req, res) => {
+    const { moId } = req.params;
+    const client = await req.dbPool.connect();
+    try {
+        await ensureMoHeaderTable(client);
+        const r = await client.query(`
+            SELECT l.*, l.log_date::text AS log_date, rg.doc_no AS reversal_gl_doc_no
+              FROM mo_operation_time_log l
+              LEFT JOIN gl_entry_header rg ON rg.id = l.reversal_gl_entry_id
+             WHERE l.header_id = $1
+             ORDER BY l.log_date DESC, l.id DESC`, [moId]);
+        res.status(200).json(r.rows);
+    } catch (error) {
+        console.error('Error fetching MO time logs:', error);
+        sendErr(res, 500, error.message || 'Internal server error');
+    } finally { client.release(); }
+};
+
+// กลับรายการบันทึกเวลา (ต้องมีเหตุผล) — หักชั่วโมงออกจากขั้นตอน และกลับรายการบัญชีปันค่าแรง/โสหุ้ย:
+// งวดของรายการเดิมยังเปิด = ลบรายการเดิม, ปิดแล้ว = ลงรายการกลับในวันนี้ จากนั้นคำนวณ WIP ของใบสั่งผลิตใหม่
+// ถ้ารับสินค้าจากการผลิตไปแล้ว ต้นทุนแปรรูปที่ตัดออกจาก WIP ไปแล้วจะเหลือเป็นผลต่างตอนปิดใบสั่งผลิต
+const reverseTimeLog = async (req, res) => {
+    const { moId, logId } = req.params;
+    const reason = reasonOf(req);
+    if (!reason) return sendErr(res, 400, 'กรุณาระบุเหตุผลการกลับรายการ');
+    const userName = req.headers.username || null;
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        await ensureMoHeaderTable(client);
+        const mo = (await client.query(`SELECT * FROM mo_header WHERE id = $1 FOR UPDATE`, [moId])).rows[0];
+        if (!mo) throw new Error('ไม่พบใบสั่งผลิต');
+        if (!['Released', 'InProgress', 'Completed'].includes(mo.status)) {
+            throw new Error('กลับรายการบันทึกเวลาได้เฉพาะใบสั่งผลิตที่ยังไม่ปิด (Released / InProgress / Completed)');
+        }
+        const log = (await client.query(`SELECT * FROM mo_operation_time_log WHERE id = $1 AND header_id = $2 FOR UPDATE`, [logId, moId])).rows[0];
+        if (!log) throw new Error('ไม่พบรายการบันทึกเวลา');
+        if (log.reversed_at) throw new Error('รายการบันทึกเวลานี้ถูกกลับรายการไปแล้ว');
+
+        let reversalGlId = null;
+        if (log.gl_entry_id) {
+            const gl = (await client.query(`
+                SELECT g.*, p.gl_status, p.im_status FROM gl_entry_header g
+                  LEFT JOIN gl_posting_period p ON p.id = g.period_id WHERE g.id = $1`, [log.gl_entry_id])).rows[0];
+            if (gl && gl.gl_status === 'OPEN' && gl.im_status === 'OPEN') {
+                await client.query(`UPDATE mo_operation_time_log SET gl_entry_id = NULL WHERE id = $1`, [logId]);
+                await client.query(`DELETE FROM gl_entry_header WHERE id = $1`, [log.gl_entry_id]);
+            } else if (gl) {
+                const lines = (await client.query(`SELECT account_id, debit_lc, credit_lc FROM gl_entry_detail WHERE header_id = $1 ORDER BY line_no`, [gl.id])).rows;
+                reversalGlId = await postMoGlEntry(client, {
+                    mo, glDocId: gl.doc_id, date: today(), createdByUserId: userIdOf(req),
+                    description: `กลับรายการบันทึกเวลา ${mo.doc_no} (${gl.doc_no}) - ${reason}`,
+                    lines: lines.map(l => ({ account_id: l.account_id, debit: Number(l.credit_lc), credit: Number(l.debit_lc) })),
+                });
+            }
+        }
+
+        // หักชั่วโมงออกจากขั้นตอน — ไม่เหลือชั่วโมง = Pending, ขั้นตอนที่เสร็จแล้วกลับเป็น InProgress
+        await client.query(`
+            UPDATE mo_operation_detail SET
+                actual_labor_hours = GREATEST(actual_labor_hours - $1, 0),
+                actual_machine_hours = GREATEST(actual_machine_hours - $2, 0),
+                status = CASE WHEN GREATEST(actual_labor_hours - $1, 0) = 0 AND GREATEST(actual_machine_hours - $2, 0) = 0 THEN 'Pending'
+                              ELSE 'InProgress' END
+             WHERE id = $3`, [log.labor_hours, log.machine_hours, log.operation_id]);
+        await client.query(`
+            UPDATE mo_operation_time_log SET reversed_at = NOW(), reversed_by = $1, reverse_reason = $2, reversal_gl_entry_id = $3
+             WHERE id = $4`, [userName, reason, reversalGlId, logId]);
+        await logReverse(client, {
+            sysModule: '61', tableName: 'mo_operation_time_log', recordId: Number(logId), docNo: log.gl_doc_no || mo.doc_no,
+            fromStatus: 'Posted', toStatus: 'Void', reason, userId: userIdOf(req),
+        });
+        await refreshMoStatus(client, moId);
+
+        await client.query('COMMIT');
+        res.status(200).json(await fetchRowById(req.dbPool, moId));
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error reversing MO time log:', error);
+        sendErr(res, 500, error.message || 'Internal server error');
+    } finally { client.release(); }
+};
+
 module.exports = {
+    fetchTimeLogs, reverseTimeLog,
     ensureMoHeaderTable, fetchRows, fetchRow, createTransaction, updateTransaction,
     releaseTransaction, submitTransaction, approveTransaction, rejectTransaction, fetchMyPending,
-    cancelTransaction, closeTransaction, deleteTransaction, reverseTransaction,
+    cancelTransaction, closeTransaction, closePreview, deleteTransaction, reverseTransaction,
     validateMoComponentIssueQty, validateMoOutputReceiptQty, refreshMoStatus,
     computeMoReceiptUnitCost, logOperationTime, checkMaterialAvailability,
     fetchExplosionCandidates, explodeSubAssembly, fetchStatusReport, fetchCostVarianceReport,
