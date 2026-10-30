@@ -2023,9 +2023,10 @@ const fetchRowById = async (pool, id) => {
     if (hRes.rows.length === 0) return null;
     const dRes = await pool.query(`
         SELECT dt.*, u.uom_code, l.location_code, tl.location_code AS to_location_code,
-               pod.unit_price_fc AS ref_po_unit_price_fc
+               pod.unit_price_fc AS ref_po_unit_price_fc, sod.unit_price_fc AS ref_so_unit_price_fc
         FROM im_transaction_detail dt
         LEFT JOIN po_transaction_detail pod ON pod.id = dt.ref_po_detail_id
+        LEFT JOIN so_transaction_detail sod ON sod.id = dt.ref_so_detail_id
         LEFT JOIN im_uom u      ON u.id = dt.uom_id
         LEFT JOIN im_location l  ON l.id = dt.location_id
         LEFT JOIN im_location tl ON tl.id = dt.to_location_id

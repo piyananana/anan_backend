@@ -13,6 +13,10 @@ router.get('/so_transaction/deliverable_lines', soTransactionController.fetchDel
 router.get('/so_transaction/closable_list',     soBulkCloseController.fetchClosableList);
 router.get('/so_transaction/my_pending',        soTransactionController.fetchMyPending);
 router.get('/so_transaction',                   soTransactionController.fetchRows);
+const soCredit = require('../controllers/sa/creditApprovalController').makeCreditHandlers('SO');
+// ต้องมาก่อน /so_transaction/:id
+router.get('/so_transaction/credit_info', soCredit.creditInfo);
+router.get('/so_transaction/credit_my_pending', soCredit.myPending);
 router.get('/so_transaction/:id',               soTransactionController.fetchRow);
 router.post('/so_transaction',                  soTransactionController.createTransaction);
 router.put('/so_transaction/:id',               soTransactionController.updateTransaction);
@@ -46,5 +50,11 @@ router.get('/quote_so_status_report', soQuoteSoStatusReportController.fetchRepor
 
 // so_pending_delivery_report (การสั่งขายและสินค้าค้างส่ง — อ่านอย่างเดียว)
 router.get('/so_pending_delivery_report', soPendingDeliveryReportController.fetchReport);
+
+// ขออนุมัติเกินวงเงินเครดิต (utils/creditCheck.js) — ตรวจตอนส่งอนุมัติใบสั่งขาย
+router.put('/so_transaction/:id/credit_request', soCredit.request);
+router.put('/so_transaction/:id/credit_approve', soCredit.approve);
+router.put('/so_transaction/:id/credit_reject', soCredit.reject);
+router.put('/so_transaction/:id/credit_withdraw', soCredit.withdraw);
 
 module.exports = router;

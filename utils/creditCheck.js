@@ -15,11 +15,13 @@
 //     ผู้อนุมัติที่วงเงินไม่พอจะไม่ถูกใส่ในคิว — ไม่มีใครวงเงินพอเลย = ขออนุมัติไม่ได้
 //   - การอนุมัติผูกกับยอดเอกสาร: ยอดเพิ่มขึ้นจากที่อนุมัติ (ใบลดหนี้ = ลดน้อยลง) ต้องขออนุมัติใหม่
 // สถานะเอกสารไม่เปลี่ยน (ยังเป็น Draft) — ใช้คอลัมน์ credit_status: NULL / Pending / Approved แยกต่างหาก
+// ใบสั่งขาย (SO, user-approved 2026-10-30): ตรวจตอนส่งอนุมัติ — ยอด = จำนวนสั่ง × ราคา × อัตราแลกเปลี่ยน (SO ยังไม่มี VAT)
+//   ใช้กลไกขออนุมัติเกินวงเงินเดียวกัน (doc_kind 'SO_CREDIT') แต่ยอด SO ไม่นับเป็นยอดคงค้างของเอกสารอื่น
 // คิวผู้อนุมัติเก็บที่ตารางกลาง doc_approval (utils/docApproval.js, doc_kind 'AR_CREDIT' / 'IM_CREDIT') — ตาราง
 // credit_approval เดิมเลิกใช้แล้ว; โหมด ALL/ANY เก็บที่คอลัมน์ credit_approval_mode ของหัวเอกสาร
 
 const DA = require('./docApproval');
-const kindOf = (module) => (module === 'AR' ? 'AR_CREDIT' : 'IM_CREDIT');
+const kindOf = (module) => (module === 'AR' ? 'AR_CREDIT' : module === 'SO' ? 'SO_CREDIT' : 'IM_CREDIT');
 
 const AR_CHECK_TYPES = ['10', '30', '35', '50', '55'];
 const AR_CREDIT_TYPES = ['50', '55'];
@@ -33,8 +35,8 @@ const ensured = new Set();
 const ensureCreditSchema = async (db) => {
   const dbName = db.options?.database || db.database;
   if (dbName && ensured.has(dbName)) return;
-  for (const t of ['ar_transaction', 'im_transaction']) {
-    await db.query(`ALTER TABLE ${t}
+  for (const t of ['ar_transaction', 'im_transaction', 'so_transaction']) {
+    await db.query(`ALTER TABLE IF EXISTS ${t}
       ADD COLUMN IF NOT EXISTS credit_status        VARCHAR(10),
       ADD COLUMN IF NOT EXISTS credit_amount        NUMERIC(18,2),
       ADD COLUMN IF NOT EXISTS credit_limit_at      NUMERIC(18,2),
@@ -105,12 +107,19 @@ const imDocAmount = (sysDocType, details, exchangeRate = 1) => {
   return round2((IM_CREDIT_TYPES.includes(sysDocType) ? -1 : 1) * sum);
 };
 
+// SO: Σ จำนวนสั่ง × ราคาต่อหน่วย × อัตราแลกเปลี่ยน (เป็นบาท) — ยังไม่มี VAT ในบรรทัด SO
+const soDocAmount = (details, exchangeRate = 1) => {
+  const rate = Number(exchangeRate) > 0 ? Number(exchangeRate) : 1;
+  return round2((details || []).reduce((s, d) =>
+    s + round2((Number(d.qty_ordered) || 0) * (Number(d.unit_price_fc) || 0) * rate), 0));
+};
+
 // อนุมัติแล้วใช้ได้กับยอดนี้ไหม (ยอดไม่เพิ่มจากที่อนุมัติ)
 const approvalCovers = (row, amount) =>
   row.credit_status === 'Approved' && row.credit_amount !== null && amount <= Number(row.credit_amount) + 0.005;
 
 // ตรวจก่อนโพสต์ — throw (code CREDIT_LIMIT) ถ้าเกินวงเงินและยังไม่ได้รับอนุมัติที่ครอบคลุมยอดนี้
-const assertCreditForPost = async (db, { customerId, amount, excludeArId, excludeImId, row }) => {
+const assertCreditForPost = async (db, { customerId, amount, excludeArId, excludeImId, row, actionTh = 'โพสต์' }) => {
   if (!customerId) return null;
   const exp = await customerExposure(db, customerId, { excludeArId, excludeImId });
   if (!exp) return null;
@@ -121,7 +130,7 @@ const assertCreditForPost = async (db, { customerId, amount, excludeArId, exclud
   const pending = row?.credit_status === 'Pending';
   const e = new Error(pending
     ? 'เอกสารนี้อยู่ระหว่างรออนุมัติเกินวงเงินเครดิต'
-    : `ยอดหนี้หลังเอกสารนี้ ${fmt(ev.after)} เกินวงเงินเครดิต ${fmt(ev.credit_limit)} (เกิน ${fmt(ev.over)}) — กรุณาขออนุมัติเกินวงเงินก่อนโพสต์`);
+    : `ยอดหนี้หลังเอกสารนี้ ${fmt(ev.after)} เกินวงเงินเครดิต ${fmt(ev.credit_limit)} (เกิน ${fmt(ev.over)}) — กรุณาขออนุมัติเกินวงเงินก่อน${actionTh}`);
   e.status = 400;
   e.code = 'CREDIT_LIMIT';
   e.credit = ev;
@@ -177,7 +186,7 @@ const withdrawCredit = async (client, { table, module, id }) => {
   const doc = (await client.query(`SELECT credit_status, status FROM ${table} WHERE id=$1 FOR UPDATE`, [id])).rows[0];
   if (!doc) throw DA.httpErr(404, 'Not found');
   if (!doc.credit_status) throw DA.httpErr(400, 'เอกสารนี้ไม่มีคำขออนุมัติเกินวงเงิน');
-  if (doc.status !== 'Draft') throw DA.httpErr(400, 'ถอนคำขอได้เฉพาะเอกสารร่าง');
+  if (!['Draft', 'Rejected'].includes(doc.status)) throw DA.httpErr(400, 'ถอนคำขอได้เฉพาะเอกสารร่าง');
   await DA.skipPending(client, kindOf(module), id);
   await client.query(`UPDATE ${table} SET credit_status=NULL WHERE id=$1`, [id]);
 };
@@ -194,7 +203,7 @@ const myPendingCredit = async (db, { table, module, userId }) => (await db.query
 
 module.exports = {
   AR_CHECK_TYPES, IM_CHECK_TYPES,
-  ensureCreditSchema, customerExposure, evaluate, arDocAmount, imDocAmount, approvalCovers,
+  ensureCreditSchema, customerExposure, evaluate, arDocAmount, imDocAmount, soDocAmount, approvalCovers,
   assertCreditForPost, requestCreditApproval, approveCredit, rejectCredit, withdrawCredit,
   loadCreditApprovals, myPendingCredit,
 };

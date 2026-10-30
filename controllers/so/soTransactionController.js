@@ -16,6 +16,7 @@ const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { reasonOf, userIdOf, sendErr, blk } = require('../../utils/docAction');
 const { ensureSalespersonTable, saveDocSalespersons, loadSalespersons } = require('../../utils/docSalesperson');
 const DA = require('../../utils/docApproval');
+const { ensureCreditSchema, assertCreditForPost, soDocAmount, loadCreditApprovals } = require('../../utils/creditCheck');
 const KIND = 'SO';
 
 // พนักงานขายของใบสั่งขาย (รายชื่อ — สัดส่วนอยู่ที่ข้อมูลลูกค้า)
@@ -129,7 +130,11 @@ const fetchRowById = async (pool, id) => {
     await ensureDocSalesperson(pool);
     const salespersons = await loadSalespersons(pool, 'so_transaction_salesperson', 'header_id', id);
     await DA.ensureDocApprovalSchema(pool);
-    return { ...hRes.rows[0], details: dRes.rows, salespersons, approvals: await DA.loadApprovals(pool, KIND, Number(id)) };
+    await ensureCreditSchema(pool);
+    return {
+        ...hRes.rows[0], details: dRes.rows, salespersons, approvals: await DA.loadApprovals(pool, KIND, Number(id)),
+        credit_approvals: await loadCreditApprovals(pool, 'SO', Number(id)),
+    };
 };
 
 // --- GET list ---
@@ -284,9 +289,11 @@ const updateTransaction = async (req, res) => {
     try {
         await client.query('BEGIN');
         await require('./soQuoteTransactionController').ensureQuoteTransactionTable(client);
-        const existing = await client.query(`SELECT status FROM so_transaction WHERE id=$1`, [id]);
+        await ensureCreditSchema(client);
+        const existing = await client.query(`SELECT status, credit_status FROM so_transaction WHERE id=$1`, [id]);
         if (existing.rows.length === 0) throw new Error('Not found');
         if (!['Draft', 'Rejected'].includes(existing.rows[0].status)) throw new Error('แก้ไขได้เฉพาะเอกสาร Draft หรือ Rejected เท่านั้น');
+        if (existing.rows[0].credit_status === 'Pending') throw new Error('เอกสารนี้อยู่ระหว่างรออนุมัติเกินวงเงินเครดิต แก้ไขไม่ได้ — ถอนคำขอก่อน');
 
         if (!header.customer_id) throw new Error('กรุณาระบุลูกค้า');
         if (!header.warehouse_id) throw new Error('กรุณาระบุคลังต้นทาง');
@@ -415,6 +422,11 @@ const markApproved = (client, id, userName) => client.query(`
 // Draft/Rejected -> Submitted (ไม่มีผู้อนุมัติ + เมนูตั้ง "ให้ผ่าน" -> Approved ทันที)
 const submitTransaction = approvalAction('submitting', async (client, t, { menuId, userName }) => {
     if (!['Draft', 'Rejected'].includes(t.status)) throw DA.httpErr(400, 'ส่งอนุมัติได้เฉพาะเอกสาร Draft หรือ Rejected เท่านั้น');
+    // วงเงินเครดิตลูกค้า (user-approved 2026-10-30): เกินวงเงินและยังไม่ได้รับอนุมัติที่ครอบคลุมยอดนี้ = ส่งอนุมัติไม่ได้
+    // ต้องขออนุมัติเกินวงเงินก่อน (utils/creditCheck.js — กลไกเดียวกับใบแจ้งหนี้/ใบส่งสินค้า)
+    await ensureCreditSchema(client);
+    const lines = (await client.query(`SELECT qty_ordered, unit_price_fc FROM so_transaction_detail WHERE header_id=$1`, [t.id])).rows;
+    await assertCreditForPost(client, { customerId: t.customer_id, amount: soDocAmount(lines, t.exchange_rate), row: t, actionTh: 'ส่งอนุมัติ' });
     const q = await DA.buildQueue(client, { kind: KIND, recordId: t.id, menuId, docCode: t.doc_code });
     await client.query(`
         UPDATE so_transaction SET status='Submitted', approval_mode=$1, submitted_at=NOW(), submitted_by=$2,

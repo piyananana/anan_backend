@@ -29,6 +29,22 @@ const DOCS = {
       return r;
     },
   },
+  // ใบสั่งขาย — ขออนุมัติได้ตอนเป็นร่างหรือถูกปฏิเสธ (ก่อนส่งอนุมัติใบสั่งขาย)
+  SO: {
+    table: 'so_transaction',
+    checkTypes: null,
+    draftStatuses: ['Draft', 'Rejected'],
+    load: async (db, id) => {
+      const r = (await db.query(`
+        SELECT t.id, t.status, t.customer_id, t.credit_status, t.credit_amount, t.exchange_rate, t.doc_code
+          FROM so_transaction t WHERE t.id = $1`, [id])).rows[0];
+      if (r) {
+        const details = (await db.query(`SELECT qty_ordered, unit_price_fc FROM so_transaction_detail WHERE header_id=$1`, [id])).rows;
+        r.amount = C.soDocAmount(details, r.exchange_rate);
+      }
+      return r;
+    },
+  },
 };
 
 const fail = (res, e) => {
@@ -69,8 +85,8 @@ const makeCreditHandlers = (module) => {
       await client.query(`SELECT id FROM ${table} WHERE id=$1 FOR UPDATE`, [id]);
       const doc = await cfg.load(client, id);
       if (!doc) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
-      if (doc.status !== 'Draft') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'ขออนุมัติได้เฉพาะเอกสารร่าง' }); }
-      if (!cfg.checkTypes.includes(doc.sys_doc_type)) { await client.query('ROLLBACK'); return res.status(400).json({ message: 'เอกสารประเภทนี้ไม่ต้องตรวจวงเงินเครดิต' }); }
+      if (!(cfg.draftStatuses || ['Draft']).includes(doc.status)) { await client.query('ROLLBACK'); return res.status(400).json({ message: 'ขออนุมัติได้เฉพาะเอกสารร่าง' }); }
+      if (cfg.checkTypes && !cfg.checkTypes.includes(doc.sys_doc_type)) { await client.query('ROLLBACK'); return res.status(400).json({ message: 'เอกสารประเภทนี้ไม่ต้องตรวจวงเงินเครดิต' }); }
       if (doc.credit_status === 'Pending') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'เอกสารนี้ขออนุมัติไปแล้ว รออนุมัติอยู่' }); }
       const exp = await C.customerExposure(client, doc.customer_id,
         module === 'AR' ? { excludeArId: Number(id) } : { excludeImId: Number(id) });
