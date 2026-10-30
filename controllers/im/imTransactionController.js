@@ -10,7 +10,7 @@ const { ensureImLocationTable } = require('./imLocationController');
 const { ensureImUomTable } = require('./imUomController');
 const { ensureImStockBalanceTable } = require('./imStockBalanceController');
 const { ensureImStockLayerTable } = require('./imStockLayerController');
-const { fetchSetupByDocCode } = require('./imGlAccountSetupController');
+const { fetchSetupByDocCode, resolveTargetDoc } = require('./imGlAccountSetupController');
 const { fetchMode } = require('./imAccountingSettingController');
 const { resolveItemModes } = require('../../utils/imAccountingMode');
 const { today: todayYmd, ymd } = require('../../utils/dateUtil');
@@ -935,14 +935,8 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
     if (!header.vendor_id) throw new Error('ต้องระบุผู้ขายสำหรับเอกสารประเภทนี้');
     if (!vendorInvoiceNo) throw new Error('ต้องระบุเลขที่ใบกำกับสินค้าผู้ขายสำหรับเอกสารประเภทนี้');
 
-    const apDocRes = await client.query(`
-        SELECT id, doc_code FROM sa_module_document
-        WHERE sys_module='21' AND sys_doc_type='10' AND is_doc_type=true AND is_active=true
-        ORDER BY sort_order LIMIT 1
-    `);
-    if (apDocRes.rows.length === 0) throw new Error('ไม่พบประเภทเอกสารใบกำกับสินค้า (Purchase Invoice) ในโมดูล AP');
-    const apDocId = apDocRes.rows[0].id;
-    const apDocCode = apDocRes.rows[0].doc_code;
+    // ประเภทเอกสารปลายทางตามที่ตั้งไว้ในหน้าตั้งค่าบัญชี IM ของ doc_code นี้ — ต้องตั้งก่อนใช้ ไม่เลือกให้เอง
+    const { id: apDocId, doc_code: apDocCode } = await resolveTargetDoc(client, header.doc_code);
 
     const apSetupRes = await client.query(`SELECT * FROM ap_gl_account_setup WHERE doc_code = $1`, [apDocCode]);
     const apSetup = apSetupRes.rows[0] || null;
@@ -1128,14 +1122,8 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
 const postArBillFromDln = async (client, { header, details, docNo }) => {
     if (!header.customer_id) throw new Error('ต้องระบุลูกค้าสำหรับเอกสารประเภทนี้');
 
-    const arDocRes = await client.query(`
-        SELECT id, doc_code FROM sa_module_document
-        WHERE sys_module='11' AND sys_doc_type='10' AND is_doc_type=true AND is_active=true
-        ORDER BY sort_order LIMIT 1
-    `);
-    if (arDocRes.rows.length === 0) throw new Error('ไม่พบประเภทเอกสารใบแจ้งหนี้ (Billing) ในโมดูล AR');
-    const arDocId = arDocRes.rows[0].id;
-    const arDocCode = arDocRes.rows[0].doc_code;
+    // ประเภทเอกสารปลายทางตามที่ตั้งไว้ในหน้าตั้งค่าบัญชี IM ของ doc_code นี้ — ต้องตั้งก่อนใช้ ไม่เลือกให้เอง
+    const { id: arDocId, doc_code: arDocCode } = await resolveTargetDoc(client, header.doc_code);
 
     const arSetupRes = await client.query(`SELECT * FROM ar_gl_account_setup WHERE doc_code = $1`, [arDocCode]);
     const arSetup = arSetupRes.rows[0] || null;
@@ -1304,17 +1292,9 @@ const postArBillFromDln = async (client, { header, details, docNo }) => {
 const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, isCredit }) => {
     if (!header.vendor_id) throw new Error('ต้องระบุผู้ขายสำหรับเอกสารประเภทนี้');
 
-    const apSysDocType = isCredit ? '30' : '50';
-    const apDocRes = await client.query(`
-        SELECT id, doc_code FROM sa_module_document
-        WHERE sys_module='21' AND sys_doc_type=$1 AND is_doc_type=true AND is_active=true
-        ORDER BY sort_order LIMIT 1
-    `, [apSysDocType]);
-    if (apDocRes.rows.length === 0) {
-        throw new Error(`ไม่พบประเภทเอกสาร${isCredit ? 'ใบลดหนี้จากผู้ขาย' : 'ใบเพิ่มหนี้จากผู้ขาย'} ในโมดูล AP`);
-    }
-    const apDocId = apDocRes.rows[0].id;
-    const apDocCode = apDocRes.rows[0].doc_code;
+    // ประเภทเอกสารปลายทางตามที่ตั้งไว้ในหน้าตั้งค่าบัญชี IM ของ doc_code นี้ — ต้องตั้งก่อนใช้ ไม่เลือกให้เอง
+    // (AP ลดหนี้ = sys_doc_type '30', เพิ่มหนี้ = '50' — resolveTargetDoc ตรวจให้ตรงกับ DOC_TYPE_TARGET แล้ว)
+    const { id: apDocId, doc_code: apDocCode } = await resolveTargetDoc(client, header.doc_code);
 
     const apSetupRes = await client.query(`SELECT * FROM ap_gl_account_setup WHERE doc_code = $1`, [apDocCode]);
     const apSetup = apSetupRes.rows[0] || null;
@@ -1515,17 +1495,9 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
 const postArCreditDebitNoteFromIm = async (client, { header, details, docNo, isCredit }) => {
     if (!header.customer_id) throw new Error('ต้องระบุลูกค้าสำหรับเอกสารประเภทนี้');
 
-    const arSysDocType = isCredit ? '50' : '30';
-    const arDocRes = await client.query(`
-        SELECT id, doc_code FROM sa_module_document
-        WHERE sys_module='11' AND sys_doc_type=$1 AND is_doc_type=true AND is_active=true
-        ORDER BY sort_order LIMIT 1
-    `, [arSysDocType]);
-    if (arDocRes.rows.length === 0) {
-        throw new Error(`ไม่พบประเภทเอกสาร${isCredit ? 'ใบลดหนี้ลูกค้า' : 'ใบเพิ่มหนี้ลูกค้า'} ในโมดูล AR`);
-    }
-    const arDocId = arDocRes.rows[0].id;
-    const arDocCode = arDocRes.rows[0].doc_code;
+    // ประเภทเอกสารปลายทางตามที่ตั้งไว้ในหน้าตั้งค่าบัญชี IM ของ doc_code นี้ — ต้องตั้งก่อนใช้ ไม่เลือกให้เอง
+    // (AR ลดหนี้ = sys_doc_type '50', เพิ่มหนี้ = '30' — resolveTargetDoc ตรวจให้ตรงกับ DOC_TYPE_TARGET แล้ว)
+    const { id: arDocId, doc_code: arDocCode } = await resolveTargetDoc(client, header.doc_code);
 
     const arSetupRes = await client.query(`SELECT * FROM ar_gl_account_setup WHERE doc_code = $1`, [arDocCode]);
     const arSetup = arSetupRes.rows[0] || null;
@@ -3210,16 +3182,15 @@ const fetchGlAccounts = async (req, res) => {
         const modes = await resolveItemModes(client, itemIds, warehouse_id || null);
         const toModes = to_warehouse_id ? await resolveItemModes(client, itemIds, to_warehouse_id) : {};
 
-        const setupOf = async (table, module, sysType) => {
-            if (!sysType) return null;
+        // การตั้งค่าบัญชีของประเภทเอกสาร AR/AP ปลายทางที่ตั้งไว้ (target_doc_id) — ยังไม่ตั้ง = ไม่มีบัญชี fallback ฝั่ง AR/AP
+        const setupOf = async (table, isTarget) => {
+            if (!isTarget || !setup.target_doc_id) return null;
             const r = await client.query(`
-                SELECT s.* FROM ${table} s JOIN sa_module_document d ON d.doc_code = s.doc_code
-                 WHERE d.sys_module = $1 AND d.sys_doc_type = $2 AND d.is_doc_type = true AND d.is_active = true
-                 ORDER BY d.sort_order LIMIT 1`, [module, sysType]);
+                SELECT s.* FROM ${table} s JOIN sa_module_document d ON d.doc_code = s.doc_code WHERE d.id = $1`, [setup.target_doc_id]);
             return r.rows[0] || null;
         };
-        const arSetup = await setupOf('ar_gl_account_setup', '11', AR_DOC_FOR_IM[sysDocType]);
-        const apSetup = await setupOf('ap_gl_account_setup', '21', AP_DOC_FOR_IM[sysDocType]);
+        const arSetup = await setupOf('ar_gl_account_setup', !!AR_DOC_FOR_IM[sysDocType]);
+        const apSetup = await setupOf('ap_gl_account_setup', !!AP_DOC_FOR_IM[sysDocType]);
         // บัญชีสต็อก fallback: ประเภทเอกสาร IM → (เอกสาร AP อัตโนมัติ: บัญชีค่าใช้จ่ายของเอกสาร AP) → บัญชีเริ่มต้นของบริษัท
         const invFallback = pickAccount(setup.inventory_account_id, apSetup?.expense_account_id, company.inventory_account_id);
         const purFallback = pickAccount(company.purchases_account_id);

@@ -36,6 +36,20 @@ const PENDING_SELECT = `
 `;
 
 // GET /im_consignment_settlement/pending?vendor_id=
+// ประเภทเอกสาร AP ตั้งหนี้ (sys_doc_type '10') ที่เปิดใช้งาน — ตัวเลือกในหน้า Settlement
+const fetchApDocTypes = async (req, res) => {
+    try {
+        const r = await req.dbPool.query(`
+            SELECT id, doc_code, doc_name_thai, doc_name_eng FROM sa_module_document
+             WHERE sys_module='21' AND sys_doc_type='10' AND is_doc_type=true AND is_active=true
+             ORDER BY sort_order, doc_code`);
+        res.json(r.rows);
+    } catch (error) {
+        console.error('Error fetching AP doc types for consignment settlement:', error);
+        res.status(500).json({ message: error.message || 'Internal server error' });
+    }
+};
+
 const fetchPending = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
@@ -121,10 +135,12 @@ const postSettlementGl = async (client, apTransactionId, userId) => {
 // POST /im_consignment_settlement { vendor_id, consumption_ids: [...], ref_no?, doc_date? }
 // สร้างใบตั้งหนี้ AP ก้อนเดียว (Dr เจ้าหนี้ฝากขาย / Cr เจ้าหนี้การค้า) จาก consumption ที่เลือก แล้ว mark ว่า settle แล้ว
 const postSettlement = async (req, res) => {
-    const { vendor_id, consumption_ids, ref_no, doc_date } = req.body;
+    const { vendor_id, consumption_ids, ref_no, doc_date, ap_doc_id } = req.body;
     const client = await req.dbPool.connect();
     try {
         if (!vendor_id) return res.status(400).json({ message: 'กรุณาระบุผู้ฝากขาย' });
+        // ผู้ใช้เลือกประเภทเอกสาร AP ตั้งหนี้ทุกครั้งเพื่อยืนยัน (user-mandated 2026-10-30) — ไม่เลือกให้เอง
+        if (!ap_doc_id) return res.status(400).json({ message: 'กรุณาเลือกประเภทเอกสาร AP ที่จะตั้งหนี้' });
         if (!Array.isArray(consumption_ids) || consumption_ids.length === 0) {
             return res.status(400).json({ message: 'กรุณาเลือกรายการที่จะตั้งหนี้อย่างน้อย 1 รายการ' });
         }
@@ -155,10 +171,9 @@ const postSettlement = async (req, res) => {
 
         const apDocRes = await client.query(`
             SELECT id, doc_code FROM sa_module_document
-            WHERE sys_module='21' AND sys_doc_type='10' AND is_doc_type=true AND is_active=true
-            ORDER BY sort_order LIMIT 1
-        `);
-        if (apDocRes.rows.length === 0) throw new Error('ไม่พบประเภทเอกสารใบกำกับสินค้า (Purchase Invoice) ในโมดูล AP');
+            WHERE id=$1 AND sys_module='21' AND sys_doc_type='10' AND is_doc_type=true AND is_active=true
+        `, [ap_doc_id]);
+        if (apDocRes.rows.length === 0) throw new Error('ประเภทเอกสาร AP ที่เลือกไม่ใช่ใบตั้งหนี้ที่เปิดใช้งาน');
         const apDocId = apDocRes.rows[0].id;
         const apDocCode = apDocRes.rows[0].doc_code;
 
@@ -409,6 +424,7 @@ const voidSettlement = (req, res) => runAction(req, res, 'voiding', async (clien
 });
 
 module.exports = {
+    fetchApDocTypes,
     fetchPending, postSettlement, fetchSettled,
     reverseSettlement, repostSettlement, deleteSettlement, voidSettlement, computeSettlementBlocks,
 };
