@@ -1,6 +1,8 @@
 // controllers/im/imItemCategoryController.js
 'use strict';
 
+const { normalizeMode, logModeChange } = require('../../utils/imAccountingMode');
+
 const CATEGORY_TYPES = ['HEADER', 'CATEGORY'];
 
 const ensureImItemCategoryTable = async (client) => {
@@ -40,6 +42,9 @@ const ensureImItemCategoryTable = async (client) => {
     await client.query(`ALTER TABLE im_item_category ADD COLUMN IF NOT EXISTS running_suffix_date  VARCHAR(10)  NOT NULL DEFAULT ''`).catch(() => {});
     await client.query(`ALTER TABLE im_item_category ADD COLUMN IF NOT EXISTS running_length       SMALLINT     NOT NULL DEFAULT 4`).catch(() => {});
     await client.query(`ALTER TABLE im_item_category ADD COLUMN IF NOT EXISTS running_next_number  INTEGER      NOT NULL DEFAULT 1`).catch(() => {});
+    // โหมดบัญชีสินค้าของหมวด (NULL = ตามคลัง → ค่าเริ่มต้น) + บัญชีซื้อสินค้าสำหรับ Periodic — ดู utils/imAccountingMode.js
+    await client.query(`ALTER TABLE im_item_category ADD COLUMN IF NOT EXISTS accounting_mode VARCHAR(10)`).catch(() => {});
+    await client.query(`ALTER TABLE im_item_category ADD COLUMN IF NOT EXISTS purchases_account_id INTEGER REFERENCES gl_account(id)`).catch(() => {});
     await client.query(`CREATE INDEX IF NOT EXISTS idx_im_item_category_parent ON im_item_category(parent_id)`);
 };
 
@@ -50,7 +55,8 @@ const CATEGORY_SELECT = `
            rev.account_code AS revenue_account_code,    rev.account_name_thai AS revenue_account_name,
            exp.account_code AS expense_account_code,    exp.account_name_thai AS expense_account_name,
            var.account_code AS variance_account_code,   var.account_name_thai AS variance_account_name,
-           wip.account_code AS wip_account_code,         wip.account_name_thai AS wip_account_name
+           wip.account_code AS wip_account_code,         wip.account_name_thai AS wip_account_name,
+           pur.account_code AS purchases_account_code,   pur.account_name_thai AS purchases_account_name
     FROM im_item_category c
     LEFT JOIN gl_account inv  ON inv.id  = c.inventory_account_id
     LEFT JOIN gl_account cogs ON cogs.id = c.cogs_account_id
@@ -58,6 +64,7 @@ const CATEGORY_SELECT = `
     LEFT JOIN gl_account exp  ON exp.id  = c.expense_account_id
     LEFT JOIN gl_account var  ON var.id  = c.variance_account_id
     LEFT JOIN gl_account wip  ON wip.id  = c.wip_account_id
+    LEFT JOIN gl_account pur  ON pur.id  = c.purchases_account_id
 `;
 
 // GET all (tree order: parent before children, then code)
@@ -107,6 +114,7 @@ const addRow = async (req, res) => {
         expense_account_id, variance_account_id, wip_account_id,
         is_active, is_auto_number, running_prefix, running_separator,
         running_suffix_date, running_length, running_next_number,
+        accounting_mode, purchases_account_id,
     } = req.body;
     const userName = req.headers.username || null;
     try {
@@ -127,8 +135,8 @@ const addRow = async (req, res) => {
                  expense_account_id, variance_account_id, wip_account_id,
                  is_active, is_auto_number, running_prefix, running_separator,
                  running_suffix_date, running_length, running_next_number,
-                 created_by, updated_by)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$20)
+                 created_by, updated_by, accounting_mode, purchases_account_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$20,$21,$22)
              RETURNING id`,
             [
                 (category_code || '').trim().toUpperCase(),
@@ -138,9 +146,10 @@ const addRow = async (req, res) => {
                 is_active ?? true,
                 is_auto_number ?? false, (running_prefix || 'ITEM').trim(), running_separator ?? '-',
                 running_suffix_date || '', running_length ?? 4, running_next_number ?? 1,
-                userName,
+                userName, normalizeMode(accounting_mode), purchases_account_id || null,
             ]
         );
+        await logModeChange(client, { level: 'CATEGORY', refId: result.rows[0].id, oldMode: null, newMode: normalizeMode(accounting_mode), changedBy: userName });
         const newRow = await client.query(`${CATEGORY_SELECT} WHERE c.id = $1`, [result.rows[0].id]);
         res.status(201).json(newRow.rows[0]);
     } catch (error) {
@@ -159,6 +168,7 @@ const updateRow = async (req, res) => {
         expense_account_id, variance_account_id, wip_account_id,
         is_active, is_auto_number, running_prefix, running_separator,
         running_suffix_date, running_length, running_next_number,
+        accounting_mode, purchases_account_id,
     } = req.body;
     const userName = req.headers.username || null;
     try {
@@ -175,6 +185,7 @@ const updateRow = async (req, res) => {
             if (parent.rows.length === 0) return res.status(400).json({ message: 'ไม่พบหมวดหมู่แม่' });
             level = parent.rows[0].level + 1;
         }
+        const oldModeRes = await client.query(`SELECT accounting_mode FROM im_item_category WHERE id = $1`, [id]);
         const result = await client.query(
             `UPDATE im_item_category SET
                 category_name_th     = $1,
@@ -196,6 +207,8 @@ const updateRow = async (req, res) => {
                 running_length        = $17,
                 running_next_number   = $18,
                 updated_by            = $19,
+                accounting_mode       = $21,
+                purchases_account_id  = $22,
                 updated_at            = NOW()
              WHERE id = $20
              RETURNING id`,
@@ -206,10 +219,11 @@ const updateRow = async (req, res) => {
                 is_active ?? true,
                 is_auto_number ?? false, (running_prefix || 'ITEM').trim(), running_separator ?? '-',
                 running_suffix_date || '', running_length ?? 4, running_next_number ?? 1,
-                userName, id,
+                userName, id, normalizeMode(accounting_mode), purchases_account_id || null,
             ]
         );
         if (result.rows.length === 0) return res.status(404).json({ message: 'ไม่พบหมวดหมู่สินค้า' });
+        await logModeChange(client, { level: 'CATEGORY', refId: Number(id), oldMode: oldModeRes.rows[0]?.accounting_mode, newMode: normalizeMode(accounting_mode), changedBy: userName });
         const updated = await client.query(`${CATEGORY_SELECT} WHERE c.id = $1`, [id]);
         res.status(200).json(updated.rows[0]);
     } catch (error) {

@@ -5,6 +5,8 @@
 // See imPeriodClosingController.js for the periodic period-end closing entry.
 'use strict';
 
+const { logModeChange } = require('../../utils/imAccountingMode');
+
 const ensureImAccountingSettingTable = async (client) => {
     await client.query(`
         CREATE TABLE IF NOT EXISTS im_accounting_setting (
@@ -161,6 +163,13 @@ const upsertSetting = async (req, res) => {
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$7) RETURNING id
             `, [inventory_accounting_mode, mode_effective_period_id || null,
                 inventory_account_id || null, cogs_account_id || null, purchases_account_id || null, closing_gl_doc_id || null, userName]);
+        }
+
+        if (isSwitchingMode) {
+            await logModeChange(client, {
+                level: 'DEFAULT', oldMode: current?.inventory_accounting_mode || 'PERPETUAL',
+                newMode: inventory_accounting_mode, changedBy: userName,
+            });
         }
 
         const full = await client.query(`${SETTING_SELECT} WHERE s.id = $1`, [result.rows[0].id]);

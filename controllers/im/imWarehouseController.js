@@ -4,6 +4,8 @@
 // (im_location's own routes, im_item_warehouse) to avoid a circular require with this file.
 'use strict';
 
+const { normalizeMode, logModeChange } = require('../../utils/imAccountingMode');
+
 const ensureImWarehouseTable = async (client) => {
     await client.query(`
         CREATE TABLE IF NOT EXISTS im_warehouse (
@@ -20,19 +22,26 @@ const ensureImWarehouseTable = async (client) => {
             updated_by         VARCHAR(100)
         )
     `);
-    // เผื่อสำหรับ TRF (โอนสินค้า) — override บัญชีสต็อกของ im_item เมื่อผังบัญชีถูกแยกตามคลังในอนาคต; ยังไม่ตั้งค่าที่ใดวันนี้
+    // บัญชีสต็อกของคลัง — ลำดับแรกสุดของการหาบัญชีสต็อก (คลัง → สินค้า → หมวดสินค้า → ประเภทเอกสาร)
     await client.query(`ALTER TABLE im_warehouse ADD COLUMN IF NOT EXISTS inventory_account_id INTEGER REFERENCES gl_account(id)`).catch(() => {});
     // Consignment-OUT — คลังนี้แทนสถานที่ของผู้รับฝากขาย (consignee) สินค้าที่โอนเข้ามาด้วย TRF ยังเป็นของเราอยู่
     // (ไม่กระทบ GL ใดๆ ตอนโอน) จนกว่าจะขายออกจากคลังนี้ด้วย DLN ตามปกติ — เป็นแค่ flag เพื่อความชัดเจน/กรองรายงาน
     // ไม่มี logic พิเศษใดๆ ผูกกับ flag นี้ในเอนจิน เพราะ TRF/DLN ที่มีอยู่เดิมรองรับ flow นี้ได้อยู่แล้วโดยไม่ต้องแก้ไข
     await client.query(`ALTER TABLE im_warehouse ADD COLUMN IF NOT EXISTS is_consignee BOOLEAN NOT NULL DEFAULT false`).catch(() => {});
+    // โหมดบัญชีสินค้าของคลัง (NULL = ค่าเริ่มต้นของบริษัท; สินค้า/หมวดสินค้าที่ตั้งโหมดไว้มีผลก่อน) + บัญชีซื้อสินค้าสำหรับ Periodic
+    await client.query(`ALTER TABLE im_warehouse ADD COLUMN IF NOT EXISTS accounting_mode VARCHAR(10)`).catch(() => {});
+    await client.query(`ALTER TABLE im_warehouse ADD COLUMN IF NOT EXISTS purchases_account_id INTEGER REFERENCES gl_account(id)`).catch(() => {});
 };
 
 const WAREHOUSE_SELECT = `
     SELECT w.*,
-           b.branch_code AS branch_code, b.branch_name_thai AS branch_name_th, b.branch_name_eng AS branch_name_en
+           b.branch_code AS branch_code, b.branch_name_thai AS branch_name_th, b.branch_name_eng AS branch_name_en,
+           inv.account_code AS inventory_account_code, inv.account_name_thai AS inventory_account_name,
+           pur.account_code AS purchases_account_code, pur.account_name_thai AS purchases_account_name
     FROM im_warehouse w
     LEFT JOIN cd_branch b ON b.id = w.branch_id
+    LEFT JOIN gl_account inv ON inv.id = w.inventory_account_id
+    LEFT JOIN gl_account pur ON pur.id = w.purchases_account_id
 `;
 
 // GET all
@@ -76,18 +85,22 @@ const fetchRow = async (req, res) => {
 
 const addRow = async (req, res) => {
     const client = await req.dbPool.connect();
-    const { warehouse_code, warehouse_name_th, warehouse_name_en, branch_id, address, is_active, is_consignee } = req.body;
+    const { warehouse_code, warehouse_name_th, warehouse_name_en, branch_id, address, is_active, is_consignee,
+            inventory_account_id, purchases_account_id, accounting_mode } = req.body;
     const userName = req.headers.username || null;
     try {
         await client.query('BEGIN');
         await ensureImWarehouseTable(client);
         const result = await client.query(
-            `INSERT INTO im_warehouse (warehouse_code, warehouse_name_th, warehouse_name_en, branch_id, address, is_active, is_consignee, created_by, updated_by)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)
+            `INSERT INTO im_warehouse (warehouse_code, warehouse_name_th, warehouse_name_en, branch_id, address, is_active, is_consignee, created_by, updated_by,
+                                       inventory_account_id, purchases_account_id, accounting_mode)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9,$10,$11)
              RETURNING id`,
-            [(warehouse_code || '').trim().toUpperCase(), warehouse_name_th || '', warehouse_name_en || null, branch_id || null, address || null, is_active ?? true, is_consignee === true, userName]
+            [(warehouse_code || '').trim().toUpperCase(), warehouse_name_th || '', warehouse_name_en || null, branch_id || null, address || null, is_active ?? true, is_consignee === true, userName,
+             inventory_account_id || null, purchases_account_id || null, normalizeMode(accounting_mode)]
         );
         const newId = result.rows[0].id;
+        await logModeChange(client, { level: 'WAREHOUSE', refId: newId, oldMode: null, newMode: normalizeMode(accounting_mode), changedBy: userName });
         await client.query('COMMIT');
         const newRow = await client.query(`${WAREHOUSE_SELECT} WHERE w.id = $1`, [newId]);
         res.status(201).json(newRow.rows[0]);
@@ -102,20 +115,25 @@ const addRow = async (req, res) => {
 const updateRow = async (req, res) => {
     const { id } = req.params;
     const client = await req.dbPool.connect();
-    const { warehouse_name_th, warehouse_name_en, branch_id, address, is_active, is_consignee } = req.body;
+    const { warehouse_name_th, warehouse_name_en, branch_id, address, is_active, is_consignee,
+            inventory_account_id, purchases_account_id, accounting_mode } = req.body;
     const userName = req.headers.username || null;
     try {
         await client.query('BEGIN');
         await ensureImWarehouseTable(client);
+        const oldModeRes = await client.query(`SELECT accounting_mode FROM im_warehouse WHERE id = $1`, [id]);
         const result = await client.query(
             `UPDATE im_warehouse SET
                 warehouse_name_th = $1, warehouse_name_en = $2, branch_id = $3,
-                address = $4, is_active = $5, is_consignee = $6, updated_by = $7, updated_at = NOW()
+                address = $4, is_active = $5, is_consignee = $6, updated_by = $7, updated_at = NOW(),
+                inventory_account_id = $9, purchases_account_id = $10, accounting_mode = $11
              WHERE id = $8
              RETURNING id`,
-            [warehouse_name_th || '', warehouse_name_en || null, branch_id || null, address || null, is_active ?? true, is_consignee === true, userName, id]
+            [warehouse_name_th || '', warehouse_name_en || null, branch_id || null, address || null, is_active ?? true, is_consignee === true, userName, id,
+             inventory_account_id || null, purchases_account_id || null, normalizeMode(accounting_mode)]
         );
         if (result.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'ไม่พบคลังสินค้า' }); }
+        await logModeChange(client, { level: 'WAREHOUSE', refId: Number(id), oldMode: oldModeRes.rows[0]?.accounting_mode, newMode: normalizeMode(accounting_mode), changedBy: userName });
         await client.query('COMMIT');
         const updated = await client.query(`${WAREHOUSE_SELECT} WHERE w.id = $1`, [id]);
         res.status(200).json(updated.rows[0]);
