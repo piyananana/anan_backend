@@ -1819,6 +1819,7 @@ const postDetailLines = async (client, headerId, header, docNo) => {
         if (['10', '11', '12'].includes(sysDocType) && d.ref_po_detail_id) {
             const { poTransactionId } = await validatePoReceivableQty(client, {
                 refPoDetailId: d.ref_po_detail_id, requestedQty: Math.abs(varianceQty), vendorId: header.vendor_id,
+                currencyCode: header.currency_code || await getBaseCurrencyCode(client),
             });
             touchedPoIds.add(poTransactionId);
         }
@@ -1826,6 +1827,7 @@ const postDetailLines = async (client, headerId, header, docNo) => {
         if (['30', '31', '32'].includes(sysDocType) && d.ref_so_detail_id) {
             const { soTransactionId } = await validateSoDeliverableQty(client, {
                 refSoDetailId: d.ref_so_detail_id, requestedQty: Math.abs(varianceQty), customerId: header.customer_id,
+                currencyCode: header.currency_code || await getBaseCurrencyCode(client),
             });
             touchedSoIds.add(soTransactionId);
         }
@@ -2020,8 +2022,10 @@ const fetchRowById = async (pool, id) => {
         WHERE t.id = $1`, [id]);
     if (hRes.rows.length === 0) return null;
     const dRes = await pool.query(`
-        SELECT dt.*, u.uom_code, l.location_code, tl.location_code AS to_location_code
+        SELECT dt.*, u.uom_code, l.location_code, tl.location_code AS to_location_code,
+               pod.unit_price_fc AS ref_po_unit_price_fc
         FROM im_transaction_detail dt
+        LEFT JOIN po_transaction_detail pod ON pod.id = dt.ref_po_detail_id
         LEFT JOIN im_uom u      ON u.id = dt.uom_id
         LEFT JOIN im_location l  ON l.id = dt.location_id
         LEFT JOIN im_location tl ON tl.id = dt.to_location_id
@@ -2200,6 +2204,14 @@ const copyImSalespersonsToAr = async (client, imId, arId) => {
         { table: 'ar_transaction_salesperson', fk: 'header_id', id: arId });
 };
 
+// มิติของเอกสารต้นทาง (ใบสั่งผลิต / ใบสั่งซื้อ / ใบสั่งขาย) — ใช้เมื่อเอกสาร IM ที่อ้างอิงไม่ได้ระบุมิติเอง
+// ให้รายการบัญชีของการเบิก/รับ/ส่งวิเคราะห์ตามมิติเดียวกับเอกสารต้นทางได้
+const refDims = async (client, { refMoId, refPoId, refSoId }) => {
+    const src = refMoId ? ['mo_header', refMoId] : refPoId ? ['po_transaction', refPoId] : refSoId ? ['so_transaction', refSoId] : null;
+    if (!src) return null;
+    return (await client.query(`SELECT dim1_id, dim2_id, dim3_id, dim4_id, dim5_id FROM ${src[0]} WHERE id = $1`, [src[1]])).rows[0] || null;
+};
+
 const insertAndPostAdjustment = async (client, {
     docId, docCode, sysDocType, docNo, docDate, warehouseId, toWarehouseId, vendorId, customerId,
     refNo, refDocId, refDocNo, refImTransactionId, refPoId, refSoId, refMoId, description,
@@ -2320,9 +2332,9 @@ const insertAndPostAdjustment = async (client, {
         }
     }
 
-    // MOI/MOR ที่อ้างอิงใบสั่งผลิตและไม่ได้ระบุมิติ — ใช้มิติของใบสั่งผลิต ให้รายการบัญชีวิเคราะห์ต้นทุนการผลิตตามมิติได้
-    if (refMoId && ![dim1Id, dim2Id, dim3Id, dim4Id, dim5Id].some(Boolean)) {
-        const md = (await client.query(`SELECT dim1_id, dim2_id, dim3_id, dim4_id, dim5_id FROM mo_header WHERE id = $1`, [refMoId])).rows[0];
+    // อ้างอิงใบสั่งผลิต/ใบสั่งซื้อ/ใบสั่งขายและไม่ได้ระบุมิติ — ใช้มิติของเอกสารต้นทาง
+    if (![dim1Id, dim2Id, dim3Id, dim4Id, dim5Id].some(Boolean)) {
+        const md = await refDims(client, { refMoId, refPoId, refSoId });
         if (md) ({ dim1_id: dim1Id, dim2_id: dim2Id, dim3_id: dim3Id, dim4_id: dim4Id, dim5_id: dim5Id } = md);
     }
 
@@ -2614,6 +2626,12 @@ const updateTransaction = async (req, res) => {
         const periodId = periodRes.rows[0].id;
 
         if (!details || details.length === 0) throw new Error('ต้องมีรายการนับสต็อกอย่างน้อย 1 รายการ');
+
+        // อ้างอิงเอกสารต้นทางและไม่ได้ระบุมิติ — ใช้มิติของเอกสารต้นทาง (เหมือนตอนสร้าง)
+        if (![header.dim1_id, header.dim2_id, header.dim3_id, header.dim4_id, header.dim5_id].some(Boolean)) {
+            const md = await refDims(client, { refPoId: header.ref_po_id, refSoId: header.ref_so_id });
+            if (md) Object.assign(header, md);
+        }
 
         await client.query(`
             UPDATE im_transaction SET

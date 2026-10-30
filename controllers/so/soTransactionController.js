@@ -11,7 +11,7 @@
 'use strict';
 
 const { generateDocNo, ensureImTransactionTable } = require('../im/imTransactionController');
-const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
+const { getBaseCurrencyCode, BASE_CURRENCY_CODE_SQL } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { reasonOf, userIdOf, sendErr, blk } = require('../../utils/docAction');
 const { ensureSalespersonTable, saveDocSalespersons, loadSalespersons } = require('../../utils/docSalesperson');
@@ -637,9 +637,10 @@ const fetchDeliverableLines = async (req, res) => {
 // ตรวจสอบว่าจำนวนที่จะส่ง (ต่อบรรทัด DLN ที่อ้างอิง ref_so_detail_id) ไม่เกินจำนวนคงเหลือที่ส่งได้ของบรรทัด SO ต้นฉบับ
 // เอกสาร SO หนึ่งบรรทัดอาจถูกส่งหลายครั้ง (คนละใบ DLN) คงเหลือคำนวณจากผลรวมการส่งที่ Posted/Delivered แล้วเท่านั้น —
 // มิเรอร์ validatePoReceivableQty ใน poTransactionController.js ทุกประการ
-const validateSoDeliverableQty = async (client, { refSoDetailId, requestedQty, customerId }) => {
+const validateSoDeliverableQty = async (client, { refSoDetailId, requestedQty, customerId, currencyCode }) => {
     const origRes = await client.query(`
-        SELECT sod.qty_ordered, sod.item_code, sod.header_id, so.customer_id, so.status AS so_status
+        SELECT sod.qty_ordered, sod.item_code, sod.header_id, so.customer_id, so.status AS so_status, so.doc_no,
+               COALESCE(so.currency_code, ${BASE_CURRENCY_CODE_SQL}) AS currency_code
         FROM so_transaction_detail sod JOIN so_transaction so ON so.id = sod.header_id
         WHERE sod.id = $1
     `, [refSoDetailId]);
@@ -650,6 +651,10 @@ const validateSoDeliverableQty = async (client, { refSoDetailId, requestedQty, c
     }
     if (Number(orig.customer_id) !== Number(customerId)) {
         throw new Error('ลูกค้าของใบส่งสินค้าต้องตรงกับลูกค้าของใบสั่งขายที่อ้างอิง');
+    }
+    // ราคาที่ดึงจาก SO เป็นสกุลเงินของ SO — ใบส่งสินค้าต้องเป็นสกุลเงินเดียวกัน
+    if (currencyCode && orig.currency_code !== currencyCode) {
+        throw new Error(`สกุลเงินของใบส่งสินค้า (${currencyCode}) ต้องตรงกับใบสั่งขาย ${orig.doc_no} (${orig.currency_code})`);
     }
     const deliveredRes = await client.query(`
         SELECT COALESCE(SUM(ABS(imd.qty)), 0) AS delivered

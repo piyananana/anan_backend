@@ -10,7 +10,7 @@
 'use strict';
 
 const { generateDocNo } = require('../im/imTransactionController');
-const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
+const { getBaseCurrencyCode, BASE_CURRENCY_CODE_SQL } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { reasonOf, userIdOf, sendErr, blk } = require('../../utils/docAction');
 const DA = require('../../utils/docApproval');
@@ -619,9 +619,10 @@ const fetchReceivableLines = async (req, res) => {
 // ตรวจสอบว่าจำนวนที่จะรับ (ต่อบรรทัด GRN ที่อ้างอิง ref_po_detail_id) ไม่เกินจำนวนคงเหลือที่รับได้ของบรรทัด PO ต้นฉบับ
 // เอกสาร PO หนึ่งบรรทัดอาจถูกรับหลายครั้ง (คนละใบ GRN) คงเหลือคำนวณจากผลรวมการรับที่ Posted/Received แล้วเท่านั้น —
 // มิเรอร์ validateReturnableQty ใน imTransactionController.js ทุกประการ (ดูเหตุผลเรื่อง computed-on-read ที่นั่น)
-const validatePoReceivableQty = async (client, { refPoDetailId, requestedQty, vendorId }) => {
+const validatePoReceivableQty = async (client, { refPoDetailId, requestedQty, vendorId, currencyCode }) => {
     const origRes = await client.query(`
-        SELECT pod.qty_ordered, pod.item_code, pod.header_id, po.vendor_id, po.status AS po_status
+        SELECT pod.qty_ordered, pod.item_code, pod.header_id, po.vendor_id, po.status AS po_status, po.doc_no,
+               COALESCE(po.currency_code, ${BASE_CURRENCY_CODE_SQL}) AS currency_code
         FROM po_transaction_detail pod JOIN po_transaction po ON po.id = pod.header_id
         WHERE pod.id = $1
     `, [refPoDetailId]);
@@ -632,6 +633,10 @@ const validatePoReceivableQty = async (client, { refPoDetailId, requestedQty, ve
     }
     if (Number(orig.vendor_id) !== Number(vendorId)) {
         throw new Error('ผู้ขายของใบรับสินค้าต้องตรงกับผู้ขายของใบสั่งซื้อที่อ้างอิง');
+    }
+    // ราคาที่ดึงจาก PO เป็นสกุลเงินของ PO — ใบรับสินค้าต้องเป็นสกุลเงินเดียวกัน ไม่งั้นราคาจะถูกตีมูลค่าผิดสกุล
+    if (currencyCode && orig.currency_code !== currencyCode) {
+        throw new Error(`สกุลเงินของใบรับสินค้า (${currencyCode}) ต้องตรงกับใบสั่งซื้อ ${orig.doc_no} (${orig.currency_code})`);
     }
     const receivedRes = await client.query(`
         SELECT COALESCE(SUM(ABS(imd.qty)), 0) AS received
