@@ -11,7 +11,8 @@ const { ensureImUomTable } = require('./imUomController');
 const { ensureImStockBalanceTable } = require('./imStockBalanceController');
 const { ensureImStockLayerTable } = require('./imStockLayerController');
 const { fetchSetupByDocCode } = require('./imGlAccountSetupController');
-const { fetchMode, fetchSettingRow } = require('./imAccountingSettingController');
+const { fetchMode } = require('./imAccountingSettingController');
+const { resolveItemModes } = require('../../utils/imAccountingMode');
 const { today: todayYmd, ymd } = require('../../utils/dateUtil');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { branchCodeSql } = require('../../utils/taxBranch');
@@ -124,6 +125,10 @@ const ensureImTransactionTable = async (client) => {
     await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS to_location_id             INTEGER REFERENCES im_location(id)`).catch(() => {});
     await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS to_balance_qty_before      NUMERIC(18,4)`).catch(() => {});
     await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS to_balance_avg_cost_before NUMERIC(18,4)`).catch(() => {});
+    // โหมดบัญชีสินค้าที่ใช้จริงตอน Post ต่อบรรทัด (to_gl_mode = ฝั่งคลังปลายทางของ TRF) — ใช้ตอน Post AP/GL ภายหลัง ('12'),
+    // ปิดงวด และตรวจย้อนหลัง (ดู utils/imAccountingMode.js, project_im_mixed_accounting_mode)
+    await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS gl_mode    VARCHAR(10)`).catch(() => {});
+    await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS to_gl_mode VARCHAR(10)`).catch(() => {});
 
     // สำหรับ GRN ('10' รับสินค้า / '11' รับสินค้า+ตั้งหนี้อัตโนมัติ) — ผู้ขาย + ลิงก์ไปยัง ap_transaction ที่สร้างให้
     await client.query(`ALTER TABLE im_transaction ADD COLUMN IF NOT EXISTS vendor_id               INTEGER REFERENCES ap_vendor(id)`).catch(() => {});
@@ -342,6 +347,8 @@ const fetchItemAccountRow = async (client, itemId, warehouseId = null) => {
     const res = await client.query(`
         SELECT i.item_code,
                w.inventory_account_id AS warehouse_inventory,
+               w.purchases_account_id AS warehouse_purchases,
+               i.purchases_account_id AS item_purchases, c.purchases_account_id AS category_purchases,
                i.inventory_account_id AS item_inventory, c.inventory_account_id AS category_inventory,
                i.cogs_account_id      AS item_cogs,      c.cogs_account_id      AS category_cogs,
                i.revenue_account_id   AS item_revenue,   c.revenue_account_id   AS category_revenue
@@ -355,18 +362,45 @@ const fetchItemAccountRow = async (client, itemId, warehouseId = null) => {
 };
 const pickAccount = (...ids) => ids.map(Number).find(n => n > 0) || null;
 
-// บัญชีสต็อก: คลัง → สินค้า → หมวดสินค้า → default ของ im_gl_account_setup
-const resolveInventoryAccount = async (client, itemId, warehouseId, fallbackAccountId) => {
+// บัญชีเริ่มต้นของบริษัท (หน้าโหมดบัญชีสินค้าคงคลัง) — ลำดับสุดท้ายของทุก resolver ข้างล่าง
+const fetchCompanyAccounts = async (client) => {
+    const t = await client.query(`SELECT to_regclass('im_accounting_setting') AS t`);
+    if (!t.rows[0].t) return {};
+    const r = await client.query(`SELECT inventory_account_id, cogs_account_id, purchases_account_id FROM im_accounting_setting ORDER BY id LIMIT 1`);
+    return r.rows[0] || {};
+};
+
+// บัญชีสต็อก: คลัง → สินค้า → หมวดสินค้า → default ของ im_gl_account_setup → (lastResort) → บัญชีเริ่มต้นของบริษัท
+const resolveInventoryAccount = async (client, itemId, warehouseId, fallbackAccountId, lastResortAccountId = null) => {
     const row = await fetchItemAccountRow(client, itemId, warehouseId);
-    const accountId = pickAccount(row.warehouse_inventory, row.item_inventory, row.category_inventory, fallbackAccountId);
+    const company = await fetchCompanyAccounts(client);
+    const accountId = pickAccount(row.warehouse_inventory, row.item_inventory, row.category_inventory, fallbackAccountId,
+        lastResortAccountId, company.inventory_account_id);
     if (!accountId) throw new Error(`ไม่พบบัญชีสต็อกสำหรับ ${row.item_code} (ตั้งค่าที่คลัง สินค้า หมวดสินค้า หรือการตั้งค่าบัญชี IM)`);
     return accountId;
 };
 
-// บัญชีต้นทุนขาย/เบิกใช้ ('30'-'45', '60'): สินค้า → หมวดสินค้า → default ของ im_gl_account_setup
+// บัญชีซื้อสินค้า (บรรทัดที่เป็น Periodic): คลัง → สินค้า → หมวดสินค้า → บัญชีเริ่มต้นของบริษัท
+const resolvePurchasesAccount = async (client, itemId, warehouseId) => {
+    const row = await fetchItemAccountRow(client, itemId, warehouseId);
+    const company = await fetchCompanyAccounts(client);
+    const accountId = pickAccount(row.warehouse_purchases, row.item_purchases, row.category_purchases, company.purchases_account_id);
+    if (!accountId) throw new Error(`ไม่พบบัญชีซื้อสินค้าสำหรับ ${row.item_code} (Periodic) — ตั้งค่าที่คลัง สินค้า หมวดสินค้า หรือหน้าโหมดบัญชีสินค้าคงคลัง`);
+    return accountId;
+};
+
+// บัญชีฝั่งสต็อกของบรรทัด: Perpetual = บัญชีสต็อก, Periodic = บัญชีซื้อสินค้า (สต็อก Periodic ไม่มีบัญชีสต็อกเคลื่อนไหว
+// ระหว่างงวด — ปิดงวดปรับยอดให้ตรงครั้งเดียว) ใช้กับเอกสารที่ต้องลงบัญชีทุกโหมด (รับ, AP, MOI/MOR, TRF ข้ามโหมด)
+const resolveStockSideAccount = async (client, itemId, warehouseId, mode, fallbackAccountId, lastResortAccountId = null) =>
+    mode === 'PERIODIC'
+        ? resolvePurchasesAccount(client, itemId, warehouseId)
+        : resolveInventoryAccount(client, itemId, warehouseId, fallbackAccountId, lastResortAccountId);
+
+// บัญชีต้นทุนขาย/เบิกใช้ ('30'-'45', '60'): สินค้า → หมวดสินค้า → default ของ im_gl_account_setup → บัญชีเริ่มต้นของบริษัท
 const resolveCogsAccount = async (client, itemId, fallbackAccountId) => {
     const row = await fetchItemAccountRow(client, itemId);
-    const accountId = pickAccount(row.item_cogs, row.category_cogs, fallbackAccountId);
+    const company = await fetchCompanyAccounts(client);
+    const accountId = pickAccount(row.item_cogs, row.category_cogs, fallbackAccountId, company.cogs_account_id);
     if (!accountId) throw new Error(`ไม่พบบัญชีต้นทุนสำหรับ ${row.item_code} (ตั้งค่าที่สินค้า หมวดสินค้า หรือการตั้งค่าบัญชี IM)`);
     return accountId;
 };
@@ -381,6 +415,16 @@ const resolveRevenueAccount = async (client, itemId, fallbackAccountId) => {
 
 // ประเภทเอกสาร IM ที่บัญชีคู่เป็นต้นทุน — แยกบรรทัดตามบัญชีต้นทุนของแต่ละสินค้า
 const COGS_COUNTER_TYPES = ['30', '31', '32', '35', '40', '45', '60'];
+
+// ประเภทเอกสารที่ลงบัญชีทุกบรรทัดไม่ว่าโหมดใด (บรรทัด Periodic ใช้บัญชีซื้อแทนบัญชีสต็อก) — ประเภทอื่น (ขาย คืน เบิก
+// ปรับยอด) ลงเฉพาะบรรทัด Perpetual เพราะต้นทุนของสต็อก Periodic คำนวณตอนปิดงวด
+const ALWAYS_POST_TYPES = ['10', '13', '90', '95'];
+const lineNeedsImGl = (sysDocType, d) => {
+    if (ALWAYS_POST_TYPES.includes(sysDocType)) return true;
+    if (sysDocType === '70') return d.gl_mode !== 'PERIODIC' || d.to_gl_mode !== 'PERIODIC';
+    return d.gl_mode !== 'PERIODIC';
+};
+const needsImGl = (sysDocType, details) => details.some(d => lineNeedsImGl(sysDocType, d));
 
 // countedQty คือยอดที่นับได้จริง (ไม่ใช่ variance) — varianceQty คำนวณสดจากยอดคงเหลือ ณ ตอน Post เสมอ
 // เพื่อรับประกันว่า qty_on_hand หลัง Post จะเท่ากับ countedQty เป๊ะ ไม่ผูกกับ system_qty ที่ผู้ใช้เห็นตอนเพิ่มบรรทัด (อาจ stale)
@@ -658,7 +702,10 @@ const resolveCounterAccount = (sysDocType, setup) => {
     }
 };
 
-const postGlEntry = async (client, headerId, header, details, docNo, sysDocType, mode) => {
+const postGlEntry = async (client, headerId, header, allDetails, docNo, sysDocType) => {
+    // บรรทัดที่ต้องลงบัญชีตามโหมดของแต่ละบรรทัด (ดู lineNeedsImGl) — ไม่มีเลย = ไม่ต้องโพสต์
+    const details = allDetails.filter(d => lineNeedsImGl(sysDocType, d));
+    if (details.length === 0) return null;
     const periodRes = await client.query(
         `SELECT id FROM gl_posting_period WHERE $1::date BETWEEN period_start_date AND period_end_date AND gl_status = 'OPEN' AND im_status = 'OPEN' LIMIT 1`,
         [header.doc_date]
@@ -674,13 +721,13 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
     const glDetails = [];
 
     if (sysDocType === '70') {
-        // TRF — โอนสินค้า: Dr บัญชีสต็อกปลายทาง / Cr บัญชีสต็อกต้นทาง ไม่มีบัญชีคู่บัญชีแยกต่างหาก (ทั้งสองฝั่งเป็นบัญชีสต็อก
-        // เหมือนกัน) วันนี้ im_warehouse ยังไม่มีบัญชีแยกตามคลัง ทั้งสองฝั่งจึง resolve ไปที่บัญชีเดียวกันเสมอ หักล้างเป็น 0
-        // และจะไม่มีการโพสต์ GL เลยจนกว่าจะตั้งค่าบัญชีแยกตามคลัง (ดู resolveInventoryAccount)
+        // TRF — โอนสินค้า: Dr ปลายทาง / Cr ต้นทาง ไม่มีบัญชีคู่บัญชีแยกต่างหาก แต่ละฝั่งใช้บัญชีตามโหมดของคลังนั้น
+        // (Perpetual = บัญชีสต็อก, Periodic = บัญชีซื้อ) — ต้นทาง/ปลายทางใช้บัญชีเดียวกันจะหักล้างเป็น 0 ไม่โพสต์
+        // ทั้งสองฝั่ง Periodic ถูกกรองออกไปแล้วด้านบน (lineNeedsImGl)
         for (const d of details) {
             const value = round2(Number(d.qty) * Number(d.unit_cost)); // ติดลบเสมอ — มูลค่าที่ออกจากต้นทาง (qty ของ TRF คือฝั่งต้นทาง)
-            const srcAcc = await resolveInventoryAccount(client, d.item_id, header.warehouse_id, setup.inventory_account_id);
-            const dstAcc = await resolveInventoryAccount(client, d.item_id, header.to_warehouse_id, setup.inventory_account_id);
+            const srcAcc = await resolveStockSideAccount(client, d.item_id, header.warehouse_id, d.gl_mode, setup.inventory_account_id);
+            const dstAcc = await resolveStockSideAccount(client, d.item_id, header.to_warehouse_id, d.to_gl_mode, setup.inventory_account_id);
             invDebitByAccount[srcAcc] = (invDebitByAccount[srcAcc] || 0) + value;
             invDebitByAccount[dstAcc] = (invDebitByAccount[dstAcc] || 0) - value;
         }
@@ -698,20 +745,13 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
         // บัญชีคู่ (GR/IR / เจ้าหนี้ฝากขาย) ตั้งตามราคาซื้อที่กรอก (entered_unit_cost) เพื่อให้ล้างกับใบตั้งหนี้ AP ได้พอดี
         // ส่วนคลังใช้มูลค่าสต็อก (STANDARD = ต้นทุนมาตรฐาน) — ส่วนต่างลงบัญชีผลต่างต้นทุน (Periodic: Dr ซื้อ = ราคาซื้อ ไม่มีผลต่าง)
         const { accountId: counterAccountId, label: counterLabel } = resolveCounterAccount(sysDocType, setup);
-        let purchasesAccountId = null;
-        if (mode === 'PERIODIC') {
-            const setting = await fetchSettingRow(client);
-            if (!setting?.purchases_account_id) {
-                throw new Error('ยังไม่ได้ตั้งค่าบัญชีซื้อสินค้า (purchases_account_id) ใน ตั้งค่าบัญชีสินค้าคงคลัง IM สำหรับโหมด Periodic');
-            }
-            purchasesAccountId = Number(setting.purchases_account_id);
-        }
         let totalValue = 0, grirVarianceLc = 0;
         for (const d of details) {
-            const invAcc = purchasesAccountId || await resolveInventoryAccount(client, d.item_id, header.warehouse_id, setup.inventory_account_id);
+            const periodic = d.gl_mode === 'PERIODIC';
+            const invAcc = await resolveStockSideAccount(client, d.item_id, header.warehouse_id, d.gl_mode, setup.inventory_account_id);
             const priceLc = d.is_free ? 0 : Number(d.entered_unit_cost ?? d.unit_cost);
             const value = round2(Number(d.qty) * priceLc);
-            const stockValue = purchasesAccountId ? value : round2(Number(d.qty) * Number(d.unit_cost));
+            const stockValue = periodic ? value : round2(Number(d.qty) * Number(d.unit_cost));
             invDebitByAccount[invAcc] = (invDebitByAccount[invAcc] || 0) + stockValue;
             totalValue += value;
             grirVarianceLc += value - stockValue;
@@ -747,7 +787,8 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
         const { accountId: wipAccountId, label: wipLabel } = resolveCounterAccount(sysDocType, setup);
         let totalInvValue = 0, totalWipValue = 0;
         for (const d of details) {
-            const invAcc = await resolveInventoryAccount(client, d.item_id, header.warehouse_id, setup.inventory_account_id);
+            // บรรทัด Periodic: Dr บัญชีซื้อ (สินค้าสำเร็จรูปเข้าสต็อก Periodic เหมือนซื้อมา — ปิดงวดคิดต้นทุนขายจากยอดนี้)
+            const invAcc = await resolveStockSideAccount(client, d.item_id, header.warehouse_id, d.gl_mode, setup.inventory_account_id);
             const qty = Number(d.qty);
             const unitCost = Number(d.unit_cost);
             const actualUnitCost = d.mo_actual_unit_cost != null ? Number(d.mo_actual_unit_cost) : unitCost;
@@ -784,7 +825,8 @@ const postGlEntry = async (client, headerId, header, details, docNo, sysDocType,
         const perItemCogs = COGS_COUNTER_TYPES.includes(sysDocType);
         const counterByAccount = {}; // account_id -> มูลค่าสต็อกที่เปลี่ยน (บวก=Cr คู่บัญชี, ลบ=Dr คู่บัญชี)
         for (const d of details) {
-            const invAcc = await resolveInventoryAccount(client, d.item_id, header.warehouse_id, setup.inventory_account_id);
+            // เหลือบรรทัด Periodic เฉพาะ '90' (MOI): Cr บัญชีซื้อ — วัตถุดิบที่ออกไปผลิตไม่ใช่ต้นทุนขายของงวด
+            const invAcc = await resolveStockSideAccount(client, d.item_id, header.warehouse_id, d.gl_mode, setup.inventory_account_id);
             const value = round2(Number(d.qty) * Number(d.unit_cost));
             invDebitByAccount[invAcc] = (invDebitByAccount[invAcc] || 0) + value;
             const cAcc = perItemCogs ? await resolveCogsAccount(client, d.item_id, counterAccountId) : counterAccountId;
@@ -889,7 +931,7 @@ const resolveDocCurrencyId = async (client, header) => {
     return r.rows[0]?.id || null;
 };
 
-const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoiceNo, mode }) => {
+const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoiceNo }) => {
     if (!header.vendor_id) throw new Error('ต้องระบุผู้ขายสำหรับเอกสารประเภทนี้');
     if (!vendorInvoiceNo) throw new Error('ต้องระบุเลขที่ใบกำกับสินค้าผู้ขายสำหรับเอกสารประเภทนี้');
 
@@ -914,18 +956,10 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
     // เหมือน resolveInventoryAccount) แล้วค่อย fallback ไปที่บัญชี VAT ของใบกำกับสินค้า AP เอง
     const imSetupVatRes = await client.query(`SELECT vat_input_account_id, inventory_account_id FROM im_gl_account_setup WHERE doc_code = $1`, [header.doc_code]);
     const vatAccountId = Number(imSetupVatRes.rows[0]?.vat_input_account_id) || Number(apSetup.vat_input_account_id) || null;
-    // บัญชีสินค้าคงคลัง (Perpetual): คลัง → สินค้า → บัญชีสินค้าคงคลังของ im_gl_account_setup (doc_code นี้ — ตรงกับ
-    // ตัวอย่างรายการบัญชีบนหน้าจอ) → บัญชีค่าใช้จ่ายของเอกสาร AP เป็นลำดับสุดท้าย
-    const invFallbackAccountId = Number(imSetupVatRes.rows[0]?.inventory_account_id) || apSetup.expense_account_id;
-
-    let purchasesAccountId = null;
-    if (mode === 'PERIODIC') {
-        const setting = await fetchSettingRow(client);
-        if (!setting?.purchases_account_id) {
-            throw new Error('ยังไม่ได้ตั้งค่าบัญชีซื้อสินค้า (purchases_account_id) ใน ตั้งค่าบัญชีสินค้าคงคลัง IM สำหรับโหมด Periodic');
-        }
-        purchasesAccountId = Number(setting.purchases_account_id);
-    }
+    // บัญชีฝั่งสินค้าต่อบรรทัดตามโหมดของบรรทัด (d.gl_mode): Perpetual = คลัง → สินค้า → หมวดสินค้า → บัญชีสินค้าคงคลัง
+    // ของ im_gl_account_setup (doc_code นี้) → บัญชีค่าใช้จ่ายของเอกสาร AP → บัญชีเริ่มต้นของบริษัท;
+    // Periodic = บัญชีซื้อสินค้า (คลัง → สินค้า → หมวดสินค้า → บัญชีเริ่มต้นของบริษัท)
+    const imSetupInventoryId = Number(imSetupVatRes.rows[0]?.inventory_account_id) || null;
 
     const vendorRow = await client.query(`SELECT vendor_code, vendor_name_th, tax_id FROM ap_vendor WHERE id = $1`, [header.vendor_id]);
     const vendorCode = vendorRow.rows[0]?.vendor_code || null;
@@ -957,8 +991,9 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
     const lineRows = [];
     let totalAmountLc = 0, totalVatLc = 0, totalAmountFc = 0, totalVatFc = 0;
     for (const d of details) {
-        const expenseAccountId = purchasesAccountId
-            || await resolveInventoryAccount(client, d.item_id, header.warehouse_id, invFallbackAccountId);
+        const periodic = d.gl_mode === 'PERIODIC';
+        const expenseAccountId = await resolveStockSideAccount(client, d.item_id, header.warehouse_id, d.gl_mode,
+            imSetupInventoryId, apSetup.expense_account_id);
         const qty = Number(d.qty);
         const unitCostLc = Number(d.unit_cost);
         const unitCostFc = d.unit_cost_fc != null ? Number(d.unit_cost_fc) : unitCostLc;
@@ -967,7 +1002,7 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
         // '12' Post AP/GL: d.unit_cost = ราคาตามใบกำกับ, d.stock_unit_cost = ต้นทุนที่ตีมูลค่าสต็อกไปแล้วตอนรับ —
         // Dr สินค้าคงคลังที่มูลค่าสต็อกจริงเพื่อให้ GL ตรงกับ IM ส่วนต่างลงบัญชีผลต่าง ('11' ไม่ส่งมา = ไม่มีผลต่าง;
         // Periodic ลงบัญชีซื้อตามใบกำกับเต็มจำนวนเพราะไม่มีการตีมูลค่าสต็อกต่อธุรกรรม)
-        const stockValueLc = (purchasesAccountId || d.stock_unit_cost == null) ? amountLc : round2(qty * Number(d.stock_unit_cost));
+        const stockValueLc = (periodic || d.stock_unit_cost == null) ? amountLc : round2(qty * Number(d.stock_unit_cost));
         const vatType = d.vat_type || 'NOVAT';
         const vatRate = vatType === 'NOVAT' ? 0 : (Number(d.vat_rate) || 0);
         const vatAmountLc = round2(amountLc * vatRate / 100);
@@ -1266,7 +1301,7 @@ const postArBillFromDln = async (client, { header, details, docNo }) => {
 // apTransactionController.js ('isCreditNote = sysDocType === '30'') — สลับกับ label ที่ผิดใน apSysDocType
 // (sa_anan_module.dart) จึง hardcode ตามโค้ดจริงตรงนี้ ไม่ผ่าน map นั้น
 // v1: ไม่มี VAT/WHT เหมือน postApBillFromGrn (เอกสารฝั่งซื้อ ผู้ใช้ AP แก้ไขเพิ่มเติมได้เองภายหลังถ้าจำเป็น)
-const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, mode, isCredit }) => {
+const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, isCredit }) => {
     if (!header.vendor_id) throw new Error('ต้องระบุผู้ขายสำหรับเอกสารประเภทนี้');
 
     const apSysDocType = isCredit ? '30' : '50';
@@ -1293,18 +1328,10 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, mod
     // บัญชี VAT ของ AP เอง (มิเรอร์ postApBillFromGrn ทุกประการ)
     const imSetupVatRes = await client.query(`SELECT vat_input_account_id, inventory_account_id FROM im_gl_account_setup WHERE doc_code = $1`, [header.doc_code]);
     const vatAccountId = Number(imSetupVatRes.rows[0]?.vat_input_account_id) || Number(apSetup.vat_input_account_id) || null;
-    // บัญชีสินค้าคงคลัง (Perpetual): คลัง → สินค้า → บัญชีสินค้าคงคลังของ im_gl_account_setup (doc_code นี้ — ตรงกับ
-    // ตัวอย่างรายการบัญชีบนหน้าจอ) → บัญชีค่าใช้จ่ายของเอกสาร AP เป็นลำดับสุดท้าย
-    const invFallbackAccountId = Number(imSetupVatRes.rows[0]?.inventory_account_id) || apSetup.expense_account_id;
-
-    let purchasesAccountId = null;
-    if (mode === 'PERIODIC') {
-        const setting = await fetchSettingRow(client);
-        if (!setting?.purchases_account_id) {
-            throw new Error('ยังไม่ได้ตั้งค่าบัญชีซื้อสินค้า (purchases_account_id) ใน ตั้งค่าบัญชีสินค้าคงคลัง IM สำหรับโหมด Periodic');
-        }
-        purchasesAccountId = Number(setting.purchases_account_id);
-    }
+    // บัญชีฝั่งสินค้าต่อบรรทัดตามโหมดของบรรทัด (d.gl_mode): Perpetual = คลัง → สินค้า → หมวดสินค้า → บัญชีสินค้าคงคลัง
+    // ของ im_gl_account_setup (doc_code นี้) → บัญชีค่าใช้จ่ายของเอกสาร AP → บัญชีเริ่มต้นของบริษัท;
+    // Periodic = บัญชีซื้อสินค้า (คลัง → สินค้า → หมวดสินค้า → บัญชีเริ่มต้นของบริษัท)
+    const imSetupInventoryId = Number(imSetupVatRes.rows[0]?.inventory_account_id) || null;
 
     const vendorRow = await client.query(`SELECT vendor_code, vendor_name_th, tax_id FROM ap_vendor WHERE id = $1`, [header.vendor_id]);
     const vendorCode = vendorRow.rows[0]?.vendor_code || null;
@@ -1334,8 +1361,9 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, mod
     const lineRows = [];
     let totalAmountLc = 0, totalVatLc = 0, totalAmountFc = 0, totalVatFc = 0;
     for (const d of details) {
-        const expenseAccountId = purchasesAccountId
-            || await resolveInventoryAccount(client, d.item_id, header.warehouse_id, invFallbackAccountId);
+        const periodic = d.gl_mode === 'PERIODIC';
+        const expenseAccountId = await resolveStockSideAccount(client, d.item_id, header.warehouse_id, d.gl_mode,
+            imSetupInventoryId, apSetup.expense_account_id);
         const qty = Math.abs(Number(d.qty) || 0); // qty ติดลบสำหรับ CN (สต็อกลด) บวกสำหรับ DN — เอกสาร AP ต้องเป็นจำนวนบวกเสมอ
         // ยอดใบลดหนี้/เพิ่มหนี้ = ราคาที่ผู้ใช้กรอก (unit_cost_fc × อัตราแลกเปลี่ยน) ไม่ใช่ต้นทุนที่ตัดจากสต็อก —
         // d.unit_cost ถูก postDetailLines เขียนทับเป็นต้นทุนสต็อกจริงแล้ว (ใช้เป็นมูลค่าสินค้าคงคลังด้านล่าง)
@@ -1345,7 +1373,7 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, mod
         const amountLc = round2(qty * unitCostLc);
         const amountFc = round2(qty * unitCostFc);
         // Periodic: บัญชีซื้อรับรู้ตามราคาเอกสาร ไม่มีการตีมูลค่าสต็อกต่อธุรกรรม จึงไม่มีผลต่าง
-        const stockValueLc = purchasesAccountId ? amountLc : round2(qty * stockCostLc);
+        const stockValueLc = periodic ? amountLc : round2(qty * stockCostLc);
         const vatType = d.vat_type || 'NOVAT';
         const vatRate = vatType === 'NOVAT' ? 0 : (Number(d.vat_rate) || 0);
         const vatAmountLc = round2(amountLc * vatRate / 100);
@@ -1690,6 +1718,17 @@ const validateReturnableQty = async (client, { refImTransactionDetailId, request
 };
 
 // นับสต็อก + โพสต์ GL สำหรับทุกบรรทัดของเอกสาร — ใช้ทั้งใน createTransaction(action=Post) และ postTransaction
+const applyLineModes = async (client, sysDocType, header, details) => {
+    const ids = details.map(d => d.item_id);
+    const modes = await resolveItemModes(client, ids, header.warehouse_id);
+    const toModes = sysDocType === '70' ? await resolveItemModes(client, ids, header.to_warehouse_id) : null;
+    for (const d of details) {
+        d.gl_mode = modes[Number(d.item_id)];
+        d.to_gl_mode = toModes ? toModes[Number(d.item_id)] : null;
+        await client.query(`UPDATE im_transaction_detail SET gl_mode=$1, to_gl_mode=$2 WHERE id=$3`, [d.gl_mode, d.to_gl_mode, d.id]);
+    }
+};
+
 const postDetailLines = async (client, headerId, header, docNo) => {
     // lazy require — เลี่ยง circular require ตอน module load (poTransactionController.js เองก็ require
     // imTransactionController.js สำหรับ generateDocNo ที่ module top-level) เรียกใช้แค่ตอนฟังก์ชันนี้ทำงานจริง
@@ -1815,6 +1854,10 @@ const postDetailLines = async (client, headerId, header, docNo) => {
         // entered_unit_cost = ราคาที่ผู้ใช้กรอก (LC) ก่อนถูกเขียนทับด้วยต้นทุนสต็อกจริง — '11' ใช้ตั้งหนี้ AP
         updatedDetails.push({ ...d, qty: varianceQty, unit_cost: actualUnitCost, entered_unit_cost: d.unit_cost, total_value_lc: valueLc });
     }
+    // โหมดบัญชีสินค้าของแต่ละบรรทัด (สินค้า → หมวดสินค้า → คลัง → ค่าเริ่มต้น) — บันทึกไว้ที่บรรทัดเพื่อให้ Post AP/GL
+    // ภายหลัง ('12') ปิดงวด และการตรวจย้อนหลังใช้โหมดเดียวกับตอนนี้ แม้ภายหลังจะเปลี่ยนโหมดที่ master
+    await applyLineModes(client, sysDocType, header, updatedDetails);
+
     // '12' (รับสินค้า รอตั้งหนี้): Post IM อย่างเดียว — อัปเดต subledger ตามปกติ แต่ไม่แตะ GL/AP เลย จนกว่าจะ Post
     // AP/GL แยกต่างหากทีหลัง (postApBillingForGrn) เมื่อได้ใบกำกับจริงจากผู้ขาย — สถานะจึงเป็น 'Received' ไม่ใช่ 'Posted'
     if (sysDocType === '12') {
@@ -1830,10 +1873,10 @@ const postDetailLines = async (client, headerId, header, docNo) => {
         return null;
     }
 
-    // Periodic mode: ไม่ Post GL ต่อธุรกรรมเลย (ยังอัปเดต subledger เหมือนเดิมทุกประการ) — COGS ทั้งหมดคำนวณครั้งเดียว
-    // ตอนปิดงวดใน imPeriodClosingController.js แทน — ดู pattern_im_periodic_accounting_mode — ยกเว้น '10' (GRN ไม่มี
-    // เลขที่อ้างอิง) ที่ต้อง Post เสมอทั้งสองโหมด เพราะ GR/IR ต้องขยับทันทีที่รับของจริง (ดู postGlEntry) และ '11'
-    // (GRN Billing) ที่ไม่ Post ผ่านทางนี้เลยไม่ว่าโหมดใด เพราะ ap_transaction ที่สร้างอัตโนมัติมี entry ของตัวเองแล้ว
+    // โหมดต่อบรรทัด (d.gl_mode): บรรทัด Periodic ของ ขาย/คืน/เบิก/ปรับยอด ไม่ Post GL (subledger ยังอัปเดตเหมือนเดิม)
+    // ต้นทุนคำนวณตอนปิดงวดใน imPeriodClosingController.js — ส่วน '10'/'13'/'90'/'95' และเอกสาร AP อัตโนมัติ Post
+    // ทุกบรรทัด โดยบรรทัด Periodic ใช้บัญชีซื้อแทนบัญชีสต็อก (ดู lineNeedsImGl / resolveStockSideAccount) — '11'
+    // (GRN Billing) ไม่ Post ผ่านทางนี้เลยไม่ว่าโหมดใด เพราะ ap_transaction ที่สร้างอัตโนมัติมี entry ของตัวเองแล้ว
     // '15'/'20'/'25' (AP CN/DN) และ '40'/'45' (AR CN/DN อิสระ) ต้องมีราคา ไม่งั้นได้ใบลดหนี้/เพิ่มหนี้ยอด 0 ทั้งที่สต็อก
     // เคลื่อนไหวจริง (ของแถมยกเว้น) — '35' ไม่บังคับ เพราะราคามาจากใบส่งสินค้าต้นฉบับ ('30' ไม่มีราคา)
     if (['15', '20', '25', '40', '45'].includes(sysDocType)) {
@@ -1847,7 +1890,6 @@ const postDetailLines = async (client, headerId, header, docNo) => {
             }
         }
     }
-    const mode = await fetchMode(client);
     let glEntryId = null;
     let linkedApTransactionId = null;
     let linkedArTransactionId = null;
@@ -1860,35 +1902,35 @@ const postDetailLines = async (client, headerId, header, docNo) => {
             stock_unit_cost: d.unit_cost,
         }));
         linkedApTransactionId = await postApBillFromGrn(client, {
-            header, details: billDetails, docNo, vendorInvoiceNo: header.ref_no, mode,
+            header, details: billDetails, docNo, vendorInvoiceNo: header.ref_no,
         });
     } else if (['15', '20'].includes(sysDocType)) {
         // คืนสินค้าผู้ขาย ('15') / ลดหนี้เจ้าหนี้ ('20') — ทั้งคู่โพสต์ AP CN เดียวกัน ('15' มีการอ้างอิงเอกสารต้นฉบับ
         // เพิ่มเติมเท่านั้น ไม่ต่างกันที่การโพสต์บัญชี — Dr AP/Cr คลัง เป็น entry เดียวจบ ไม่ผ่าน postGlEntry ของ IM
         // เอง เลย (มิเรอร์ '11') ไม่ระงับใน Periodic เพราะเป็นภาระผูกพันจริงกับเจ้าหนี้ ไม่ใช่การตีมูลค่าสต็อก
         linkedApTransactionId = await postApCreditDebitNoteFromIm(client, {
-            header, details: updatedDetails, docNo, mode, isCredit: true,
+            header, details: updatedDetails, docNo, isCredit: true,
         });
     } else if (sysDocType === '25') {
         // เพิ่มหนี้เจ้าหนี้ (DNS) — โพสต์ AP DN, Dr คลัง/Cr AP (เหมือน '11' ทุกประการในรูปร่าง ต่างกันแค่เหตุผลทางธุรกิจ)
         linkedApTransactionId = await postApCreditDebitNoteFromIm(client, {
-            header, details: updatedDetails, docNo, mode, isCredit: false,
+            header, details: updatedDetails, docNo, isCredit: false,
         });
     } else if (['35', '40'].includes(sysDocType)) {
         // รับคืนสินค้าจากลูกค้า ('35') / ลดหนี้ลูกหนี้ ('40') — มิเรอร์ '31': กลับรายการต้นทุนขาย (Dr คลัง/Cr COGS ผ่าน
         // postGlEntry ของ IM เอง ระงับใน Periodic เหมือน '30'/'31'/ISS) + โพสต์ AR CN แยกต่างหาก (Dr รายได้+ภาษี/Cr AR
         // ต้อง Post เสมอไม่ว่าโหมดใด เพราะเป็นภาระผูกพันจริงกับลูกค้า) — 2 entry แยกกันเหมือน '31' ('15'/'20' ฝั่ง AP
         // ไม่ต้องแยกเพราะ Dr/Cr คลัง-เจ้าหนี้เป็น entry เดียวจบได้ในตัว ไม่มีการรับรู้ต้นทุนขายแยกแบบฝั่งขาย)
-        if (mode !== 'PERIODIC') {
-            glEntryId = await postGlEntry(client, headerId, header, updatedDetails, docNo, sysDocType, mode);
+        if (needsImGl(sysDocType, updatedDetails)) {
+            glEntryId = await postGlEntry(client, headerId, header, updatedDetails, docNo, sysDocType);
         }
         linkedArTransactionId = await postArCreditDebitNoteFromIm(client, {
             header, details: updatedDetails, docNo, isCredit: true,
         });
     } else if (sysDocType === '45') {
         // เพิ่มหนี้ลูกหนี้ (DNC) — มิเรอร์ '31' ทุกประการในรูปร่าง (Dr COGS/Cr คลัง + Dr AR/Cr รายได้+ภาษี)
-        if (mode !== 'PERIODIC') {
-            glEntryId = await postGlEntry(client, headerId, header, updatedDetails, docNo, sysDocType, mode);
+        if (needsImGl(sysDocType, updatedDetails)) {
+            glEntryId = await postGlEntry(client, headerId, header, updatedDetails, docNo, sysDocType);
         }
         linkedArTransactionId = await postArCreditDebitNoteFromIm(client, {
             header, details: updatedDetails, docNo, isCredit: false,
@@ -1897,16 +1939,16 @@ const postDetailLines = async (client, headerId, header, docNo) => {
         // DLN Billing — ต้นทุนขาย (Dr COGS/Cr คลัง) ถูกระงับใน Periodic เหมือน '30'/ISS ทุกประการ (คำนวณรวมตอนปิดงวด
         // แทน) แต่ใบแจ้งหนี้ลูกหนี้ (Dr AR/Cr รายได้+ภาษี) ต้อง Post เสมอไม่ว่าโหมดใด เพราะเป็นภาระผูกพันจริงกับลูกค้า
         // ไม่ใช่การตีมูลค่าสต็อก — มิเรอร์ '11' ที่ ap_transaction ก็ Post เสมอไม่สนโหมดเช่นกัน
-        if (mode !== 'PERIODIC') {
-            glEntryId = await postGlEntry(client, headerId, header, updatedDetails, docNo, sysDocType, mode);
+        if (needsImGl(sysDocType, updatedDetails)) {
+            glEntryId = await postGlEntry(client, headerId, header, updatedDetails, docNo, sysDocType);
         }
         linkedArTransactionId = await postArBillFromDln(client, { header, details: updatedDetails, docNo });
     } else if (sysDocType === '32') {
         // DLN รอตั้งหนี้ — Stage 1 (Post IM): ต้นทุนขาย Post ทันที (มิเรอร์ '30', ระงับเฉพาะใน Periodic) เพราะต้นทุน
         // คำนวณจาก stock ledger เอง ไม่ขึ้นกับราคาขาย/ใบแจ้งหนี้ที่ยังไม่ออกเลย — ต่างจาก GRN '12' ที่ราคาซื้อจากผู้ขาย
         // ยังไม่ทราบแน่ชัดจนกว่าใบกำกับจะมาถึง จึงต้องพักทั้งหมด ส่วนใบแจ้งหนี้ลูกหนี้รอ Stage 2 (postBillingForDln)
-        if (mode !== 'PERIODIC') {
-            glEntryId = await postGlEntry(client, headerId, header, updatedDetails, docNo, sysDocType, mode);
+        if (needsImGl(sysDocType, updatedDetails)) {
+            glEntryId = await postGlEntry(client, headerId, header, updatedDetails, docNo, sysDocType);
         }
         await client.query(`
             UPDATE im_transaction SET status='Delivered', gl_entry_id=$1, total_qty=$2, total_value_lc=$3, updated_at=NOW() WHERE id=$4
@@ -1918,11 +1960,12 @@ const postDetailLines = async (client, headerId, header, docNo) => {
             await refreshSoStatus(client, soId);
         }
         return glEntryId;
-    } else if (['10', '13', '90', '95'].includes(sysDocType) || mode !== 'PERIODIC') {
+    } else if (needsImGl(sysDocType, updatedDetails)) {
+        // บรรทัด Periodic ของ ขาย/เบิก/ปรับยอด/โอนภายในโหมดเดียวกัน ไม่ลงบัญชี (ปิดงวดคิดต้นทุนแทน) — ดู lineNeedsImGl
         // '90'/'95' (เบิกวัตถุดิบเข้าผลิต/รับสินค้าเข้าคลังจากการผลิต) Post ที่นี่เสมอไม่ว่าโหมดใด มิเรอร์ '10'/'13'
         // ทุกประการ — งานระหว่างผลิต (WIP) เป็นบัญชีคุมยอดที่ต้องขยับทันทีตามธุรกรรมจริง ไม่ใช่การตีมูลค่าสต็อกที่รอ
         // คำนวณรวมตอนปิดงวดแบบ Periodic ได้ (ถ้าระงับไว้ ยอด wip_balance_lc ของใบสั่งผลิตจะไม่ sync กับ GL จริง)
-        glEntryId = await postGlEntry(client, headerId, header, updatedDetails, docNo, sysDocType, mode);
+        glEntryId = await postGlEntry(client, headerId, header, updatedDetails, docNo, sysDocType);
     }
     await client.query(`
         UPDATE im_transaction SET status='Posted', gl_entry_id=$1, linked_ap_transaction_id=$2, linked_ar_transaction_id=$3,
@@ -2709,10 +2752,14 @@ const postBillingForGrn = async (req, res) => {
             stock_unit_cost: d.unit_cost, // มูลค่าสต็อกตอนรับ — ส่วนต่างกับราคาใบกำกับลงบัญชีผลต่าง (ดู postApBillFromGrn)
         }));
 
-        const mode = await fetchMode(client);
+        // ใช้โหมดที่บันทึกไว้ตอน Post IM — เอกสารเก่าที่ยังไม่มี gl_mode หาโหมดใหม่ ณ ตอนนี้
+        if (billedDetails.some(d => !d.gl_mode)) {
+            const modes = await resolveItemModes(client, billedDetails.map(d => d.item_id), tx.warehouse_id);
+            for (const d of billedDetails) if (!d.gl_mode) d.gl_mode = modes[Number(d.item_id)];
+        }
         const headerForBilling = { ...tx, doc_code: tx.doc_code || tx.d_doc_code, updated_by: userName };
         const apTransactionId = await postApBillFromGrn(client, {
-            header: headerForBilling, details: billedDetails, docNo: tx.doc_no, vendorInvoiceNo: refNo, mode,
+            header: headerForBilling, details: billedDetails, docNo: tx.doc_no, vendorInvoiceNo: refNo,
         });
 
         await client.query(`
@@ -3143,7 +3190,9 @@ const deleteTransaction = async (req, res) => {
 };
 
 // GET-like (POST เพราะส่งรายการสินค้า) — บัญชีที่ตอน Post จะใช้ต่อสินค้า สำหรับตัวอย่างรายการบัญชีบนหน้าจอ
-// body: { doc_code, warehouse_id, to_warehouse_id, item_ids: [] } → { mode, purchases, items: { [item_id]: {...} } }
+// body: { doc_code, warehouse_id, to_warehouse_id, item_ids: [] }
+//   → { mode (ค่าเริ่มต้นของบริษัท), items: { [item_id]: { mode, to_mode, inventory, to_inventory, purchases, to_purchases, cogs, revenue } } }
+// mode/to_mode = โหมดของสินค้าในคลังต้นทาง/ปลายทาง (สินค้า → หมวดสินค้า → คลัง → ค่าเริ่มต้น) แบบเดียวกับ applyLineModes
 // ใช้ resolver ชุดเดียวกับ postGlEntry/postApBillFromGrn/postArBillFromDln (ไม่ throw — บัญชีที่หาไม่เจอส่ง null)
 const AR_DOC_FOR_IM = { '31': '10', '32': '10', '35': '50', '40': '50', '45': '30' };
 const AP_DOC_FOR_IM = { '11': '10', '12': '10', '15': '30', '20': '30', '25': '50' };
@@ -3157,7 +3206,9 @@ const fetchGlAccounts = async (req, res) => {
         const sysDocType = sdRes.rows[0]?.sys_doc_type || '';
         const setup = (await fetchSetupByDocCode(client, doc_code)) || {};
         const mode = await fetchMode(client);
-        const setting = await fetchSettingRow(client);
+        const company = await fetchCompanyAccounts(client);
+        const modes = await resolveItemModes(client, itemIds, warehouse_id || null);
+        const toModes = to_warehouse_id ? await resolveItemModes(client, itemIds, to_warehouse_id) : {};
 
         const setupOf = async (table, module, sysType) => {
             if (!sysType) return null;
@@ -3169,8 +3220,9 @@ const fetchGlAccounts = async (req, res) => {
         };
         const arSetup = await setupOf('ar_gl_account_setup', '11', AR_DOC_FOR_IM[sysDocType]);
         const apSetup = await setupOf('ap_gl_account_setup', '21', AP_DOC_FOR_IM[sysDocType]);
-        // เอกสาร AP อัตโนมัติ: บัญชีสต็อก fallback สุดท้ายเป็นบัญชีค่าใช้จ่ายของเอกสาร AP (มิเรอร์ postApBillFromGrn)
-        const invFallback = pickAccount(setup.inventory_account_id, apSetup?.expense_account_id);
+        // บัญชีสต็อก fallback: ประเภทเอกสาร IM → (เอกสาร AP อัตโนมัติ: บัญชีค่าใช้จ่ายของเอกสาร AP) → บัญชีเริ่มต้นของบริษัท
+        const invFallback = pickAccount(setup.inventory_account_id, apSetup?.expense_account_id, company.inventory_account_id);
+        const purFallback = pickAccount(company.purchases_account_id);
 
         const items = {};
         const ids = new Set();
@@ -3180,21 +3232,25 @@ const fetchGlAccounts = async (req, res) => {
             const a = {
                 inventory: pickAccount(row.warehouse_inventory, row.item_inventory, row.category_inventory, invFallback),
                 to_inventory: dst ? pickAccount(dst.warehouse_inventory, dst.item_inventory, dst.category_inventory, invFallback) : null,
-                cogs: pickAccount(row.item_cogs, row.category_cogs, setup.cogs_account_id),
+                purchases: pickAccount(row.warehouse_purchases, row.item_purchases, row.category_purchases, purFallback),
+                to_purchases: dst ? pickAccount(dst.warehouse_purchases, dst.item_purchases, dst.category_purchases, purFallback) : null,
+                cogs: pickAccount(row.item_cogs, row.category_cogs, setup.cogs_account_id, company.cogs_account_id),
                 revenue: pickAccount(row.item_revenue, row.category_revenue, arSetup?.revenue_account_id),
             };
             Object.values(a).forEach(v => v && ids.add(v));
             items[itemId] = a;
         }
-        const purchases = mode === 'PERIODIC' ? pickAccount(setting?.purchases_account_id) : null;
-        if (purchases) ids.add(purchases);
 
         const accRes = ids.size ? await client.query(
             `SELECT id, account_code, account_name_thai, account_name_eng FROM gl_account WHERE id = ANY($1::int[])`, [[...ids]]) : { rows: [] };
         const acc = Object.fromEntries(accRes.rows.map(r => [r.id, r]));
         const describe = (id) => id ? { id, code: acc[id]?.account_code || '', name_th: acc[id]?.account_name_thai || '', name_en: acc[id]?.account_name_eng || '' } : null;
-        for (const a of Object.values(items)) for (const k of Object.keys(a)) a[k] = describe(a[k]);
-        res.json({ sys_doc_type: sysDocType, mode, purchases: describe(purchases), items });
+        for (const [itemId, a] of Object.entries(items)) {
+            for (const k of Object.keys(a)) a[k] = describe(a[k]);
+            a.mode = modes[Number(itemId)] || mode;
+            a.to_mode = to_warehouse_id ? (toModes[Number(itemId)] || mode) : null;
+        }
+        res.json({ sys_doc_type: sysDocType, mode, items });
     } catch (err) {
         console.error('Error fetching IM GL accounts:', err);
         res.status(500).json({ error: err.message });
