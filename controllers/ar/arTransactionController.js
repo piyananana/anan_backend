@@ -96,6 +96,50 @@ const generateDocNo = async (client, docId, date, branchId = null) => {
     return docNo;
 };
 
+// --- Helper: ยอดหักเงินมัดจำ (apply_type 'inv_advance' ตอนตั้งหนี้ / 'advance' ตอนรับชำระ) แยกส่วนก่อน VAT และ VAT
+// ตามสัดส่วน VAT ของใบมัดจำ (ใบมัดจำลง Cr เงินมัดจำรับเฉพาะส่วนก่อน VAT และออกภาษีขายไปแล้วตอนรับมัดจำ) — ยอดสกุลเงิน
+// หลักคิดที่อัตราของใบมัดจำ (ตรงกับที่ลงบัญชีมัดจำไว้) user-approved 2026-10-31 ดู project_vat_discount_deposit
+const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+const depositParts = async (client, apply) => {
+    const dep = (await client.query(`
+        SELECT t.id, t.doc_no, t.customer_id, t.currency_code, t.exchange_rate, t.status,
+               t.total_amount_lc, t.vat_amount_lc, t.balance_amount_lc, d.sys_doc_type,
+               (SELECT dt.vat_rate FROM ar_transaction_detail dt WHERE dt.header_id = t.id AND dt.vat_type <> 'NOVAT' LIMIT 1) AS vat_rate,
+               s.advance_account_id -- บัญชีเงินมัดจำรับที่ใบมัดจำลงไว้ (ล้างบัญชีเดียวกัน)
+          FROM ar_transaction t JOIN sa_module_document d ON d.id = t.doc_id
+          LEFT JOIN ar_gl_account_setup s ON s.doc_code = d.doc_code WHERE t.id = $1`, [apply.applied_to_id])).rows[0];
+    if (!dep) throw new Error('ไม่พบใบรับเงินมัดจำที่หัก');
+    const fc = Number(apply.applied_amount_fc) || 0;
+    const ratio = Number(dep.total_amount_lc) ? Number(dep.vat_amount_lc) / Number(dep.total_amount_lc) : 0;
+    const legLc = round2(fc * (Number(dep.exchange_rate) || 1));
+    const vatLc = round2(legLc * ratio);
+    const vatFc = round2(fc * ratio);
+    return { dep, fc, legLc, vatLc, netLc: round2(legLc - vatLc), vatFc, netFc: round2(fc - vatFc) };
+};
+
+// ภาษีขายของมัดจำที่ถูกหัก — บันทึกติดลบในเอกสารที่หัก (ใบแจ้งหนี้หรือใบเสร็จ) เพื่อไม่ให้ภาษีของส่วนมัดจำถูกนับซ้ำ
+const insertDepositVtReversal = async (client, headerId, header, part) => {
+    if (!part.vatLc) return;
+    await client.query(`
+        INSERT INTO vt_transaction
+        (module_code, vat_type, doc_id, source_header_id, source_detail_id,
+         doc_no, doc_date, vat_rate,
+         base_amount_lc, vat_amount_lc, base_amount_fc, vat_amount_fc,
+         currency_id, exchange_rate,
+         customer_id, entity_name, entity_tax_id, entity_branch_code,
+         created_by)
+        VALUES ($1,$2,$3,$4,NULL,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+                COALESCE($16, (SELECT tax_id FROM ar_customer WHERE id = $14)), ${branchCodeSql('ar_customer', '$14')},$17)
+    `, [
+        'AR', 'OUTPUT_VAT', header.doc_id, headerId,
+        header.doc_no, header.doc_date, part.dep.vat_rate ?? 7,
+        -part.netLc, -part.vatLc, -part.netFc, -part.vatFc,
+        header.currency_id || null, header.exchange_rate || 1,
+        header.customer_id, header.customer_name_th || '', header.customer_tax_id || null,
+        header.created_by || null,
+    ]);
+};
+
 // --- Helper: Insert VAT records (เฉพาะรายการที่ไม่ใช่ VAT รอตัดบัญชี) ---
 const insertVtRecords = async (client, headerId, header, details, sysDocType) => {
     // is_deferred_vat = true → ข้าม เพราะจะบันทึกตอนรับชำระแทน
@@ -528,6 +572,43 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
                 [d.debit_fc, d.credit_fc] = [d.credit_fc, d.debit_fc];
             }
         }
+
+        // ใบแจ้งหนี้ ('10') หักเงินมัดจำตอนตั้งหนี้ (apply_type 'inv_advance'): ลูกหนี้ลดลงเท่ายอดที่หัก แทนด้วย
+        // Dr เงินมัดจำรับ (ส่วนก่อน VAT) + Dr ภาษีขาย (VAT ของมัดจำที่ออกไปแล้ว) — ภาษีขายสุทธิของใบนี้จึงเท่ากับ VAT
+        // ของ (ยอดขาย − มัดจำก่อน VAT) ตามใบกำกับภาษีหักมัดจำ ส่วนต่างอัตราแลกเปลี่ยน (อัตราใบแจ้งหนี้ − อัตรามัดจำ) ลงกำไร/ขาดทุน
+        const invAdvances = (header._applies || []).filter(a => a.apply_type === 'inv_advance');
+        if (invAdvances.length) {
+            if (sysDocType !== '10') throw new Error('หักเงินมัดจำตอนตั้งหนี้ได้เฉพาะใบแจ้งหนี้');
+            let arReduceLc = 0, arReduceFc = 0;
+            header._depositParts = [];
+            for (const a of invAdvances) {
+                const part = await depositParts(client, a);
+                const { dep } = part;
+                if (dep.sys_doc_type !== '60' || dep.status !== 'Posted') throw new Error(`${dep.doc_no} ไม่ใช่ใบรับเงินมัดจำที่ Post แล้ว`);
+                if (Number(dep.customer_id) !== Number(header.customer_id)) throw new Error(`ใบมัดจำ ${dep.doc_no} เป็นของลูกค้าอื่น`);
+                if ((dep.currency_code || '') !== (header.currency_code || '')) throw new Error(`ใบมัดจำ ${dep.doc_no} คนละสกุลเงินกับใบแจ้งหนี้`);
+                if (Number(dep.balance_amount_lc) < -0.01) throw new Error(`หักมัดจำ ${dep.doc_no} เกินยอดคงเหลือ`);
+                if (part.vatLc && !vatAccountId) throw new Error('ยังไม่ได้ตั้งค่าบัญชีภาษีขาย');
+                const depAdvanceAccountId = Number(dep.advance_account_id) || advanceAccountId;
+                if (!depAdvanceAccountId) throw new Error('ยังไม่ได้ตั้งค่าบัญชีเงินมัดจำรับ (ประเภทเอกสารรับมัดจำ หรือประเภทเอกสารนี้)');
+                glDetails.push({ account_id: depAdvanceAccountId, description: `หักเงินมัดจำ ${dep.doc_no}`,
+                    debit_lc: part.netLc, credit_lc: 0, debit_fc: part.netFc, credit_fc: 0 });
+                if (part.vatLc) glDetails.push({ account_id: vatAccountId, description: `ภาษีขายของมัดจำ ${dep.doc_no}`,
+                    debit_lc: part.vatLc, credit_lc: 0, debit_fc: part.vatFc, credit_fc: 0 });
+                const arLc = round2(part.fc * exchangeRate);
+                const fx = round2(arLc - part.legLc);
+                if (fx !== 0) {
+                    const fxAcc = fx > 0 ? fxLossAccountId : fxGainAccountId;
+                    if (!fxAcc) throw new Error('ยังไม่ได้ตั้งค่าบัญชีกำไร/ขาดทุนจากอัตราแลกเปลี่ยน');
+                    glDetails.push({ account_id: fxAcc, description: `ผลต่างอัตราแลกเปลี่ยนมัดจำ ${dep.doc_no}`,
+                        debit_lc: fx > 0 ? fx : 0, credit_lc: fx < 0 ? -fx : 0, debit_fc: 0, credit_fc: 0 });
+                }
+                arReduceLc += arLc; arReduceFc += part.fc;
+                header._depositParts.push(part);
+            }
+            glDetails[0].debit_lc = round2(glDetails[0].debit_lc - arReduceLc);
+            glDetails[0].debit_fc = round2(glDetails[0].debit_fc - arReduceFc);
+        }
     } else if (isAdvanceReceipt) {
         // ===== รับเงินมัดจำ (60) =====
         // DR: เงินสด/ธนาคาร (แยกตามวิธีรับชำระ ถ้ามี ถ้าไม่มีใช้ cash_account_id) — ยอดเต็มรวม VAT
@@ -767,16 +848,36 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
             }
         }
 
-        // DR: เงินมัดจำรับ (ตัดมัดจำ)
+        // DR: เงินมัดจำรับ (ตัดมัดจำ) — ส่วนก่อน VAT เข้าบัญชีเงินมัดจำรับ ส่วน VAT ของมัดจำ Dr ภาษีขาย (ใบแจ้งหนี้ออก VAT
+        // เต็มจำนวนแล้ว VAT ของมัดจำจึงต้องกลับรายการ ไม่งั้นภาษีส่วนมัดจำถูกนับ 2 ครั้ง) — รวมยอดเท่าเดิม
         if (totalAdvanceDeducted > 0 && advanceAccountId) {
+            header._depositParts = [];
+            let vatLcSum = 0, vatFcSum = 0;
+            for (const a of advanceDeductions) {
+                const part = await depositParts(client, a);
+                // ใช้ยอด LC ที่หน้าจอส่งมา (applied_amount_lc) เพื่อให้รวมเท่าเดิม แยก VAT ตามสัดส่วนของใบมัดจำ
+                const ratio = Number(part.dep.total_amount_lc) ? Number(part.dep.vat_amount_lc) / Number(part.dep.total_amount_lc) : 0;
+                const vatLc = round2((Number(a.applied_amount_lc) || 0) * ratio);
+                if (vatLc && vatAccountId) {
+                    vatLcSum += vatLc; vatFcSum += part.vatFc;
+                    header._depositParts.push({ ...part, vatLc, netLc: round2((Number(a.applied_amount_lc) || 0) - vatLc) });
+                }
+            }
             glDetails.push({
                 account_id: advanceAccountId,
                 description: `ตัดมัดจำ ${docNo}`,
-                debit_lc: totalAdvanceDeducted,
+                debit_lc: round2(totalAdvanceDeducted - vatLcSum),
                 credit_lc: 0,
-                debit_fc: totalAdvanceDeductedFc,
+                debit_fc: round2(totalAdvanceDeductedFc - vatFcSum),
                 credit_fc: 0,
             });
+            if (vatLcSum) {
+                glDetails.push({
+                    account_id: vatAccountId,
+                    description: `ภาษีขายของมัดจำที่ตัด ${docNo}`,
+                    debit_lc: round2(vatLcSum), credit_lc: 0, debit_fc: round2(vatFcSum), credit_fc: 0,
+                });
+            }
         }
 
         // คำนวณ Deferred VAT ที่ต้องรับรู้ จาก applied invoices (เฉพาะ invoice applies เท่านั้น)
@@ -910,10 +1011,14 @@ const recalcInvoiceBalances = async (client, invoiceIds) => {
     if (ids.length === 0) return;
     await client.query(`
         UPDATE ar_transaction t SET
-            paid_amount_lc    = x.paid,
-            balance_amount_lc = t.total_amount_lc + x.dn - x.paid,
+            paid_amount_lc    = x.paid + x.self_adv,
+            balance_amount_lc = t.total_amount_lc + x.dn - x.paid - x.self_adv,
             updated_at = NOW()
           FROM (SELECT inv.id,
+                       -- มัดจำที่ใบแจ้งหนี้หักเองตอนตั้งหนี้ (แถว apply ของตัวเอง apply_type 'inv_advance')
+                       COALESCE((SELECT SUM(sa.applied_amount_fc) * inv.exchange_rate FROM ar_transaction_apply sa
+                                  WHERE sa.transaction_id = inv.id AND sa.apply_type = 'inv_advance'
+                                    AND inv.status NOT IN ('Void', 'Deleted')), 0) AS self_adv,
                        COALESCE(SUM(a.applied_amount_fc * inv.exchange_rate)
                                 FILTER (WHERE a.apply_type NOT IN ('dn_ref','bc_invoice','bc_advance','bc_cn')), 0) AS paid,
                        COALESCE(SUM(a.applied_amount_fc * inv.exchange_rate)
@@ -1133,7 +1238,8 @@ const createTransaction = async (req, res) => {
             ADD COLUMN IF NOT EXISTS billing_date DATE,
             ADD COLUMN IF NOT EXISTS expected_payment_date DATE,
             ADD COLUMN IF NOT EXISTS customer_po_no VARCHAR(50),
-            ADD COLUMN IF NOT EXISTS customer_po_date DATE
+            ADD COLUMN IF NOT EXISTS customer_po_date DATE,
+            ADD COLUMN IF NOT EXISTS price_includes_vat BOOLEAN NOT NULL DEFAULT false
         `);
 
         // Insert header
@@ -1175,6 +1281,8 @@ const createTransaction = async (req, res) => {
         ]);
         const newHeaderId = hRes.rows[0].id;
         await saveDocSalespersons(client, 'ar_transaction_salesperson', 'header_id', newHeaderId, req.body.salespersons);
+        // ราคาที่กรอกรวม VAT (ยอดที่เก็บทุกช่องเป็นยอดก่อน VAT เหมือนเดิม — ดู lib/utils/vat_calc.dart)
+        await client.query(`UPDATE ar_transaction SET price_includes_vat=$1 WHERE id=$2`, [header.price_includes_vat === true, newHeaderId]);
 
         // Insert details
         const detailSql = `
@@ -1217,6 +1325,8 @@ const createTransaction = async (req, res) => {
             (applies || []).filter(a => !['bc_invoice','bc_advance','bc_cn'].includes(a.apply_type || 'invoice'))
                            .map(a => a.applied_to_id).filter(Boolean)
         )];
+        // ใบแจ้งหนี้ที่หักมัดจำเอง — คำนวณยอดคงค้างของตัวเองด้วย
+        if ((applies || []).some(a => a.apply_type === 'inv_advance')) createdAffectedIds.push(newHeaderId);
         await recalcInvoiceBalances(client, createdAffectedIds);
 
         // Insert payment rows (ar_transaction_payment)
@@ -1258,6 +1368,7 @@ const createTransaction = async (req, res) => {
                 const headerWithDocNo = { ...header, doc_no: finalDocNo, _applies: applies || [], _payments: payments || [] };
                 glEntryId = await postGlEntry(client, newHeaderId, headerWithDocNo, details || [], finalDocNo);
                 await insertVtRecords(client, newHeaderId, headerWithDocNo, details || [], sysDocType1);
+                for (const part of headerWithDocNo._depositParts || []) await insertDepositVtReversal(client, newHeaderId, headerWithDocNo, part);
                 await insertDeferredVtRecordsForReceipt(client, newHeaderId, headerWithDocNo, applies || []);
                 await client.query(`UPDATE ar_transaction SET gl_entry_id=$1 WHERE id=$2`, [glEntryId, newHeaderId]);
                 // Post CM receipt records for Receipt documents
@@ -1326,7 +1437,8 @@ const updateTransaction = async (req, res) => {
             ADD COLUMN IF NOT EXISTS billing_date DATE,
             ADD COLUMN IF NOT EXISTS expected_payment_date DATE,
             ADD COLUMN IF NOT EXISTS customer_po_no VARCHAR(50),
-            ADD COLUMN IF NOT EXISTS customer_po_date DATE
+            ADD COLUMN IF NOT EXISTS customer_po_date DATE,
+            ADD COLUMN IF NOT EXISTS price_includes_vat BOOLEAN NOT NULL DEFAULT false
         `);
         await client.query(`
             UPDATE ar_transaction SET
@@ -1339,7 +1451,7 @@ const updateTransaction = async (req, res) => {
             dim1_id=$24, dim2_id=$25, dim3_id=$26, dim4_id=$27, dim5_id=$28,
             branch_id=$29, updated_by=$30, updated_at=NOW(),
             billing_date=$31, expected_payment_date=$32,
-            customer_po_no=$34, customer_po_date=$35
+            customer_po_no=$34, customer_po_date=$35, price_includes_vat=$36
             WHERE id=$33
         `, [
             header.doc_date, header.due_date || null, periodId,
@@ -1357,6 +1469,7 @@ const updateTransaction = async (req, res) => {
             header.branch_id || null, header.updated_by || null,
             header.billing_date || null, header.expected_payment_date || null, id,
             (header.customer_po_no || '').trim() || null, header.customer_po_date || null,
+            header.price_includes_vat === true,
         ]);
 
         await saveDocSalespersons(client, 'ar_transaction_salesperson', 'header_id', id, req.body.salespersons);
@@ -1432,6 +1545,7 @@ const updateTransaction = async (req, res) => {
         await recalcInvoiceBalances(client, [
             ...oldAppliesRes.rows.filter(a => !['bc_invoice','bc_advance','bc_cn'].includes(a.apply_type)).map(a => a.applied_to_id),
             ...(applies || []).filter(a => !['bc_invoice','bc_advance','bc_cn'].includes(a.apply_type)).map(a => a.applied_to_id),
+            Number(id), // ใบแจ้งหนี้ที่หักมัดจำเอง (inv_advance) — ยอดคงค้างของตัวเองเปลี่ยนตามมัดจำที่หัก
         ]);
 
         // If Post: create GL + VAT
@@ -1449,6 +1563,7 @@ const updateTransaction = async (req, res) => {
                 const headerWithDocNo = { ...header, doc_no: docNo, _applies: applies || [], _payments: payments || [] };
                 glEntryId = await postGlEntry(client, id, headerWithDocNo, details || [], docNo, docNoRes.rows[0].gl_doc_no);
                 await insertVtRecords(client, id, headerWithDocNo, details || [], sysDocType2);
+                for (const part of headerWithDocNo._depositParts || []) await insertDepositVtReversal(client, id, headerWithDocNo, part);
                 await insertDeferredVtRecordsForReceipt(client, id, headerWithDocNo, applies || []);
                 await client.query(`UPDATE ar_transaction SET gl_entry_id=$1 WHERE id=$2`, [glEntryId, id]);
                 // Post CM receipt records for Receipt documents
@@ -1878,6 +1993,9 @@ const fetchOpenInvoices = async (req, res) => {
                    COALESCE((SELECT SUM(dd.vat_amount_fc) FROM ar_transaction_detail dd
                              WHERE dd.header_id = t.id AND dd.is_deferred_vat = TRUE AND dd.vat_type != 'NOVAT'), 0) AS deferred_vat_amount_fc,
                    d.doc_name_thai, d.sys_doc_type,
+                   -- มัดจำที่ใบแจ้งหนี้หักไปแล้วตอนตั้งหนี้ (หน้ารับชำระเตือนก่อนหักมัดจำซ้ำ)
+                   COALESCE((SELECT SUM(sa.applied_amount_fc) FROM ar_transaction_apply sa
+                              WHERE sa.transaction_id = t.id AND sa.apply_type = 'inv_advance'), 0) AS inv_advance_amount_fc,
                    ${postedArAccountSql('t')} AS ar_account_id
             FROM ar_transaction t
             JOIN sa_module_document d ON t.doc_id = d.id
