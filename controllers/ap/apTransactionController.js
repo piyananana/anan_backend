@@ -103,6 +103,10 @@ const insertVtRecords = async (client, headerId, header, details, sysDocType) =>
         Number(d.vat_amount_fc) !== 0 &&
         !d.is_deferred_vat
     );
+    // รายงานภาษีซื้อต้องแสดงเลขที่ใบกำกับภาษี/ใบลดหนี้/ใบเพิ่มหนี้ที่ผู้ขายออก — บังคับก่อน Post (user-approved 2026-11-01)
+    if (vatDetails.length && ['10', '30', '50', '60'].includes(sysDocType) && !taxInvoiceOf(header)[0]) {
+        throw new Error('กรุณาระบุเลขที่ใบกำกับภาษีของผู้ขาย (เอกสารมีภาษีซื้อ)');
+    }
     // CN-AP (30) → VAT is negative (reduces input VAT)
     const vatSign = (sysDocType === '30') ? -1 : 1;
 

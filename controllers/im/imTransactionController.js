@@ -1586,6 +1586,13 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
     const grandTotalFc = round2(totalAmountFc + totalVatFc);
 
     const label = isCredit ? 'ใบลดหนี้จากผู้ขาย' : 'ใบเพิ่มหนี้จากผู้ขาย';
+    // เลขที่ใบลดหนี้/เพิ่มหนี้ของผู้ขาย (ref_no) + วันที่ (vendor_invoice_date ว่าง = วันที่เอกสาร) — รายงานภาษีซื้อแสดงค่านี้
+    // เหมือนใบตั้งหนี้จากการรับสินค้า ไม่มีเลขที่ = ว่าง (รายงาน fallback เลขที่/วันที่เอกสาร AP)
+    const vendorDocNo = (header.ref_no || '').toString().trim() || null;
+    const vendorDocDate = vendorDocNo ? ymd(header.vendor_invoice_date || header.doc_date) : null;
+    if (totalVatFc !== 0 && !vendorDocNo) {
+        throw new Error(`กรุณาระบุเลขที่${isCredit ? 'ใบลดหนี้' : 'ใบเพิ่มหนี้'}ของผู้ขาย (เอกสารมีภาษีซื้อ)`);
+    }
     const apHeaderRes = await client.query(`
         INSERT INTO ap_transaction
         (doc_id, doc_no, doc_date, period_id, vendor_id, vendor_code, vendor_name_th, ap_account_id, gl_doc_id,
@@ -1605,6 +1612,8 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
         header.price_includes_vat === true,
     ]);
     const apTransactionId = apHeaderRes.rows[0].id;
+    await client.query(`UPDATE ap_transaction SET tax_invoice_no = $1, tax_invoice_date = $2 WHERE id = $3`,
+        [vendorDocNo, vendorDocDate, apTransactionId]);
 
     let lineNo = 1;
     for (const l of lineRows) {
@@ -1623,6 +1632,7 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
             entityName: vendorNameTh, entityTaxId: vendorTaxId, createdByUserId,
             vatSign: isCredit ? -1 : 1, // CN ลดยอดภาษีซื้อ (ตรงข้ามใบกำกับปกติ) มิเรอร์ AP's own insertVtRecords
             baseFc: l.amountFc, vatFc: l.vatAmountFc, currencyId: docCurrencyId, exchangeRate: docExchangeRate,
+            taxInvoiceNo: vendorDocNo, taxInvoiceDate: vendorDocDate,
         });
     }
 
