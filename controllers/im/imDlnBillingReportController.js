@@ -1,4 +1,5 @@
 // controllers/im/imDlnBillingReportController.js
+const { netUnitPriceSql, ensureImPriceColumns } = require('../../utils/vatCalc');
 const { today } = require('../../utils/dateUtil');
 // รายงานตรวจสอบ DLN รอ/ผ่านการโพสต์ AR-GL (sys_doc_type='32') — ต้นทุนขาย (COGS) Post ไปแล้วตั้งแต่ตอน Post IM
 // (สถานะ Delivered) เสมอ ต่างจาก GRN '12' ที่ยังไม่มี GL ใดๆ เลย — ช่องว่างที่รายงานนี้เฝ้าดูคือรายได้/ลูกหนี้ที่ยังไม่
@@ -6,6 +7,7 @@ const { today } = require('../../utils/dateUtil');
 // unit_price เป็นคอลัมน์เดียว แก้ไขตรงๆ ก่อน Post (ดู project_im_dln_module) จึงไม่มีค่า "ก่อน/หลัง" ให้เทียบส่วนต่างหลัง Post
 
 const getDlnBillingReport = async (req, res) => {
+    await ensureImPriceColumns(req.dbPool);
     const {
         as_of_date,
         warehouse_id,
@@ -42,7 +44,7 @@ const getDlnBillingReport = async (req, res) => {
                 t.ref_no, t.linked_ar_transaction_id,
                 ($1::date - t.doc_date::date) AS days_outstanding,
                 COALESCE(SUM(ABS(dt.qty) * dt.unit_cost), 0) AS cogs_value,
-                COALESCE(SUM(ABS(dt.qty) * COALESCE(dt.unit_price, 0)), 0) AS estimated_revenue,
+                COALESCE(SUM(ABS(dt.qty) * ${netUnitPriceSql('dt.unit_price', 'dt', 't')}), 0) AS estimated_revenue,
                 ar.subtotal_lc AS billed_revenue
             FROM im_transaction t
             JOIN sa_module_document d ON d.id = t.doc_id

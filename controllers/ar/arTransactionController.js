@@ -140,6 +140,41 @@ const insertDepositVtReversal = async (client, headerId, header, part) => {
     ]);
 };
 
+// GL ของการหักเงินมัดจำตอนตั้งหนี้ (apply_type 'inv_advance'): ลูกหนี้ลดลงเท่ายอดที่หัก แทนด้วย Dr เงินมัดจำรับ (ส่วนก่อน VAT)
+// + Dr ภาษีขาย (VAT ของมัดจำที่ออกไปแล้ว) — ภาษีขายสุทธิของใบนี้จึงเท่ากับ VAT ของ (ยอดขาย − มัดจำก่อน VAT) ตามใบกำกับภาษี
+// หักมัดจำ ส่วนต่างอัตราแลกเปลี่ยน (อัตราใบแจ้งหนี้ − อัตรามัดจำ) ลงกำไร/ขาดทุน — ใช้ร่วมกับใบแจ้งหนี้ที่ IM สร้างอัตโนมัติ
+// คืน { lines, reduceLc, reduceFc, parts } — ผู้เรียกลดยอด Dr ลูกหนี้ด้วย reduceLc/Fc และบันทึกภาษีขายติดลบจาก parts
+const buildInvAdvanceGl = async (client, invAdvances, { customerId, currencyCode, exchangeRate, vatAccountId, advanceAccountId, fxGainAccountId, fxLossAccountId }) => {
+    const lines = [], parts = [];
+    let reduceLc = 0, reduceFc = 0;
+    for (const a of invAdvances) {
+        const part = await depositParts(client, a);
+        const { dep } = part;
+        if (dep.sys_doc_type !== '60' || dep.status !== 'Posted') throw new Error(`${dep.doc_no} ไม่ใช่ใบรับเงินมัดจำที่ Post แล้ว`);
+        if (Number(dep.customer_id) !== Number(customerId)) throw new Error(`ใบมัดจำ ${dep.doc_no} เป็นของลูกค้าอื่น`);
+        if ((dep.currency_code || '') !== (currencyCode || '')) throw new Error(`ใบมัดจำ ${dep.doc_no} คนละสกุลเงินกับใบแจ้งหนี้`);
+        if (Number(dep.balance_amount_lc) < -0.01) throw new Error(`หักมัดจำ ${dep.doc_no} เกินยอดคงเหลือ`);
+        if (part.vatLc && !vatAccountId) throw new Error('ยังไม่ได้ตั้งค่าบัญชีภาษีขาย');
+        const depAdvanceAccountId = Number(dep.advance_account_id) || advanceAccountId;
+        if (!depAdvanceAccountId) throw new Error('ยังไม่ได้ตั้งค่าบัญชีเงินมัดจำรับ (ประเภทเอกสารรับมัดจำ หรือประเภทเอกสารนี้)');
+        lines.push({ account_id: depAdvanceAccountId, description: `หักเงินมัดจำ ${dep.doc_no}`,
+            debit_lc: part.netLc, credit_lc: 0, debit_fc: part.netFc, credit_fc: 0 });
+        if (part.vatLc) lines.push({ account_id: vatAccountId, description: `ภาษีขายของมัดจำ ${dep.doc_no}`,
+            debit_lc: part.vatLc, credit_lc: 0, debit_fc: part.vatFc, credit_fc: 0 });
+        const arLc = round2(part.fc * exchangeRate);
+        const fx = round2(arLc - part.legLc);
+        if (fx !== 0) {
+            const fxAcc = fx > 0 ? fxLossAccountId : fxGainAccountId;
+            if (!fxAcc) throw new Error('ยังไม่ได้ตั้งค่าบัญชีกำไร/ขาดทุนจากอัตราแลกเปลี่ยน');
+            lines.push({ account_id: fxAcc, description: `ผลต่างอัตราแลกเปลี่ยนมัดจำ ${dep.doc_no}`,
+                debit_lc: fx > 0 ? fx : 0, credit_lc: fx < 0 ? -fx : 0, debit_fc: 0, credit_fc: 0 });
+        }
+        reduceLc += arLc; reduceFc += part.fc;
+        parts.push(part);
+    }
+    return { lines, reduceLc: round2(reduceLc), reduceFc: round2(reduceFc), parts };
+};
+
 // --- Helper: Insert VAT records (เฉพาะรายการที่ไม่ใช่ VAT รอตัดบัญชี) ---
 const insertVtRecords = async (client, headerId, header, details, sysDocType) => {
     // is_deferred_vat = true → ข้าม เพราะจะบันทึกตอนรับชำระแทน
@@ -573,41 +608,18 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
             }
         }
 
-        // ใบแจ้งหนี้ ('10') หักเงินมัดจำตอนตั้งหนี้ (apply_type 'inv_advance'): ลูกหนี้ลดลงเท่ายอดที่หัก แทนด้วย
-        // Dr เงินมัดจำรับ (ส่วนก่อน VAT) + Dr ภาษีขาย (VAT ของมัดจำที่ออกไปแล้ว) — ภาษีขายสุทธิของใบนี้จึงเท่ากับ VAT
-        // ของ (ยอดขาย − มัดจำก่อน VAT) ตามใบกำกับภาษีหักมัดจำ ส่วนต่างอัตราแลกเปลี่ยน (อัตราใบแจ้งหนี้ − อัตรามัดจำ) ลงกำไร/ขาดทุน
+        // ใบแจ้งหนี้ ('10') หักเงินมัดจำตอนตั้งหนี้ (apply_type 'inv_advance') — ดู buildInvAdvanceGl
         const invAdvances = (header._applies || []).filter(a => a.apply_type === 'inv_advance');
         if (invAdvances.length) {
             if (sysDocType !== '10') throw new Error('หักเงินมัดจำตอนตั้งหนี้ได้เฉพาะใบแจ้งหนี้');
-            let arReduceLc = 0, arReduceFc = 0;
-            header._depositParts = [];
-            for (const a of invAdvances) {
-                const part = await depositParts(client, a);
-                const { dep } = part;
-                if (dep.sys_doc_type !== '60' || dep.status !== 'Posted') throw new Error(`${dep.doc_no} ไม่ใช่ใบรับเงินมัดจำที่ Post แล้ว`);
-                if (Number(dep.customer_id) !== Number(header.customer_id)) throw new Error(`ใบมัดจำ ${dep.doc_no} เป็นของลูกค้าอื่น`);
-                if ((dep.currency_code || '') !== (header.currency_code || '')) throw new Error(`ใบมัดจำ ${dep.doc_no} คนละสกุลเงินกับใบแจ้งหนี้`);
-                if (Number(dep.balance_amount_lc) < -0.01) throw new Error(`หักมัดจำ ${dep.doc_no} เกินยอดคงเหลือ`);
-                if (part.vatLc && !vatAccountId) throw new Error('ยังไม่ได้ตั้งค่าบัญชีภาษีขาย');
-                const depAdvanceAccountId = Number(dep.advance_account_id) || advanceAccountId;
-                if (!depAdvanceAccountId) throw new Error('ยังไม่ได้ตั้งค่าบัญชีเงินมัดจำรับ (ประเภทเอกสารรับมัดจำ หรือประเภทเอกสารนี้)');
-                glDetails.push({ account_id: depAdvanceAccountId, description: `หักเงินมัดจำ ${dep.doc_no}`,
-                    debit_lc: part.netLc, credit_lc: 0, debit_fc: part.netFc, credit_fc: 0 });
-                if (part.vatLc) glDetails.push({ account_id: vatAccountId, description: `ภาษีขายของมัดจำ ${dep.doc_no}`,
-                    debit_lc: part.vatLc, credit_lc: 0, debit_fc: part.vatFc, credit_fc: 0 });
-                const arLc = round2(part.fc * exchangeRate);
-                const fx = round2(arLc - part.legLc);
-                if (fx !== 0) {
-                    const fxAcc = fx > 0 ? fxLossAccountId : fxGainAccountId;
-                    if (!fxAcc) throw new Error('ยังไม่ได้ตั้งค่าบัญชีกำไร/ขาดทุนจากอัตราแลกเปลี่ยน');
-                    glDetails.push({ account_id: fxAcc, description: `ผลต่างอัตราแลกเปลี่ยนมัดจำ ${dep.doc_no}`,
-                        debit_lc: fx > 0 ? fx : 0, credit_lc: fx < 0 ? -fx : 0, debit_fc: 0, credit_fc: 0 });
-                }
-                arReduceLc += arLc; arReduceFc += part.fc;
-                header._depositParts.push(part);
-            }
-            glDetails[0].debit_lc = round2(glDetails[0].debit_lc - arReduceLc);
-            glDetails[0].debit_fc = round2(glDetails[0].debit_fc - arReduceFc);
+            const adv = await buildInvAdvanceGl(client, invAdvances, {
+                customerId: header.customer_id, currencyCode: header.currency_code, exchangeRate,
+                vatAccountId, advanceAccountId, fxGainAccountId, fxLossAccountId,
+            });
+            glDetails.push(...adv.lines);
+            header._depositParts = adv.parts;
+            glDetails[0].debit_lc = round2(glDetails[0].debit_lc - adv.reduceLc);
+            glDetails[0].debit_fc = round2(glDetails[0].debit_fc - adv.reduceFc);
         }
     } else if (isAdvanceReceipt) {
         // ===== รับเงินมัดจำ (60) =====
@@ -2018,7 +2030,7 @@ const fetchOpenAdvances = async (req, res) => {
     try {
         const result = await req.dbPool.query(`
             SELECT t.id, t.doc_no, t.doc_date, t.due_date,
-                   t.total_amount_lc, t.paid_amount_lc, t.balance_amount_lc,
+                   t.total_amount_lc, t.paid_amount_lc, t.balance_amount_lc, t.currency_code, t.exchange_rate, t.vat_amount_lc,
                    d.doc_name_thai, d.sys_doc_type
             FROM ar_transaction t
             JOIN sa_module_document d ON t.doc_id = d.id
@@ -2170,6 +2182,7 @@ module.exports = {
     updateTransaction,
     voidTransaction,
     voidArDocument,
+    buildInvAdvanceGl, insertDepositVtReversal, recalcInvoiceBalances,
     getArVoidBlockById,
     getArLinkedState,
     generateDocNo,

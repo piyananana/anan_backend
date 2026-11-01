@@ -28,6 +28,7 @@ const AR_CREDIT_TYPES = ['50', '55'];
 const IM_CHECK_TYPES = ['30', '31', '32', '35', '40', '45'];
 const IM_CREDIT_TYPES = ['35', '40'];
 
+const { calcLineAmounts, netUnitPriceSql, ensureImPriceColumns } = require('./vatCalc');
 const round2 = (n) => Math.round(Number(n) * 100) / 100;
 
 const ensured = new Set();
@@ -46,6 +47,7 @@ const ensureCreditSchema = async (db) => {
       ADD COLUMN IF NOT EXISTS credit_requested_at  TIMESTAMPTZ`);
   }
   await DA.ensureDocApprovalSchema(db); // คิวผู้อนุมัติ + sa_menu.no_approver_action
+  await ensureImPriceColumns(db); // ยอดใบส่งสินค้ารอตั้งหนี้คิดตามส่วนลด/ราคารวม VAT
   if (dbName) ensured.add(dbName);
 };
 
@@ -63,7 +65,7 @@ const customerExposure = async (db, customerId, { excludeArId = 0, excludeImId =
            ), 0)::float AS ar_outstanding,
            COALESCE((
              SELECT SUM(x.lc + ROUND(x.lc * x.vat / 100, 2))
-               FROM (SELECT ROUND(ABS(dt.qty) * COALESCE(dt.unit_price, 0) * COALESCE(NULLIF(i.exchange_rate, 0), 1), 2) AS lc,
+               FROM (SELECT ROUND(ABS(dt.qty) * ${netUnitPriceSql('dt.unit_price', 'dt', 'i')} * COALESCE(NULLIF(i.exchange_rate, 0), 1), 2) AS lc,
                             CASE WHEN COALESCE(dt.vat_type, 'NOVAT') = 'NOVAT' THEN 0 ELSE COALESCE(dt.vat_rate, 0) END AS vat
                FROM im_transaction i JOIN sa_module_document d ON d.id = i.doc_id
                JOIN im_transaction_detail dt ON dt.header_id = i.id
@@ -95,13 +97,16 @@ const evaluate = (exp, amount) => {
 const arDocAmount = (sysDocType, totalAmountLc) =>
   round2((AR_CREDIT_TYPES.includes(sysDocType) ? -1 : 1) * Math.abs(Number(totalAmountLc) || 0));
 
-// IM: จำนวน = counted − system (หรือ qty หลังโพสต์) × ราคาขาย × อัตราแลกเปลี่ยน (เป็นบาท) + VAT จากยอดบาท
-const imDocAmount = (sysDocType, details, exchangeRate = 1) => {
+// IM: จำนวน = counted − system (หรือ qty หลังโพสต์) × ราคาขาย (หลังส่วนลด ตามตัวเลือกราคารวม VAT) × อัตราแลกเปลี่ยน
+// (เป็นบาท) + VAT จากยอดบาท — ราคารวม VAT ใช้ยอดรวมบาทของบรรทัด
+const imDocAmount = (sysDocType, details, exchangeRate = 1, priceIncludesVat = false) => {
   const rate = Number(exchangeRate) > 0 ? Number(exchangeRate) : 1;
   const sum = (details || []).reduce((s, d) => {
     const q = d.qty != null && Number(d.qty) !== 0 ? Number(d.qty) : (Number(d.counted_qty) || 0) - (Number(d.system_qty) || 0);
     const vat = !d.vat_type || d.vat_type === 'NOVAT' ? 0 : (Number(d.vat_rate) || 0);
-    const lc = round2(Math.abs(q) * (Number(d.unit_price) || 0) * rate);
+    const a = calcLineAmounts({ qty: Math.abs(q), price: d.unit_price, discountPercent: d.discount_percent, vatRate: vat, priceIncludesVat });
+    if (priceIncludesVat && vat) return s + round2(a.total * rate);
+    const lc = round2(a.net * rate);
     return s + lc + round2(lc * vat / 100);
   }, 0);
   return round2((IM_CREDIT_TYPES.includes(sysDocType) ? -1 : 1) * sum);

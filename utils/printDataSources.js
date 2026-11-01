@@ -52,6 +52,7 @@ const PRINT_FIELDS = [
 
 const ymdSql = (col) => `to_char(${col}, 'YYYY-MM-DD')`;
 const num = (v) => (v === null || v === undefined ? 0 : Number(v));
+const { calcLineAmounts, netUnitPriceSql, ensureImPriceColumns } = require('./vatCalc');
 const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 const s = (v) => (v === null || v === undefined ? '' : String(v).trim());
 
@@ -342,6 +343,7 @@ const SALES_INVOICE = {
   // เอกสารที่พิมพ์ได้ (โพสต์แล้วเท่านั้น) — docIds = ประเภทเอกสารที่ผู้ใช้มีสิทธิ์และเลือกไว้
   // keys = จำกัดเฉพาะเอกสารที่ระบุ (ใช้ตรวจก่อนพิมพ์)
   listDocs: async (db, { docIds, docNoFrom, docNoTo, dateFrom, dateTo, keys }) => {
+    await ensureImPriceColumns(db);
     const p = [docIds];
     const cond = (alias, module) => {
       let c = '';
@@ -360,9 +362,9 @@ const SALES_INVOICE = {
       SELECT * FROM (
         SELECT 'IM:' || t.id AS key, 'IM' AS module, t.id, d.doc_code, t.doc_no, ${ymdSql('t.doc_date')} AS doc_date,
                t.customer_code, t.customer_name_th AS customer_name,
-               (SELECT COALESCE(SUM(ROUND(ABS(x.qty) * COALESCE(x.unit_price, 0), 2)
+               (SELECT COALESCE(SUM(ROUND(ABS(x.qty) * ${netUnitPriceSql('x.unit_price', 'x', 't')}, 2)
                         + CASE WHEN COALESCE(x.vat_type, 'NOVAT') = 'NOVAT' THEN 0
-                               ELSE ROUND(ROUND(ABS(x.qty) * COALESCE(x.unit_price, 0), 2) * COALESCE(x.vat_rate, 0) / 100, 2) END), 0)
+                               ELSE ROUND(ROUND(ABS(x.qty) * ${netUnitPriceSql('x.unit_price', 'x', 't')}, 2) * COALESCE(x.vat_rate, 0) / 100, 2) END), 0)
                   FROM im_transaction_detail x WHERE x.header_id = t.id)::float AS total_amount,
                t.currency_code
           FROM im_transaction t JOIN sa_module_document d ON d.id = t.doc_id
@@ -382,6 +384,7 @@ const SALES_INVOICE = {
 
   // ข้อมูลพิมพ์ต่อเอกสาร: Map(key → { header, lines })
   loadDocs: async (db, keys) => {
+    await ensureImPriceColumns(db);
     const ids = (m) => keys.filter(k => k.startsWith(m + ':')).map(k => Number(k.split(':')[1])).filter(Boolean);
     const imIds = ids('IM');
     const arIds = ids('AR');
@@ -390,7 +393,7 @@ const SALES_INVOICE = {
     const imHeads = imIds.length ? (await db.query(`
         SELECT t.id, t.doc_no, ${ymdSql('t.doc_date')} AS doc_date, t.ref_no, t.ref_doc_no, t.description,
                t.currency_code, t.exchange_rate::float AS exchange_rate, COALESCE(NULLIF(t.linked_ar_doc_no, ''), ar.doc_no) AS linked_ar_doc_no,
-               t.customer_id, t.customer_code, t.customer_name_th, t.branch_id,
+               t.customer_id, t.customer_code, t.customer_name_th, t.branch_id, t.price_includes_vat,
                d.doc_code, d.doc_name_thai, d.doc_name_eng,
                so.id AS so_id, so.doc_no AS so_doc_no, ${ymdSql('so.doc_date')} AS so_doc_date,
                so.approved_by AS so_approved_by, ${ymdSql('so.approved_at')} AS so_approved_at,
@@ -411,7 +414,7 @@ const SALES_INVOICE = {
     const arHeads = arIds.length ? (await db.query(`
         SELECT t.id, t.doc_no, ${ymdSql('t.doc_date')} AS doc_date, ${ymdSql('t.due_date')} AS due_date, t.ref_no, t.ref_doc_no,
                t.description, t.currency_code, t.exchange_rate::float AS exchange_rate,
-               t.customer_id, t.customer_code, t.customer_name_th, t.branch_id,
+               t.customer_id, t.customer_code, t.customer_name_th, t.branch_id, t.price_includes_vat,
                t.subtotal_fc::float AS subtotal_fc, t.discount_amount_fc::float AS discount_amount_fc,
                t.before_vat_fc::float AS before_vat_fc, t.vat_amount_fc::float AS vat_amount_fc, t.total_amount_fc::float AS total_amount_fc,
                t.subtotal_lc::float AS subtotal_lc, t.discount_amount_lc::float AS discount_amount_lc,
@@ -467,7 +470,7 @@ const SALES_INVOICE = {
     const imLines = imIds.length ? (await db.query(`
         SELECT dt.header_id, dt.line_no, COALESCE(NULLIF(dt.item_code, ''), it.item_code) AS item_code,
                COALESCE(NULLIF(dt.item_name, ''), it.item_name_th) AS item_name, dt.description,
-               ABS(dt.qty)::float AS qty, COALESCE(dt.unit_price, 0)::float AS unit_price,
+               ABS(dt.qty)::float AS qty, COALESCE(dt.unit_price, 0)::float AS unit_price, COALESCE(dt.discount_percent, 0)::float AS discount_percent,
                COALESCE(dt.vat_type, 'NOVAT') AS vat_type, COALESCE(dt.vat_rate, 0)::float AS vat_rate, dt.is_free,
                u.uom_code, u.uom_name_th, u.uom_name_en, it.item_name_en
           FROM im_transaction_detail dt LEFT JOIN im_uom u ON u.id = dt.uom_id
@@ -522,18 +525,24 @@ const SALES_INVOICE = {
     for (const h of imHeads) {
       const rate = curOf(h) === base ? 1 : (num(h.exchange_rate) || 1);
       const lines = imLines.filter(l => l.header_id === h.id).map((l, i) => {
-        const amount = round2(l.qty * l.unit_price);
-        const vat = l.vat_type === 'NOVAT' ? 0 : round2(amount * l.vat_rate / 100);
+        // ราคาที่กรอก (ส่วนลด/ราคารวม VAT ตามหัวเอกสาร) — พิมพ์ราคาต่อหน่วยก่อน VAT, ส่วนลดและยอดก่อน VAT
+        const vr = l.vat_type === 'NOVAT' ? 0 : l.vat_rate;
+        const incl = h.price_includes_vat === true && vr > 0;
+        const a = calcLineAmounts({ qty: l.qty, price: l.unit_price, discountPercent: l.discount_percent, vatRate: vr, priceIncludesVat: incl });
+        const amount = a.net;
+        const vat = a.vat;
         const amountLc = round2(amount * rate);
-        const vatLc = l.vat_type === 'NOVAT' ? 0 : round2(amountLc * l.vat_rate / 100);
+        const vatLc = incl ? round2(round2(a.total * rate) - amountLc) : round2(amountLc * vr / 100);
         return {
-          ...lineCommon(l, i), qty: l.qty, unit_price: l.unit_price, discount_percent: 0, discount_amount: 0,
-          amount, vat_rate: l.vat_type === 'NOVAT' ? 0 : l.vat_rate, vat_amount: vat, line_total: round2(amount + vat),
+          ...lineCommon(l, i), qty: l.qty, unit_price: incl ? round2(l.unit_price * 100 / (100 + vr)) : l.unit_price,
+          discount_percent: l.discount_percent, discount_amount: a.discount, gross_amount: a.gross,
+          amount, vat_rate: vr, vat_amount: vat, line_total: round2(amount + vat),
           amount_lc: amountLc, vat_amount_lc: vatLc, line_total_lc: round2(amountLc + vatLc),
           free_label: l.is_free ? 'ของแถม' : '', free_label_en: l.is_free ? 'Free' : '',
         };
       });
       const sub = lines.reduce((a, l) => a + l.amount, 0);
+      const gross = lines.reduce((a, l) => a + l.gross_amount, 0);
       const vat = lines.reduce((a, l) => a + l.vat_amount, 0);
       const subLc = lines.reduce((a, l) => a + l.amount_lc, 0);
       const vatLc = lines.reduce((a, l) => a + l.vat_amount_lc, 0);
@@ -557,9 +566,11 @@ const SALES_INVOICE = {
           ...currencyFields(currencies, curOf(h)), currency_code: curOf(h), exchange_rate: rate,
           line_count: lines.length,
           ...totalsFields({
-            subtotal: sub, discount: 0, beforeVat: sub, vat, total: sub + vat, vatRate: headerVatRate(lines),
+            subtotal: gross, discount: gross - sub, beforeVat: sub, vat, total: sub + vat, vatRate: headerVatRate(lines),
             qty: lines.reduce((a, l) => a + l.qty, 0),
-          }, curOf(h), base, { subtotal: subLc, discount: 0, beforeVat: subLc, vat: vatLc, total: subLc + vatLc }),
+          }, curOf(h), base, {
+            subtotal: round2(gross * rate), discount: round2(gross * rate) - subLc, beforeVat: subLc, vat: vatLc, total: subLc + vatLc,
+          }),
         },
         lines,
       });
