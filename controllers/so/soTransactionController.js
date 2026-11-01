@@ -18,6 +18,7 @@ const { ensureSalespersonTable, saveDocSalespersons, loadSalespersons } = requir
 const DA = require('../../utils/docApproval');
 const { ensureCreditSchema, assertCreditForPost, soDocAmount, loadCreditApprovals } = require('../../utils/creditCheck');
 const { ensureSoPriceColumns, netUnitPriceSql, orderLineValues, saveOrderTotals } = require('../../utils/vatCalc');
+const { fetchOrderDeposits } = require('../../utils/depositRef');
 const KIND = 'SO';
 
 // พนักงานขายของใบสั่งขาย (รายชื่อ — สัดส่วนอยู่ที่ข้อมูลลูกค้า)
@@ -141,6 +142,8 @@ const fetchRowById = async (pool, id) => {
     return {
         ...hRes.rows[0], details: dRes.rows, salespersons, approvals: await DA.loadApprovals(pool, KIND, Number(id)),
         credit_approvals: await loadCreditApprovals(pool, 'SO', Number(id)),
+        // ใบมัดจำลูกค้า (AR 60) ที่อ้างอิงใบสั่งขายนี้ — เตือนตอนปิดถ้ายังมียอดคงเหลือ
+        deposits: await fetchOrderDeposits(pool, 'ar', Number(id)),
     };
 };
 

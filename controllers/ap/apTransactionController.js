@@ -3,6 +3,7 @@ const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { branchCodeSql } = require('../../utils/taxBranch');
 const { today: todayYmd } = require('../../utils/dateUtil');
 const { resolveApAccountId, postedApAccountId, postedApAccountSql } = require('../../utils/apAccount');
+const { ensureDepositRefColumns, saveDepositRef } = require('../../utils/depositRef');
 // controllers/ap/apTransactionController.js
 
 // --- Helper: Generate Document Number ---
@@ -1283,8 +1284,9 @@ const fetchOpenAdvances = async (req, res) => {
     const txnId = Number(req.query.transaction_id) || 0;
     if (!vendor_id) return res.status(400).json({ message: 'vendor_id required' });
     try {
+        await ensureDepositRefColumns(req.dbPool);
         const result = await req.dbPool.query(`
-            SELECT t.id, t.doc_no, t.doc_date,
+            SELECT t.id, t.doc_no, t.doc_date, t.ref_po_id, t.ref_po_doc_no,
                    t.total_amount_lc, ROUND(t.balance_amount_lc + COALESCE(own.amt, 0), 2) AS balance_amount_lc,
                    t.total_amount_fc, t.vat_amount_fc, t.vat_amount_lc,
                    t.currency_code, t.exchange_rate,
@@ -1482,6 +1484,8 @@ const createTransaction = async (req, res) => {
         ]);
         const newHeaderId = hRes.rows[0].id;
         await client.query(`UPDATE ap_transaction SET price_includes_vat=$1 WHERE id=$2`, [header.price_includes_vat === true, newHeaderId]);
+        // ใบมัดจำอ้างอิงใบสั่งซื้อ (utils/depositRef.js)
+        await saveDepositRef(client, 'ap', newHeaderId, header);
 
         // Insert details
         let lineNo = 1;
@@ -1665,6 +1669,7 @@ const updateTransaction = async (req, res) => {
             header.branch_id || null, header.updated_by || null, id,
             header.price_includes_vat === true,
         ]);
+        await saveDepositRef(client, 'ap', id, header);
 
         // คืนยอดคงค้างของใบตั้งหนี้ตาม apply เดิม (เดิมลบ apply โดยไม่คืนยอด ทำให้ยอดค้างของใบตั้งหนี้ผิด)
         await adjustInvoiceBalances(client, id, -1);

@@ -15,6 +15,7 @@ const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { reasonOf, userIdOf, sendErr, blk } = require('../../utils/docAction');
 const DA = require('../../utils/docApproval');
 const { ensurePoPriceColumns, netUnitPriceSql, orderLineValues, saveOrderTotals } = require('../../utils/vatCalc');
+const { fetchOrderDeposits } = require('../../utils/depositRef');
 const KIND = 'PO';
 
 const ensurePoTransactionTable = async (client) => {
@@ -118,7 +119,9 @@ const fetchRowById = async (pool, id) => {
         LEFT JOIN im_uom u ON u.id = dt.uom_id
         WHERE dt.header_id = $1 ORDER BY dt.line_no`, [id]);
     await DA.ensureDocApprovalSchema(pool);
-    return { ...hRes.rows[0], details: dRes.rows, approvals: await DA.loadApprovals(pool, KIND, Number(id)) };
+    // ใบมัดจำผู้ขาย (AP 60) ที่อ้างอิงใบสั่งซื้อนี้ — เตือนตอนปิดถ้ายังมียอดคงเหลือ
+    return { ...hRes.rows[0], details: dRes.rows, approvals: await DA.loadApprovals(pool, KIND, Number(id)),
+        deposits: await fetchOrderDeposits(pool, 'ap', Number(id)) };
 };
 
 // --- GET list ---

@@ -6,6 +6,7 @@ const { branchCodeSql } = require('../../utils/taxBranch');
 const { ensureSalespersonTable, saveDocSalespersons, loadSalespersons } = require('../../utils/docSalesperson');
 const { AR_CHECK_TYPES, ensureCreditSchema, arDocAmount, assertCreditForPost, loadCreditApprovals } = require('../../utils/creditCheck');
 const { resolveArAccountId, postedArAccountId, postedArAccountSql } = require('../../utils/arAccount');
+const { ensureDepositRefColumns, saveDepositRef } = require('../../utils/depositRef');
 
 // ตรวจวงเงินเครดิตก่อนโพสต์ (ตั้งหนี้/เพิ่มหนี้/ลดหนี้) — เกินวงเงินและยังไม่ได้รับอนุมัติที่ครอบคลุมยอด = throw CREDIT_LIMIT
 const checkArCreditForPost = async (client, header, id, row) => {
@@ -1295,6 +1296,8 @@ const createTransaction = async (req, res) => {
         await saveDocSalespersons(client, 'ar_transaction_salesperson', 'header_id', newHeaderId, req.body.salespersons);
         // ราคาที่กรอกรวม VAT (ยอดที่เก็บทุกช่องเป็นยอดก่อน VAT เหมือนเดิม — ดู lib/utils/vat_calc.dart)
         await client.query(`UPDATE ar_transaction SET price_includes_vat=$1 WHERE id=$2`, [header.price_includes_vat === true, newHeaderId]);
+        // ใบมัดจำอ้างอิงใบสั่งขาย (utils/depositRef.js)
+        await saveDepositRef(client, 'ar', newHeaderId, header);
 
         // Insert details
         const detailSql = `
@@ -1485,6 +1488,7 @@ const updateTransaction = async (req, res) => {
         ]);
 
         await saveDocSalespersons(client, 'ar_transaction_salesperson', 'header_id', id, req.body.salespersons);
+        await saveDepositRef(client, 'ar', id, header);
 
         // Replace details
         await client.query('DELETE FROM ar_transaction_detail WHERE header_id=$1', [id]);
@@ -2028,9 +2032,11 @@ const fetchOpenAdvances = async (req, res) => {
     const { customer_id } = req.query;
     if (!customer_id) return res.status(400).json({ error: 'customer_id required' });
     try {
+        await ensureDepositRefColumns(req.dbPool);
         const result = await req.dbPool.query(`
             SELECT t.id, t.doc_no, t.doc_date, t.due_date,
                    t.total_amount_lc, t.paid_amount_lc, t.balance_amount_lc, t.currency_code, t.exchange_rate, t.vat_amount_lc,
+                   t.ref_so_id, t.ref_so_doc_no,
                    d.doc_name_thai, d.sys_doc_type
             FROM ar_transaction t
             JOIN sa_module_document d ON t.doc_id = d.id
