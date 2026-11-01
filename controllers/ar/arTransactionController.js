@@ -1,5 +1,6 @@
 // controllers/ar/arTransactionController.js
 const { today: todayYmd } = require('../../utils/dateUtil');
+const { syncPartyBankItems, voidBankItems, deleteBankItems, bankItemsClearedSql, ensureBankItemColumns } = require('../../utils/cmBankItems');
 const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { branchCodeSql } = require('../../utils/taxBranch');
@@ -311,90 +312,8 @@ const resolvePaymentGlAccount = async (client, payment, setup, fallbackCashAccou
     return fallbackCashAccountId || null;
 };
 
-// --- Helper: Create CM receipt records after AR Receipt (sysDocType=80) is posted ---
-const postCmReceiptsHelper = async (client, arTransactionId, glEntryId) => {
-    await client.query(`
-        CREATE TABLE IF NOT EXISTS cm_receipt (
-            id                  SERIAL PRIMARY KEY,
-            receipt_date        DATE          NOT NULL,
-            bank_account_id     INTEGER       REFERENCES cm_bank_account(id),
-            payment_method_id   INTEGER,
-            payment_method_type VARCHAR(30)   NOT NULL DEFAULT 'CASH',
-            ar_transaction_id   INTEGER,
-            ar_doc_no           VARCHAR(50),
-            customer_id         INTEGER,
-            customer_code       VARCHAR(50),
-            customer_name_th    VARCHAR(200),
-            amount_lc           NUMERIC(18,4) NOT NULL DEFAULT 0,
-            amount_fc           NUMERIC(18,4) NOT NULL DEFAULT 0,
-            currency_code       VARCHAR(10)   NOT NULL DEFAULT 'THB',
-            exchange_rate       NUMERIC(15,6) NOT NULL DEFAULT 1,
-            check_no            VARCHAR(50),
-            check_date          DATE,
-            drawer_bank         VARCHAR(200),
-            status              VARCHAR(20)   NOT NULL DEFAULT 'Pending',
-            clearing_date       DATE,
-            clearing_note       TEXT,
-            gl_entry_id         INTEGER,
-            created_by          INTEGER,
-            created_at          TIMESTAMP DEFAULT NOW(),
-            updated_at          TIMESTAMP DEFAULT NOW()
-        )`);
-
-    // Idempotent: delete and re-create (handles re-post scenario)
-    await client.query(`DELETE FROM cm_receipt WHERE ar_transaction_id = $1`, [arTransactionId]);
-
-    // Fetch AR transaction header for customer info + doc date
-    const hRes = await client.query(`
-        SELECT t.doc_no, t.doc_date, t.currency_code, t.exchange_rate,
-               t.customer_id,
-               c.customer_code, c.customer_name_th
-        FROM ar_transaction t
-        LEFT JOIN ar_customer c ON c.id = t.customer_id
-        WHERE t.id = $1`, [arTransactionId]);
-    if (hRes.rows.length === 0) return;
-    const h = hRes.rows[0];
-
-    // Fetch payment rows that have a CM bank account linked
-    const pmRes = await client.query(`
-        SELECT payment_method_id, payment_method_type,
-               cm_bank_account_id, amount_lc, amount_fc,
-               ref_no, payment_date, drawer_bank_name
-        FROM ar_transaction_payment
-        WHERE header_id = $1 AND cm_bank_account_id IS NOT NULL`,
-        [arTransactionId]);
-
-    for (const pm of pmRes.rows) {
-        const isCheck = pm.payment_method_type === 'CHECK';
-        await client.query(`
-            INSERT INTO cm_receipt
-                (receipt_date, bank_account_id, payment_method_id, payment_method_type,
-                 ar_transaction_id, ar_doc_no,
-                 customer_id, customer_code, customer_name_th,
-                 amount_lc, amount_fc, currency_code, exchange_rate,
-                 check_no, check_date, drawer_bank, gl_entry_id)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
-            [
-                h.doc_date,
-                pm.cm_bank_account_id,
-                pm.payment_method_id,
-                pm.payment_method_type || 'CASH',
-                arTransactionId,
-                h.doc_no,
-                h.customer_id  || null,
-                h.customer_code || null,
-                h.customer_name_th || null,
-                pm.amount_lc   || 0,
-                pm.amount_fc   || 0,
-                h.currency_code || await getBaseCurrencyCode(client),
-                h.exchange_rate || 1,
-                isCheck ? (pm.ref_no || null) : null,
-                isCheck ? (pm.payment_date || h.doc_date) : null,
-                pm.drawer_bank_name || null,
-                glEntryId,
-            ]);
-    }
-};
+// --- Helper: รายการเงินเข้า/ออกบัญชีธนาคารของ AR 60/65/80 (utils/cmBankItems.js) ---
+const postCmReceiptsHelper = (client, arTransactionId, glEntryId) => syncPartyBankItems(client, 'AR', arTransactionId, glEntryId);
 
 // --- Helper: Post GL Entry for AR transaction ---
 // reservedGlDocNo: เลขที่รายการบัญชีเดิมของเอกสารที่ถอยเป็นร่าง (ar_transaction.gl_doc_no) — โพสต์ใหม่ใช้เลขเดิม
@@ -1071,16 +990,15 @@ const AR_REVERSE_INFO_SQL = `
            (SELECT string_agg(DISTINCT to_char(ar.run_date, 'DD/MM/YYYY'), ', ')
               FROM ar_allowance_run_detail ad JOIN ar_allowance_run ar ON ar.id = ad.run_id
              WHERE ad.invoice_id = t.id AND ar.status NOT IN ('Void', 'Deleted')) AS in_allowance,
-           (SELECT string_agg(DISTINCT COALESCE(c.check_no, c.ar_doc_no, c.id::text), ', ')
-              FROM cm_receipt c
-             WHERE c.ar_transaction_id = t.id
-               AND (c.status NOT IN ('Pending', 'Voided') OR c.is_reconciled IS TRUE)) AS cm_cleared
+           ${bankItemsClearedSql('AR', 't')} AS cm_cleared
       FROM ar_transaction t
       JOIN sa_module_document d ON d.id = t.doc_id
       LEFT JOIN gl_posting_period p  ON p.id = t.period_id
       LEFT JOIN gl_entry_header   g  ON g.id = t.gl_entry_id
       LEFT JOIN gl_posting_period gp ON gp.id = g.period_id
      WHERE t.id = $1`;
+// คอลัมน์ของรายการธนาคาร (cm_receipt/cm_payment) ที่ subquery cm_cleared ใช้ — เพิ่มก่อนอ่านเสมอ
+const queryARReverseInfo = async (db, id) => { await ensureBankItemColumns(db); return db.query(AR_REVERSE_INFO_SQL, [id]); };
 
 // เงื่อนไขที่ใช้ร่วมกันระหว่างถอยกับยกเลิก: มีเอกสารอื่นอ้างอิงอยู่
 const getArDependentBlock = (r) => {
@@ -1118,13 +1036,13 @@ const AR_BLOCK_MESSAGES = {
     BC_PAID:        'ใบวางบิลนี้ถูกนำไปรับชำระแล้ว',
     FX_REVAL:       'เอกสารนี้อยู่ในการปรับมูลค่าอัตราแลกเปลี่ยน',
     ALLOWANCE:      'เอกสารนี้อยู่ในการตั้งค่าเผื่อหนี้สงสัยจะสูญ',
-    CM_CLEARED:     'การรับเงินผ่านธนาคารของเอกสารนี้เคลียร์/กระทบยอดแล้ว',
+    CM_CLEARED:     'รายการรับ/จ่ายเงินผ่านธนาคารของเอกสารนี้เคลียร์/กระทบยอดแล้ว',
 };
 const arBlockMessage = (b) => AR_BLOCK_MESSAGES[b.code] + (b.ref ? ` (${b.ref})` : '');
 
 // ใช้ภายนอกโมดูล (CM เช็คคืน): เหตุที่ยกเลิกเอกสาร AR ไม่ได้ พร้อมข้อความ หรือ null
 const getArVoidBlockById = async (db, id) => {
-    const info = (await db.query(AR_REVERSE_INFO_SQL, [id])).rows[0];
+    const info = (await queryARReverseInfo(db, id)).rows[0];
     if (!info) return null;
     const b = getArVoidBlock(info);
     return b ? { ...b, message: arBlockMessage(b) } : null;
@@ -1132,7 +1050,7 @@ const getArVoidBlockById = async (db, id) => {
 
 // ใช้จาก IM: ใบแจ้งหนี้/ลดหนี้ที่เอกสาร IM สร้างให้ — สถานะ, เหตุที่ถอย/ยกเลิกไม่ได้ (ไม่นับ IM_SOURCE), งวดยังเปิดหรือไม่
 const getArLinkedState = async (db, id) => {
-    const info = (await db.query(AR_REVERSE_INFO_SQL, [id])).rows[0];
+    const info = (await queryARReverseInfo(db, id)).rows[0];
     if (!info) return null;
     const b = info.status === 'Posted' ? getArDependentBlock({ ...info, from_im: false }) : null;
     return {
@@ -1387,7 +1305,7 @@ const createTransaction = async (req, res) => {
                 await insertDeferredVtRecordsForReceipt(client, newHeaderId, headerWithDocNo, applies || []);
                 await client.query(`UPDATE ar_transaction SET gl_entry_id=$1 WHERE id=$2`, [glEntryId, newHeaderId]);
                 // Post CM receipt records for Receipt documents
-                if (sysDocType1 === '80') await postCmReceiptsHelper(client, newHeaderId, glEntryId);
+                if (['60', '65', '80'].includes(sysDocType1)) await postCmReceiptsHelper(client, newHeaderId, glEntryId);
                 // DN-35, CN-55, RDP-65 ไม่มียอดค้างชำระตัวเอง
                 if (['35', '55', '65'].includes(sysDocType1)) {
                     await client.query(`UPDATE ar_transaction SET balance_amount_lc=0 WHERE id=$1`, [newHeaderId]);
@@ -1583,7 +1501,7 @@ const updateTransaction = async (req, res) => {
                 await insertDeferredVtRecordsForReceipt(client, id, headerWithDocNo, applies || []);
                 await client.query(`UPDATE ar_transaction SET gl_entry_id=$1 WHERE id=$2`, [glEntryId, id]);
                 // Post CM receipt records for Receipt documents
-                if (sysDocType2 === '80') await postCmReceiptsHelper(client, id, glEntryId);
+                if (['60', '65', '80'].includes(sysDocType2)) await postCmReceiptsHelper(client, id, glEntryId);
                 if (['35', '55', '65'].includes(sysDocType2)) {
                     await client.query(`UPDATE ar_transaction SET balance_amount_lc=0 WHERE id=$1`, [id]);
                 }
@@ -1620,7 +1538,7 @@ const voidArDocument = async (client, id, { voidReason, userId, userName, fromIm
         const lock = await client.query(`SELECT * FROM ar_transaction WHERE id=$1 FOR UPDATE`, [id]);
         if (lock.rows.length === 0) return { error: 'Not found', httpStatus: 404 };
         const tx = lock.rows[0];
-        const info = (await client.query(AR_REVERSE_INFO_SQL, [id])).rows[0];
+        const info = (await queryARReverseInfo(client, id)).rows[0];
         // fromIm = เรียกจากเอกสาร IM ต้นทาง → ข้ามเงื่อนไข IM_SOURCE
         const block = getArVoidBlock(fromIm ? { ...info, from_im: false } : info);
         if (block) return { error: arBlockMessage(block), code: block.code, ref: block.ref || null };
@@ -1697,13 +1615,9 @@ const voidArDocument = async (client, id, { voidReason, userId, userName, fromIm
         // คืนยอดคงค้างให้เอกสารที่จับคู่ไว้ (คำนวณหลังเปลี่ยนสถานะ จึงไม่นับเอกสารนี้แล้ว)
         await recalcInvoiceBalances(client, await appliedTargetIds(client, id));
 
-        if (info.sys_doc_type === '80') {
-            // รายการรับเงินผ่านธนาคารที่ยังรอเคลียร์ (ที่เคลียร์แล้วถูกกันไว้ข้างบน)
-            await client.query(`
-                UPDATE cm_receipt SET status='Voided', updated_at=NOW()
-                 WHERE ar_transaction_id=$1 AND status <> 'Voided'`, [id]);
-            await restoreBillCollection(client, tx.ref_no);
-        }
+        // รายการเงินเข้า/ออกธนาคาร (60/65/80) ที่ยังรอเคลียร์ (ที่เคลียร์แล้วถูกกันไว้ข้างบน)
+        await voidBankItems(client, 'AR', id);
+        if (info.sys_doc_type === '80') await restoreBillCollection(client, tx.ref_no);
 
         await logReverse(client, {
             sysModule: '11', tableName: 'ar_transaction', recordId: Number(id),
@@ -1755,7 +1669,7 @@ const reverseTransaction = async (req, res) => {
         await client.query('BEGIN');
         const lock = await client.query(`SELECT id, ref_no FROM ar_transaction WHERE id=$1 FOR UPDATE`, [id]);
         if (lock.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
-        const info = (await client.query(AR_REVERSE_INFO_SQL, [id])).rows[0];
+        const info = (await queryARReverseInfo(client, id)).rows[0];
         const block = getArReverseBlock(info);
         if (block) {
             await client.query('ROLLBACK');
@@ -1768,10 +1682,8 @@ const reverseTransaction = async (req, res) => {
             await client.query(`DELETE FROM gl_entry_header WHERE id=$1`, [info.gl_entry_id]);
         }
         await client.query(`DELETE FROM vt_transaction WHERE module_code='AR' AND source_header_id=$1`, [id]);
-        if (info.sys_doc_type === '80') {
-            await client.query(`DELETE FROM cm_receipt WHERE ar_transaction_id=$1`, [id]);
-            await restoreBillCollection(client, lock.rows[0].ref_no);
-        }
+        await deleteBankItems(client, 'AR', id);
+        if (info.sys_doc_type === '80') await restoreBillCollection(client, lock.rows[0].ref_no);
         // DN-35, CN-55, RDP-65: ตอนโพสต์ตั้ง balance = 0 → คืนยอดเต็มให้ร่าง (ตามที่ create ตั้งไว้)
         if (['35', '55', '65'].includes(info.sys_doc_type)) {
             await client.query(`UPDATE ar_transaction SET balance_amount_lc = total_amount_lc WHERE id=$1`, [id]);
@@ -1969,7 +1881,7 @@ const fetchRow = async (req, res) => {
             console.warn('ar_transaction_payment query failed (table may not exist):', e.message);
         }
 
-        const info = (await req.dbPool.query(AR_REVERSE_INFO_SQL, [id])).rows[0];
+        const info = (await queryARReverseInfo(req.dbPool, id)).rows[0];
         const rBlock = info ? getArReverseBlock(info) : null;
         const vBlock = info ? getArVoidBlock(info) : null;
         const history = await getReverseHistory(req.dbPool, 'ar_transaction', Number(id));

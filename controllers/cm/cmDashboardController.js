@@ -1,3 +1,4 @@
+const { bankBalanceLc } = require('../../utils/cmBankBalance');
 const { getBaseCurrency } = require('../../utils/baseCurrency');
 // controllers/cm/cmDashboardController.js
 'use strict';
@@ -13,9 +14,8 @@ const getDashboard = async (req, res) => {
     try {
         const hasReceipt  = await tableExists(client, 'cm_receipt');
         const hasPayment  = await tableExists(client, 'cm_payment');
-        const hasTransfer = await tableExists(client, 'cm_inter_bank_transfer');
         const hasFxReval  = await tableExists(client, 'cm_bank_fx_revaluation');
-        const hasPCV      = await tableExists(client, 'cm_petty_cash_voucher');
+        const hasCmTx     = await tableExists(client, 'cm_transaction');
         const hasStmt     = await tableExists(client, 'cm_bank_statement');
 
         // ── 1. Bank account balances ─────────────────────────────────────────
@@ -29,32 +29,7 @@ const getDashboard = async (req, res) => {
 
         const bankBalances = [];
         for (const acc of accsRes.rows) {
-            let balance = 0;
-            if (hasReceipt) {
-                const r = await client.query(
-                    `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_receipt WHERE bank_account_id=$1 AND status!='Voided'`,
-                    [acc.id]);
-                balance += parseFloat(r.rows[0].amt);
-            }
-            if (hasPayment) {
-                const r = await client.query(
-                    `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_payment WHERE bank_account_id=$1 AND status!='Voided'`,
-                    [acc.id]);
-                balance -= parseFloat(r.rows[0].amt);
-            }
-            if (hasTransfer) {
-                const rIn  = await client.query(`SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_inter_bank_transfer WHERE to_bank_account_id=$1   AND status='Posted'`, [acc.id]);
-                const rOut = await client.query(`SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_inter_bank_transfer WHERE from_bank_account_id=$1 AND status='Posted'`, [acc.id]);
-                balance += parseFloat(rIn.rows[0].amt) - parseFloat(rOut.rows[0].amt);
-            }
-            if (hasFxReval) {
-                const r = await client.query(`
-                    SELECT COALESCE(SUM(rl.fx_gain_loss),0) AS adj
-                    FROM cm_bank_fx_revaluation_line rl
-                    JOIN cm_bank_fx_revaluation rv ON rv.id=rl.revaluation_id
-                    WHERE rl.bank_account_id=$1 AND rv.status='Posted'`, [acc.id]);
-                balance += parseFloat(r.rows[0].adj);
-            }
+            const balance = await bankBalanceLc(client, acc.id, '9999-12-31');
             bankBalances.push({
                 bank_account_id:   acc.id,
                 bank_account_code: acc.account_code,
@@ -75,10 +50,11 @@ const getDashboard = async (req, res) => {
         const pettyCashBalances = [];
         for (const acc of pcAccsRes.rows) {
             let usedAmount = 0;
-            if (hasPCV) {
+            if (hasCmTx) {
+                // ใบเบิกเงินสดย่อย (CM 40) ของกองนี้ที่ยังไม่ได้เติมเงิน
                 const r = await client.query(`
-                    SELECT COALESCE(SUM(amount),0) AS amt FROM cm_petty_cash_voucher
-                    WHERE petty_cash_account_id=$1 AND status='Approved'`, [acc.id]);
+                    SELECT COALESCE(SUM(t.balance_amount_lc),0) AS amt FROM cm_transaction t JOIN sa_module_document d ON d.id = t.doc_id
+                 WHERE d.sys_doc_type = '40' AND t.status = 'Posted' AND t.balance_amount_lc > 0.005 AND t.bank_account_id = $1`, [acc.id]);
                 usedAmount = parseFloat(r.rows[0].amt);
             }
             // cm_bank_account has no fund_amount column — no petty-cash fund-limit source exists yet
@@ -123,14 +99,9 @@ const getDashboard = async (req, res) => {
                 alerts.push({ key: 'DRAFT_FX_REVAL', severity: 'ERROR',
                     title: 'FX Revaluation Draft รอ Post', count: parseInt(r.rows[0].cnt) });
         }
-        if (hasTransfer) {
-            const r = await client.query(`SELECT COUNT(*) AS cnt FROM cm_inter_bank_transfer WHERE status='Draft'`);
-            if (parseInt(r.rows[0].cnt) > 0)
-                alerts.push({ key: 'DRAFT_TRANSFER', severity: 'ERROR',
-                    title: 'Inter-bank Transfer Draft รอ Post', count: parseInt(r.rows[0].cnt) });
-        }
-        if (hasPCV) {
-            const r = await client.query(`SELECT COUNT(*) AS cnt FROM cm_petty_cash_voucher WHERE status='Approved'`);
+        if (hasCmTx) {
+            const r = await client.query(`SELECT COUNT(*) AS cnt FROM cm_transaction t JOIN sa_module_document d ON d.id = t.doc_id
+                 WHERE d.sys_doc_type = '40' AND t.status = 'Posted' AND t.balance_amount_lc > 0.005 `);
             if (parseInt(r.rows[0].cnt) > 0)
                 alerts.push({ key: 'PENDING_PCV', severity: 'INFO',
                     title: 'ใบสำคัญเงินสดย่อยรอเบิก', count: parseInt(r.rows[0].cnt) });
@@ -146,10 +117,6 @@ const getDashboard = async (req, res) => {
             txParts.push(`(SELECT payment_date AS tx_date, ap_doc_no AS doc_no, 'PAYMENT' AS tx_type,
                 COALESCE(payee_name_th, '') AS description, amount_lc FROM cm_payment
                 WHERE status!='Voided' ORDER BY payment_date DESC, id DESC LIMIT 10)`);
-        if (hasTransfer)
-            txParts.push(`(SELECT transfer_date AS tx_date, transfer_no AS doc_no, 'TRANSFER' AS tx_type,
-                COALESCE(description,'โอนเงินระหว่างบัญชี') AS description, amount_lc FROM cm_inter_bank_transfer
-                WHERE status!='Voided' ORDER BY transfer_date DESC, id DESC LIMIT 10)`);
 
         let recentTransactions = [];
         if (txParts.length > 0) {

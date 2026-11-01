@@ -1,4 +1,5 @@
 // controllers/cm/cmCashFlowStatementController.js
+const { bankBalanceLc } = require('../../utils/cmBankBalance');
 const { addDays, ymd } = require('../../utils/dateUtil');
 'use strict';
 
@@ -9,97 +10,8 @@ const tableExists = async (client, name) => {
 };
 
 // Calculate balance for a bank account as of a given date
-const calcBalance = async (client, accId, asOfDate, tables) => {
-    let balance = 0;
-
-    // Use opening balance if available and its as_of_date <= asOfDate
-    const hasOB = await tableExists(client, 'cm_bank_opening_balance');
-    if (hasOB) {
-        const ob = await client.query(
-            `SELECT opening_balance, as_of_date FROM cm_bank_opening_balance
-             WHERE bank_account_id=$1 AND as_of_date<=$2
-             ORDER BY as_of_date DESC LIMIT 1`,
-            [accId, asOfDate]);
-        if (ob.rows.length > 0) {
-            balance = parseFloat(ob.rows[0].opening_balance);
-            const obDate = ymd(ob.rows[0].as_of_date);
-
-            if (tables.receipt) {
-                const r = await client.query(
-                    `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_receipt
-                     WHERE bank_account_id=$1 AND status!='Voided' AND receipt_date>$2 AND receipt_date<=$3`,
-                    [accId, obDate, asOfDate]);
-                balance += parseFloat(r.rows[0].amt);
-            }
-            if (tables.payment) {
-                const r = await client.query(
-                    `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_payment
-                     WHERE bank_account_id=$1 AND status!='Voided' AND payment_date>$2 AND payment_date<=$3`,
-                    [accId, obDate, asOfDate]);
-                balance -= parseFloat(r.rows[0].amt);
-            }
-            if (tables.transfer) {
-                const rIn  = await client.query(
-                    `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_inter_bank_transfer
-                     WHERE to_bank_account_id=$1 AND status='Posted' AND transfer_date>$2 AND transfer_date<=$3`,
-                    [accId, obDate, asOfDate]);
-                const rOut = await client.query(
-                    `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_inter_bank_transfer
-                     WHERE from_bank_account_id=$1 AND status='Posted' AND transfer_date>$2 AND transfer_date<=$3`,
-                    [accId, obDate, asOfDate]);
-                balance += parseFloat(rIn.rows[0].amt) - parseFloat(rOut.rows[0].amt);
-            }
-            if (tables.fxReval) {
-                const r = await client.query(
-                    `SELECT COALESCE(SUM(rl.fx_gain_loss),0) AS adj
-                     FROM cm_bank_fx_revaluation_line rl
-                     JOIN cm_bank_fx_revaluation rv ON rv.id=rl.revaluation_id
-                     WHERE rl.bank_account_id=$1 AND rv.status='Posted'
-                       AND rv.revaluation_date>$2 AND rv.revaluation_date<=$3`,
-                    [accId, obDate, asOfDate]);
-                balance += parseFloat(r.rows[0].adj);
-            }
-            return Math.round(balance * 100) / 100;
-        }
-    }
-
-    // No opening balance record: sum all transactions up to asOfDate
-    if (tables.receipt) {
-        const r = await client.query(
-            `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_receipt
-             WHERE bank_account_id=$1 AND status!='Voided' AND receipt_date<=$2`,
-            [accId, asOfDate]);
-        balance += parseFloat(r.rows[0].amt);
-    }
-    if (tables.payment) {
-        const r = await client.query(
-            `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_payment
-             WHERE bank_account_id=$1 AND status!='Voided' AND payment_date<=$2`,
-            [accId, asOfDate]);
-        balance -= parseFloat(r.rows[0].amt);
-    }
-    if (tables.transfer) {
-        const rIn  = await client.query(
-            `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_inter_bank_transfer
-             WHERE to_bank_account_id=$1 AND status='Posted' AND transfer_date<=$2`,
-            [accId, asOfDate]);
-        const rOut = await client.query(
-            `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_inter_bank_transfer
-             WHERE from_bank_account_id=$1 AND status='Posted' AND transfer_date<=$2`,
-            [accId, asOfDate]);
-        balance += parseFloat(rIn.rows[0].amt) - parseFloat(rOut.rows[0].amt);
-    }
-    if (tables.fxReval) {
-        const r = await client.query(
-            `SELECT COALESCE(SUM(rl.fx_gain_loss),0) AS adj
-             FROM cm_bank_fx_revaluation_line rl
-             JOIN cm_bank_fx_revaluation rv ON rv.id=rl.revaluation_id
-             WHERE rl.bank_account_id=$1 AND rv.status='Posted' AND rv.revaluation_date<=$2`,
-            [accId, asOfDate]);
-        balance += parseFloat(r.rows[0].adj);
-    }
-    return Math.round(balance * 100) / 100;
-};
+// ยอดธนาคาร ณ วันที่ — utils/cmBankBalance.js
+const calcBalance = (client, accId, asOfDate) => bankBalanceLc(client, accId, asOfDate);
 
 const getStatement = async (req, res) => {
     const { date_from, date_to, account_code_from, account_code_to } = req.query;
@@ -115,7 +27,6 @@ const getStatement = async (req, res) => {
         const tables = {
             receipt:  await tableExists(client, 'cm_receipt'),
             payment:  await tableExists(client, 'cm_payment'),
-            transfer: await tableExists(client, 'cm_inter_bank_transfer'),
             fxReval:  await tableExists(client, 'cm_bank_fx_revaluation'),
         };
 
@@ -143,43 +54,33 @@ const getStatement = async (req, res) => {
             // Opening balance (as of day before date_from)
             const opening = await calcBalance(client, acc.id, openingDate, tables);
 
-            // Period receipts
+            // Period receipts / payments — เงินโอนระหว่างบัญชี (CM 50) แยกเป็นโอนเข้า/โอนออก
+            let transferIn = 0, transferOut = 0;
             let receipts = 0;
             if (tables.receipt) {
                 const r = await client.query(
-                    `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_receipt
+                    `SELECT COALESCE(SUM(amount_lc) FILTER (WHERE COALESCE(source_type, '') <> 'CM50'),0) AS amt,
+                            COALESCE(SUM(amount_lc) FILTER (WHERE source_type = 'CM50'),0) AS transfer
+                       FROM cm_receipt
                      WHERE bank_account_id=$1 AND status!='Voided'
                        AND receipt_date>=$2 AND receipt_date<=$3`,
                     [acc.id, date_from, date_to]);
                 receipts = parseFloat(r.rows[0].amt);
+                transferIn = parseFloat(r.rows[0].transfer);
             }
 
             // Period payments
             let payments = 0;
             if (tables.payment) {
                 const r = await client.query(
-                    `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_payment
+                    `SELECT COALESCE(SUM(amount_lc) FILTER (WHERE COALESCE(source_type, '') <> 'CM50'),0) AS amt,
+                            COALESCE(SUM(amount_lc) FILTER (WHERE source_type = 'CM50'),0) AS transfer
+                       FROM cm_payment
                      WHERE bank_account_id=$1 AND status!='Voided'
                        AND payment_date>=$2 AND payment_date<=$3`,
                     [acc.id, date_from, date_to]);
                 payments = parseFloat(r.rows[0].amt);
-            }
-
-            // Period inter-bank transfers (net per account)
-            let transferIn = 0, transferOut = 0;
-            if (tables.transfer) {
-                const rIn  = await client.query(
-                    `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_inter_bank_transfer
-                     WHERE to_bank_account_id=$1 AND status='Posted'
-                       AND transfer_date>=$2 AND transfer_date<=$3`,
-                    [acc.id, date_from, date_to]);
-                const rOut = await client.query(
-                    `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_inter_bank_transfer
-                     WHERE from_bank_account_id=$1 AND status='Posted'
-                       AND transfer_date>=$2 AND transfer_date<=$3`,
-                    [acc.id, date_from, date_to]);
-                transferIn  = parseFloat(rIn.rows[0].amt);
-                transferOut = parseFloat(rOut.rows[0].amt);
+                transferOut = parseFloat(r.rows[0].transfer);
             }
 
             // Period FX adjustments

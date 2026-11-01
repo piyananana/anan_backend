@@ -1,4 +1,5 @@
 // controllers/cm/cmPreCloseCheckController.js
+const { bankBalanceLc } = require('../../utils/cmBankBalance');
 const { ymd } = require('../../utils/dateUtil');
 'use strict';
 
@@ -9,61 +10,8 @@ const tableExists = async (client, name) => {
 };
 
 // CM balance for a bank account as of a date (mirrors cmBankGlReconcileController's getCmBalance)
-const getCmBalance = async (client, bankAccountId, asOfDate, flags) => {
-    let balance = 0;
-    let fromDate = null;
-
-    if (flags.hasOpeningBalance) {
-        const ob = await client.query(
-            `SELECT opening_balance, as_of_date FROM cm_bank_opening_balance
-             WHERE bank_account_id=$1 AND as_of_date<=$2
-             ORDER BY as_of_date DESC LIMIT 1`,
-            [bankAccountId, asOfDate]);
-        if (ob.rows.length > 0) {
-            balance  = parseFloat(ob.rows[0].opening_balance);
-            fromDate = ymd(ob.rows[0].as_of_date);
-        }
-    }
-
-    if (flags.hasReceipt) {
-        const dateSql = fromDate ? `AND receipt_date > $2 AND receipt_date <= $3` : `AND receipt_date <= $2`;
-        const params = fromDate ? [bankAccountId, fromDate, asOfDate] : [bankAccountId, asOfDate];
-        const r = await client.query(
-            `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_receipt
-             WHERE bank_account_id=$1 AND status!='Voided' ${dateSql}`, params);
-        balance += parseFloat(r.rows[0].amt);
-    }
-    if (flags.hasPayment) {
-        const dateSql = fromDate ? `AND payment_date > $2 AND payment_date <= $3` : `AND payment_date <= $2`;
-        const params = fromDate ? [bankAccountId, fromDate, asOfDate] : [bankAccountId, asOfDate];
-        const r = await client.query(
-            `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_payment
-             WHERE bank_account_id=$1 AND status!='Voided' ${dateSql}`, params);
-        balance -= parseFloat(r.rows[0].amt);
-    }
-    if (flags.hasTransfer) {
-        const dateSql = fromDate ? `AND transfer_date > $2 AND transfer_date <= $3` : `AND transfer_date <= $2`;
-        const params = fromDate ? [bankAccountId, fromDate, asOfDate] : [bankAccountId, asOfDate];
-        const rIn  = await client.query(
-            `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_inter_bank_transfer
-             WHERE to_bank_account_id=$1 AND status='Posted' ${dateSql}`, params);
-        const rOut = await client.query(
-            `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_inter_bank_transfer
-             WHERE from_bank_account_id=$1 AND status='Posted' ${dateSql}`, params);
-        balance += parseFloat(rIn.rows[0].amt) - parseFloat(rOut.rows[0].amt);
-    }
-    if (flags.hasFxReval) {
-        const dateSql = fromDate ? `AND rv.revaluation_date > $2 AND rv.revaluation_date <= $3` : `AND rv.revaluation_date <= $2`;
-        const params = fromDate ? [bankAccountId, fromDate, asOfDate] : [bankAccountId, asOfDate];
-        const r = await client.query(`
-            SELECT COALESCE(SUM(rl.fx_gain_loss),0) AS adj
-            FROM cm_bank_fx_revaluation_line rl
-            JOIN cm_bank_fx_revaluation rv ON rv.id = rl.revaluation_id
-            WHERE rl.bank_account_id=$1 AND rv.status='Posted' ${dateSql}`, params);
-        balance += parseFloat(r.rows[0].adj);
-    }
-    return Math.round(balance * 100) / 100;
-};
+// ยอดธนาคารฝั่ง CM — utils/cmBankBalance.js
+const getCmBalance = (client, bankAccountId, asOfDate) => bankBalanceLc(client, bankAccountId, asOfDate);
 
 const runChecks = async (req, res) => {
     const { period_date } = req.query;
@@ -77,8 +25,7 @@ const runChecks = async (req, res) => {
         const hasReceipt  = await tableExists(client, 'cm_receipt');
         const hasPayment  = await tableExists(client, 'cm_payment');
         const hasFxReval  = await tableExists(client, 'cm_bank_fx_revaluation');
-        const hasPCV      = await tableExists(client, 'cm_petty_cash_voucher');
-        const hasTransfer = await tableExists(client, 'cm_inter_bank_transfer');
+        const hasCmTx     = await tableExists(client, 'cm_transaction');
         const hasBB             = await tableExists(client, 'gl_beginning_balance');
         const hasOpeningBalance = await tableExists(client, 'cm_bank_opening_balance');
 
@@ -173,43 +120,27 @@ const runChecks = async (req, res) => {
                 title: 'FX Revaluation ที่ยังไม่ได้ Post GL', title_en: 'FX Revaluations not yet posted to GL' });
         }
 
-        // 6. Approved petty cash vouchers not replenished
-        if (hasPCV) {
-            const cntRes = await client.query(
-                `SELECT COUNT(*) AS cnt FROM cm_petty_cash_voucher WHERE status='Approved' AND voucher_date<=$1`,
-                [period_date]);
-            const cnt = parseInt(cntRes.rows[0].cnt);
-            let docs = [];
-            if (cnt > 0) {
-                const r = await client.query(
-                    `SELECT voucher_no FROM cm_petty_cash_voucher WHERE status='Approved' AND voucher_date<=$1
-                     ORDER BY voucher_date LIMIT 5`, [period_date]);
-                docs = r.rows.map(x => ({ doc_no: x.voucher_no }));
-            }
-            checks.push({ check_key: 'PENDING_PETTY_CASH', severity: 'INFO', count: cnt, docs,
-                title: 'ใบสำคัญเงินสดย่อยที่ยังไม่เบิก', title_en: 'Approved petty cash vouchers not yet replenished' });
+        // 6. ใบเบิกเงินสดย่อย (CM 40) ที่ยังเติมเงินไม่ครบ
+        if (hasCmTx) {
+            const r = await client.query(`
+                SELECT t.doc_no FROM cm_transaction t JOIN sa_module_document d ON d.id = t.doc_id
+                 WHERE d.sys_doc_type = '40' AND t.status = 'Posted' AND t.balance_amount_lc > 0.005 AND t.doc_date <= $1 ORDER BY t.doc_date, t.id`, [period_date]);
+            checks.push({ check_key: 'PENDING_PETTY_CASH', severity: 'INFO', count: r.rows.length,
+                docs: r.rows.slice(0, 5).map(x => ({ doc_no: x.doc_no })),
+                title: 'ใบเบิกเงินสดย่อยที่ยังไม่ได้เติมเงิน', title_en: 'Petty cash vouchers not yet replenished' });
         }
 
-        // 7. Draft inter-bank transfers
-        if (hasTransfer) {
-            const cntRes = await client.query(
-                `SELECT COUNT(*) AS cnt FROM cm_inter_bank_transfer WHERE status='Draft' AND transfer_date<=$1`,
-                [period_date]);
-            const cnt = parseInt(cntRes.rows[0].cnt);
-            let docs = [];
-            if (cnt > 0) {
-                const r = await client.query(
-                    `SELECT transfer_no FROM cm_inter_bank_transfer WHERE status='Draft' AND transfer_date<=$1
-                     ORDER BY transfer_date LIMIT 5`, [period_date]);
-                docs = r.rows.map(x => ({ doc_no: x.transfer_no }));
-            }
-            checks.push({ check_key: 'DRAFT_TRANSFERS', severity: 'ERROR', count: cnt, docs,
-                title: 'Inter-bank Transfer ที่ยังไม่ได้ Post GL', title_en: 'Inter-bank Transfers not yet posted to GL' });
+        // 7. เอกสาร CM ที่ยังเป็นร่าง (ยังไม่ลงบัญชี)
+        if (hasCmTx) {
+            const r = await client.query(`
+                SELECT t.doc_no FROM cm_transaction t WHERE t.status = 'Draft' AND t.doc_date <= $1 ORDER BY t.doc_date, t.id`, [period_date]);
+            checks.push({ check_key: 'DRAFT_CM_TRANSACTIONS', severity: 'ERROR', count: r.rows.length,
+                docs: r.rows.slice(0, 5).map(x => ({ doc_no: x.doc_no })),
+                title: 'ธุรกรรม CM ที่ยังไม่ได้ Post', title_en: 'CM transactions not yet posted' });
         }
 
         // 8. CM vs GL reconciliation (bank accounts with a GL account configured)
         {
-            const flags = { hasReceipt, hasPayment, hasTransfer, hasFxReval, hasBB, hasOpeningBalance };
             const accsRes = await client.query(`
                 SELECT ba.id, ba.account_code, ba.gl_account_id
                 FROM cm_bank_account ba
@@ -219,7 +150,7 @@ const runChecks = async (req, res) => {
             let mismatchCount = 0;
             const mismatchDocs = [];
             for (const acc of accsRes.rows) {
-                const cmBalance = await getCmBalance(client, acc.id, period_date, flags);
+                const cmBalance = await getCmBalance(client, acc.id, period_date);
 
                 let glBalance = 0;
                 if (hasBB) {

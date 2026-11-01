@@ -1,4 +1,5 @@
 // controllers/cm/cmYearEndController.js
+const { bankBalanceLc } = require('../../utils/cmBankBalance');
 'use strict';
 
 const tableExists = async (client, name) => {
@@ -40,8 +41,7 @@ const checkReadiness = async (req, res) => {
         const hasReceipt  = await tableExists(client, 'cm_receipt');
         const hasPayment  = await tableExists(client, 'cm_payment');
         const hasFxReval  = await tableExists(client, 'cm_bank_fx_revaluation');
-        const hasTransfer = await tableExists(client, 'cm_inter_bank_transfer');
-        const hasPCV      = await tableExists(client, 'cm_petty_cash_voucher');
+        const hasCmTx     = await tableExists(client, 'cm_transaction');
 
         if (hasStmt) {
             let r = await client.query(
@@ -79,19 +79,14 @@ const checkReadiness = async (req, res) => {
             if (parseInt(r.rows[0].cnt) > 0)
                 issues.push({ severity: 'ERROR', title: 'FX Revaluation ยังไม่ Post GL', count: parseInt(r.rows[0].cnt) });
         }
-        if (hasTransfer) {
-            const r = await client.query(
-                `SELECT COUNT(*) AS cnt FROM cm_inter_bank_transfer WHERE status='Draft' AND transfer_date BETWEEN $1 AND $2`,
-                [yearStart, yearEnd]);
+        if (hasCmTx) {
+            let r = await client.query(`SELECT COUNT(*) AS cnt FROM cm_transaction t WHERE t.status = 'Draft' AND t.doc_date BETWEEN $1 AND $2`, [yearStart, yearEnd]);
             if (parseInt(r.rows[0].cnt) > 0)
-                issues.push({ severity: 'ERROR', title: 'Inter-bank Transfer ยังไม่ Post GL', count: parseInt(r.rows[0].cnt) });
-        }
-        if (hasPCV) {
-            const r = await client.query(
-                `SELECT COUNT(*) AS cnt FROM cm_petty_cash_voucher WHERE status='Approved' AND voucher_date BETWEEN $1 AND $2`,
-                [yearStart, yearEnd]);
+                issues.push({ severity: 'ERROR', title: 'ธุรกรรม CM ยังไม่ Post', count: parseInt(r.rows[0].cnt) });
+            r = await client.query(`SELECT COUNT(*) AS cnt FROM cm_transaction t JOIN sa_module_document d ON d.id = t.doc_id
+                 WHERE d.sys_doc_type = '40' AND t.status = 'Posted' AND t.balance_amount_lc > 0.005 AND t.doc_date BETWEEN $1 AND $2`, [yearStart, yearEnd]);
             if (parseInt(r.rows[0].cnt) > 0)
-                issues.push({ severity: 'INFO', title: 'ใบสำคัญเงินสดย่อยรอเบิก', count: parseInt(r.rows[0].cnt) });
+                issues.push({ severity: 'INFO', title: 'ใบเบิกเงินสดย่อยรอเติมเงิน', count: parseInt(r.rows[0].cnt) });
         }
 
         // Check if already closed
@@ -150,36 +145,9 @@ const closeYear = async (req, res) => {
             LEFT JOIN cd_bank cb ON cb.id = ba.bank_id
             WHERE ba.cm_type='BANK' AND ba.is_active=TRUE ORDER BY ba.account_code`);
 
-        const hasReceipt  = await tableExists(client, 'cm_receipt');
-        const hasPayment  = await tableExists(client, 'cm_payment');
-        const hasTransfer = await tableExists(client, 'cm_inter_bank_transfer');
-        const hasFxReval  = await tableExists(client, 'cm_bank_fx_revaluation');
-
         const bankSnapshots = [];
         for (const acc of accsRes.rows) {
-            let balance = 0;
-            if (hasReceipt) {
-                const r = await client.query(`SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_receipt WHERE bank_account_id=$1 AND status!='Voided' AND receipt_date<=$2`, [acc.id, yearEnd]);
-                balance += parseFloat(r.rows[0].amt);
-            }
-            if (hasPayment) {
-                const r = await client.query(`SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_payment WHERE bank_account_id=$1 AND status!='Voided' AND payment_date<=$2`, [acc.id, yearEnd]);
-                balance -= parseFloat(r.rows[0].amt);
-            }
-            if (hasTransfer) {
-                const rIn  = await client.query(`SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_inter_bank_transfer WHERE to_bank_account_id=$1   AND status='Posted' AND transfer_date<=$2`, [acc.id, yearEnd]);
-                const rOut = await client.query(`SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_inter_bank_transfer WHERE from_bank_account_id=$1 AND status='Posted' AND transfer_date<=$2`, [acc.id, yearEnd]);
-                balance += parseFloat(rIn.rows[0].amt) - parseFloat(rOut.rows[0].amt);
-            }
-            if (hasFxReval) {
-                const r = await client.query(`
-                    SELECT COALESCE(SUM(rl.fx_gain_loss),0) AS adj
-                    FROM cm_bank_fx_revaluation_line rl
-                    JOIN cm_bank_fx_revaluation rv ON rv.id=rl.revaluation_id
-                    WHERE rl.bank_account_id=$1 AND rv.status='Posted' AND rv.revaluation_date<=$2`,
-                    [acc.id, yearEnd]);
-                balance += parseFloat(r.rows[0].adj);
-            }
+            const balance = await bankBalanceLc(client, acc.id, yearEnd);
             bankSnapshots.push({
                 bank_account_id: acc.id, bank_account_code: acc.account_code,
                 bank_account_name: acc.account_name_th, currency_code: acc.currency_code,

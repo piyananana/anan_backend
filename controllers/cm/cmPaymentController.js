@@ -77,7 +77,7 @@ const getUnclearBlock = (p) => {
 const getVoidBlock = (p) => {
     if (p.status !== 'Pending') return { code: 'NOT_PENDING' };
     if (p.is_reconciled === true) return { code: 'RECONCILED' };
-    if (p.ap_transaction_id || p.gl_entry_id) return { code: 'SOURCE_DOC', ref: p.ap_doc_no };
+    if (p.ap_transaction_id || p.ar_transaction_id || p.cm_transaction_id || p.gl_entry_id) return { code: 'SOURCE_DOC', ref: p.ap_doc_no };
     return null;
 };
 
@@ -86,7 +86,7 @@ const BLOCK_MESSAGES = {
     NOT_PENDING:   'ยกเลิกได้เฉพาะรายการที่รอเคลียร์',
     RECONCILED:    'รายการนี้กระทบยอดกับ Bank Statement แล้ว กรุณายกเลิกการกระทบยอดก่อน',
     PERIOD_CLOSED: 'งวด CM ของวันที่เคลียร์ปิดแล้ว',
-    SOURCE_DOC:    'รายการนี้มาจากเอกสาร AP กรุณายกเลิกที่เอกสารต้นทาง',
+    SOURCE_DOC:    'รายการนี้มาจากเอกสาร AR/AP/CM กรุณายกเลิกที่เอกสารต้นทาง',
 };
 const blockMessage = (b) => BLOCK_MESSAGES[b.code] + (b.ref ? ` (${b.ref})` : '');
 const blockError = (res, b) => res.status(400).json({ error: blockMessage(b), code: b.code, ref: b.ref || null });

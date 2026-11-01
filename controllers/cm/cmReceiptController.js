@@ -71,7 +71,7 @@ const getUnclearBlock = (r) => {
 const getVoidBlock = (r) => {
     if (r.status !== 'Pending') return { code: 'NOT_PENDING' };
     if (r.is_reconciled === true) return { code: 'RECONCILED' };
-    if (r.ar_transaction_id || r.gl_entry_id) return { code: 'SOURCE_DOC', ref: r.ar_doc_no };
+    if (r.ar_transaction_id || r.ap_transaction_id || r.cm_transaction_id || r.gl_entry_id) return { code: 'SOURCE_DOC', ref: r.ar_doc_no };
     return null;
 };
 
@@ -79,6 +79,8 @@ const getBounceBlock = async (db, r) => {
     if (r.status !== 'Pending') return { code: 'NOT_PENDING' };
     if (r.payment_method_type !== 'CHECK') return { code: 'NOT_CHECK' };
     if (r.is_reconciled === true) return { code: 'RECONCILED' };
+    // เช็คคืนยกเลิกเอกสารต้นทางให้อัตโนมัติเฉพาะเอกสาร AR — รายการจาก AP (รับคืนมัดจำ) / CM ให้ยกเลิกที่เอกสารต้นทาง
+    if (r.ap_transaction_id || r.cm_transaction_id) return { code: 'SOURCE_DOC', ref: r.ar_doc_no };
     if (r.ar_transaction_id && r.source_status === 'Posted') {
         const b = await getArVoidBlockById(db, r.ar_transaction_id);
         if (b) return { code: 'AR_BLOCKED', ref: r.ar_doc_no, message: b.message };
@@ -92,7 +94,7 @@ const BLOCK_MESSAGES = {
     NOT_CHECK:     'บันทึกเช็คคืนได้เฉพาะรายการรับเป็นเช็ค',
     RECONCILED:    'รายการนี้กระทบยอดกับ Bank Statement แล้ว กรุณายกเลิกการกระทบยอดก่อน',
     PERIOD_CLOSED: 'งวด CM ของวันที่เคลียร์ปิดแล้ว',
-    SOURCE_DOC:    'รายการนี้มาจากใบเสร็จ AR กรุณายกเลิกที่ใบเสร็จ',
+    SOURCE_DOC:    'รายการนี้มาจากเอกสาร AR/AP/CM กรุณายกเลิกที่เอกสารต้นทาง',
     AR_BLOCKED:    'ยกเลิกใบเสร็จ AR ต้นทางไม่ได้',
 };
 const blockMessage = (b) => BLOCK_MESSAGES[b.code] + (b.ref ? ` (${b.ref})` : '') + (b.message ? `: ${b.message}` : '');

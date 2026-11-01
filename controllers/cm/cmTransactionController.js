@@ -12,6 +12,7 @@ const { today: todayYmd } = require('../../utils/dateUtil');
 const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { checkCmPeriodOpen } = require('./cmPeriodCheckHelper');
+const { syncCmBankItems, voidBankItems, deleteBankItems, bankItemsClearedSql, ensureBankItemColumns } = require('../../utils/cmBankItems');
 
 const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 
@@ -43,6 +44,18 @@ const normalizeAmounts = async (client, header, details, applies, payments) => {
     }
     if (sys === '40') spread(details, 'amount_fc', 'amount_lc');
     if (sys === '30') spread(applies, 'applied_amount_fc', 'applied_amount_lc');
+    // บัญชีธนาคาร/กองเงินสดย่อยที่ใช้ต้องเป็นสกุลเงินเดียวกับเอกสาร (ยอดเงินตราต่างประเทศของรายการธนาคารคือยอดของเอกสาร)
+    const bankIds = [header.bank_account_id, header.from_bank_account_id, header.to_bank_account_id,
+        ...(payments || []).map(x => x.cm_bank_account_id)].map(Number).filter(Boolean);
+    if (bankIds.length) {
+        const docCcy = header.currency_code || await getBaseCurrencyCode(client);
+        const bad = (await client.query(`
+            SELECT account_code, currency_code FROM cm_bank_account
+             WHERE id = ANY($1::int[]) AND COALESCE(NULLIF(currency_code, ''), $2) <> $2`, [bankIds, docCcy])).rows;
+        if (bad.length) {
+            throw new Error(`บัญชีธนาคาร ${bad.map(b => `${b.account_code} (${b.currency_code})`).join(', ')} ไม่ใช่สกุลเงินเดียวกับเอกสาร (${docCcy})`);
+        }
+    }
     return sys;
 };
 
@@ -477,7 +490,8 @@ const CM_REVERSE_INFO_SQL = `
            (SELECT string_agg(DISTINCT s.doc_no, ', ')
               FROM cm_transaction_apply a JOIN cm_transaction s ON s.id = a.transaction_id
              WHERE a.applied_to_id = t.id AND a.transaction_id <> t.id
-               AND s.status NOT IN ('Void', 'Deleted')) AS applied_by
+               AND s.status NOT IN ('Void', 'Deleted')) AS applied_by,
+           ${bankItemsClearedSql('CM', 't')} AS cm_cleared
       FROM cm_transaction t
       JOIN sa_module_document d ON d.id = t.doc_id
       LEFT JOIN gl_posting_period p  ON p.id = t.period_id
@@ -485,11 +499,14 @@ const CM_REVERSE_INFO_SQL = `
       LEFT JOIN gl_posting_period gp ON gp.id = g.period_id
      WHERE t.id = $1`;
 
+const queryCmReverseInfo = async (db, id) => { await ensureBankItemColumns(db); return db.query(CM_REVERSE_INFO_SQL, [id]); };
+
 // ถอยเป็นร่าง (Posted → Draft): งวด CM ของเอกสารและงวด GL ของรายการบัญชียังเปิด และไม่มีใบเติมเงินอ้างอิง
 const getCmReverseBlock = (r) => {
     if (r.status !== 'Posted') return { code: 'NOT_REVERSIBLE' };
     if (r.cm_status !== 'OPEN' || (r.gl_period_status && r.gl_period_status !== 'OPEN')) return { code: 'PERIOD_CLOSED' };
     if (r.applied_by) return { code: 'APPLIED', ref: r.applied_by };
+    if (r.cm_cleared) return { code: 'CM_CLEARED', ref: r.cm_cleared };
     return null;
 };
 
@@ -497,6 +514,7 @@ const getCmReverseBlock = (r) => {
 const getCmVoidBlock = (r) => {
     if (r.status !== 'Posted') return { code: 'NOT_POSTED' };
     if (r.applied_by) return { code: 'APPLIED', ref: r.applied_by };
+    if (r.cm_cleared) return { code: 'CM_CLEARED', ref: r.cm_cleared };
     return null;
 };
 
@@ -505,6 +523,7 @@ const CM_BLOCK_MESSAGES = {
     NOT_POSTED:     'ยกเลิกได้เฉพาะเอกสารที่โพสต์แล้ว (เอกสารร่างให้ลบแทน)',
     PERIOD_CLOSED:  'งวดบัญชีของเอกสารนี้ปิดแล้ว ถอยเป็นร่างไม่ได้',
     APPLIED:        'ใบเบิกนี้ถูกนำไปเติมเงินสดย่อยแล้ว',
+    CM_CLEARED:     'รายการรับ/จ่ายเงินผ่านธนาคารของเอกสารนี้เคลียร์/กระทบยอดแล้ว',
 };
 const cmBlockMessage = (b) => CM_BLOCK_MESSAGES[b.code] + (b.ref ? ` (${b.ref})` : '');
 
@@ -549,7 +568,7 @@ const fetchRowById = async (pool, id) => {
             .catch(() => ({ rows: [] })),
     ]);
     if (hRes.rows.length === 0) return null;
-    const info = (await pool.query(CM_REVERSE_INFO_SQL, [id])).rows[0];
+    const info = (await queryCmReverseInfo(pool, id)).rows[0];
     const rBlock = info ? getCmReverseBlock(info) : null;
     const vBlock = info ? getCmVoidBlock(info) : null;
     return {
@@ -792,6 +811,7 @@ const createTransaction = async (req, res) => {
             if (glEntryId) {
                 await client.query(`UPDATE cm_transaction SET gl_entry_id=$1 WHERE id=$2`, [glEntryId, newHeaderId]);
             }
+            await syncCmBankItems(client, newHeaderId, glEntryId);
         }
 
         await client.query('COMMIT');
@@ -901,6 +921,7 @@ const updateTransaction = async (req, res) => {
                 `UPDATE cm_transaction SET status='Posted', gl_entry_id=$1 WHERE id=$2`,
                 [glEntryId, id]
             );
+            await syncCmBankItems(client, id, glEntryId);
         }
 
         await client.query('COMMIT');
@@ -932,7 +953,7 @@ const voidTransaction = async (req, res) => {
         const lock = await client.query(`SELECT * FROM cm_transaction WHERE id=$1 FOR UPDATE`, [id]);
         if (lock.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
         const tx = lock.rows[0];
-        const info = (await client.query(CM_REVERSE_INFO_SQL, [id])).rows[0];
+        const info = (await queryCmReverseInfo(client, id)).rows[0];
         const block = getCmVoidBlock(info);
         if (block) {
             await client.query('ROLLBACK');
@@ -987,6 +1008,7 @@ const voidTransaction = async (req, res) => {
              WHERE id=$4`, [voidReason, userName, reversingGlId, id]);
         // คำนวณหลังเปลี่ยนสถานะ จึงไม่นับใบเติมเงินนี้แล้ว
         await recalcVoucherBalances(client, await appliedVoucherIds(client, id));
+        await voidBankItems(client, 'CM', id);
         await logReverse(client, {
             sysModule: '81', tableName: 'cm_transaction', recordId: Number(id),
             docNo: tx.doc_no, fromStatus: 'Posted', toStatus: 'Void', reason: voidReason, userId,
@@ -1020,7 +1042,7 @@ const reverseTransaction = async (req, res) => {
         await client.query('BEGIN');
         const lock = await client.query(`SELECT id FROM cm_transaction WHERE id=$1 FOR UPDATE`, [id]);
         if (lock.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Not found' }); }
-        const info = (await client.query(CM_REVERSE_INFO_SQL, [id])).rows[0];
+        const info = (await queryCmReverseInfo(client, id)).rows[0];
         const block = getCmReverseBlock(info);
         if (block) {
             await client.query('ROLLBACK');
@@ -1032,6 +1054,7 @@ const reverseTransaction = async (req, res) => {
             await client.query(`UPDATE cm_transaction SET gl_entry_id=NULL WHERE id=$1`, [id]);
             await client.query(`DELETE FROM gl_entry_header WHERE id=$1`, [info.gl_entry_id]);
         }
+        await deleteBankItems(client, 'CM', id);
         await client.query(`
             UPDATE cm_transaction SET status='Draft', gl_entry_id=NULL, updated_at=NOW(), updated_by=$1 WHERE id=$2`,
             [userName, id]);

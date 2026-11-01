@@ -1,4 +1,5 @@
 // controllers/cm/cmBankGlReconcileController.js
+const { bankBalanceLc } = require('../../utils/cmBankBalance');
 const { ymd } = require('../../utils/dateUtil');
 'use strict';
 
@@ -9,67 +10,8 @@ const tableExists = async (client, name) => {
 };
 
 // Returns CM-side balance for a bank account as of a date, using opening balance if available
-const getCmBalance = async (client, bankAccountId, asOfDate, flags) => {
-    let balance = 0;
-    let fromDate = null; // null = from beginning
-
-    if (flags.hasOpeningBalance) {
-        const ob = await client.query(
-            `SELECT opening_balance, as_of_date FROM cm_bank_opening_balance
-             WHERE bank_account_id=$1 AND as_of_date<=$2
-             ORDER BY as_of_date DESC LIMIT 1`,
-            [bankAccountId, asOfDate]);
-        if (ob.rows.length > 0) {
-            balance  = parseFloat(ob.rows[0].opening_balance);
-            fromDate = ymd(ob.rows[0].as_of_date);
-        }
-    }
-
-    // ใช้ parameterized query เสมอ — ห้าม interpolate ค่าจาก request (as_of_date) ลง SQL ตรงๆ (SQL injection)
-    if (flags.hasReceipt) {
-        const dateSql = fromDate ? `AND receipt_date > $2 AND receipt_date <= $3` : `AND receipt_date <= $2`;
-        const params = fromDate ? [bankAccountId, fromDate, asOfDate] : [bankAccountId, asOfDate];
-        const r = await client.query(
-            `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_receipt
-             WHERE bank_account_id=$1 AND status!='Voided' ${dateSql}`,
-            params);
-        balance += parseFloat(r.rows[0].amt);
-    }
-    if (flags.hasPayment) {
-        const dateSql = fromDate ? `AND payment_date > $2 AND payment_date <= $3` : `AND payment_date <= $2`;
-        const params = fromDate ? [bankAccountId, fromDate, asOfDate] : [bankAccountId, asOfDate];
-        const r = await client.query(
-            `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_payment
-             WHERE bank_account_id=$1 AND status!='Voided' ${dateSql}`,
-            params);
-        balance -= parseFloat(r.rows[0].amt);
-    }
-    if (flags.hasTransfer) {
-        const dateSql = fromDate ? `AND transfer_date > $2 AND transfer_date <= $3` : `AND transfer_date <= $2`;
-        const params = fromDate ? [bankAccountId, fromDate, asOfDate] : [bankAccountId, asOfDate];
-        const rIn = await client.query(
-            `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_inter_bank_transfer
-             WHERE to_bank_account_id=$1 AND status='Posted' ${dateSql}`,
-            params);
-        const rOut = await client.query(
-            `SELECT COALESCE(SUM(amount_lc),0) AS amt FROM cm_inter_bank_transfer
-             WHERE from_bank_account_id=$1 AND status='Posted' ${dateSql}`,
-            params);
-        balance += parseFloat(rIn.rows[0].amt) - parseFloat(rOut.rows[0].amt);
-    }
-    if (flags.hasFxReval) {
-        const dateSql = fromDate ? `AND rv.revaluation_date > $2 AND rv.revaluation_date <= $3` : `AND rv.revaluation_date <= $2`;
-        const params = fromDate ? [bankAccountId, fromDate, asOfDate] : [bankAccountId, asOfDate];
-        const r = await client.query(`
-            SELECT COALESCE(SUM(rl.fx_gain_loss),0) AS adj
-            FROM cm_bank_fx_revaluation_line rl
-            JOIN cm_bank_fx_revaluation rv ON rv.id = rl.revaluation_id
-            WHERE rl.bank_account_id=$1 AND rv.status='Posted' ${dateSql}`,
-            params);
-        balance += parseFloat(r.rows[0].adj);
-    }
-    return Math.round(balance * 100) / 100;
-};
+// ยอดธนาคารฝั่ง CM — utils/cmBankBalance.js (ยอดยกมา + เงินเข้า − เงินออก + ผลปรับมูลค่า)
+const getCmBalance = (client, bankAccountId, asOfDate) => bankBalanceLc(client, bankAccountId, asOfDate);
 
 const getReport = async (req, res) => {
     const { as_of_date, account_code_from, account_code_to } = req.query;
@@ -80,7 +22,6 @@ const getReport = async (req, res) => {
         const flags = {
             hasReceipt:         await tableExists(client, 'cm_receipt'),
             hasPayment:         await tableExists(client, 'cm_payment'),
-            hasTransfer:        await tableExists(client, 'cm_inter_bank_transfer'),
             hasFxReval:         await tableExists(client, 'cm_bank_fx_revaluation'),
             hasBB:              await tableExists(client, 'gl_beginning_balance'),
             hasOpeningBalance:  await tableExists(client, 'cm_bank_opening_balance'),

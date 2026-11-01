@@ -1,4 +1,5 @@
 // controllers/cm/cmReportController.js — CM Reporting
+const { bankBalanceLc } = require('../../utils/cmBankBalance');
 'use strict';
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -10,21 +11,8 @@ const tableExists = async (client, name) => {
 };
 
 // Calculate opening LC balance for a bank account (all non-voided CM records before dateFrom)
-const getOpeningBalance = async (client, bankAccountId, dateFrom) => {
-    const hasReceipt = await tableExists(client, 'cm_receipt');
-    const hasPayment = await tableExists(client, 'cm_payment');
-    if (!hasReceipt && !hasPayment) return 0;
-
-    const parts = [];
-    if (hasReceipt) parts.push(
-        `SELECT amount_lc FROM cm_receipt WHERE bank_account_id=$1 AND status!='Voided' AND receipt_date < $2::date`);
-    if (hasPayment) parts.push(
-        `SELECT -amount_lc FROM cm_payment WHERE bank_account_id=$1 AND status!='Voided' AND payment_date < $2::date`);
-
-    const r = await client.query(
-        `SELECT COALESCE(SUM(amount_lc),0) AS opening FROM (${parts.join(' UNION ALL ')}) t`, [bankAccountId, dateFrom]);
-    return parseFloat(r.rows[0].opening) || 0;
-};
+// ยอดยกมา (ก่อน dateFrom) — utils/cmBankBalance.js
+const getOpeningBalance = (client, bankAccountId, dateFrom) => bankBalanceLc(client, bankAccountId, dateFrom, { before: true });
 
 // ── Cash Position Report ─────────────────────────────────────────────────────
 // Returns per-bank-account summary: opening + period receipts - period payments = closing
@@ -89,8 +77,11 @@ const getCashPosition = async (req, res) => {
                 periodPayment  = parseFloat(r.rows[0].period)  || 0;
             }
 
-            const opening = openingReceipt - openingPayment;
-            const closing = opening + periodReceipt - periodPayment;
+            // ยอดยกมา/ยอดคงเหลือจากฟังก์ชันกลาง (รวมยอดยกมาที่ตั้งไว้และผลปรับมูลค่าอัตราแลกเปลี่ยน — fx_adj = ส่วนที่ไม่ใช่รับ/จ่าย)
+            void openingReceipt; void openingPayment;
+            const opening = await bankBalanceLc(client, acc.id, date_from, { before: true });
+            const closing = await bankBalanceLc(client, acc.id, date_to);
+            const fxAdj = closing - opening - periodReceipt + periodPayment;
 
             rows.push({
                 bank_account_id:   acc.id,
@@ -103,6 +94,7 @@ const getCashPosition = async (req, res) => {
                 period_receipts:   Math.round(periodReceipt   * 100) / 100,
                 period_payments:   Math.round(periodPayment   * 100) / 100,
                 closing_balance:   Math.round(closing         * 100) / 100,
+                fx_adj:            Math.round(fxAdj           * 100) / 100,
             });
         }
         res.json({ date_from, date_to, rows });
