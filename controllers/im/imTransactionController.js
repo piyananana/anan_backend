@@ -273,6 +273,8 @@ const ensureImTransactionTable = async (client) => {
     await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS discount_percent NUMERIC(7,4) NOT NULL DEFAULT 0`).catch(() => {});
     // เอกสาร AP/AR ที่สร้างอัตโนมัติเก็บตัวเลือกเดียวกัน (คอลัมน์ของ AP/AR เอง — เผื่อยังไม่เคยบันทึกเอกสาร AP/AR หลังเพิ่มคอลัมน์)
     await client.query(`ALTER TABLE ap_transaction ADD COLUMN IF NOT EXISTS price_includes_vat BOOLEAN NOT NULL DEFAULT false`).catch(() => {});
+    await client.query(`ALTER TABLE ap_transaction ADD COLUMN IF NOT EXISTS tax_invoice_no VARCHAR(50)`).catch(() => {});
+    await client.query(`ALTER TABLE ap_transaction ADD COLUMN IF NOT EXISTS tax_invoice_date DATE`).catch(() => {});
     await client.query(`ALTER TABLE ar_transaction ADD COLUMN IF NOT EXISTS price_includes_vat BOOLEAN NOT NULL DEFAULT false`).catch(() => {});
     // เงินมัดจำที่เลือกหักในใบตั้งหนี้/ใบแจ้งหนี้ที่สร้างอัตโนมัติ ('11'/'12' → ใบจ่ายมัดจำ AP, '31'/'32' → ใบรับมัดจำ AR)
     // เก็บไว้ที่เอกสาร IM จนถึงตอนสร้างใบตั้งหนี้ แล้วบันทึกเป็น apply_type 'inv_advance' ของใบนั้น
@@ -1189,6 +1191,8 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
         header.price_includes_vat === true, dueDate,
     ]);
     const apTransactionId = apHeaderRes.rows[0].id;
+    await client.query(`UPDATE ap_transaction SET tax_invoice_no = $1, tax_invoice_date = $2 WHERE id = $3`,
+        [vendorInvoiceNo, billDate, apTransactionId]);
 
     let lineNo = 1;
     for (const l of lineRows) {
@@ -1252,7 +1256,8 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
     const adv = await applyImAdvances(client, {
         module: 'AP', advances, billId: apTransactionId, billTotalFc: grandTotalFc, setup: apSetup, vatAccountId, createdBy: header.created_by,
         billHeader: { doc_id: apDocId, doc_no: apDocNo, doc_date: billDate, currency_id: docCurrencyId, currency_code: docCurrencyCode,
-            exchange_rate: docExchangeRate, vendor_id: header.vendor_id, vendor_name_th: vendorNameTh, vendor_tax_id: vendorTaxId, created_by: createdByUserId },
+            exchange_rate: docExchangeRate, vendor_id: header.vendor_id, vendor_name_th: vendorNameTh, vendor_tax_id: vendorTaxId, created_by: createdByUserId,
+            tax_invoice_no: vendorInvoiceNo, tax_invoice_date: billDate },
     });
     if (adv) {
         const apLine = apGlDetails.find(l => l.account_id === apAccountId && l.credit_lc > 0);

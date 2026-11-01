@@ -230,6 +230,48 @@ const totalsFields = (t, currency, base, lc) => ({
   amount_text_lc_en: englishAmountText(lc.total, base),
 });
 
+// เงินมัดจำที่หักในใบกำกับ (AR ใบแจ้งหนี้: ar_transaction_apply 'inv_advance', IM ใบส่งสินค้า: im_transaction_advance)
+// ตามแนวปฏิบัติใบกำกับภาษีหักมัดจำ: มูลค่าก่อนภาษีลดลงด้วยส่วนก่อน VAT ของมัดจำ และ VAT ลดลงด้วย VAT ของมัดจำ
+// (ออกใบกำกับไปแล้วตอนรับมัดจำ) แยกส่วนตามสัดส่วน VAT ของใบมัดจำ — สกุลเงินหลักคิดที่อัตราของใบมัดจำ ตรงกับรายงานภาษีขาย
+// ไม่มีมัดจำ = ยอดหลังหักมัดจำเท่ากับยอดเดิม จึงวางฟิลด์ "หลังหักมัดจำ" ในแบบฟอร์มได้เสมอ
+const loadDeposits = async (db, sql, ids) => {
+  if (!ids.length) return new Map();
+  const rows = await db.query(sql, [ids]).then(r => r.rows).catch(e => { if (e.code === '42P01') return []; throw e; });
+  const m = new Map();
+  for (const r of rows) {
+    if (!m.has(r.hid)) m.set(r.hid, []);
+    m.get(r.hid).push(r);
+  }
+  return m;
+};
+const DEPOSIT_COLS = `dep.doc_no, ${ymdSql('dep.doc_date')} AS doc_date, dep.exchange_rate::float AS rate,
+       dep.vat_amount_lc::float AS vat_lc, dep.total_amount_lc::float AS total_lc`;
+const depositFields = (deps, t, lc, currency, base) => {
+  let fc = 0, vatFc = 0, legLc = 0, vatLc = 0;
+  for (const d of deps || []) {
+    const amt = num(d.fc);
+    const ratio = num(d.total_lc) ? num(d.vat_lc) / num(d.total_lc) : 0;
+    const leg = round2(amt * (num(d.rate) || 1));
+    fc += amt; vatFc += round2(amt * ratio); legLc += leg; vatLc += round2(leg * ratio);
+  }
+  const netFc = round2(fc - vatFc), netLc = round2(legLc - vatLc);
+  const beforeVat = round2(t.beforeVat - netFc), vat = round2(t.vat - vatFc);
+  const beforeVatLc = round2(lc.beforeVat - netLc), vatLcAfter = round2(lc.vat - vatLc);
+  const total = round2(beforeVat + vat), totalLc = round2(beforeVatLc + vatLcAfter);
+  const sorted = [...(deps || [])].sort((a, b) => s(a.doc_date).localeCompare(s(b.doc_date)));
+  return {
+    deposit_doc_nos: sorted.map(d => s(d.doc_no)).join(', '),
+    deposit_doc_date: sorted.length ? sorted[sorted.length - 1].doc_date : '',
+    deposit_amount: netFc, deposit_vat_amount: round2(vatFc), deposit_total: round2(fc),
+    before_vat_after_deposit: beforeVat, vat_after_deposit: vat, total_after_deposit: total,
+    amount_text_after_deposit: amountWords(total, currency),
+    amount_text_after_deposit_en: englishAmountText(total, currency),
+    deposit_amount_lc: netLc, deposit_vat_amount_lc: round2(vatLc),
+    before_vat_after_deposit_lc: beforeVatLc, vat_after_deposit_lc: vatLcAfter, total_after_deposit_lc: totalLc,
+    amount_text_after_deposit_lc: amountWords(totalLc, base),
+  };
+};
+
 // อัตรา VAT ที่พิมพ์หัวเอกสาร — อัตราสูงสุดของรายการที่มี VAT (ปกติทุกรายการอัตราเดียวกัน)
 const headerVatRate = (lines) => lines.reduce((m, l) => Math.max(m, l.vat_amount ? num(l.vat_rate) : 0), 0);
 
@@ -315,6 +357,22 @@ const SALES_INVOICE = {
     f('amount_text_lc', 'จำนวนเงินตัวอักษร (สกุลเงินหลัก)', 'Amount in words (base currency)', 'total'),
     f('amount_text_lc_en', 'จำนวนเงินตัวอักษร (สกุลเงินหลัก อังกฤษ)', 'Amount in words (base currency, EN)', 'total'),
     f('line_count', 'จำนวนรายการ', 'Line count', 'total', 'number'),
+    f('deposit_doc_nos', 'เลขที่ใบรับเงินมัดจำที่หัก', 'Deducted deposit receipt no.', 'deposit'),
+    f('deposit_doc_date', 'วันที่ใบรับเงินมัดจำที่หัก (ใบล่าสุด)', 'Deducted deposit receipt date (latest)', 'deposit', 'date'),
+    f('deposit_amount', 'หักเงินมัดจำ (ก่อนภาษี)', 'Less deposit (before VAT)', 'deposit', 'money'),
+    f('deposit_vat_amount', 'ภาษีของเงินมัดจำที่หัก', 'VAT of deducted deposit', 'deposit', 'money'),
+    f('deposit_total', 'หักเงินมัดจำ (รวมภาษี)', 'Less deposit (incl. VAT)', 'deposit', 'money'),
+    f('before_vat_after_deposit', 'มูลค่าก่อนภาษีหลังหักมัดจำ', 'Amount before VAT after deposit', 'deposit', 'money'),
+    f('vat_after_deposit', 'ภาษีมูลค่าเพิ่มหลังหักมัดจำ', 'VAT after deposit', 'deposit', 'money'),
+    f('total_after_deposit', 'จำนวนเงินรวมทั้งสิ้นหลังหักมัดจำ', 'Grand total after deposit', 'deposit', 'money'),
+    f('amount_text_after_deposit', 'จำนวนเงินตัวอักษรหลังหักมัดจำ', 'Amount in words after deposit (Thai)', 'deposit'),
+    f('amount_text_after_deposit_en', 'จำนวนเงินตัวอักษรหลังหักมัดจำ (อังกฤษ)', 'Amount in words after deposit (EN)', 'deposit'),
+    f('deposit_amount_lc', 'หักเงินมัดจำก่อนภาษี (สกุลเงินหลัก)', 'Less deposit before VAT (base currency)', 'deposit', 'money'),
+    f('deposit_vat_amount_lc', 'ภาษีของเงินมัดจำ (สกุลเงินหลัก)', 'VAT of deposit (base currency)', 'deposit', 'money'),
+    f('before_vat_after_deposit_lc', 'มูลค่าก่อนภาษีหลังหักมัดจำ (สกุลเงินหลัก)', 'Amount before VAT after deposit (base currency)', 'deposit', 'money'),
+    f('vat_after_deposit_lc', 'ภาษีหลังหักมัดจำ (สกุลเงินหลัก)', 'VAT after deposit (base currency)', 'deposit', 'money'),
+    f('total_after_deposit_lc', 'รวมทั้งสิ้นหลังหักมัดจำ (สกุลเงินหลัก)', 'Grand total after deposit (base currency)', 'deposit', 'money'),
+    f('amount_text_after_deposit_lc', 'จำนวนเงินตัวอักษรหลังหักมัดจำ (สกุลเงินหลัก)', 'Amount in words after deposit (base currency)', 'deposit'),
     ...PRINT_FIELDS,
     f('line_no', 'ลำดับ', 'No.', 'line', 'number', 'L'),
     f('item_code', 'รหัสสินค้า', 'Item code', 'line', 'text', 'L'),
@@ -465,6 +523,14 @@ const SALES_INVOICE = {
     const curOf = (h) => s(h.currency_code) || base;
     const currencies = await loadCurrencies(db, [...imHeads, ...arHeads].map(curOf));
     const imSp = await loadSalespersonNames(db, 'im_transaction_salesperson', imIds);
+    const imDeps = await loadDeposits(db, `
+        SELECT a.header_id AS hid, a.applied_amount_fc::float AS fc, ${DEPOSIT_COLS}
+          FROM im_transaction_advance a JOIN ar_transaction dep ON dep.id = a.advance_id
+         WHERE a.header_id = ANY($1::int[]) AND COALESCE(a.applied_amount_fc, 0) <> 0`, imIds);
+    const arDeps = await loadDeposits(db, `
+        SELECT a.transaction_id AS hid, a.applied_amount_fc::float AS fc, ${DEPOSIT_COLS}
+          FROM ar_transaction_apply a JOIN ar_transaction dep ON dep.id = a.applied_to_id
+         WHERE a.transaction_id = ANY($1::int[]) AND a.apply_type = 'inv_advance'`, arIds);
     const arSp = await loadSalespersonNames(db, 'ar_transaction_salesperson', arIds);
 
     const imLines = imIds.length ? (await db.query(`
@@ -548,6 +614,11 @@ const SALES_INVOICE = {
       const vatLc = lines.reduce((a, l) => a + l.vat_amount_lc, 0);
       const sp = imSp.get(h.id) || {};
       const days = h.credit_term_days || 0;
+      const imT = {
+        subtotal: gross, discount: gross - sub, beforeVat: sub, vat, total: sub + vat, vatRate: headerVatRate(lines),
+        qty: lines.reduce((a, l) => a + l.qty, 0),
+      };
+      const imLc = { subtotal: round2(gross * rate), discount: round2(gross * rate) - subLc, beforeVat: subLc, vat: vatLc, total: subLc + vatLc };
       out.set(`IM:${h.id}`, {
         header: {
           ...(branches.get(h.branch_id) || branches.get(0)),
@@ -565,12 +636,8 @@ const SALES_INVOICE = {
           warehouse_name: s(h.warehouse_name_th), warehouse_name_en: s(h.warehouse_name_en) || s(h.warehouse_name_th),
           ...currencyFields(currencies, curOf(h)), currency_code: curOf(h), exchange_rate: rate,
           line_count: lines.length,
-          ...totalsFields({
-            subtotal: gross, discount: gross - sub, beforeVat: sub, vat, total: sub + vat, vatRate: headerVatRate(lines),
-            qty: lines.reduce((a, l) => a + l.qty, 0),
-          }, curOf(h), base, {
-            subtotal: round2(gross * rate), discount: round2(gross * rate) - subLc, beforeVat: subLc, vat: vatLc, total: subLc + vatLc,
-          }),
+          ...totalsFields(imT, curOf(h), base, imLc),
+          ...depositFields(imDeps.get(h.id), imT, imLc, curOf(h), base),
         },
         lines,
       });
@@ -586,6 +653,11 @@ const SALES_INVOICE = {
       }));
       const sp = arSp.get(h.id) || {};
       const days = h.due_days ?? h.credit_term_days ?? 0;
+      const arT = {
+        subtotal: h.subtotal_fc, discount: h.discount_amount_fc, beforeVat: h.before_vat_fc, vat: h.vat_amount_fc,
+        total: h.total_amount_fc, vatRate: headerVatRate(lines), qty: lines.reduce((a, l) => a + l.qty, 0),
+      };
+      const arLc = { subtotal: h.subtotal_lc, discount: h.discount_amount_lc, beforeVat: h.before_vat_lc, vat: h.vat_amount_lc, total: h.total_amount_lc };
       out.set(`AR:${h.id}`, {
         header: {
           ...(branches.get(h.branch_id) || branches.get(0)),
@@ -601,12 +673,8 @@ const SALES_INVOICE = {
           warehouse_name: '', warehouse_name_en: '',
           ...currencyFields(currencies, curOf(h)), currency_code: curOf(h), exchange_rate: h.exchange_rate || 1,
           line_count: lines.length,
-          ...totalsFields({
-            subtotal: h.subtotal_fc, discount: h.discount_amount_fc, beforeVat: h.before_vat_fc, vat: h.vat_amount_fc,
-            total: h.total_amount_fc, vatRate: headerVatRate(lines), qty: lines.reduce((a, l) => a + l.qty, 0),
-          }, curOf(h), base, {
-            subtotal: h.subtotal_lc, discount: h.discount_amount_lc, beforeVat: h.before_vat_lc, vat: h.vat_amount_lc, total: h.total_amount_lc,
-          }),
+          ...totalsFields(arT, curOf(h), base, arLc),
+          ...depositFields(arDeps.get(h.id), arT, arLc, curOf(h), base),
         },
         lines,
       });

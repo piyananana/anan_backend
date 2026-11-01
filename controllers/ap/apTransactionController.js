@@ -86,6 +86,16 @@ const ensureApprovalSchema = async (pool) => {
     await DA.ensureDocApprovalSchema(pool);
 };
 
+// เลขที่/วันที่ใบกำกับภาษีของผู้ขาย — รายงานภาษีซื้อแสดงค่านี้ (ว่าง = fallback เลขที่/วันที่เอกสาร ตาม vatReportController)
+const ensureTaxInvoiceColumns = async (q) => {
+    await q.query(`ALTER TABLE ap_transaction ADD COLUMN IF NOT EXISTS tax_invoice_no VARCHAR(50)`);
+    await q.query(`ALTER TABLE ap_transaction ADD COLUMN IF NOT EXISTS tax_invoice_date DATE`);
+};
+const taxInvoiceOf = (header) => {
+    const no = (header.tax_invoice_no || '').toString().trim();
+    return no ? [no, header.tax_invoice_date || header.doc_date || null] : [null, null];
+};
+
 // --- Helper: Insert VAT records for AP (Input VAT) ---
 const insertVtRecords = async (client, headerId, header, details, sysDocType) => {
     const vatDetails = details.filter(d =>
@@ -104,9 +114,9 @@ const insertVtRecords = async (client, headerId, header, details, sysDocType) =>
              base_amount_lc, vat_amount_lc, base_amount_fc, vat_amount_fc,
              currency_id, exchange_rate,
              vendor_id, entity_name, entity_tax_id, entity_branch_code,
-             created_by)
+             created_by, tax_invoice_no, tax_invoice_date)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
-                    COALESCE($17, (SELECT tax_id FROM ap_vendor WHERE id = $15)), ${branchCodeSql('ap_vendor', '$15')},$18)
+                    COALESCE($17, (SELECT tax_id FROM ap_vendor WHERE id = $15)), ${branchCodeSql('ap_vendor', '$15')},$18,$19,$20)
         `, [
             'AP', 'INPUT_VAT', header.doc_id, headerId, d.id || null,
             header.doc_no, header.doc_date, d.vat_rate ?? 7,
@@ -115,7 +125,8 @@ const insertVtRecords = async (client, headerId, header, details, sysDocType) =>
             header.currency_id || null, header.exchange_rate || 1,
             header.vendor_id, header.vendor_name_th || '',
             header.vendor_tax_id || null,
-            header.created_by || null
+            header.created_by || null,
+            ...taxInvoiceOf(header),
         ]);
     }
 };
@@ -150,9 +161,9 @@ const insertDepositVtReversal = async (client, headerId, header, part) => {
          base_amount_lc, vat_amount_lc, base_amount_fc, vat_amount_fc,
          currency_id, exchange_rate,
          vendor_id, entity_name, entity_tax_id, entity_branch_code,
-         created_by)
+         created_by, tax_invoice_no, tax_invoice_date)
         VALUES ($1,$2,$3,$4,NULL,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
-                COALESCE($16, (SELECT tax_id FROM ap_vendor WHERE id = $14)), ${branchCodeSql('ap_vendor', '$14')},$17)
+                COALESCE($16, (SELECT tax_id FROM ap_vendor WHERE id = $14)), ${branchCodeSql('ap_vendor', '$14')},$17,$18,$19)
     `, [
         'AP', 'INPUT_VAT', header.doc_id, headerId,
         header.doc_no, header.doc_date, part.dep.vat_rate ?? 7,
@@ -160,6 +171,7 @@ const insertDepositVtReversal = async (client, headerId, header, part) => {
         header.currency_id || null, header.exchange_rate || 1,
         header.vendor_id, header.vendor_name_th || '', header.vendor_tax_id || null,
         header.created_by || null,
+        ...taxInvoiceOf(header),
     ]);
 };
 
@@ -1423,6 +1435,7 @@ const createTransaction = async (req, res) => {
         await client.query(`ALTER TABLE ap_transaction_detail ADD COLUMN IF NOT EXISTS item_code VARCHAR(50)`).catch(() => {});
         await client.query(`ALTER TABLE ap_transaction_detail ADD COLUMN IF NOT EXISTS item_name VARCHAR(200)`).catch(() => {});
         await client.query(`ALTER TABLE ap_transaction ADD COLUMN IF NOT EXISTS price_includes_vat BOOLEAN NOT NULL DEFAULT false`);
+        await ensureTaxInvoiceColumns(client);
 
         if (action === 'Post') {
             const periodRes = await client.query(
@@ -1483,7 +1496,8 @@ const createTransaction = async (req, res) => {
             header.branch_id || null, header.created_by || null,
         ]);
         const newHeaderId = hRes.rows[0].id;
-        await client.query(`UPDATE ap_transaction SET price_includes_vat=$1 WHERE id=$2`, [header.price_includes_vat === true, newHeaderId]);
+        await client.query(`UPDATE ap_transaction SET price_includes_vat=$1, tax_invoice_no=$3, tax_invoice_date=$4 WHERE id=$2`,
+            [header.price_includes_vat === true, newHeaderId, ...taxInvoiceOf(header)]);
         // ใบมัดจำอ้างอิงใบสั่งซื้อ (utils/depositRef.js)
         await saveDepositRef(client, 'ap', newHeaderId, header);
 
@@ -1624,6 +1638,7 @@ const updateTransaction = async (req, res) => {
         await client.query(`ALTER TABLE ap_transaction_detail ADD COLUMN IF NOT EXISTS item_name VARCHAR(200)`).catch(() => {});
 
         await client.query(`ALTER TABLE ap_transaction ADD COLUMN IF NOT EXISTS price_includes_vat BOOLEAN NOT NULL DEFAULT false`);
+        await ensureTaxInvoiceColumns(client);
         const existing = await client.query(`SELECT status FROM ap_transaction WHERE id=$1 FOR UPDATE`, [id]);
         if (existing.rows.length === 0) throw new Error('Not found');
         if (existing.rows[0].status !== 'Draft') throw new Error('แก้ไขได้เฉพาะเอกสาร Draft เท่านั้น');
@@ -1651,7 +1666,8 @@ const updateTransaction = async (req, res) => {
                 balance_amount_lc = $20,
                 ref_no = $21, ref_doc_id = $22, ref_doc_no = $23, description = $24,
                 dim1_id = $25, dim2_id = $26, dim3_id = $27, dim4_id = $28, dim5_id = $29,
-                branch_id = $30, updated_by = $31, updated_at = NOW(), price_includes_vat = $33
+                branch_id = $30, updated_by = $31, updated_at = NOW(), price_includes_vat = $33,
+                tax_invoice_no = $34, tax_invoice_date = $35
             WHERE id = $32
         `, [
             header.doc_date, header.due_date || null, periodId,
@@ -1668,6 +1684,7 @@ const updateTransaction = async (req, res) => {
             header.dim4_id || null, header.dim5_id || null,
             header.branch_id || null, header.updated_by || null, id,
             header.price_includes_vat === true,
+            ...taxInvoiceOf(header),
         ]);
         await saveDepositRef(client, 'ap', id, header);
 
