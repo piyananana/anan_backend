@@ -73,6 +73,7 @@ const fetchWhtReport = async (req, res) => {
         t.party_address, NULL, NULL, NULL, NULL, NULL, NULL, NULL
       FROM cm_transaction_wht w
       JOIN cm_transaction t ON t.id = w.header_id
+      JOIN sa_module_document cd ON cd.id = t.doc_id AND cd.sys_doc_type = '20' -- รายรับ (10) = ผู้จ่ายหักเรา ไม่ใช่ ภ.ง.ด. ของเรา
       LEFT JOIN cd_wht_type wt ON wt.id = w.wht_type_id
       WHERE
         EXTRACT(MONTH FROM t.doc_date) = $1

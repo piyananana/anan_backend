@@ -349,6 +349,24 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
             const acc = await resolvePaymentGlAccount(client, p);
             pushLine(acc, `จ่ายเงิน ${p.payment_method_code || ''} ${docNo}`, 0, Number(p.amount_lc) || 0, 0, Number(p.amount_fc) || 0);
         }
+    } else if (sysDocType === '10' && details.length > 0) {
+        // รายรับหลายบรรทัด: Dr ช่องทางรับเงิน + Dr ภาษีถูกหัก ณ ที่จ่าย / Cr รายได้ต่อบรรทัด (ก่อน VAT) + Cr ภาษีขาย
+        for (const p of payments) {
+            const acc = await resolvePaymentGlAccount(client, p);
+            pushLine(acc, `รับเงิน ${p.payment_method_code || ''} ${docNo}`, Number(p.amount_lc) || 0, 0, Number(p.amount_fc) || 0, 0);
+        }
+        if (whtLc || whtFc) {
+            if (!setup.wht_prepaid_account_id) throw new Error('ยังไม่ได้ตั้งค่าบัญชีภาษีถูกหัก ณ ที่จ่ายในการตั้งค่าบัญชี CM ของประเภทเอกสารนี้');
+            pushLine(setup.wht_prepaid_account_id, `ภาษีถูกหัก ณ ที่จ่าย ${docNo}`, whtLc, 0, whtFc, 0);
+        }
+        for (const d of details) {
+            pushLine(d.expense_account_id || header.gl_account_id || setup.revenue_account_id,
+                d.description || `รายรับ ${docNo}`, 0, Number(d.amount_lc) || 0, 0, Number(d.amount_fc) || 0);
+        }
+        if (vatLc || vatFc) {
+            if (!setup.vat_output_account_id) throw new Error('ยังไม่ได้ตั้งค่าบัญชีภาษีขายในการตั้งค่าบัญชี CM ของประเภทเอกสารนี้');
+            pushLine(setup.vat_output_account_id, `ภาษีขาย ${docNo}`, 0, vatLc, 0, vatFc);
+        }
     } else if (sysDocType === '10') {
         // รายรับ: Dr [บัญชีตามช่องทางรับเงิน] / Cr บัญชีรายได้
         const revenueAccountId = header.gl_account_id || setup.revenue_account_id;
