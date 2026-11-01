@@ -5,6 +5,8 @@
 // ที่ถือว่า "ค้างส่ง"
 'use strict';
 
+const { netUnitPriceSql, ensureSoPriceColumns } = require('../../utils/vatCalc');
+
 const fetchReport = async (req, res) => {
     const { so_date_from, so_date_to, due_date_from, due_date_to, customer_ids, item_ids, sort_due_date } = req.query;
     const customerIdList = (customer_ids || '').split(',').map(s => parseInt(s, 10)).filter(n => !isNaN(n));
@@ -13,12 +15,14 @@ const fetchReport = async (req, res) => {
 
     const client = await req.dbPool.connect();
     try {
+        await ensureSoPriceColumns(client);
         const result = await client.query(`
             SELECT
                 so.id AS so_id, so.doc_no AS so_doc_no, so.doc_date AS so_doc_date, so.due_date,
                 so.exchange_rate,
                 sod.id AS so_detail_id, sod.item_id, sod.item_code, sod.item_name,
-                sod.qty_ordered, sod.unit_price_fc,
+                -- ราคาหลังส่วนลด ก่อน VAT — มูลค่าค้างส่งไม่รวม VAT ไม่ว่าใบสั่งขายจะกรอกราคารวม VAT หรือไม่
+                sod.qty_ordered, ${netUnitPriceSql('sod.unit_price_fc', 'sod', 'so')} AS unit_price_fc,
                 COALESCE((
                     SELECT SUM(ABS(imd.qty)) FROM im_transaction_detail imd
                     JOIN im_transaction imt ON imt.id = imd.header_id

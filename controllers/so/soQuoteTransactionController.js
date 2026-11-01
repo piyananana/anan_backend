@@ -20,6 +20,10 @@ const { ensureSalespersonTable, saveDocSalespersons, loadSalespersons } = requir
 // พนักงานขายของใบเสนอราคา (รายชื่อ — สัดส่วนอยู่ที่ข้อมูลลูกค้า)
 const ensureDocSalesperson = (db) => ensureSalespersonTable(db, 'quote_transaction_salesperson', 'quote_transaction', 'header_id');
 const { ensureSoTransactionTable } = require('./soTransactionController');
+const { addSalesPriceColumns } = require('../../utils/vatCalc');
+// lazy — soTransactionController export ครบหลังโหลดเสร็จ (require วนกัน)
+const soLineValues = (...a) => require('./soTransactionController').soLineValues(...a);
+const saveSoTotals = (...a) => require('./soTransactionController').saveSoTotals(...a);
 
 const ensureQuoteTransactionTable = async (client) => {
     // quote_transaction_detail.ref_quote_detail_id ฝั่ง so_transaction ต้องมีตาราง so_transaction อยู่ก่อนจึง ALTER
@@ -91,6 +95,8 @@ const ensureQuoteTransactionTable = async (client) => {
             ADD COLUMN IF NOT EXISTS void_reason TEXT,
             ADD COLUMN IF NOT EXISTS voided_by   VARCHAR(100),
             ADD COLUMN IF NOT EXISTS voided_at   TIMESTAMPTZ`);
+    // ราคารวม VAT / ส่วนลด % / VAT ต่อบรรทัด เหมือนใบสั่งขาย — total_value_lc = หลังส่วนลด ก่อน VAT
+    await addSalesPriceColumns(client, 'quote_transaction');
 };
 
 // --- Fetch helpers ---
@@ -136,7 +142,7 @@ const fetchRows = async (req, res) => {
             SELECT t.id, t.doc_no, t.doc_date, t.status, t.customer_id, t.customer_code, t.customer_name_th,
                    t.warehouse_id, w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
                    t.prepared_by, u.user_name AS prepared_by_name,
-                   t.valid_until_date, t.total_qty, t.total_value_lc, t.description,
+                   t.valid_until_date, t.total_qty, t.total_value_lc, t.total_amount_lc, t.description,
                    d.doc_code, d.doc_name_thai, d.doc_name_eng
             FROM quote_transaction t
             JOIN sa_module_document d ON d.id = t.doc_id
@@ -216,8 +222,8 @@ const createTransaction = async (req, res) => {
             INSERT INTO quote_transaction
             (doc_id, doc_no, doc_code, doc_date, prepared_by, customer_id, customer_code, customer_name_th, warehouse_id,
              currency_id, currency_code, exchange_rate, valid_until_date,
-             description, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id, created_by, updated_by)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$21)
+             description, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id, created_by, updated_by, price_includes_vat)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$21,$22)
             RETURNING id
         `, [
             header.doc_id, docNo, docCode, header.doc_date, header.prepared_by || userId || null,
@@ -226,25 +232,27 @@ const createTransaction = async (req, res) => {
             header.valid_until_date || null,
             header.description || null,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
-            header.branch_id || null, userName,
+            header.branch_id || null, userName, header.price_includes_vat === true,
         ]);
         const headerId = hRes.rows[0].id;
 
-        let lineNo = 1, totalQty = 0, totalValue = 0;
+        let lineNo = 1, totalQty = 0;
+        const amts = [];
         for (const d of details) {
             const qty = Number(d.qty_quoted) || 0;
             const price = Number(d.unit_price_fc) || 0;
-            const value = qty * price * (Number(header.exchange_rate) || 1);
+            const { vatType, vatRate, discountPercent, amt } = soLineValues(d, header, qty);
             totalQty += qty;
-            totalValue += value;
+            amts.push(amt);
             await client.query(`
                 INSERT INTO quote_transaction_detail
-                (header_id, line_no, item_id, item_code, item_name, uom_id, qty_quoted, unit_price_fc, total_value_lc, description)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                (header_id, line_no, item_id, item_code, item_name, uom_id, qty_quoted, unit_price_fc, total_value_lc, description,
+                 discount_percent, vat_type, vat_rate)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
             `, [headerId, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                qty, price, value, d.description || null]);
+                qty, price, amt.netLc, d.description || null, discountPercent, vatType, vatRate]);
         }
-        await client.query(`UPDATE quote_transaction SET total_qty=$1, total_value_lc=$2 WHERE id=$3`, [totalQty, totalValue, headerId]);
+        await saveSoTotals(client, headerId, totalQty, amts, 'quote_transaction');
         await saveDocSalespersons(client, 'quote_transaction_salesperson', 'header_id', headerId, req.body.salespersons);
 
         await client.query('COMMIT');
@@ -285,14 +293,14 @@ const updateTransaction = async (req, res) => {
                 doc_date=$1, customer_id=$2, customer_code=$3, customer_name_th=$4, warehouse_id=$5, description=$6,
                 currency_id=$7, currency_code=$8, exchange_rate=$9, valid_until_date=$10,
                 dim1_id=$11, dim2_id=$12, dim3_id=$13, dim4_id=$14, dim5_id=$15, branch_id=$16,
-                status='Draft', updated_by=$17, updated_at=NOW()
+                status='Draft', updated_by=$17, updated_at=NOW(), price_includes_vat=$19
             WHERE id=$18
         `, [
             header.doc_date, header.customer_id || null, customerCode, customerNameTh, header.warehouse_id || null,
             header.description || null,
             header.currency_id || null, header.currency_code || await getBaseCurrencyCode(client), header.exchange_rate || 1, header.valid_until_date || null,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
-            header.branch_id || null, userName, id,
+            header.branch_id || null, userName, id, header.price_includes_vat === true,
         ]);
 
         // แก้ไขแล้วถือว่าเป็นรอบ Draft ใหม่ — ล้างคิวอนุมัติเดิมทิ้ง (ถ้ามีจากรอบที่ถูกปฏิเสธ)
@@ -311,31 +319,34 @@ const updateTransaction = async (req, res) => {
             await client.query(`DELETE FROM quote_transaction_detail WHERE id = ANY($1::int[])`, [removedIds]);
         }
 
-        let lineNo = 1, totalQty = 0, totalValue = 0;
+        let lineNo = 1, totalQty = 0;
+        const amts = [];
         for (const d of details) {
             const qty = Number(d.qty_quoted) || 0;
             const price = Number(d.unit_price_fc) || 0;
-            const value = qty * price * (Number(header.exchange_rate) || 1);
+            const { vatType, vatRate, discountPercent, amt } = soLineValues(d, header, qty);
+            const value = amt.netLc;
             totalQty += qty;
-            totalValue += value;
+            amts.push(amt);
             if (d.id && existingIds.has(d.id)) {
                 await client.query(`
                     UPDATE quote_transaction_detail SET
                         line_no=$1, item_id=$2, item_code=$3, item_name=$4, uom_id=$5, qty_quoted=$6,
-                        unit_price_fc=$7, total_value_lc=$8, description=$9
+                        unit_price_fc=$7, total_value_lc=$8, description=$9, discount_percent=$11, vat_type=$12, vat_rate=$13
                     WHERE id=$10
                 `, [lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                    qty, price, value, d.description || null, d.id]);
+                    qty, price, value, d.description || null, d.id, discountPercent, vatType, vatRate]);
             } else {
                 await client.query(`
                     INSERT INTO quote_transaction_detail
-                    (header_id, line_no, item_id, item_code, item_name, uom_id, qty_quoted, unit_price_fc, total_value_lc, description)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                    (header_id, line_no, item_id, item_code, item_name, uom_id, qty_quoted, unit_price_fc, total_value_lc, description,
+                     discount_percent, vat_type, vat_rate)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                 `, [id, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                    qty, price, value, d.description || null]);
+                    qty, price, value, d.description || null, discountPercent, vatType, vatRate]);
             }
         }
-        await client.query(`UPDATE quote_transaction SET total_qty=$1, total_value_lc=$2 WHERE id=$3`, [totalQty, totalValue, id]);
+        await saveSoTotals(client, id, totalQty, amts, 'quote_transaction');
         await saveDocSalespersons(client, 'quote_transaction_salesperson', 'header_id', id, req.body.salespersons);
 
         await client.query('COMMIT');
@@ -550,6 +561,7 @@ const fetchConvertibleLines = async (req, res) => {
             SELECT t.id AS header_id, t.doc_no, t.doc_date, t.status, t.currency_code, t.exchange_rate,
                    dt.id AS detail_id, dt.line_no, dt.item_id, dt.item_code, dt.item_name, dt.uom_id,
                    dt.qty_quoted, dt.unit_price_fc, u.uom_code,
+                   dt.discount_percent, dt.vat_type, dt.vat_rate, t.price_includes_vat,
                    COALESCE((
                        SELECT SUM(sod.qty_ordered) FROM so_transaction_detail sod
                        JOIN so_transaction so ON so.id = sod.header_id

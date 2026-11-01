@@ -46,4 +46,38 @@ const ensureImPriceColumns = async (db) => {
     if (dbName) ensuredIm.add(dbName);
 };
 
-module.exports = { round2, calcLineAmounts, netUnitPrice, netUnitPriceSql, ensureImPriceColumns };
+// คอลัมน์ราคารวม VAT / ส่วนลด / VAT ต่อบรรทัดของใบสั่งขายและใบเสนอราคา — เรียกก่อน query นอก SO ที่อ้างถึง
+// (วงเงินเครดิต/DLN) vat_type ว่าง = เอกสารเก่าก่อนมี VAT (ยอดไม่มี VAT, เอกสารที่ดึงไปใช้ VAT ตั้งต้นของสินค้า)
+const addSalesPriceColumns = async (db, table) => {
+    await db.query(`ALTER TABLE IF EXISTS ${table}
+        ADD COLUMN IF NOT EXISTS price_includes_vat BOOLEAN NOT NULL DEFAULT false,
+        ADD COLUMN IF NOT EXISTS discount_value_lc NUMERIC(18,4) NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS vat_amount_lc NUMERIC(18,4) NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS total_amount_lc NUMERIC(18,4) NOT NULL DEFAULT 0`);
+    await db.query(`ALTER TABLE IF EXISTS ${table}_detail
+        ADD COLUMN IF NOT EXISTS discount_percent NUMERIC(7,4) NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS vat_type VARCHAR(20),
+        ADD COLUMN IF NOT EXISTS vat_rate NUMERIC(7,4) NOT NULL DEFAULT 0`);
+};
+const ensuredSo = new Set();
+const ensureSoPriceColumns = async (db) => {
+    const dbName = db.options?.database || db.database;
+    if (dbName && ensuredSo.has(dbName)) return;
+    await addSalesPriceColumns(db, 'so_transaction');
+    await addSalesPriceColumns(db, 'quote_transaction');
+    if (dbName) ensuredSo.add(dbName);
+};
+
+// ยอดบรรทัดเป็นบาทของเอกสารสกุลเงินต่างประเทศ — มิเรอร์ imDocAmount: ราคารวม VAT ใช้ยอดรวมแปลงเป็นบาท,
+// ไม่รวม VAT คิด VAT จากยอดบาท  d = { qty, price, discount_percent, vat_type, vat_rate }
+const lineAmountsLc = (d, exchangeRate = 1, priceIncludesVat = false) => {
+    const rate = Number(exchangeRate) > 0 ? Number(exchangeRate) : 1;
+    const vat = !d.vat_type || d.vat_type === 'NOVAT' ? 0 : (Number(d.vat_rate) || 0);
+    const a = calcLineAmounts({ qty: d.qty, price: d.price, discountPercent: d.discount_percent, vatRate: vat, priceIncludesVat });
+    const grossLc = round2(a.gross * rate);
+    const netLc = round2(a.net * rate);
+    const totalLc = priceIncludesVat && vat ? round2(a.total * rate) : round2(netLc + round2(netLc * vat / 100));
+    return { grossLc, discountLc: round2(grossLc - netLc), netLc, vatLc: round2(totalLc - netLc), totalLc };
+};
+
+module.exports = { round2, calcLineAmounts, netUnitPrice, netUnitPriceSql, ensureImPriceColumns, ensureSoPriceColumns, addSalesPriceColumns, lineAmountsLc };

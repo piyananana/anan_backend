@@ -28,7 +28,7 @@ const AR_CREDIT_TYPES = ['50', '55'];
 const IM_CHECK_TYPES = ['30', '31', '32', '35', '40', '45'];
 const IM_CREDIT_TYPES = ['35', '40'];
 
-const { calcLineAmounts, netUnitPriceSql, ensureImPriceColumns } = require('./vatCalc');
+const { calcLineAmounts, netUnitPriceSql, ensureImPriceColumns, ensureSoPriceColumns, lineAmountsLc } = require('./vatCalc');
 const round2 = (n) => Math.round(Number(n) * 100) / 100;
 
 const ensured = new Set();
@@ -48,6 +48,7 @@ const ensureCreditSchema = async (db) => {
   }
   await DA.ensureDocApprovalSchema(db); // คิวผู้อนุมัติ + sa_menu.no_approver_action
   await ensureImPriceColumns(db); // ยอดใบส่งสินค้ารอตั้งหนี้คิดตามส่วนลด/ราคารวม VAT
+  await ensureSoPriceColumns(db); // ยอดใบสั่งขาย (รวม VAT หลังส่วนลด)
   if (dbName) ensured.add(dbName);
 };
 
@@ -113,11 +114,11 @@ const imDocAmount = (sysDocType, details, exchangeRate = 1, priceIncludesVat = f
 };
 
 // SO: Σ จำนวนสั่ง × ราคาต่อหน่วย × อัตราแลกเปลี่ยน (เป็นบาท) — ยังไม่มี VAT ในบรรทัด SO
-const soDocAmount = (details, exchangeRate = 1) => {
-  const rate = Number(exchangeRate) > 0 ? Number(exchangeRate) : 1;
-  return round2((details || []).reduce((s, d) =>
-    s + round2((Number(d.qty_ordered) || 0) * (Number(d.unit_price_fc) || 0) * rate), 0));
-};
+// SO: Σ ยอดรวม VAT หลังส่วนลดเป็นบาท (บรรทัดต้องมี qty_ordered, unit_price_fc, discount_percent, vat_type, vat_rate)
+const soDocAmount = (details, exchangeRate = 1, priceIncludesVat = false) =>
+  round2((details || []).reduce((s, d) => s + lineAmountsLc({
+    qty: d.qty_ordered, price: d.unit_price_fc, discount_percent: d.discount_percent, vat_type: d.vat_type, vat_rate: d.vat_rate,
+  }, exchangeRate, priceIncludesVat).totalLc, 0));
 
 // อนุมัติแล้วใช้ได้กับยอดนี้ไหม (ยอดไม่เพิ่มจากที่อนุมัติ)
 const approvalCovers = (row, amount) =>
