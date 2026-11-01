@@ -11,6 +11,46 @@
 const { today: todayYmd } = require('../../utils/dateUtil');
 const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
+const { checkCmPeriodOpen } = require('./cmPeriodCheckHelper');
+
+const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+
+// ยอดของเอกสาร: ยอดรวมมาจากบรรทัด (40 = รายการเบิก, 30 = ใบเบิกที่เติม, 10/20 = ช่องทางรับ/จ่าย) — ยอดบาทคิดที่ backend
+// ปัดทศนิยม 2 ตำแหน่ง ส่วนต่างจากการปัดเศษลงบรรทัดสุดท้าย เพื่อให้รายการบัญชีสมดุลเสมอ (เดิมคิดที่หน้าจอแบบไม่ปัดเศษ
+// ทำให้เอกสารเงินตราต่างประเทศต่างกัน 0.01 ได้) และ 30: ยอดช่องทางจ่ายต้องเท่ากับยอดใบเบิกที่เติม
+const normalizeAmounts = async (client, header, details, applies, payments) => {
+    const sys = (await client.query(`SELECT sys_doc_type FROM sa_module_document WHERE id = $1`, [header.doc_id])).rows[0]?.sys_doc_type || '';
+    const rate = Number(header.exchange_rate) || 1;
+    const fcOf = (rows, key) => round2(rows.reduce((t, r) => t + (Number(r[key]) || 0), 0));
+    const source = sys === '40' ? details : sys === '30' ? applies : ['10', '20'].includes(sys) ? payments : null;
+    const srcKey = sys === '30' ? 'applied_amount_fc' : 'amount_fc';
+    const totalFc = source ? fcOf(source, srcKey) : round2(Number(header.total_amount_fc) || 0);
+    header.total_amount_fc = totalFc;
+    header.total_amount_lc = round2(totalFc * rate);
+    const spread = (rows, fcKey, lcKey) => {
+        let lcSum = 0;
+        rows.forEach((r, i) => {
+            r[fcKey] = round2(Number(r[fcKey]) || 0);
+            r[lcKey] = i === rows.length - 1 ? round2(header.total_amount_lc - lcSum) : round2(r[fcKey] * rate);
+            lcSum = round2(lcSum + r[lcKey]);
+        });
+    };
+    if (['10', '20', '30'].includes(sys) && payments.length) {
+        if (Math.abs(fcOf(payments, 'amount_fc') - totalFc) > 0.005) {
+            throw new Error(`ยอดช่องทางรับ/จ่ายเงิน (${fcOf(payments, 'amount_fc')}) ไม่เท่ากับยอดเอกสาร (${totalFc})`);
+        }
+        spread(payments, 'amount_fc', 'amount_lc');
+    }
+    if (sys === '40') spread(details, 'amount_fc', 'amount_lc');
+    if (sys === '30') spread(applies, 'applied_amount_fc', 'applied_amount_lc');
+    return sys;
+};
+
+// Post: งวด CM ต้องเปิด (เดิมตรวจเฉพาะที่หน้าจอ)
+const assertCmPeriodOpen = async (client, docDate) => {
+    const pc = await checkCmPeriodOpen(client, docDate);
+    if (!pc.allowed) throw new Error(pc.message);
+};
 
 // --- Helper: Generate Document Number (คัดลอกจาก apTransactionController.js) ---
 const generateDocNo = async (client, docId, date, branchId = null) => {
@@ -314,10 +354,17 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
         return null;
     }
 
-    const totalDebitLc  = glDetails.reduce((s, l) => s + l.debit_lc, 0);
-    const totalCreditLc = glDetails.reduce((s, l) => s + l.credit_lc, 0);
-    const totalDebitFc  = glDetails.reduce((s, l) => s + l.debit_fc, 0);
-    const totalCreditFc = glDetails.reduce((s, l) => s + l.credit_fc, 0);
+    for (const l of glDetails) {
+        l.debit_lc = round2(l.debit_lc); l.credit_lc = round2(l.credit_lc);
+        l.debit_fc = round2(l.debit_fc); l.credit_fc = round2(l.credit_fc);
+    }
+    const totalDebitLc  = round2(glDetails.reduce((s, l) => s + l.debit_lc, 0));
+    const totalCreditLc = round2(glDetails.reduce((s, l) => s + l.credit_lc, 0));
+    const totalDebitFc  = round2(glDetails.reduce((s, l) => s + l.debit_fc, 0));
+    const totalCreditFc = round2(glDetails.reduce((s, l) => s + l.credit_fc, 0));
+    if (totalDebitLc !== totalCreditLc || totalDebitFc !== totalCreditFc) {
+        throw new Error(`รายการบัญชีไม่สมดุล (เดบิต ${totalDebitLc} / เครดิต ${totalCreditLc})`);
+    }
 
     // gl_entry_header.created_by เป็นรหัสผู้ใช้ (INT) แต่หน้าจอส่งชื่อผู้ใช้มา → แปลงก่อน (เดิมส่งชื่อตรงๆ ทำให้โพสต์ไม่ได้)
     let createdByUserId = null;
@@ -656,6 +703,8 @@ const createTransaction = async (req, res) => {
     try {
         await client.query('BEGIN');
         await ensureTables(req.dbPool);
+        await normalizeAmounts(client, header, details || [], applies || [], payments || []);
+        if (action === 'Post') await assertCmPeriodOpen(client, header.doc_date);
 
         const periodRes = await client.query(
             `SELECT id FROM gl_posting_period
@@ -771,6 +820,8 @@ const updateTransaction = async (req, res) => {
         if (existing.rows[0].status !== 'Draft') throw new Error('แก้ไขได้เฉพาะเอกสาร Draft เท่านั้น');
         const existingDocNo = existing.rows[0].doc_no;
         const oldVoucherIds = await appliedVoucherIds(client, id);
+        await normalizeAmounts(client, header, details || [], applies || [], payments || []);
+        if (action === 'Post') await assertCmPeriodOpen(client, header.doc_date);
 
         const periodRes = await client.query(
             `SELECT id FROM gl_posting_period

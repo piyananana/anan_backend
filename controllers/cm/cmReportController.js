@@ -17,12 +17,12 @@ const getOpeningBalance = async (client, bankAccountId, dateFrom) => {
 
     const parts = [];
     if (hasReceipt) parts.push(
-        `SELECT amount_lc FROM cm_receipt WHERE bank_account_id=${bankAccountId} AND status!='Voided' AND receipt_date < '${dateFrom}'`);
+        `SELECT amount_lc FROM cm_receipt WHERE bank_account_id=$1 AND status!='Voided' AND receipt_date < $2::date`);
     if (hasPayment) parts.push(
-        `SELECT -amount_lc FROM cm_payment WHERE bank_account_id=${bankAccountId} AND status!='Voided' AND payment_date < '${dateFrom}'`);
+        `SELECT -amount_lc FROM cm_payment WHERE bank_account_id=$1 AND status!='Voided' AND payment_date < $2::date`);
 
     const r = await client.query(
-        `SELECT COALESCE(SUM(amount_lc),0) AS opening FROM (${parts.join(' UNION ALL ')}) t`);
+        `SELECT COALESCE(SUM(amount_lc),0) AS opening FROM (${parts.join(' UNION ALL ')}) t`, [bankAccountId, dateFrom]);
     return parseFloat(r.rows[0].opening) || 0;
 };
 
@@ -131,9 +131,9 @@ const buildAccountTxReport = async (client, bankAccountId, date_from, date_to, r
                    r.id           AS source_id
             FROM cm_receipt r
             LEFT JOIN cm_bank_statement_line sl ON sl.id = r.statement_line_id
-            WHERE r.bank_account_id = ${bankAccountId}
+            WHERE r.bank_account_id = $1
               AND r.status != 'Voided'
-              AND r.receipt_date >= '${date_from}' AND r.receipt_date <= '${date_to}'`);
+              AND r.receipt_date >= $2::date AND r.receipt_date <= $3::date`);
     }
     if (hasPayment && (!record_type || record_type === 'PAYMENT')) {
         parts.push(`
@@ -148,19 +148,19 @@ const buildAccountTxReport = async (client, bankAccountId, date_from, date_to, r
                    p.id           AS source_id
             FROM cm_payment p
             LEFT JOIN cm_bank_statement_line sl ON sl.id = p.statement_line_id
-            WHERE p.bank_account_id = ${bankAccountId}
+            WHERE p.bank_account_id = $1
               AND p.status != 'Voided'
-              AND p.payment_date >= '${date_from}' AND p.payment_date <= '${date_to}'`);
+              AND p.payment_date >= $2::date AND p.payment_date <= $3::date`);
     }
 
     let transactions = [];
     if (parts.length > 0) {
         const txRes = await client.query(`
             SELECT *,
-                ${opening} + SUM(credit_amount - debit_amount)
+                $4::numeric + SUM(credit_amount - debit_amount)
                     OVER (ORDER BY record_date, record_type DESC, source_id) AS running_balance
             FROM (${parts.join(' UNION ALL ')}) t
-            ORDER BY record_date, record_type DESC, source_id`);
+            ORDER BY record_date, record_type DESC, source_id`, [bankAccountId, date_from, date_to, opening]);
         transactions = txRes.rows.map(r => ({
             record_date:     r.record_date,
             doc_no:          r.doc_no,
@@ -250,10 +250,13 @@ const getCheckRegister = async (req, res) => {
         const hasReceipt = await tableExists(client, 'cm_receipt');
         const hasPayment = await tableExists(client, 'cm_payment');
 
-        let accFilter = bank_account_id ? `AND ba.id = ${parseInt(bank_account_id)}` : '';
-        if (account_code_from) accFilter += ` AND ba.account_code >= '${account_code_from}'`;
-        if (account_code_to)   accFilter += ` AND ba.account_code <= '${account_code_to}'`;
-        const statusFilter = (status && status !== 'All') ? `AND status = '${status}'` : '';
+        // $1/$2 = ช่วงวันที่ ตัวกรองอื่นต่อท้ายเป็นพารามิเตอร์ (ใช้ชุดเดียวกันทั้งสองส่วนของ UNION)
+        const params = [date_from, date_to];
+        const arg = (v) => { params.push(v); return `$${params.length}`; };
+        let accFilter = bank_account_id ? `AND ba.id = ${arg(parseInt(bank_account_id))}` : '';
+        if (account_code_from) accFilter += ` AND ba.account_code >= ${arg(account_code_from)}`;
+        if (account_code_to)   accFilter += ` AND ba.account_code <= ${arg(account_code_to)}`;
+        const statusArg = (status && status !== 'All') ? arg(status) : null;
 
         const parts = [];
         if (hasReceipt && (!check_type || check_type === 'RECEIVED')) {
@@ -278,8 +281,8 @@ const getCheckRegister = async (req, res) => {
                 LEFT JOIN cd_bank         cb ON cb.id = ba.bank_id
                 LEFT JOIN cm_bank_statement_line sl ON sl.id = r.statement_line_id
                 WHERE r.check_no IS NOT NULL AND r.check_no != ''
-                  AND r.receipt_date >= '${date_from}' AND r.receipt_date <= '${date_to}'
-                  ${accFilter} ${statusFilter}`);
+                  AND r.receipt_date >= $1::date AND r.receipt_date <= $2::date
+                  ${accFilter} ${statusArg ? `AND r.status = ${statusArg}` : ''}`);
         }
         if (hasPayment && (!check_type || check_type === 'ISSUED')) {
             parts.push(`
@@ -303,14 +306,14 @@ const getCheckRegister = async (req, res) => {
                 LEFT JOIN cd_bank         cb ON cb.id = ba.bank_id
                 LEFT JOIN cm_bank_statement_line sl ON sl.id = p.statement_line_id
                 WHERE p.check_no IS NOT NULL AND p.check_no != ''
-                  AND p.payment_date >= '${date_from}' AND p.payment_date <= '${date_to}'
-                  ${accFilter} ${statusFilter}`);
+                  AND p.payment_date >= $1::date AND p.payment_date <= $2::date
+                  ${accFilter} ${statusArg ? `AND p.status = ${statusArg}` : ''}`);
         }
 
         let checks = [];
         if (parts.length > 0) {
             const r = await client.query(
-                `${parts.join(' UNION ALL ')} ORDER BY record_date, check_no`);
+                `${parts.join(' UNION ALL ')} ORDER BY record_date, check_no`, params);
             checks = r.rows;
         }
 
