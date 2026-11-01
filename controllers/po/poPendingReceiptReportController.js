@@ -4,12 +4,15 @@
 // poTransactionController.js ทุกประการ เฉพาะบรรทัดที่มี qty_outstanding > 0 เท่านั้นที่ถือว่า "ค้างรับ"
 'use strict';
 
+const { ensurePoPriceColumns, netUnitPriceSql } = require('../../utils/vatCalc');
+
 const fetchReport = async (req, res) => {
     const { po_date_from, po_date_to, due_date_from, due_date_to, vendor_ids, item_ids, sort_due_date } = req.query;
     const vendorIdList = (vendor_ids || '').split(',').map(s => parseInt(s, 10)).filter(n => !isNaN(n));
     const itemIdList = (item_ids || '').split(',').map(s => parseInt(s, 10)).filter(n => !isNaN(n));
     const sortAsc = sort_due_date !== 'desc';
 
+    await ensurePoPriceColumns(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         const result = await client.query(`
@@ -17,7 +20,7 @@ const fetchReport = async (req, res) => {
                 po.id AS po_id, po.doc_no AS po_doc_no, po.doc_date AS po_doc_date, po.due_date,
                 po.exchange_rate,
                 pod.id AS po_detail_id, pod.item_id, pod.item_code, pod.item_name,
-                pod.qty_ordered, pod.unit_price_fc,
+                pod.qty_ordered, ${netUnitPriceSql('pod.unit_price_fc', 'pod', 'po')} AS unit_price_fc,
                 COALESCE((
                     SELECT SUM(ABS(imd.qty)) FROM im_transaction_detail imd
                     JOIN im_transaction imt ON imt.id = imd.header_id

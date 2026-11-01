@@ -1,5 +1,6 @@
 // controllers/po/poReplenishmentController.js — ใบแนะนำสั่งซื้อเพื่อเติมสต็อก (Purchase Replenishment Suggestion)
 const { today } = require('../../utils/dateUtil');
+const { ensurePoPriceColumns, netUnitPriceSql } = require('../../utils/vatCalc');
 // อ่านอย่างเดียว ไม่เขียนอะไรเลย — ใช้ min_stock_qty/max_stock_qty/reorder_point ที่มีอยู่แล้วใน im_item/
 // im_item_warehouse (เดิมไม่เคยถูกใช้คำนวณอะไรเลย) ผสมกับยอดขายจริงจาก DLN ('30'/'31'/'32') ในช่วงย้อนหลังที่เลือก
 // เพื่อประมาณจำนวนที่ต้องสั่งให้พอสำหรับช่วงเวลาข้างหน้าที่เลือก — สูตรและเหตุผลแต่ละขั้นดู plan ตอนออกแบบ
@@ -19,6 +20,7 @@ const fetchSuggestions = async (req, res) => {
     const coverageDays = Math.max(parseInt(coverage_days, 10) || 30, 1);
     const categoryIds = (category_ids || '').split(',').map(s => parseInt(s, 10)).filter(n => !isNaN(n));
 
+    await ensurePoPriceColumns(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         const params = [warehouseIds, asOf, lookbackDays];
@@ -128,7 +130,8 @@ const fetchSuggestions = async (req, res) => {
             const itemIds = [...new Set(suggestions.map(s => s.item_id))];
             const vendorRes = await client.query(`
                 SELECT DISTINCT ON (pod.item_id)
-                    pod.item_id, po.vendor_id, po.vendor_code, po.vendor_name_th, pod.unit_price_fc, po.doc_date
+                    pod.item_id, po.vendor_id, po.vendor_code, po.vendor_name_th,
+                    ${netUnitPriceSql('pod.unit_price_fc', 'pod', 'po')} AS unit_price_fc, po.doc_date
                 FROM po_transaction_detail pod
                 JOIN po_transaction po ON po.id = pod.header_id
                 WHERE pod.item_id = ANY($1::int[]) AND po.status NOT IN ('Void', 'Deleted')

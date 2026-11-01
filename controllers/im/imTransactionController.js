@@ -20,7 +20,7 @@ const { branchCodeSql } = require('../../utils/taxBranch');
 const { IM_CHECK_TYPES, ensureCreditSchema, imDocAmount, assertCreditForPost, loadCreditApprovals } = require('../../utils/creditCheck');
 const { resolveArAccountId } = require('../../utils/arAccount');
 const { resolveApAccountId } = require('../../utils/apAccount');
-const { calcLineAmounts, netUnitPrice, netUnitPriceSql, ensureSoPriceColumns } = require('../../utils/vatCalc');
+const { calcLineAmounts, netUnitPrice, netUnitPriceSql, ensureSoPriceColumns, ensurePoPriceColumns } = require('../../utils/vatCalc');
 
 // ตรวจวงเงินเครดิตก่อนโพสต์เอกสารฝั่งขาย (ส่งสินค้า/รับคืน/ลดหนี้/เพิ่มหนี้ลูกหนี้) — เกินและยังไม่ได้รับอนุมัติ = throw
 const checkImCreditForPost = async (client, { docId, customerId, details, id, row, exchangeRate, priceIncludesVat }) => {
@@ -2202,7 +2202,8 @@ const postDetailLines = async (client, headerId, header, docNo) => {
 
 // --- Fetch helpers ---
 const fetchRowById = async (pool, id) => {
-    await ensureSoPriceColumns(pool); // ราคาใบสั่งขายอ้างอิง (ส่วนลด/VAT)
+    await ensureSoPriceColumns(pool); // ราคาใบสั่งขาย/ใบสั่งซื้ออ้างอิง (ส่วนลด/VAT)
+    await ensurePoPriceColumns(pool);
     const hRes = await pool.query(`
         SELECT t.*,
                d.doc_code AS d_doc_code, d.doc_name_thai, d.doc_name_eng, d.sys_doc_type, d.is_auto_numbering,
@@ -2235,11 +2236,12 @@ const fetchRowById = async (pool, id) => {
     if (hRes.rows.length === 0) return null;
     const dRes = await pool.query(`
         SELECT dt.*, u.uom_code, l.location_code, tl.location_code AS to_location_code,
-               pod.unit_price_fc AS ref_po_unit_price_fc,
-               -- ราคาใบสั่งขายหลังส่วนลด ก่อน VAT (เทียบกับราคาสุทธิของใบส่งสินค้า)
+               -- ราคาใบสั่งซื้อ/ใบสั่งขายหลังส่วนลด ก่อน VAT (เทียบกับราคาสุทธิของใบรับ/ใบส่งสินค้า)
+               ${netUnitPriceSql('pod.unit_price_fc', 'pod', 'poh')} AS ref_po_unit_price_fc,
                ${netUnitPriceSql('sod.unit_price_fc', 'sod', 'soh')} AS ref_so_unit_price_fc
         FROM im_transaction_detail dt
         LEFT JOIN po_transaction_detail pod ON pod.id = dt.ref_po_detail_id
+        LEFT JOIN po_transaction poh ON poh.id = pod.header_id
         LEFT JOIN so_transaction_detail sod ON sod.id = dt.ref_so_detail_id
         LEFT JOIN so_transaction soh ON soh.id = sod.header_id
         LEFT JOIN im_uom u      ON u.id = dt.uom_id

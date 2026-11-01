@@ -16,9 +16,11 @@
 'use strict';
 
 const { ensureDocApprovalSchema } = require('../../utils/docApproval');
+const { ensurePoPriceColumns, netUnitPriceSql } = require('../../utils/vatCalc');
 
 const fetchReport = async (req, res) => {
     await ensureDocApprovalSchema(req.dbPool); // ผู้อนุมัติ/เวลาตัดสินมาจากตารางกลาง doc_approval
+    await ensurePoPriceColumns(req.dbPool); // ราคาหลังส่วนลด ก่อน VAT
     const { pr_date_from, pr_date_to, po_date_from, po_date_to, pr_statuses, po_statuses, show_pr, show_po } = req.query;
     const prStatusList = (pr_statuses || '').split(',').map(s => s.trim()).filter(Boolean);
     const poStatusList = (po_statuses || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -96,8 +98,10 @@ const fetchReport = async (req, res) => {
         const poItemsByHeader = {};
         if (poIds.length > 0) {
             const poItemsRes = await client.query(`
-                SELECT header_id, item_code, item_name, qty_ordered, unit_price_fc
-                FROM po_transaction_detail WHERE header_id = ANY($1::int[]) ORDER BY line_no
+                SELECT pod.header_id, pod.item_code, pod.item_name, pod.qty_ordered,
+                       ${netUnitPriceSql('pod.unit_price_fc', 'pod', 'po')} AS unit_price_fc
+                FROM po_transaction_detail pod JOIN po_transaction po ON po.id = pod.header_id
+                WHERE pod.header_id = ANY($1::int[]) ORDER BY pod.line_no
             `, [poIds]);
             for (const d of poItemsRes.rows) {
                 (poItemsByHeader[d.header_id] ??= []).push({

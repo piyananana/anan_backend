@@ -17,7 +17,7 @@ const { reasonOf, userIdOf, sendErr, blk } = require('../../utils/docAction');
 const { ensureSalespersonTable, saveDocSalespersons, loadSalespersons } = require('../../utils/docSalesperson');
 const DA = require('../../utils/docApproval');
 const { ensureCreditSchema, assertCreditForPost, soDocAmount, loadCreditApprovals } = require('../../utils/creditCheck');
-const { ensureSoPriceColumns, lineAmountsLc, netUnitPriceSql, round2 } = require('../../utils/vatCalc');
+const { ensureSoPriceColumns, netUnitPriceSql, orderLineValues, saveOrderTotals } = require('../../utils/vatCalc');
 const KIND = 'SO';
 
 // พนักงานขายของใบสั่งขาย (รายชื่อ — สัดส่วนอยู่ที่ข้อมูลลูกค้า)
@@ -95,25 +95,9 @@ const ensureSoTransactionTable = async (client) => {
     await ensureSoPriceColumns(client);
 };
 
-// บันทึกบรรทัด: ค่าที่คำนวณจากราคาที่กรอก (ราคารวม VAT หรือไม่) + ส่วนลด + VAT ของบรรทัด (ใบเสนอราคาใช้ร่วม, qty = จำนวน)
-const soLineValues = (d, header, qty = d.qty_ordered) => {
-    const vatType = d.vat_type || null;
-    const vatRate = vatType && vatType !== 'NOVAT' ? (Number(d.vat_rate) || 0) : 0;
-    const discountPercent = Math.min(Math.max(Number(d.discount_percent) || 0, 0), 100);
-    const amt = lineAmountsLc({ qty: Number(qty) || 0, price: Number(d.unit_price_fc) || 0, discount_percent: discountPercent,
-        vat_type: vatType, vat_rate: vatRate }, header.exchange_rate, header.price_includes_vat === true);
-    return { vatType, vatRate, discountPercent, amt };
-};
-// ยอดรวมหัวเอกสาร (บาท)
-const sumSoTotals = (rows) => rows.reduce((t, a) => ({
-    gross: round2(t.gross + a.grossLc), discount: round2(t.discount + a.discountLc), net: round2(t.net + a.netLc),
-    vat: round2(t.vat + a.vatLc), total: round2(t.total + a.totalLc),
-}), { gross: 0, discount: 0, net: 0, vat: 0, total: 0 });
-const saveSoTotals = (client, headerId, totalQty, amts, table = 'so_transaction') => {
-    const t = sumSoTotals(amts);
-    return client.query(`UPDATE ${table} SET total_qty=$1, total_value_lc=$2, discount_value_lc=$3, vat_amount_lc=$4, total_amount_lc=$5
-        WHERE id=$6`, [totalQty, t.net, t.discount, t.vat, t.total, headerId]);
-};
+// บันทึกบรรทัด/ยอดรวม: helper ร่วมของใบสั่งใน utils/vatCalc.js (ใบเสนอราคาใช้ร่วม, qty = จำนวน)
+const soLineValues = orderLineValues;
+const saveSoTotals = (client, headerId, totalQty, amts, table = 'so_transaction') => saveOrderTotals(client, table, headerId, totalQty, amts);
 
 // --- Fetch helpers ---
 const fetchRowById = async (pool, id) => {

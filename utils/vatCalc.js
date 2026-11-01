@@ -80,4 +80,36 @@ const lineAmountsLc = (d, exchangeRate = 1, priceIncludesVat = false) => {
     return { grossLc, discountLc: round2(grossLc - netLc), netLc, vatLc: round2(totalLc - netLc), totalLc };
 };
 
-module.exports = { round2, calcLineAmounts, netUnitPrice, netUnitPriceSql, ensureImPriceColumns, ensureSoPriceColumns, addSalesPriceColumns, lineAmountsLc };
+// คอลัมน์ราคารวม VAT / ส่วนลด / VAT ต่อบรรทัดของใบสั่งซื้อ — เรียกก่อน query นอก PO ที่อ้างถึง (GR/รายงาน)
+const ensuredPo = new Set();
+const ensurePoPriceColumns = async (db) => {
+    const dbName = db.options?.database || db.database;
+    if (dbName && ensuredPo.has(dbName)) return;
+    await addSalesPriceColumns(db, 'po_transaction');
+    if (dbName) ensuredPo.add(dbName);
+};
+
+// บันทึกบรรทัดใบสั่ง (SO / ใบเสนอราคา / PO): ค่าที่คำนวณจากราคาที่กรอก (รวม VAT หรือไม่) + ส่วนลด + VAT ของบรรทัด
+const orderLineValues = (d, header, qty = d.qty_ordered) => {
+    const vatType = d.vat_type || null;
+    const vatRate = vatType && vatType !== 'NOVAT' ? (Number(d.vat_rate) || 0) : 0;
+    const discountPercent = Math.min(Math.max(Number(d.discount_percent) || 0, 0), 100);
+    const amt = lineAmountsLc({ qty: Number(qty) || 0, price: Number(d.unit_price_fc) || 0, discount_percent: discountPercent,
+        vat_type: vatType, vat_rate: vatRate }, header.exchange_rate, header.price_includes_vat === true);
+    return { vatType, vatRate, discountPercent, amt };
+};
+// ยอดรวมหัวเอกสาร (บาท) — total_value_lc = หลังส่วนลด ก่อน VAT
+const sumOrderTotals = (rows) => rows.reduce((t, a) => ({
+    gross: round2(t.gross + a.grossLc), discount: round2(t.discount + a.discountLc), net: round2(t.net + a.netLc),
+    vat: round2(t.vat + a.vatLc), total: round2(t.total + a.totalLc),
+}), { gross: 0, discount: 0, net: 0, vat: 0, total: 0 });
+const saveOrderTotals = (client, table, headerId, totalQty, amts) => {
+    const t = sumOrderTotals(amts);
+    return client.query(`UPDATE ${table} SET total_qty=$1, total_value_lc=$2, discount_value_lc=$3, vat_amount_lc=$4, total_amount_lc=$5
+        WHERE id=$6`, [totalQty, t.net, t.discount, t.vat, t.total, headerId]);
+};
+
+module.exports = {
+    round2, calcLineAmounts, netUnitPrice, netUnitPriceSql, ensureImPriceColumns, ensureSoPriceColumns, ensurePoPriceColumns,
+    addSalesPriceColumns, lineAmountsLc, orderLineValues, saveOrderTotals,
+};
