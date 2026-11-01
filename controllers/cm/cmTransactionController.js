@@ -14,7 +14,7 @@ const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { checkCmPeriodOpen } = require('./cmPeriodCheckHelper');
 const { syncCmBankItems, voidBankItems, deleteBankItems, bankItemsClearedSql, ensureBankItemColumns } = require('../../utils/cmBankItems');
 const {
-    TAX_LINE_TYPES, ensureCmTaxColumns, resolveParty, calcTaxDoc, saveTaxExtras, assertTaxPostable,
+    TAX_LINE_TYPES, ensureCmTaxColumns, resolveParty, calcTaxDoc, saveTaxExtras, assertTaxPostable, assertVoucherLinesPostable,
     insertCmVt, deleteCmVt, voidCmVt,
 } = require('./cmTransactionTax');
 
@@ -52,7 +52,7 @@ const normalizeAmounts = async (client, header, details, applies, payments, whts
         }
         spread(payments, 'amount_fc', 'amount_lc', round2(header.total_amount_lc - (Number(header.wht_amount_lc) || 0)));
     }
-    if (sys === '40') spread(details, 'amount_fc', 'amount_lc');
+    if (sys === '40' && !taxDoc) spread(details, 'amount_fc', 'amount_lc'); // บรรทัดแบบ VAT คิดยอดบาทใน calcTaxDoc แล้ว
     if (sys === '30') spread(applies, 'applied_amount_fc', 'applied_amount_lc');
     // บัญชีธนาคาร/กองเงินสดย่อยที่ใช้ต้องเป็นสกุลเงินเดียวกับเอกสาร (ยอดเงินตราต่างประเทศของรายการธนาคารคือยอดของเอกสาร)
     const bankIds = [header.bank_account_id, header.from_bank_account_id, header.to_bank_account_id,
@@ -392,8 +392,13 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
         }
     } else if (sysDocType === '40') {
         // เบิกเงินสดย่อย: Dr บัญชีค่าใช้จ่ายตามรายการ / Cr บัญชีพักเบิกเงินสดย่อย
+        // ค่าใช้จ่ายต่อบรรทัด (ก่อน VAT) + ภาษีซื้อของใบเสร็จที่มีใบกำกับภาษี / Cr เงินสดย่อยเต็มจำนวนที่เบิก
         for (const d of details) {
             pushLine(d.expense_account_id, d.description || `เบิกเงินสดย่อย ${docNo}`, Number(d.amount_lc) || 0, 0, Number(d.amount_fc) || 0, 0);
+        }
+        if (vatLc || vatFc) {
+            if (!setup.vat_input_account_id) throw new Error('ยังไม่ได้ตั้งค่าบัญชีภาษีซื้อในการตั้งค่าบัญชี CM ของประเภทเอกสารนี้');
+            pushLine(setup.vat_input_account_id, `ภาษีซื้อ ${docNo}`, vatLc, 0, vatFc, 0);
         }
         pushLine(await pettyCashAccountId(), `เบิกเงินสดย่อย ${docNo}`, 0, totalAmountLc, 0, totalAmountFc);
     } else if (sysDocType === '50') {
@@ -789,6 +794,7 @@ const createTransaction = async (req, res) => {
         if (action === 'Post') {
             await assertCmPeriodOpen(client, header.doc_date);
             assertTaxPostable(header, sys);
+            if (sys === '40') assertVoucherLinesPostable(details || []);
         }
 
         const periodRes = await client.query(
@@ -910,6 +916,7 @@ const updateTransaction = async (req, res) => {
         if (action === 'Post') {
             await assertCmPeriodOpen(client, header.doc_date);
             assertTaxPostable(header, sys);
+            if (sys === '40') assertVoucherLinesPostable(details || []);
         }
 
         const periodRes = await client.query(

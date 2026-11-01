@@ -11,8 +11,10 @@ const { thaiAddress } = require('../../utils/thaiText');
 
 const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 
-// ประเภทเอกสารที่มีบรรทัดรายการแบบ VAT (เอกสารเก่าที่ไม่มีบรรทัดยังใช้บัญชีเดียวจากหัวเอกสารเหมือนเดิม)
-const TAX_LINE_TYPES = ['10', '20'];
+// ประเภทเอกสารที่มีบรรทัดรายการแบบ VAT (10/20 เอกสารเก่าที่ไม่มีบรรทัดยังใช้บัญชีเดียวจากหัวเอกสารเหมือนเดิม)
+// 40 เบิกเงินสดย่อย: VAT ต่อบรรทัด ผู้ขาย/ใบกำกับภาษีต่อบรรทัด (ใบเสร็จมาจากหลายร้าน) ไม่มีภาษีหัก ณ ที่จ่าย
+// บรรทัดเดิมของ 40 ไม่มี vat_type = ไม่มี VAT → ยอดเท่าเดิม
+const TAX_LINE_TYPES = ['10', '20', '40'];
 
 const ensured = new Set();
 const ensureCmTaxColumns = async (db) => {
@@ -166,6 +168,17 @@ const assertTaxPostable = (header, sys) => {
     if (sys === '10' && vat && !has(header.counterparty_name)) throw new Error('กรุณาระบุชื่อผู้ซื้อ (เอกสารมีภาษีขาย)');
 };
 
+// เบิกเงินสดย่อย (40): บรรทัดที่มี VAT ต้องมีผู้ขาย (ชื่อ/เลขผู้เสียภาษี) และเลขที่ใบกำกับภาษีของบรรทัดนั้น
+const assertVoucherLinesPostable = (details) => {
+    const has = (v) => (v ?? '').toString().trim() !== '';
+    details.forEach((d, i) => {
+        if (!Number(d.vat_amount_fc)) return;
+        if (!has(d.seller_name) || !has(d.seller_tax_id) || !has(d.tax_invoice_no)) {
+            throw new Error(`บรรทัดที่ ${i + 1}: มีภาษีซื้อ กรุณาระบุชื่อผู้ขาย เลขประจำตัวผู้เสียภาษี และเลขที่ใบกำกับภาษี`);
+        }
+    });
+};
+
 // รายงานภาษี: 20 = ภาษีซื้อ (เลขที่/วันที่ใบกำกับของผู้ขาย), 10 = ภาษีขาย (เลขที่เอกสารนี้คือใบกำกับภาษี)
 const insertCmVt = async (client, id, sys) => {
     if (!TAX_LINE_TYPES.includes(sys)) return;
@@ -173,7 +186,8 @@ const insertCmVt = async (client, id, sys) => {
     const lines = (await client.query(
         `SELECT * FROM cm_transaction_detail WHERE header_id = $1 AND COALESCE(vat_amount_fc, 0) <> 0 ORDER BY line_no`, [id])).rows;
     const createdBy = h.updated_by || h.created_by || null; // vt_transaction.created_by = ชื่อผู้ใช้
-    const isInput = sys === '20';
+    const isInput = sys !== '10';
+    const perLine = sys === '40'; // ผู้ขาย/ใบกำกับต่อบรรทัด
     for (const d of lines) {
         await client.query(`
             INSERT INTO vt_transaction
@@ -183,9 +197,12 @@ const insertCmVt = async (client, id, sys) => {
             VALUES ('CM',$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`, [
             isInput ? 'INPUT_VAT' : 'OUTPUT_VAT', h.doc_id, id, d.id, h.doc_no, h.doc_date, d.vat_rate || 0,
             d.amount_lc, d.vat_amount_lc, d.amount_fc, d.vat_amount_fc, h.currency_id || null, h.exchange_rate || 1,
-            h.party_source === 'AP' ? h.party_id : null, h.party_source === 'AR' ? h.party_id : null,
-            h.counterparty_name || '', h.party_tax_id || null, h.party_branch_code || '00000', createdBy,
-            isInput ? h.tax_invoice_no : null, isInput && h.tax_invoice_no ? h.tax_invoice_date : null,
+            perLine ? null : h.party_source === 'AP' ? h.party_id : null, perLine ? null : h.party_source === 'AR' ? h.party_id : null,
+            perLine ? (d.seller_name || '') : (h.counterparty_name || ''),
+            perLine ? (d.seller_tax_id || null) : (h.party_tax_id || null),
+            (perLine ? d.seller_branch_code : h.party_branch_code) || '00000', createdBy,
+            perLine ? d.tax_invoice_no : isInput ? h.tax_invoice_no : null,
+            perLine ? (d.tax_invoice_no ? d.tax_invoice_date || h.doc_date : null) : isInput && h.tax_invoice_no ? h.tax_invoice_date : null,
         ]);
     }
 };
@@ -215,6 +232,6 @@ const voidCmVt = async (client, id, docDate, voidDate, userName) => {
 };
 
 module.exports = {
-    TAX_LINE_TYPES, ensureCmTaxColumns, resolveParty, calcTaxDoc, saveTaxExtras, assertTaxPostable,
+    TAX_LINE_TYPES, ensureCmTaxColumns, resolveParty, calcTaxDoc, saveTaxExtras, assertTaxPostable, assertVoucherLinesPostable,
     insertCmVt, deleteCmVt, voidCmVt, round2,
 };
