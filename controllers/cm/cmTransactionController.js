@@ -13,34 +13,44 @@ const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { checkCmPeriodOpen } = require('./cmPeriodCheckHelper');
 const { syncCmBankItems, voidBankItems, deleteBankItems, bankItemsClearedSql, ensureBankItemColumns } = require('../../utils/cmBankItems');
+const {
+    TAX_LINE_TYPES, ensureCmTaxColumns, resolveParty, calcTaxDoc, saveTaxExtras, assertTaxPostable,
+    insertCmVt, deleteCmVt, voidCmVt,
+} = require('./cmTransactionTax');
 
 const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 
 // ยอดของเอกสาร: ยอดรวมมาจากบรรทัด (40 = รายการเบิก, 30 = ใบเบิกที่เติม, 10/20 = ช่องทางรับ/จ่าย) — ยอดบาทคิดที่ backend
 // ปัดทศนิยม 2 ตำแหน่ง ส่วนต่างจากการปัดเศษลงบรรทัดสุดท้าย เพื่อให้รายการบัญชีสมดุลเสมอ (เดิมคิดที่หน้าจอแบบไม่ปัดเศษ
 // ทำให้เอกสารเงินตราต่างประเทศต่างกัน 0.01 ได้) และ 30: ยอดช่องทางจ่ายต้องเท่ากับยอดใบเบิกที่เติม
-const normalizeAmounts = async (client, header, details, applies, payments) => {
+const normalizeAmounts = async (client, header, details, applies, payments, whts = []) => {
     const sys = (await client.query(`SELECT sys_doc_type FROM sa_module_document WHERE id = $1`, [header.doc_id])).rows[0]?.sys_doc_type || '';
     const rate = Number(header.exchange_rate) || 1;
     const fcOf = (rows, key) => round2(rows.reduce((t, r) => t + (Number(r[key]) || 0), 0));
-    const source = sys === '40' ? details : sys === '30' ? applies : ['10', '20'].includes(sys) ? payments : null;
+    // 10/20 ที่มีบรรทัดรายการ: ยอดจากบรรทัด (VAT) และช่องทางรับ/จ่าย = ยอดรวม − ภาษีหัก ณ ที่จ่าย (cmTransactionTax.js)
+    // เอกสาร 10/20 เดิมที่ไม่มีบรรทัด: ยอดจากช่องทางรับ/จ่ายเหมือนเดิม
+    const taxDoc = TAX_LINE_TYPES.includes(sys) && details.length > 0;
+    if (taxDoc) calcTaxDoc(header, details, whts);
+    else { whts.length = 0; Object.assign(header, { subtotal_fc: 0, subtotal_lc: 0, vat_amount_fc: 0, vat_amount_lc: 0, wht_amount_fc: 0, wht_amount_lc: 0 }); }
+    const source = taxDoc ? null : sys === '40' ? details : sys === '30' ? applies : ['10', '20'].includes(sys) ? payments : null;
     const srcKey = sys === '30' ? 'applied_amount_fc' : 'amount_fc';
-    const totalFc = source ? fcOf(source, srcKey) : round2(Number(header.total_amount_fc) || 0);
+    const totalFc = taxDoc ? header.total_amount_fc : source ? fcOf(source, srcKey) : round2(Number(header.total_amount_fc) || 0);
     header.total_amount_fc = totalFc;
-    header.total_amount_lc = round2(totalFc * rate);
-    const spread = (rows, fcKey, lcKey) => {
+    header.total_amount_lc = taxDoc ? header.total_amount_lc : round2(totalFc * rate);
+    const spread = (rows, fcKey, lcKey, targetLc = header.total_amount_lc) => {
         let lcSum = 0;
         rows.forEach((r, i) => {
             r[fcKey] = round2(Number(r[fcKey]) || 0);
-            r[lcKey] = i === rows.length - 1 ? round2(header.total_amount_lc - lcSum) : round2(r[fcKey] * rate);
+            r[lcKey] = i === rows.length - 1 ? round2(targetLc - lcSum) : round2(r[fcKey] * rate);
             lcSum = round2(lcSum + r[lcKey]);
         });
     };
     if (['10', '20', '30'].includes(sys) && payments.length) {
-        if (Math.abs(fcOf(payments, 'amount_fc') - totalFc) > 0.005) {
-            throw new Error(`ยอดช่องทางรับ/จ่ายเงิน (${fcOf(payments, 'amount_fc')}) ไม่เท่ากับยอดเอกสาร (${totalFc})`);
+        const netFc = round2(totalFc - (Number(header.wht_amount_fc) || 0));
+        if (Math.abs(fcOf(payments, 'amount_fc') - netFc) > 0.005) {
+            throw new Error(`ยอดช่องทางรับ/จ่ายเงิน (${fcOf(payments, 'amount_fc')}) ไม่เท่ากับยอดที่ต้องรับ/จ่าย (${netFc})`);
         }
-        spread(payments, 'amount_fc', 'amount_lc');
+        spread(payments, 'amount_fc', 'amount_lc', round2(header.total_amount_lc - (Number(header.wht_amount_lc) || 0)));
     }
     if (sys === '40') spread(details, 'amount_fc', 'amount_lc');
     if (sys === '30') spread(applies, 'applied_amount_fc', 'applied_amount_lc');
@@ -58,6 +68,18 @@ const normalizeAmounts = async (client, header, details, applies, payments) => {
     }
     return sys;
 };
+
+// บรรทัดรายการ: ยอดก่อน VAT + VAT (10/20), ผู้ขาย/ใบกำกับต่อบรรทัด (40)
+const insertDetail = (client, headerId, lineNo, d) => client.query(`
+    INSERT INTO cm_transaction_detail (header_id, line_no, description, expense_account_id, amount_lc, amount_fc,
+           entered_amount_fc, vat_type, vat_rate, vat_amount_fc, vat_amount_lc,
+           seller_name, seller_tax_id, seller_branch_code, tax_invoice_no, tax_invoice_date)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, [
+    headerId, lineNo, d.description || null, d.expense_account_id || null, d.amount_lc || 0, d.amount_fc || 0,
+    d.entered_amount_fc ?? d.amount_fc ?? 0, d.vat_type || 'NOVAT', d.vat_rate || 0, d.vat_amount_fc || 0, d.vat_amount_lc || 0,
+    d.seller_name || null, d.seller_tax_id || null, d.seller_branch_code || null,
+    (d.tax_invoice_no || '').trim() || null, (d.tax_invoice_no || '').trim() ? (d.tax_invoice_date || null) : null,
+]);
 
 // Post: งวด CM ต้องเปิด (เดิมตรวจเฉพาะที่หน้าจอ)
 const assertCmPeriodOpen = async (client, docDate) => {
@@ -232,6 +254,7 @@ const ensureTables = async (pool) => {
             updated_by                    VARCHAR(100)
         )
     `);
+    await ensureCmTaxColumns(pool);
 };
 
 // --- Helper: resolve GL account for a payment row ---
@@ -306,7 +329,27 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
         return setup.petty_cash_payable_account_id;
     };
 
-    if (sysDocType === '10') {
+    const vatLc = Number(header.vat_amount_lc) || 0, vatFc = Number(header.vat_amount_fc) || 0;
+    const whtLc = Number(header.wht_amount_lc) || 0, whtFc = Number(header.wht_amount_fc) || 0;
+    if (sysDocType === '20' && details.length > 0) {
+        // รายจ่ายหลายบรรทัด: Dr ค่าใช้จ่ายต่อบรรทัด (ก่อน VAT) + Dr ภาษีซื้อ / Cr ภาษีหัก ณ ที่จ่ายค้างจ่าย + Cr ช่องทางจ่าย
+        for (const d of details) {
+            pushLine(d.expense_account_id || header.gl_account_id || setup.expense_account_id,
+                d.description || `รายจ่าย ${docNo}`, Number(d.amount_lc) || 0, 0, Number(d.amount_fc) || 0, 0);
+        }
+        if (vatLc || vatFc) {
+            if (!setup.vat_input_account_id) throw new Error('ยังไม่ได้ตั้งค่าบัญชีภาษีซื้อในการตั้งค่าบัญชี CM ของประเภทเอกสารนี้');
+            pushLine(setup.vat_input_account_id, `ภาษีซื้อ ${docNo}`, vatLc, 0, vatFc, 0);
+        }
+        if (whtLc || whtFc) {
+            if (!setup.wht_payable_account_id) throw new Error('ยังไม่ได้ตั้งค่าบัญชีภาษีหัก ณ ที่จ่ายค้างจ่ายในการตั้งค่าบัญชี CM ของประเภทเอกสารนี้');
+            pushLine(setup.wht_payable_account_id, `ภาษีหัก ณ ที่จ่าย ${docNo}`, 0, whtLc, 0, whtFc);
+        }
+        for (const p of payments) {
+            const acc = await resolvePaymentGlAccount(client, p);
+            pushLine(acc, `จ่ายเงิน ${p.payment_method_code || ''} ${docNo}`, 0, Number(p.amount_lc) || 0, 0, Number(p.amount_fc) || 0);
+        }
+    } else if (sysDocType === '10') {
         // รายรับ: Dr [บัญชีตามช่องทางรับเงิน] / Cr บัญชีรายได้
         const revenueAccountId = header.gl_account_id || setup.revenue_account_id;
         for (const p of payments) {
@@ -568,11 +611,12 @@ const fetchRowById = async (pool, id) => {
             .catch(() => ({ rows: [] })),
     ]);
     if (hRes.rows.length === 0) return null;
+    const whts = (await pool.query(`SELECT * FROM cm_transaction_wht WHERE header_id = $1 ORDER BY id`, [id])).rows;
     const info = (await queryCmReverseInfo(pool, id)).rows[0];
     const rBlock = info ? getCmReverseBlock(info) : null;
     const vBlock = info ? getCmVoidBlock(info) : null;
     return {
-        ...hRes.rows[0], details: dRes.rows, applies: aRes.rows, payments: pRes.rows,
+        ...hRes.rows[0], details: dRes.rows, applies: aRes.rows, payments: pRes.rows, whts,
         reverse_block: rBlock ? rBlock.code : null,
         reverse_block_ref: rBlock ? (rBlock.ref || null) : null,
         void_block: vBlock ? vBlock.code : null,
@@ -717,13 +761,17 @@ const fetchOpenVouchers = async (req, res) => {
 
 // --- POST create ---
 const createTransaction = async (req, res) => {
-    const { header, details, applies, payments, action } = req.body;
+    const { header, details, applies, payments, whts, action } = req.body;
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
         await ensureTables(req.dbPool);
-        await normalizeAmounts(client, header, details || [], applies || [], payments || []);
-        if (action === 'Post') await assertCmPeriodOpen(client, header.doc_date);
+        await resolveParty(client, header);
+        const sys = await normalizeAmounts(client, header, details || [], applies || [], payments || [], whts || []);
+        if (action === 'Post') {
+            await assertCmPeriodOpen(client, header.doc_date);
+            assertTaxPostable(header, sys);
+        }
 
         const periodRes = await client.query(
             `SELECT id FROM gl_posting_period
@@ -767,13 +815,11 @@ const createTransaction = async (req, res) => {
             header.created_by || null,
         ]);
         const newHeaderId = hRes.rows[0].id;
+        await saveTaxExtras(client, newHeaderId, header, whts || []);
 
         let lineNo = 1;
         for (const d of (details || [])) {
-            await client.query(`
-                INSERT INTO cm_transaction_detail (header_id, line_no, description, expense_account_id, amount_lc, amount_fc)
-                VALUES ($1,$2,$3,$4,$5,$6)
-            `, [newHeaderId, lineNo++, d.description || null, d.expense_account_id || null, d.amount_lc || 0, d.amount_fc || 0]);
+            await insertDetail(client, newHeaderId, lineNo++, d);
         }
 
         for (const a of (applies || [])) {
@@ -812,6 +858,7 @@ const createTransaction = async (req, res) => {
                 await client.query(`UPDATE cm_transaction SET gl_entry_id=$1 WHERE id=$2`, [glEntryId, newHeaderId]);
             }
             await syncCmBankItems(client, newHeaderId, glEntryId);
+            await insertCmVt(client, newHeaderId, sys);
         }
 
         await client.query('COMMIT');
@@ -829,7 +876,7 @@ const createTransaction = async (req, res) => {
 // --- PUT update (Draft only) — action:'Post' ในบอดี้เดียวกันนี้ทำการ Post ต่อได้เลย ---
 const updateTransaction = async (req, res) => {
     const { id } = req.params;
-    const { header, details, applies, payments, action } = req.body;
+    const { header, details, applies, payments, whts, action } = req.body;
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
@@ -840,8 +887,12 @@ const updateTransaction = async (req, res) => {
         if (existing.rows[0].status !== 'Draft') throw new Error('แก้ไขได้เฉพาะเอกสาร Draft เท่านั้น');
         const existingDocNo = existing.rows[0].doc_no;
         const oldVoucherIds = await appliedVoucherIds(client, id);
-        await normalizeAmounts(client, header, details || [], applies || [], payments || []);
-        if (action === 'Post') await assertCmPeriodOpen(client, header.doc_date);
+        await resolveParty(client, header);
+        const sys = await normalizeAmounts(client, header, details || [], applies || [], payments || [], whts || []);
+        if (action === 'Post') {
+            await assertCmPeriodOpen(client, header.doc_date);
+            assertTaxPostable(header, sys);
+        }
 
         const periodRes = await client.query(
             `SELECT id FROM gl_posting_period
@@ -876,16 +927,14 @@ const updateTransaction = async (req, res) => {
             header.updated_by || null, id,
         ]);
 
+        await saveTaxExtras(client, id, header, whts || []);
         await client.query(`DELETE FROM cm_transaction_detail WHERE header_id=$1`, [id]);
         await client.query(`DELETE FROM cm_transaction_apply WHERE transaction_id=$1`, [id]);
         await client.query(`DELETE FROM cm_transaction_payment WHERE header_id=$1`, [id]);
 
         let lineNo = 1;
         for (const d of (details || [])) {
-            await client.query(`
-                INSERT INTO cm_transaction_detail (header_id, line_no, description, expense_account_id, amount_lc, amount_fc)
-                VALUES ($1,$2,$3,$4,$5,$6)
-            `, [id, lineNo++, d.description || null, d.expense_account_id || null, d.amount_lc || 0, d.amount_fc || 0]);
+            await insertDetail(client, id, lineNo++, d);
         }
         for (const a of (applies || [])) {
             await client.query(`
@@ -922,6 +971,7 @@ const updateTransaction = async (req, res) => {
                 [glEntryId, id]
             );
             await syncCmBankItems(client, id, glEntryId);
+            await insertCmVt(client, id, sys);
         }
 
         await client.query('COMMIT');
@@ -1009,6 +1059,7 @@ const voidTransaction = async (req, res) => {
         // คำนวณหลังเปลี่ยนสถานะ จึงไม่นับใบเติมเงินนี้แล้ว
         await recalcVoucherBalances(client, await appliedVoucherIds(client, id));
         await voidBankItems(client, 'CM', id);
+        await voidCmVt(client, id, tx.doc_date, voidDate, userName);
         await logReverse(client, {
             sysModule: '81', tableName: 'cm_transaction', recordId: Number(id),
             docNo: tx.doc_no, fromStatus: 'Posted', toStatus: 'Void', reason: voidReason, userId,
@@ -1055,6 +1106,7 @@ const reverseTransaction = async (req, res) => {
             await client.query(`DELETE FROM gl_entry_header WHERE id=$1`, [info.gl_entry_id]);
         }
         await deleteBankItems(client, 'CM', id);
+        await deleteCmVt(client, id);
         await client.query(`
             UPDATE cm_transaction SET status='Draft', gl_entry_id=NULL, updated_at=NOW(), updated_by=$1 WHERE id=$2`,
             [userName, id]);

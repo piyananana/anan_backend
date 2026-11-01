@@ -24,6 +24,7 @@ const fetchWhtReport = async (req, res) => {
     await req.dbPool.query(`ALTER TABLE ap_transaction_wht ADD COLUMN IF NOT EXISTS income_type VARCHAR(20)`).catch(() => {});
     await req.dbPool.query(`ALTER TABLE cd_wht_type ADD COLUMN IF NOT EXISTS wht_name_en VARCHAR(200)`).catch(() => {});
 
+    const hasCm = (await req.dbPool.query(`SELECT to_regclass('public.cm_transaction_wht') IS NOT NULL AS ok`)).rows[0].ok;
     const sql = `
       SELECT
         w.id,
@@ -63,7 +64,23 @@ const fetchWhtReport = async (req, res) => {
         AND v.vendor_type  = $3
         AND t.status       = 'Posted'
         AND w.wht_amount_lc > 0
-      ORDER BY v.vendor_code ASC, t.doc_date ASC, w.id ASC
+      ${hasCm ? `
+      UNION ALL
+      -- รายจ่าย CM (20): ผู้รับเงินจาก snapshot ที่หัวเอกสาร (เลือกจากผู้ขาย AP หรือพิมพ์เอง) — ที่อยู่เป็นข้อความเดียว
+      SELECT
+        w.id, t.doc_no, t.doc_date, t.party_code, t.counterparty_name, NULL, t.party_tax_id, t.party_type,
+        w.wht_type, wt.wht_name_en, w.income_type, w.wht_rate, w.base_amount_lc, w.wht_amount_lc, w.description,
+        t.party_address, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+      FROM cm_transaction_wht w
+      JOIN cm_transaction t ON t.id = w.header_id
+      LEFT JOIN cd_wht_type wt ON wt.id = w.wht_type_id
+      WHERE
+        EXTRACT(MONTH FROM t.doc_date) = $1
+        AND EXTRACT(YEAR  FROM t.doc_date) = $2
+        AND t.party_type   = $3
+        AND t.status       = 'Posted'
+        AND w.wht_amount_lc > 0` : ''}
+      ORDER BY vendor_code ASC, payment_date ASC, id ASC
     `;
 
     const result = await req.dbPool.query(sql, [
