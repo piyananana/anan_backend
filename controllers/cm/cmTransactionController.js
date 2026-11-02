@@ -12,6 +12,7 @@ const { today: todayYmd } = require('../../utils/dateUtil');
 const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { checkCmPeriodOpen } = require('./cmPeriodCheckHelper');
+const { ensureCheckbookColumns, assignCheckNumbers } = require('../../utils/cmCheckbook');
 const { syncCmBankItems, voidBankItems, deleteBankItems, bankItemsClearedSql, ensureBankItemColumns } = require('../../utils/cmBankItems');
 const {
     TAX_LINE_TYPES, ensureCmTaxColumns, resolveParty, calcTaxDoc, calcWht, saveTaxExtras, assertTaxPostable, assertVoucherLinesPostable,
@@ -259,6 +260,7 @@ const ensureTables = async (pool) => {
         )
     `);
     await ensureCmTaxColumns(pool);
+    await ensureCheckbookColumns(pool);
 };
 
 // --- Helper: resolve GL account for a payment row ---
@@ -881,8 +883,8 @@ const createTransaction = async (req, res) => {
                 INSERT INTO cm_transaction_payment
                 (header_id, line_no, payment_method_id, payment_method_code, payment_method_name, payment_method_type,
                  cm_bank_account_id, gl_account_id, amount_lc, amount_fc, ref_no, payment_date, remark,
-                 drawer_bank_name, drawer_bank_branch, drawer_account_no, created_by)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+                 drawer_bank_name, drawer_bank_branch, drawer_account_no, created_by, checkbook_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
             `, [
                 newHeaderId, pmLineNo++,
                 p.payment_method_id || null, p.payment_method_code || null, p.payment_method_name || null,
@@ -890,6 +892,7 @@ const createTransaction = async (req, res) => {
                 p.amount_lc || 0, p.amount_fc || 0, p.ref_no || null, p.payment_date || header.doc_date, p.remark || null,
                 p.drawer_bank_name || null, p.drawer_bank_branch || null, p.drawer_account_no || null,
                 header.created_by || null,
+                p.payment_method_type === 'CHECK' ? (p.checkbook_id || null) : null,
             ]);
         }
 
@@ -902,6 +905,8 @@ const createTransaction = async (req, res) => {
             if (glEntryId) {
                 await client.query(`UPDATE cm_transaction SET gl_entry_id=$1 WHERE id=$2`, [glEntryId, newHeaderId]);
             }
+            // เลขเช็คจากสมุดเช็ค (รายจ่าย/เติมเงินสดย่อย) ก่อนสร้างรายการจ่ายธนาคาร
+            if (['20', '30'].includes(sys)) await assignCheckNumbers(client, 'cm_transaction_payment', newHeaderId, 'cm_transaction_id');
             await syncCmBankItems(client, newHeaderId, glEntryId);
             await insertCmVt(client, newHeaderId, sys);
         }
@@ -995,8 +1000,8 @@ const updateTransaction = async (req, res) => {
                 INSERT INTO cm_transaction_payment
                 (header_id, line_no, payment_method_id, payment_method_code, payment_method_name, payment_method_type,
                  cm_bank_account_id, gl_account_id, amount_lc, amount_fc, ref_no, payment_date, remark,
-                 drawer_bank_name, drawer_bank_branch, drawer_account_no, created_by)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+                 drawer_bank_name, drawer_bank_branch, drawer_account_no, created_by, checkbook_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
             `, [
                 id, pmLineNo++,
                 p.payment_method_id || null, p.payment_method_code || null, p.payment_method_name || null,
@@ -1004,6 +1009,7 @@ const updateTransaction = async (req, res) => {
                 p.amount_lc || 0, p.amount_fc || 0, p.ref_no || null, p.payment_date || header.doc_date, p.remark || null,
                 p.drawer_bank_name || null, p.drawer_bank_branch || null, p.drawer_account_no || null,
                 header.updated_by || null,
+                p.payment_method_type === 'CHECK' ? (p.checkbook_id || null) : null,
             ]);
         }
 
@@ -1016,6 +1022,7 @@ const updateTransaction = async (req, res) => {
                 `UPDATE cm_transaction SET status='Posted', gl_entry_id=$1 WHERE id=$2`,
                 [glEntryId, id]
             );
+            if (['20', '30'].includes(sys)) await assignCheckNumbers(client, 'cm_transaction_payment', id, 'cm_transaction_id');
             await syncCmBankItems(client, id, glEntryId);
             await insertCmVt(client, id, sys);
         }

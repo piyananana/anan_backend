@@ -17,10 +17,11 @@ const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 // 70 ค่าธรรมเนียมธนาคาร: หน้าจอส่งบรรทัดเดียว (ยอดค่าธรรมเนียม + VAT) ผู้ขาย = ธนาคาร (ชื่อ/เลขผู้เสียภาษีที่หัวเอกสาร)
 const TAX_LINE_TYPES = ['10', '20', '40', '70'];
 
-const ensured = new Set();
-const ensureCmTaxColumns = async (db) => {
-    const key = db.options?.database || db.database || 'default';
-    if (ensured.has(key)) return;
+const { makeEnsureOnce } = require('../../utils/schemaOnce');
+const ensureCmTaxColumns = makeEnsureOnce(
+    [['cm_transaction', 'wht_amount_lc'], ['cm_transaction_detail', 'tax_invoice_date'], ['cm_transaction_wht', 'description'],
+     ['cm_transaction_gl_setup', 'wht_prepaid_account_id']],
+    async (db) => {
     await require('./cmTransactionGlSetupController').ensureTable(db);
     const head = [
         'price_includes_vat BOOLEAN NOT NULL DEFAULT false',
@@ -54,8 +55,7 @@ const ensureCmTaxColumns = async (db) => {
             wht_amount_lc  NUMERIC(18,4) DEFAULT 0,
             description    TEXT
         )`);
-    ensured.add(key);
-};
+});
 
 // คู่ค้าจากข้อมูลหลัก: ดึงค่าจาก AP/AR ทับค่าที่หน้าจอส่งมาเสมอ — ไม่เลือก = ใช้ค่าที่พิมพ์เอง
 const resolveParty = async (client, header) => {

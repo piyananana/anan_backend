@@ -4,6 +4,7 @@ const { branchCodeSql } = require('../../utils/taxBranch');
 const { today: todayYmd } = require('../../utils/dateUtil');
 const { resolveApAccountId, postedApAccountId, postedApAccountSql } = require('../../utils/apAccount');
 const { ensureDepositRefColumns, saveDepositRef } = require('../../utils/depositRef');
+const { ensureCheckbookColumns, assignCheckNumbers } = require('../../utils/cmCheckbook');
 const { syncPartyBankItems, voidBankItems, deleteBankItems, bankItemsClearedSql, ensureBankItemColumns } = require('../../utils/cmBankItems');
 // controllers/ap/apTransactionController.js
 
@@ -1459,13 +1460,14 @@ const createTransaction = async (req, res) => {
         await ensurePaymentTable(client);
         let pmLineNo = 1;
         for (const p of (payments || [])) {
+            await ensureCheckbookColumns(client);
             await client.query(`
                 INSERT INTO ap_transaction_payment
                 (header_id, line_no, payment_method_id, payment_method_code, payment_method_name,
                  payment_method_type, cm_bank_account_id, gl_account_id,
                  amount_lc, amount_fc, ref_no, payment_date, remark,
-                 drawer_bank_name, drawer_bank_branch, drawer_account_no, created_by)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+                 drawer_bank_name, drawer_bank_branch, drawer_account_no, created_by, checkbook_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
             `, [
                 newHeaderId, pmLineNo++,
                 p.payment_method_id || null, p.payment_method_code || null, p.payment_method_name || null,
@@ -1473,7 +1475,8 @@ const createTransaction = async (req, res) => {
                 p.amount_lc || 0, p.amount_fc || 0,
                 p.ref_no || null, p.payment_date || header.doc_date, p.remark || null,
                 p.drawer_bank_name || null, p.drawer_bank_branch || null, p.drawer_account_no || null,
-                header.created_by || null
+                header.created_by || null,
+                p.payment_method_type === 'CHECK' ? (p.checkbook_id || null) : null,
             ]);
         }
 
@@ -1530,6 +1533,8 @@ const createTransaction = async (req, res) => {
                 if (['65'].includes(sysDocType1)) {
                     await client.query(`UPDATE ap_transaction SET balance_amount_lc=0 WHERE id=$1`, [newHeaderId]);
                 }
+                // เลขเช็คจากสมุดเช็ค (จ่ายมัดจำ/จ่ายชำระ) ก่อนสร้างรายการจ่ายธนาคาร
+                if (['60', '80'].includes(sysDocType1)) await assignCheckNumbers(client, 'ap_transaction_payment', newHeaderId, 'ap_transaction_id');
                 if (['60', '65', '80'].includes(sysDocType1)) await postCmPaymentHelper(client, newHeaderId, glEntryId);
             }
         }
@@ -1657,13 +1662,14 @@ const updateTransaction = async (req, res) => {
         await ensurePaymentTable(client);
         let pmLineNo = 1;
         for (const p of (payments || [])) {
+            await ensureCheckbookColumns(client);
             await client.query(`
                 INSERT INTO ap_transaction_payment
                 (header_id, line_no, payment_method_id, payment_method_code, payment_method_name,
                  payment_method_type, cm_bank_account_id, gl_account_id,
                  amount_lc, amount_fc, ref_no, payment_date, remark,
-                 drawer_bank_name, drawer_bank_branch, drawer_account_no, created_by)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+                 drawer_bank_name, drawer_bank_branch, drawer_account_no, created_by, checkbook_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
             `, [
                 id, pmLineNo++,
                 p.payment_method_id || null, p.payment_method_code || null, p.payment_method_name || null,
@@ -1671,7 +1677,8 @@ const updateTransaction = async (req, res) => {
                 p.amount_lc || 0, p.amount_fc || 0,
                 p.ref_no || null, p.payment_date || header.doc_date, p.remark || null,
                 p.drawer_bank_name || null, p.drawer_bank_branch || null, p.drawer_account_no || null,
-                header.updated_by || null
+                header.updated_by || null,
+                p.payment_method_type === 'CHECK' ? (p.checkbook_id || null) : null,
             ]);
         }
 
@@ -1809,6 +1816,7 @@ const postTransaction = async (req, res) => {
             if (sysDocType1 === '65') {
                 await client.query(`UPDATE ap_transaction SET balance_amount_lc=0 WHERE id=$1`, [id]);
             }
+            if (['60', '80'].includes(sysDocType1)) await assignCheckNumbers(client, 'ap_transaction_payment', id, 'ap_transaction_id');
             if (['60', '65', '80'].includes(sysDocType1)) await postCmPaymentHelper(client, id, glEntryId);
         }
 

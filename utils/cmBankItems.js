@@ -12,10 +12,11 @@
 // สถานะเริ่มต้น Pending เหมือนรายการของ AR/AP (เคลียร์ภายหลังในหน้ารายการรับ/จ่ายเงิน)
 const { getBaseCurrencyCode } = require('./baseCurrency');
 
-const ensured = new Set();
-const ensureBankItemColumns = async (db) => {
-    const key = db.options?.database || db.database || 'default';
-    if (ensured.has(key)) return;
+const { makeEnsureOnce } = require('./schemaOnce');
+const ensureBankItemColumns = makeEnsureOnce(
+    [['cm_receipt', 'source_type'], ['cm_payment', 'source_type'], ['cm_receipt', 'ap_transaction_id'],
+     ['cm_payment', 'ar_transaction_id'], ['cm_payment', 'drawer_bank']],
+    async (db) => {
     // สร้างตารางก่อนเสมอ (ฐานข้อมูลใหม่ที่ยังไม่เคยใช้ CM) — require ตอนเรียกเพื่อเลี่ยง require วนกับ AR controller
     await require('../controllers/cm/cmReceiptController').ensureCmReceiptTable(db);
     await require('../controllers/cm/cmPaymentController').ensureCmPaymentTable(db);
@@ -27,9 +28,8 @@ const ensureBankItemColumns = async (db) => {
         await db.query(`CREATE INDEX IF NOT EXISTS ${t}_cm_transaction_idx ON ${t} (cm_transaction_id)`).catch(() => {});
     }
     await db.query(`ALTER TABLE IF EXISTS cm_payment ADD COLUMN IF NOT EXISTS drawer_bank VARCHAR(200)`);
-    ensured.add(key);
     await backfillBankItems(db);
-};
+});
 
 // เอกสารที่โพสต์ไว้ก่อนเริ่มเขียนรายการธนาคาร (CM ทุกประเภท, AR/AP 60/65) — สร้างรายการให้ครั้งเดียว (เฉพาะที่ยังไม่มี)
 // เอกสารที่ยกเลิกแล้วไม่ต้องสร้าง (ไม่นับยอดอยู่แล้ว) — AR/AP 80 มีรายการอยู่แล้วตั้งแต่เดิม
@@ -68,13 +68,13 @@ const insertPayment = (client, r) => client.query(`
          ar_transaction_id, ap_transaction_id, cm_transaction_id, source_type, ap_doc_no,
          payee_type, payee_id, payee_code, payee_name_th,
          amount_lc, amount_fc, currency_code, exchange_rate,
-         check_no, check_date, drawer_bank, gl_entry_id)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`, [
+         check_no, check_date, drawer_bank, gl_entry_id, checkbook_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`, [
     r.date, r.bankAccountId, r.paymentMethodId || null, r.methodType || 'TRANSFER',
     r.arId || null, r.apId || null, r.cmId || null, r.sourceType, r.docNo || null,
     r.payeeType || 'OTHER', r.partyId || null, r.partyCode || null, r.partyName || null,
     r.amountLc || 0, r.amountFc || 0, r.currencyCode, r.exchangeRate || 1,
-    r.checkNo || null, r.checkDate || null, r.drawerBank || null, r.glEntryId || null,
+    r.checkNo || null, r.checkDate || null, r.drawerBank || null, r.glEntryId || null, r.checkbookId || null,
 ]);
 
 const deleteBankItems = async (client, module, id) => {
@@ -123,8 +123,8 @@ const syncPartyBankItems = async (client, module, id, glEntryId) => {
     const inflow = isAr ? h.sys_doc_type !== '65' : h.sys_doc_type === '65';
     const pms = (await client.query(`
         SELECT payment_method_id, payment_method_type, cm_bank_account_id, amount_lc, amount_fc,
-               ref_no, payment_date, drawer_bank_name
-          FROM ${isAr ? 'ar_transaction_payment' : 'ap_transaction_payment'}
+               ref_no, payment_date, drawer_bank_name, (to_jsonb(p)->>'checkbook_id')::int AS checkbook_id
+          FROM ${isAr ? 'ar_transaction_payment' : 'ap_transaction_payment'} p
          WHERE header_id = $1 AND cm_bank_account_id IS NOT NULL ORDER BY line_no`, [id])).rows;
     const currencyCode = h.currency_code || await getBaseCurrencyCode(client);
     for (const pm of pms) {
@@ -136,7 +136,7 @@ const syncPartyBankItems = async (client, module, id, glEntryId) => {
             payeeType: isAr ? 'CUSTOMER' : 'VENDOR', partyId: h.party_id, partyCode: h.party_code, partyName: h.party_name,
             amountLc: pm.amount_lc, amountFc: pm.amount_fc, currencyCode, exchangeRate: h.exchange_rate,
             checkNo: isCheck ? pm.ref_no : null, checkDate: isCheck ? (pm.payment_date || h.doc_date) : null,
-            drawerBank: pm.drawer_bank_name, glEntryId,
+            drawerBank: pm.drawer_bank_name, glEntryId, checkbookId: isCheck ? pm.checkbook_id : null,
         };
         // รายการเดิมของ 80 ไม่มี source_type (รายงานถือว่าเป็นรับ/จ่ายชำระปกติ) — ใส่ให้ครบสำหรับรายการใหม่
         await (inflow ? insertReceipt(client, row) : insertPayment(client, row));
@@ -158,8 +158,8 @@ const syncCmBankItems = async (client, id, glEntryId) => {
     const whole = { amountLc: h.total_amount_lc, amountFc: h.total_amount_fc };
     const pms = (await client.query(`
         SELECT payment_method_id, payment_method_type, cm_bank_account_id, amount_lc, amount_fc,
-               ref_no, payment_date, drawer_bank_name
-          FROM cm_transaction_payment WHERE header_id = $1 AND cm_bank_account_id IS NOT NULL ORDER BY line_no`, [id])).rows;
+               ref_no, payment_date, drawer_bank_name, (to_jsonb(p)->>'checkbook_id')::int AS checkbook_id
+          FROM cm_transaction_payment p WHERE header_id = $1 AND cm_bank_account_id IS NOT NULL ORDER BY line_no`, [id])).rows;
     const fromPayments = async (inflow) => {
         for (const pm of pms) {
             const isCheck = pm.payment_method_type === 'CHECK';
@@ -167,7 +167,7 @@ const syncCmBankItems = async (client, id, glEntryId) => {
                 ...base, bankAccountId: pm.cm_bank_account_id, paymentMethodId: pm.payment_method_id,
                 methodType: pm.payment_method_type, amountLc: pm.amount_lc, amountFc: pm.amount_fc,
                 checkNo: isCheck ? pm.ref_no : null, checkDate: isCheck ? (pm.payment_date || h.doc_date) : null,
-                drawerBank: pm.drawer_bank_name,
+                drawerBank: pm.drawer_bank_name, checkbookId: isCheck ? pm.checkbook_id : null,
             };
             await (inflow ? insertReceipt(client, row) : insertPayment(client, row));
         }
