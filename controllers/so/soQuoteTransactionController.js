@@ -559,6 +559,7 @@ const fetchConvertibleLines = async (req, res) => {
         const { search } = req.query;
         let query = `
             SELECT t.id AS header_id, t.doc_no, t.doc_date, t.status, t.currency_code, t.exchange_rate,
+                   t.dim1_id, t.dim2_id, t.dim3_id, t.dim4_id, t.dim5_id,
                    dt.id AS detail_id, dt.line_no, dt.item_id, dt.item_code, dt.item_name, dt.uom_id,
                    dt.qty_quoted, dt.unit_price_fc, u.uom_code,
                    dt.discount_percent, dt.vat_type, dt.vat_rate, t.price_includes_vat,
