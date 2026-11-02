@@ -6,6 +6,7 @@ const { generateNextCodeForCategory } = require('./imItemCategoryController');
 const imUomConversion = require('./imUomConversionController');
 const imItemWarehouse = require('./imItemWarehouseController');
 const { ensureImPriceListTable } = require('./imPriceListController');
+const { MODES: ACCOUNTING_MODES, logModeChange } = require('../../utils/imAccountingMode');
 
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -35,6 +36,7 @@ const TEMPLATE_SHEETS = [
       { key: 'item_type',           label: `ประเภทสินค้า (${ITEM_TYPES.join('/')})`,        required: false, example: 'STOCK' },
       { key: 'base_uom_code',       label: 'รหัสหน่วยนับหลัก',                              required: false, example: 'PCS' },
       { key: 'costing_method',      label: `วิธีคำนวณต้นทุน (${COSTING_METHODS.join('/')})`, required: false, example: 'AVG' },
+      { key: 'accounting_mode',     label: 'โหมดบัญชีสินค้า (PERPETUAL/PERIODIC, ว่าง = ตามหมวดสินค้า/คลัง/ค่าตั้งต้น)', required: false, example: '', optional: true },
       { key: 'standard_cost',       label: 'ต้นทุนมาตรฐาน',                                 required: false, example: '0' },
       { key: 'is_purchase_item',    label: 'ซื้อได้ (Y/N)',                                 required: false, example: 'Y' },
       { key: 'is_sales_item',       label: 'ขายได้ (Y/N)',                                  required: false, example: 'Y' },
@@ -83,6 +85,7 @@ const TEMPLATE_SHEETS = [
       { key: 'cogs_account_code',      label: 'รหัสบัญชีต้นทุนขาย',                              required: false, example: '5010' },
       { key: 'revenue_account_code',   label: 'รหัสบัญชีรายได้',                                 required: false, example: '4010' },
       { key: 'expense_account_code',   label: 'รหัสบัญชีค่าใช้จ่าย',                             required: false, example: '5510' },
+      { key: 'purchases_account_code', label: 'รหัสบัญชีซื้อ (ใช้กับโหมด Periodic)',               required: false, example: '', optional: true },
     ],
   },
   {
@@ -161,7 +164,8 @@ const readSheet = (workbook, sheetDef, { required = false } = {}) => {
   if (aoa.length === 0) return { present: false, colIdx: {}, rows: [] };
 
   const headers = aoa[0].map(h => String(h || '').trim());
-  const expectedKeys = sheetDef.columns.map(c => c.key);
+  // คอลัมน์ optional = เพิ่มเข้าเทมเพลตทีหลัง — ไฟล์เทมเพลตรุ่นเก่าที่ไม่มีคอลัมน์นี้ยังนำเข้าได้ (ถือว่าว่าง)
+  const expectedKeys = sheetDef.columns.filter(c => !c.optional).map(c => c.key);
   const missing = expectedKeys.filter(k => !headers.includes(k));
   if (missing.length > 0) {
     throw new ImportTemplateError(`Sheet "${sheetDef.name}" ไม่ตรงตามเทมเพลต ขาดคอลัมน์: ${missing.join(', ')}`);
@@ -309,6 +313,12 @@ const validateFile = [
           rowErrors.push({ column: 'costing_method', message: `วิธีคำนวณต้นทุนต้องเป็นหนึ่งใน ${COSTING_METHODS.join(', ')}` });
         }
 
+        // โหมดบัญชีของสินค้า (โหมดบัญชีแบบผสม) — ว่าง = ตามหมวดสินค้า → คลัง → ค่าตั้งต้น
+        const accountingModeRaw = get('accounting_mode').toUpperCase();
+        if (accountingModeRaw && !ACCOUNTING_MODES.includes(accountingModeRaw)) {
+          rowErrors.push({ column: 'accounting_mode', message: `โหมดบัญชีต้องเป็นหนึ่งใน ${ACCOUNTING_MODES.join(', ')} หรือว่าง` });
+        }
+
         const baseUomCode = get('base_uom_code').toUpperCase();
         let resolvedBaseUom = null;
         if (baseUomCode) {
@@ -374,6 +384,7 @@ const validateFile = [
           base_uom_code:          baseUomCode || null,
           base_uom_id:            resolvedBaseUom?.id || null,
           costing_method:         costingMethod,
+          accounting_mode:        ACCOUNTING_MODES.includes(accountingModeRaw) ? accountingModeRaw : null,
           standard_cost:          standardCost,
           shelf_life_days:        shelfLifeDays,
           default_warehouse_code: defaultWarehouseCode || null,
@@ -387,6 +398,7 @@ const validateFile = [
           cogs_account_code:      null, cogs_account_id:      null,
           revenue_account_code:   null, revenue_account_id:   null,
           expense_account_code:   null, expense_account_id:   null,
+          purchases_account_code: null, purchases_account_id: null,
           uom_conversions:        [],
           item_warehouses:        [],
           price_lines:            [],
@@ -535,6 +547,7 @@ const validateFile = [
         resolveAccount('cogs_account_code',      'cogs_account_code',      'cogs_account_id');
         resolveAccount('revenue_account_code',   'revenue_account_code',   'revenue_account_id');
         resolveAccount('expense_account_code',   'expense_account_code',   'expense_account_id');
+        resolveAccount('purchases_account_code', 'purchases_account_code', 'purchases_account_id');
       }
 
       // ── Sheet 5: ตารางราคา (ตั้งราคาตั้งต้นให้สินค้าที่นำเข้าใหม่ ไม่ได้สร้างตารางราคาใหม่) ─────────────
@@ -711,8 +724,8 @@ const confirmImport = async (req, res) => {
               shelf_life_days, default_warehouse_id,
               min_stock_qty, max_stock_qty, reorder_point, default_vat_type,
               inventory_account_id, cogs_account_id, revenue_account_id, expense_account_id,
-              is_active, is_code_auto_generated, created_by, updated_by)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$29)
+              is_active, is_code_auto_generated, created_by, updated_by, accounting_mode, purchases_account_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$29,$30,$31)
            ON CONFLICT (item_code) DO NOTHING
            RETURNING id`,
           [
@@ -728,8 +741,12 @@ const confirmImport = async (req, res) => {
             r.is_active !== undefined ? r.is_active : true,
             isCodeAutoGenerated,
             userName,
+            r.accounting_mode || null, r.purchases_account_id || null,
           ]
         );
+        if (result.rows.length && r.accounting_mode) {
+          await logModeChange(client, { level: 'ITEM', refId: result.rows[0].id, oldMode: null, newMode: r.accounting_mode, changedBy: userName });
+        }
 
         if (result.rows.length === 0) {
           skipped++;

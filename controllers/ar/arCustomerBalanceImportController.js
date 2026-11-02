@@ -2,6 +2,7 @@
 const XLSX = require('xlsx');
 const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const multer = require('multer');
+const { templateDimColumns, loadDimLookup, parseRowDims } = require('../../utils/importDims');
 
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -24,10 +25,15 @@ const TEMPLATE_SHEET = {
     { key: 'exchange_rate', label: 'อัตราแลกเปลี่ยน (ว่าง = 1)', required: false, example: '1' },
     { key: 'amount', label: 'ยอดคงเหลือ', required: true, example: '50000' },
     { key: 'description', label: 'คำอธิบาย/หมายเหตุ', required: false, example: 'ยอดยกมาจากระบบเดิม' },
+    { key: 'billing_date', label: 'วันวางบิล (YYYY-MM-DD, ว่าง = ยังไม่วางบิล)', required: false, example: '', optional: true },
+    { key: 'expected_payment_date', label: 'วันคาดว่าจะได้รับชำระ (YYYY-MM-DD)', required: false, example: '', optional: true },
   ],
 };
 
 // GET /ar_customer_balance/import/template
+// เทมเพลตจริง = คอลัมน์คงที่ + คอลัมน์มิติตามประเภทมิติที่เปิดใช้
+const sheetDef = async (db) => ({ ...TEMPLATE_SHEET, columns: [...TEMPLATE_SHEET.columns, ...await templateDimColumns(db)] });
+
 const getTemplate = async (req, res) => {
   try {
     const docTypesR = await req.dbPool.query(
@@ -36,7 +42,7 @@ const getTemplate = async (req, res) => {
        ORDER BY doc_code`,
       [DR_DOC_TYPES]
     );
-    res.json({ sheet: TEMPLATE_SHEET, docTypes: docTypesR.rows });
+    res.json({ sheet: await sheetDef(req.dbPool), docTypes: docTypesR.rows });
   } catch (err) {
     console.error('getTemplate error:', err);
     res.status(500).json({ message: 'เกิดข้อผิดพลาด: ' + err.message });
@@ -44,11 +50,12 @@ const getTemplate = async (req, res) => {
 };
 
 // GET /ar_customer_balance/import/template/download — ส่งไฟล์ xlsx เทมเพลต
-const downloadTemplate = (req, res) => {
-  const headers = TEMPLATE_SHEET.columns.map(c => c.key);
-  const labels = TEMPLATE_SHEET.columns.map(c => `(${c.label}${c.required ? ' *' : ''})`);
+const downloadTemplate = async (req, res) => {
+  const def = await sheetDef(req.dbPool);
+  const headers = def.columns.map(c => c.key);
+  const labels = def.columns.map(c => `(${c.label}${c.required ? ' *' : ''})`);
   const ws = XLSX.utils.aoa_to_sheet([headers, labels]);
-  ws['!cols'] = TEMPLATE_SHEET.columns.map(c => ({ wch: Math.max(c.key.length, c.label.length) + 4 }));
+  ws['!cols'] = def.columns.map(c => ({ wch: Math.max(c.key.length, c.label.length) + 4 }));
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, TEMPLATE_SHEET.name);
   const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
@@ -78,7 +85,8 @@ const readSheet = (workbook) => {
   if (aoa.length === 0) return { present: false, colIdx: {}, rows: [] };
 
   const headers = aoa[0].map(h => String(h || '').trim());
-  const expectedKeys = TEMPLATE_SHEET.columns.map(c => c.key);
+  // คอลัมน์ optional = เพิ่มเข้าเทมเพลตทีหลัง — ไฟล์เทมเพลตรุ่นเก่าที่ไม่มีคอลัมน์นี้ยังนำเข้าได้ (ถือว่าว่าง)
+  const expectedKeys = TEMPLATE_SHEET.columns.filter(c => !c.optional).map(c => c.key);
   const missing = expectedKeys.filter(k => !headers.includes(k));
   if (missing.length > 0) {
     throw new ImportTemplateError(`Sheet "${TEMPLATE_SHEET.name}" ไม่ตรงตามเทมเพลต ขาดคอลัมน์: ${missing.join(', ')}`);
@@ -152,6 +160,7 @@ const validateFile = [
       const currencyMap = buildCodeMap(currenciesR.rows, 'currency_code');
       const docTypeMap = buildCodeMap(docTypesR.rows, 'doc_code');
 
+      const dimLookup = await loadDimLookup(req.dbPool);
       const errors = [];
       const validatedRows = [];
 
@@ -263,6 +272,18 @@ const validateFile = [
 
         const description = trunc(getStr('description'), 500);
 
+        // วันวางบิล / วันคาดว่าจะได้รับชำระ (รายงานแผนการวางบิลใช้)
+        const optDate = (key, label) => {
+          const s = getStr(key);
+          if (!s) return null;
+          const d = parseDateCell(get(key));
+          if (!d) rowErrors.push({ column: key, message: `${label} "${s}" ไม่ถูกต้อง (รูปแบบ YYYY-MM-DD)` });
+          return d;
+        };
+        const billingDate = optDate('billing_date', 'วันวางบิล');
+        const expectedPaymentDate = optDate('expected_payment_date', 'วันคาดว่าจะได้รับชำระ');
+        const { dims, label: dimLabel } = parseRowDims(getStr, dimLookup, rowErrors);
+
         if (rowErrors.length > 0) {
           errors.push({ row: rowNum, customerCode: customerCode || '-', errors: rowErrors });
           continue;
@@ -284,6 +305,10 @@ const validateFile = [
           amount,
           ar_account_id: arAccountId,
           description,
+          billing_date: billingDate,
+          expected_payment_date: expectedPaymentDate,
+          ...dims,
+          dim_label: dimLabel,
         });
       }
 
@@ -384,12 +409,14 @@ const confirmImport = async (req, res) => {
               subtotal_fc, discount_amount_fc, before_vat_fc, vat_amount_fc, total_amount_fc,
               subtotal_lc, discount_amount_lc, before_vat_lc, vat_amount_lc, total_amount_lc,
               paid_amount_lc, balance_amount_lc,
-              description, status, created_by, updated_by)
+              description, status, created_by, updated_by,
+              dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, billing_date, expected_payment_date)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
                    $13,0,$13,0,$13,
                    $14,0,$14,0,$14,
                    0,$14,
-                   $15,'Posted',$16,$16)`,
+                   $15,'Posted',$16,$16,
+                   $17,$18,$19,$20,$21,$22,$23)`,
           [
             r.doc_id, trunc(r.doc_no, 30), r.doc_date, r.due_date || null, periodId,
             r.customer_id, trunc(r.customer_code, 20), trunc(r.customer_name_th, 200),
@@ -398,6 +425,8 @@ const confirmImport = async (req, res) => {
             amountLc,
             trunc(r.description, 500),
             userName,
+            r.dim1_id || null, r.dim2_id || null, r.dim3_id || null, r.dim4_id || null, r.dim5_id || null,
+            r.billing_date || null, r.expected_payment_date || null,
           ]
         );
 
