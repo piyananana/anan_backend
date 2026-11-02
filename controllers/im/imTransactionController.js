@@ -21,6 +21,9 @@ const { IM_CHECK_TYPES, ensureCreditSchema, imDocAmount, assertCreditForPost, lo
 const { resolveArAccountId } = require('../../utils/arAccount');
 const { resolveApAccountId } = require('../../utils/apAccount');
 const { calcLineAmounts, netUnitPrice, netUnitPriceSql, ensureSoPriceColumns, ensurePoPriceColumns } = require('../../utils/vatCalc');
+const { headerDims, lineDims, ensureDetailDimColumns, detailDimParams, assertRequiredDims } = require('../../utils/glDims');
+// บรรทัด IM: บัญชีที่ใช้ลงบัญชีของบรรทัด (เบิกสินค้า '60') + มิติของบรรทัด — utils/glDims.js
+const ensureImLineGlColumns = (db) => ensureDetailDimColumns(db, 'im_transaction_detail', [['gl_account_id', 'INTEGER']]);
 
 // ตรวจวงเงินเครดิตก่อนโพสต์เอกสารฝั่งขาย (ส่งสินค้า/รับคืน/ลดหนี้/เพิ่มหนี้ลูกหนี้) — เกินและยังไม่ได้รับอนุมัติ = throw
 const checkImCreditForPost = async (client, { docId, customerId, details, id, row, exchangeRate, priceIncludesVat }) => {
@@ -923,14 +926,21 @@ const postGlEntry = async (client, headerId, header, allDetails, docNo, sysDocTy
     } else {
         const { accountId: counterAccountId, label: counterLabel } = resolveCounterAccount(sysDocType, setup);
         const perItemCogs = COGS_COUNTER_TYPES.includes(sysDocType);
-        const counterByAccount = {}; // account_id -> มูลค่าสต็อกที่เปลี่ยน (บวก=Cr คู่บัญชี, ลบ=Dr คู่บัญชี)
+        // บัญชีคู่ → มูลค่าสต็อกที่เปลี่ยน (บวก=Cr คู่บัญชี, ลบ=Dr คู่บัญชี) — เบิกสินค้า ('60') แยกตามบัญชี+มิติของบรรทัด
+        // (บัญชีของบรรทัดเลือกได้ ไม่เลือก = สินค้า → หมวดสินค้า → setup, มิติที่ว่างใช้ของหัวเอกสาร)
+        const counterByAccount = {};
+        const hDims = headerDims(header);
         for (const d of details) {
             // เหลือบรรทัด Periodic เฉพาะ '90' (MOI): Cr บัญชีซื้อ — วัตถุดิบที่ออกไปผลิตไม่ใช่ต้นทุนขายของงวด
             const invAcc = await resolveStockSideAccount(client, d.item_id, header.warehouse_id, d.gl_mode, setup.inventory_account_id);
             const value = round2(Number(d.qty) * Number(d.unit_cost));
             invDebitByAccount[invAcc] = (invDebitByAccount[invAcc] || 0) + value;
-            const cAcc = perItemCogs ? await resolveCogsAccount(client, d.item_id, counterAccountId) : counterAccountId;
-            counterByAccount[cAcc] = (counterByAccount[cAcc] || 0) + value;
+            const lineAcc = sysDocType === '60' ? Number(d.gl_account_id) || null : null;
+            const cAcc = lineAcc || (perItemCogs ? await resolveCogsAccount(client, d.item_id, counterAccountId) : counterAccountId);
+            const cDims = sysDocType === '60' ? lineDims(d, hDims) : null;
+            const key = cDims ? `${cAcc}|${cDims.join(',')}` : String(cAcc);
+            if (!counterByAccount[key]) counterByAccount[key] = { acc: cAcc, dims: cDims, amt: 0 };
+            counterByAccount[key].amt += value;
         }
         for (const [accId, amt] of Object.entries(invDebitByAccount)) {
             if (amt === 0) continue;
@@ -939,15 +949,18 @@ const postGlEntry = async (client, headerId, header, allDetails, docNo, sysDocTy
                 debit_lc: amt > 0 ? round2(amt) : 0, credit_lc: amt < 0 ? round2(-amt) : 0, debit_fc: 0, credit_fc: 0,
             });
         }
-        for (const [accId, amt] of Object.entries(counterByAccount)) {
+        for (const { acc, dims, amt } of Object.values(counterByAccount)) {
             if (round2(amt) === 0) continue;
             glDetails.push({
-                account_id: Number(accId), description: `${counterLabel} ${docNo}`,
+                account_id: Number(acc), description: `${counterLabel} ${docNo}`,
                 debit_lc: amt < 0 ? round2(-amt) : 0, credit_lc: amt > 0 ? round2(amt) : 0, debit_fc: 0, credit_fc: 0,
+                ...(dims ? { dims } : {}),
             });
         }
     }
     if (glDetails.length === 0) return null; // ไม่มีผลต่างมูลค่าใดๆ — ไม่ต้องโพสต์ GL
+    // ตรวจมิติที่บัญชีบังคับ (gl_account_dim_rule) ต่อบรรทัดรายการบัญชี — เหมือน AR/AP
+    await assertRequiredDims(client, glDetails, headerDims(header));
 
     let glDocNo = header.gl_doc_no || await generateDocNo(client, setup.gl_doc_id, header.doc_date, header.branch_id);
     if (!glDocNo) glDocNo = `GL-${docNo}`;
@@ -982,7 +995,7 @@ const postGlEntry = async (client, headerId, header, allDetails, docNo, sysDocTy
                                           dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
         `, [glEntryId, lineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc, l.debit_fc, l.credit_fc,
-            header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null]);
+            ...(l.dims || headerDims(header))]);
     }
     return glEntryId;
 };
@@ -1072,6 +1085,10 @@ const applyImAdvances = async (client, { module, advances, billId, billTotalFc, 
     for (const part of adv.parts) await M.insertDepositVtReversal(client, billId, billHeader, part);
     return adv;
 };
+
+// มิติของเอกสาร IM ส่งต่อไปที่หัวเอกสาร AR/AP ที่สร้างอัตโนมัติ (รายการบัญชีของเอกสารนั้นใช้มิติเดียวกัน)
+const setAutoDocDims = (client, table, id, header) => client.query(
+    `UPDATE ${table} SET dim1_id=$1, dim2_id=$2, dim3_id=$3, dim4_id=$4, dim5_id=$5 WHERE id=$6`, [...headerDims(header), id]);
 
 const resolveDocCurrencyId = async (client, header) => {
     if (header.currency_id) return Number(header.currency_id);
@@ -1191,6 +1208,7 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
         header.price_includes_vat === true, dueDate,
     ]);
     const apTransactionId = apHeaderRes.rows[0].id;
+    await setAutoDocDims(client, 'ap_transaction', apTransactionId, header);
     await client.query(`UPDATE ap_transaction SET tax_invoice_no = $1, tax_invoice_date = $2 WHERE id = $3`,
         [vendorInvoiceNo, billDate, apTransactionId]);
 
@@ -1286,12 +1304,15 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
             docExchangeRate, totalDebitFc, totalCreditFc,
         ]);
         const apGlEntryId = apGlHeaderRes.rows[0].id;
+        // มิติของเอกสาร IM ลงทุกบรรทัด + ตรวจมิติที่บัญชีบังคับ (เหมือน AR/AP)
+        await assertRequiredDims(client, apGlDetails, headerDims(header));
         let glLineNo = 1;
         for (const l of apGlDetails) {
             await client.query(`
-                INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-            `, [apGlEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc, l.debit_fc || 0, l.credit_fc || 0]);
+                INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc,
+                                              dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            `, [apGlEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc, l.debit_fc || 0, l.credit_fc || 0, ...headerDims(header)]);
         }
         await client.query(`UPDATE ap_transaction SET gl_entry_id = $1 WHERE id = $2`, [apGlEntryId, apTransactionId]);
     }
@@ -1403,6 +1424,7 @@ const postArBillFromDln = async (client, { header, details, docNo, advances = []
         header.price_includes_vat === true,
     ]);
     const arTransactionId = arHeaderRes.rows[0].id;
+    await setAutoDocDims(client, 'ar_transaction', arTransactionId, header);
 
     let lineNo = 1;
     for (const l of lineRows) {
@@ -1484,12 +1506,15 @@ const postArBillFromDln = async (client, { header, details, docNo, advances = []
             docExchangeRate, totalDebitFc, totalCreditFc,
         ]);
         const arGlEntryId = arGlHeaderRes.rows[0].id;
+        // มิติของเอกสาร IM ลงทุกบรรทัด + ตรวจมิติที่บัญชีบังคับ (เหมือน AR/AP)
+        await assertRequiredDims(client, arGlDetails, headerDims(header));
         let glLineNo = 1;
         for (const l of arGlDetails) {
             await client.query(`
-                INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-            `, [arGlEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc, l.debit_fc || 0, l.credit_fc || 0]);
+                INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc,
+                                              dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            `, [arGlEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc, l.debit_fc || 0, l.credit_fc || 0, ...headerDims(header)]);
         }
         await client.query(`UPDATE ar_transaction SET gl_entry_id = $1 WHERE id = $2`, [arGlEntryId, arTransactionId]);
     }
@@ -1612,6 +1637,7 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
         header.price_includes_vat === true,
     ]);
     const apTransactionId = apHeaderRes.rows[0].id;
+    await setAutoDocDims(client, 'ap_transaction', apTransactionId, header);
     await client.query(`UPDATE ap_transaction SET tax_invoice_no = $1, tax_invoice_date = $2 WHERE id = $3`,
         [vendorDocNo, vendorDocDate, apTransactionId]);
 
@@ -1709,12 +1735,15 @@ const postApCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
             docExchangeRate, totalDebitFc, totalCreditFc,
         ]);
         const apGlEntryId = apGlHeaderRes.rows[0].id;
+        // มิติของเอกสาร IM ลงทุกบรรทัด + ตรวจมิติที่บัญชีบังคับ (เหมือน AR/AP)
+        await assertRequiredDims(client, apGlDetails, headerDims(header));
         let glLineNo = 1;
         for (const l of apGlDetails) {
             await client.query(`
-                INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-            `, [apGlEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc, l.debit_fc || 0, l.credit_fc || 0]);
+                INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc,
+                                              dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            `, [apGlEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc, l.debit_fc || 0, l.credit_fc || 0, ...headerDims(header)]);
         }
         await client.query(`UPDATE ap_transaction SET gl_entry_id = $1 WHERE id = $2`, [apGlEntryId, apTransactionId]);
     }
@@ -1826,6 +1855,7 @@ const postArCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
         header.price_includes_vat === true,
     ]);
     const arTransactionId = arHeaderRes.rows[0].id;
+    await setAutoDocDims(client, 'ar_transaction', arTransactionId, header);
 
     let lineNo = 1;
     for (const l of lineRows) {
@@ -1910,12 +1940,15 @@ const postArCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
             docExchangeRate, totalDebitFc, totalCreditFc,
         ]);
         const arGlEntryId = arGlHeaderRes.rows[0].id;
+        // มิติของเอกสาร IM ลงทุกบรรทัด + ตรวจมิติที่บัญชีบังคับ (เหมือน AR/AP)
+        await assertRequiredDims(client, arGlDetails, headerDims(header));
         let glLineNo = 1;
         for (const l of arGlDetails) {
             await client.query(`
-                INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-            `, [arGlEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc, l.debit_fc || 0, l.credit_fc || 0]);
+                INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc,
+                                              dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            `, [arGlEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc, l.debit_fc || 0, l.credit_fc || 0, ...headerDims(header)]);
         }
         await client.query(`UPDATE ar_transaction SET gl_entry_id = $1 WHERE id = $2`, [arGlEntryId, arTransactionId]);
     }
@@ -2455,7 +2488,21 @@ const copyImSalespersonsToAr = async (client, imId, arId) => {
 const refDims = async (client, { refMoId, refPoId, refSoId }) => {
     const src = refMoId ? ['mo_header', refMoId] : refPoId ? ['po_transaction', refPoId] : refSoId ? ['so_transaction', refSoId] : null;
     if (!src) return null;
-    return (await client.query(`SELECT dim1_id, dim2_id, dim3_id, dim4_id, dim5_id FROM ${src[0]} WHERE id = $1`, [src[1]])).rows[0] || null;
+    const row = (await client.query(`SELECT dim1_id, dim2_id, dim3_id, dim4_id, dim5_id FROM ${src[0]} WHERE id = $1`, [src[1]])).rows[0];
+    // เอกสารต้นทางไม่มีมิติ = ไม่ล็อก ใช้มิติที่ระบุที่เอกสาร IM
+    return row && Object.values(row).some(Boolean) ? row : null;
+};
+
+// GET มิติของเอกสารต้นทาง (?po_id= / ?so_id= / ?mo_id=) — หน้าจอ IM ใช้ล็อกมิติตามใบสั่งซื้อ/ใบสั่งขาย/ใบสั่งผลิต
+// (null = เอกสารต้นทางไม่มีมิติ แก้ที่เอกสาร IM ได้)
+const fetchRefDims = async (req, res) => {
+    try {
+        const { po_id, so_id, mo_id } = req.query;
+        res.json(await refDims(req.dbPool, { refMoId: Number(mo_id) || null, refPoId: Number(po_id) || null, refSoId: Number(so_id) || null }));
+    } catch (error) {
+        console.error('Error fetching ref dims:', error);
+        res.status(500).json({ message: error.message });
+    }
 };
 
 const insertAndPostAdjustment = async (client, {
@@ -2578,8 +2625,8 @@ const insertAndPostAdjustment = async (client, {
         }
     }
 
-    // อ้างอิงใบสั่งผลิต/ใบสั่งซื้อ/ใบสั่งขายและไม่ได้ระบุมิติ — ใช้มิติของเอกสารต้นทาง
-    if (![dim1Id, dim2Id, dim3Id, dim4Id, dim5Id].some(Boolean)) {
+    // อ้างอิงใบสั่งผลิต/ใบสั่งซื้อ/ใบสั่งขายที่มีมิติ — ใช้มิติของเอกสารต้นทางเสมอ (แก้ที่เอกสาร IM ไม่ได้)
+    {
         const md = await refDims(client, { refMoId, refPoId, refSoId });
         if (md) ({ dim1_id: dim1Id, dim2_id: dim2Id, dim3_id: dim3Id, dim4_id: dim4Id, dim5_id: dim5Id } = md);
     }
@@ -2614,6 +2661,7 @@ const insertAndPostAdjustment = async (client, {
     // (unit_cost_fc) ให้แปลงเป็นบาทด้วย exchange_rate ของเอกสารนี้ตรงนี้ที่เดียว ส่วนที่เหลือทั้งหมด (FIFO/ถัวเฉลี่ย/
     // GL posting/รายงาน) ไม่ต้องรู้จักสกุลเงินต่างประเทศเลย (ดู plan: "แปลงตอนกรอก ไม่ใช่เก็บเป็น FC ตลอดสาย")
     const rate = Number(exchangeRate) || 1;
+    await ensureImLineGlColumns(client);
     let lineNo = 1;
     for (const d of lines) {
         // ราคาที่กรอกในสกุลเงินเอกสาร → ต้นทุนต่อหน่วย LC ก่อนส่วนลด ก่อน VAT
@@ -2622,8 +2670,9 @@ const insertAndPostAdjustment = async (client, {
             INSERT INTO im_transaction_detail
             (header_id, line_no, item_id, item_code, item_name, location_id, to_location_id, lot_no, serial_no, uom_id,
              system_qty, counted_qty, unit_cost, unit_cost_fc, unit_price, vat_type, vat_rate, ref_im_transaction_detail_id, ref_po_detail_id, ref_so_detail_id, description, is_free,
-             ref_mo_component_detail_id, ref_mo_output_detail_id, mo_actual_unit_cost, mo_applied_overhead_unit_cost, discount_percent)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
+             ref_mo_component_detail_id, ref_mo_output_detail_id, mo_actual_unit_cost, mo_applied_overhead_unit_cost, discount_percent,
+             gl_account_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33)
         `, [
             newHeaderId, lineNo++, d.item_id, d.item_code || null, d.item_name || null,
             d.location_id || null, d.to_location_id || null, d.lot_no || null, d.serial_no || null, d.uom_id || null,
@@ -2632,6 +2681,7 @@ const insertAndPostAdjustment = async (client, {
             d.ref_im_transaction_detail_id || null, d.ref_po_detail_id || null, d.ref_so_detail_id || null, d.description || null, d.is_free === true,
             d.ref_mo_component_detail_id || null, d.ref_mo_output_detail_id || null, d.mo_actual_unit_cost ?? null,
             d.mo_applied_overhead_unit_cost ?? null, Number(d.discount_percent) || 0,
+            Number(d.gl_account_id) || null, ...detailDimParams(d),
         ]);
     }
 
@@ -2890,9 +2940,9 @@ const updateTransaction = async (req, res) => {
 
         if (!details || details.length === 0) throw new Error('ต้องมีรายการนับสต็อกอย่างน้อย 1 รายการ');
 
-        // อ้างอิงเอกสารต้นทางและไม่ได้ระบุมิติ — ใช้มิติของเอกสารต้นทาง (เหมือนตอนสร้าง)
-        if (![header.dim1_id, header.dim2_id, header.dim3_id, header.dim4_id, header.dim5_id].some(Boolean)) {
-            const md = await refDims(client, { refPoId: header.ref_po_id, refSoId: header.ref_so_id });
+        // อ้างอิงเอกสารต้นทางที่มีมิติ — ใช้มิติของเอกสารต้นทางเสมอ (เหมือนตอนสร้าง)
+        {
+            const md = await refDims(client, { refMoId: header.ref_mo_id, refPoId: header.ref_po_id, refSoId: header.ref_so_id });
             if (md) Object.assign(header, md);
         }
 
@@ -2923,6 +2973,7 @@ const updateTransaction = async (req, res) => {
         await saveImSalespersons(client, id, req.body.salespersons);
         await saveImAdvances(client, id, req.body.advances);
         await client.query(`DELETE FROM im_transaction_detail WHERE header_id=$1`, [id]);
+        await ensureImLineGlColumns(client);
         // unit_cost (LC) คำนวณจาก unit_cost_fc * exchange_rate ของเอกสารนี้ — มิเรอร์ insertAndPostAdjustment ทุกประการ
         const updRate = Number(header.exchange_rate) || 1;
         let lineNo = 1;
@@ -2932,8 +2983,9 @@ const updateTransaction = async (req, res) => {
                 INSERT INTO im_transaction_detail
                 (header_id, line_no, item_id, item_code, item_name, location_id, to_location_id, lot_no, serial_no, uom_id,
                  system_qty, counted_qty, unit_cost, unit_cost_fc, unit_price, vat_type, vat_rate, ref_im_transaction_detail_id, ref_po_detail_id, ref_so_detail_id, description, is_free,
-                 ref_mo_component_detail_id, ref_mo_output_detail_id, discount_percent)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+                 ref_mo_component_detail_id, ref_mo_output_detail_id, discount_percent,
+                 gl_account_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
             `, [
                 id, lineNo++, d.item_id, d.item_code || null, d.item_name || null,
                 d.location_id || null, d.to_location_id || null, d.lot_no || null, d.serial_no || null, d.uom_id || null,
@@ -2941,6 +2993,7 @@ const updateTransaction = async (req, res) => {
                 d.vat_type || null, d.vat_rate ?? null,
                 d.ref_im_transaction_detail_id || null, d.ref_po_detail_id || null, d.ref_so_detail_id || null, d.description || null, d.is_free === true,
                 d.ref_mo_component_detail_id || null, d.ref_mo_output_detail_id || null, Number(d.discount_percent) || 0,
+                Number(d.gl_account_id) || null, ...detailDimParams(d),
             ]);
         }
 
@@ -3574,7 +3627,7 @@ const fetchGlAccounts = async (req, res) => {
 };
 
 module.exports = {
-    ensureImTransactionTable, fetchGlAccounts,
+    ensureImTransactionTable, fetchGlAccounts, fetchRefDims,
     fetchRows, fetchRow, fetchSystemQty, fetchReturnableDocs, fetchReturnableLines,
     createTransaction, createMoReceipt, updateTransaction, postTransaction, postBillingForGrn, postBillingForDln, voidTransaction, reverseToDraft, deleteTransaction,
     computeImBlocks, voidImDocument, removeSystemImDocument, reasonOf, userIdOf,
