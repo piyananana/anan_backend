@@ -186,7 +186,9 @@ const syncCmBankItems = async (client, id, glEntryId) => {
     } else if (sys === '70') {
         await insertPayment(client, { ...base, ...whole, bankAccountId: h.bank_account_id });
     } else if (sys === '90') {
-        const row = { ...base, ...whole, bankAccountId: h.bank_account_id };
+        // ดอกเบี้ยรับ: เงินเข้าธนาคารเฉพาะยอดสุทธิหลังภาษีถูกหัก ณ ที่จ่าย
+        const row = { ...base, bankAccountId: h.bank_account_id,
+            amountLc: Number(h.total_amount_lc) - (Number(h.wht_amount_lc) || 0), amountFc: Number(h.total_amount_fc) - (Number(h.wht_amount_fc) || 0) };
         await (h.charge_type === 'INTEREST_INCOME' ? insertReceipt(client, row) : insertPayment(client, row));
     }
 };

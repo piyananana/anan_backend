@@ -14,7 +14,7 @@ const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { checkCmPeriodOpen } = require('./cmPeriodCheckHelper');
 const { syncCmBankItems, voidBankItems, deleteBankItems, bankItemsClearedSql, ensureBankItemColumns } = require('../../utils/cmBankItems');
 const {
-    TAX_LINE_TYPES, ensureCmTaxColumns, resolveParty, calcTaxDoc, saveTaxExtras, assertTaxPostable, assertVoucherLinesPostable,
+    TAX_LINE_TYPES, ensureCmTaxColumns, resolveParty, calcTaxDoc, calcWht, saveTaxExtras, assertTaxPostable, assertVoucherLinesPostable,
     insertCmVt, deleteCmVt, voidCmVt,
 } = require('./cmTransactionTax');
 
@@ -31,7 +31,11 @@ const normalizeAmounts = async (client, header, details, applies, payments, whts
     // เอกสาร 10/20 เดิมที่ไม่มีบรรทัด: ยอดจากช่องทางรับ/จ่ายเหมือนเดิม
     const taxDoc = TAX_LINE_TYPES.includes(sys) && details.length > 0;
     if (taxDoc) calcTaxDoc(header, details, whts);
-    else { whts.length = 0; Object.assign(header, { subtotal_fc: 0, subtotal_lc: 0, vat_amount_fc: 0, vat_amount_lc: 0, wht_amount_fc: 0, wht_amount_lc: 0 }); }
+    else {
+        // ดอกเบี้ยรับ (90): ธนาคารหักภาษี ณ ที่จ่ายไว้ — ยอดดอกเบี้ยเต็มเป็นรายได้ ส่วนที่ถูกหักเป็นภาษีถูกหัก ณ ที่จ่าย
+        if (!(sys === '90' && header.charge_type === 'INTEREST_INCOME')) whts.length = 0;
+        Object.assign(header, { subtotal_fc: 0, subtotal_lc: 0, vat_amount_fc: 0, vat_amount_lc: 0, ...calcWht(header, whts) });
+    }
     const source = taxDoc ? null : sys === '40' ? details : sys === '30' ? applies : ['10', '20'].includes(sys) ? payments : null;
     const srcKey = sys === '30' ? 'applied_amount_fc' : 'amount_fc';
     const totalFc = taxDoc ? header.total_amount_fc : source ? fcOf(source, srcKey) : round2(Number(header.total_amount_fc) || 0);
@@ -412,6 +416,18 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
         }
         pushLine(toRes.rows[0]?.gl_account_id, `รับโอนเข้า ${docNo}`, totalAmountLc, 0, totalAmountFc, 0);
         pushLine(fromRes.rows[0]?.gl_account_id, `โอนออก ${docNo}`, 0, totalAmountLc, 0, totalAmountFc);
+    } else if (sysDocType === '70' && details.length > 0) {
+        // ค่าธรรมเนียมธนาคาร: Dr ค่าธรรมเนียม (ก่อน VAT) + Dr ภาษีซื้อ / Cr ธนาคาร (ยอดรวม VAT)
+        const bankRes = await client.query(`SELECT gl_account_id FROM cm_bank_account WHERE id = $1`, [header.bank_account_id]);
+        for (const d of details) {
+            pushLine(d.expense_account_id || header.gl_account_id || setup.expense_account_id,
+                d.description || `ค่าธรรมเนียมธนาคาร ${docNo}`, Number(d.amount_lc) || 0, 0, Number(d.amount_fc) || 0, 0);
+        }
+        if (vatLc || vatFc) {
+            if (!setup.vat_input_account_id) throw new Error('ยังไม่ได้ตั้งค่าบัญชีภาษีซื้อในการตั้งค่าบัญชี CM ของประเภทเอกสารนี้');
+            pushLine(setup.vat_input_account_id, `ภาษีซื้อ ${docNo}`, vatLc, 0, vatFc, 0);
+        }
+        pushLine(bankRes.rows[0]?.gl_account_id, `ค่าธรรมเนียมธนาคาร ${docNo}`, 0, totalAmountLc, 0, totalAmountFc);
     } else if (['70', '90'].includes(sysDocType)) {
         // ค่าธรรมเนียมธนาคาร / ดอกเบี้ย: ทิศทาง Dr/Cr กลับกันถ้าเป็นดอกเบี้ยรับ
         const bankRes = await client.query(`SELECT gl_account_id FROM cm_bank_account WHERE id = $1`, [header.bank_account_id]);
@@ -423,7 +439,12 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
             ? (isIncome ? 'ดอกเบี้ยรับ' : 'ดอกเบี้ยจ่าย')
             : 'ค่าธรรมเนียมธนาคาร';
         if (isIncome) {
-            pushLine(bankAccountId, `${label} ${docNo}`, totalAmountLc, 0, totalAmountFc, 0);
+            // ดอกเบี้ยรับที่ธนาคารหักภาษี ณ ที่จ่าย: ธนาคารได้รับสุทธิ + ภาษีถูกหัก ณ ที่จ่าย = ดอกเบี้ยเต็ม
+            pushLine(bankAccountId, `${label} ${docNo}`, round2(totalAmountLc - whtLc), 0, round2(totalAmountFc - whtFc), 0);
+            if (whtLc || whtFc) {
+                if (!setup.wht_prepaid_account_id) throw new Error('ยังไม่ได้ตั้งค่าบัญชีภาษีถูกหัก ณ ที่จ่ายในการตั้งค่าบัญชี CM ของประเภทเอกสารนี้');
+                pushLine(setup.wht_prepaid_account_id, `ภาษีถูกหัก ณ ที่จ่าย ${docNo}`, whtLc, 0, whtFc, 0);
+            }
             pushLine(offsetAccountId, `${label} ${docNo}`, 0, totalAmountLc, 0, totalAmountFc);
         } else {
             pushLine(offsetAccountId, `${label} ${docNo}`, totalAmountLc, 0, totalAmountFc, 0);

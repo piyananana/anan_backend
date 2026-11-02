@@ -14,7 +14,8 @@ const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 // ประเภทเอกสารที่มีบรรทัดรายการแบบ VAT (10/20 เอกสารเก่าที่ไม่มีบรรทัดยังใช้บัญชีเดียวจากหัวเอกสารเหมือนเดิม)
 // 40 เบิกเงินสดย่อย: VAT ต่อบรรทัด ผู้ขาย/ใบกำกับภาษีต่อบรรทัด (ใบเสร็จมาจากหลายร้าน) ไม่มีภาษีหัก ณ ที่จ่าย
 // บรรทัดเดิมของ 40 ไม่มี vat_type = ไม่มี VAT → ยอดเท่าเดิม
-const TAX_LINE_TYPES = ['10', '20', '40'];
+// 70 ค่าธรรมเนียมธนาคาร: หน้าจอส่งบรรทัดเดียว (ยอดค่าธรรมเนียม + VAT) ผู้ขาย = ธนาคาร (ชื่อ/เลขผู้เสียภาษีที่หัวเอกสาร)
+const TAX_LINE_TYPES = ['10', '20', '40', '70'];
 
 const ensured = new Set();
 const ensureCmTaxColumns = async (db) => {
@@ -90,6 +91,20 @@ const resolveParty = async (client, header) => {
     } else {
         header.party_source = null; header.party_id = null; header.party_code = null;
     }
+    // ค่าธรรมเนียมธนาคาร (70): ผู้ขาย = ธนาคารของบัญชีที่เลือก — บัญชีที่ตั้งเลขผู้เสียภาษีไว้ใช้ข้อมูลบัญชีเสมอ
+    // (ยังไม่ตั้ง = ใช้ค่าที่พิมพ์ในเอกสาร)
+    if (header.charge_type === 'BANK_CHARGE' && header.bank_account_id) {
+        await require('./cmBankAccountController').ensureColumns(client);
+        const b = (await client.query(`
+            SELECT ba.tax_id, ba.tax_branch_code, cb.bank_name_thai FROM cm_bank_account ba
+              LEFT JOIN cd_bank cb ON cb.id = ba.bank_id WHERE ba.id = $1`, [header.bank_account_id])).rows[0];
+        if (b && (b.tax_id || '').trim()) {
+            Object.assign(header, {
+                counterparty_name: b.bank_name_thai || header.counterparty_name, party_tax_id: b.tax_id,
+                party_branch_code: b.tax_branch_code || '00000',
+            });
+        }
+    }
 };
 
 // บรรทัดรายการ + ภาษีหัก ณ ที่จ่าย: คำนวณยอดก่อน VAT / VAT / ยอดบาท (ปัดเศษ ส่วนต่างลงบรรทัดสุดท้าย) — แก้ค่าในอ็อบเจกต์
@@ -111,6 +126,16 @@ const calcTaxDoc = (header, details, whts) => {
     const totalLc = round2(totalFc * rate);
     const diff = round2(totalLc - round2(subLc + vatLc));
     if (diff && details.length) { const last = details[details.length - 1]; last.amount_lc = round2(last.amount_lc + diff); subLc += diff; }
+    const wht = calcWht(header, whts);
+    Object.assign(header, {
+        subtotal_fc: round2(subFc), subtotal_lc: round2(subLc), vat_amount_fc: round2(vatFc), vat_amount_lc: round2(vatLc),
+        total_amount_fc: totalFc, total_amount_lc: totalLc, ...wht,
+    });
+};
+
+// ภาษีหัก ณ ที่จ่าย (ยอดสกุลเงินเอกสาร → บาท) — ใช้กับ 10/20 และดอกเบี้ยรับ (90) ที่ไม่มีบรรทัดรายการ
+const calcWht = (header, whts) => {
+    const rate = Number(header.exchange_rate) || 1;
     let whtFc = 0, whtLc = 0;
     for (const w of whts) {
         w.base_amount_fc = round2(w.base_amount_fc ?? w.base_amount_lc);
@@ -119,10 +144,7 @@ const calcTaxDoc = (header, details, whts) => {
         w.wht_amount_lc = round2(w.wht_amount_fc * rate);
         whtFc += w.wht_amount_fc; whtLc += w.wht_amount_lc;
     }
-    Object.assign(header, {
-        subtotal_fc: round2(subFc), subtotal_lc: round2(subLc), vat_amount_fc: round2(vatFc), vat_amount_lc: round2(vatLc),
-        total_amount_fc: totalFc, total_amount_lc: totalLc, wht_amount_fc: round2(whtFc), wht_amount_lc: round2(whtLc),
-    });
+    return { wht_amount_fc: round2(whtFc), wht_amount_lc: round2(whtLc) };
 };
 
 // คอลัมน์เพิ่มเติมของหัวเอกสาร + ภาษีหัก ณ ที่จ่าย (บันทึกหลัง insert/update หัวเอกสาร)
@@ -156,6 +178,10 @@ const saveTaxExtras = async (client, id, header, whts) => {
 const assertTaxPostable = (header, sys) => {
     const has = (v) => (v ?? '').toString().trim() !== '';
     const vat = Number(header.vat_amount_fc) || 0, wht = Number(header.wht_amount_fc) || 0;
+    if (sys === '70' && vat) {
+        if (!has(header.tax_invoice_no)) throw new Error('กรุณาระบุเลขที่ใบกำกับภาษีของธนาคาร (ค่าธรรมเนียมมีภาษีซื้อ)');
+        if (!has(header.counterparty_name) || !has(header.party_tax_id)) throw new Error('กรุณาระบุชื่อและเลขประจำตัวผู้เสียภาษีของธนาคาร');
+    }
     if (sys === '20') {
         if (vat && !has(header.tax_invoice_no)) throw new Error('กรุณาระบุเลขที่ใบกำกับภาษีของผู้ขาย (เอกสารมีภาษีซื้อ)');
         if ((vat || wht) && (!has(header.counterparty_name) || !has(header.party_tax_id))) {
@@ -232,6 +258,6 @@ const voidCmVt = async (client, id, docDate, voidDate, userName) => {
 };
 
 module.exports = {
-    TAX_LINE_TYPES, ensureCmTaxColumns, resolveParty, calcTaxDoc, saveTaxExtras, assertTaxPostable, assertVoucherLinesPostable,
+    TAX_LINE_TYPES, ensureCmTaxColumns, resolveParty, calcTaxDoc, calcWht, saveTaxExtras, assertTaxPostable, assertVoucherLinesPostable,
     insertCmVt, deleteCmVt, voidCmVt, round2,
 };

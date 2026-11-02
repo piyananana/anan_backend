@@ -147,88 +147,11 @@ const fetchRow = async (req, res) => {
 };
 
 // POST — create manual payment (check issuance or transfer)
-const createPayment = async (req, res) => {
-    const body = req.body;
-    const userName = req.headers['username'] || null;
-    const client = await req.dbPool.connect();
-    try {
-        await client.query('BEGIN');
-        await ensureCmPaymentTable(client);
+// สร้างรายการจ่ายเองโดยไม่มีรายการบัญชีทำให้ยอดธนาคารฝั่ง CM ไม่ตรงกับ GL — เลิกใช้ (user-approved 2026-11-01,
+// ดู project_cm_recheck_2026_11) รายการจ่ายมาจากธุรกรรม CM รายจ่าย (20) / ใบจ่ายชำระ AP เท่านั้น
+const createPayment = async (req, res) =>
+    res.status(400).json({ error: 'สร้างรายการจ่ายในหน้านี้ไม่ได้แล้ว กรุณาบันทึกที่ธุรกรรม CM ประเภทรายจ่าย (20) หรือใบจ่ายชำระ AP' });
 
-        // created_by เป็นรหัสผู้ใช้ (ตัวเลข) แต่หน้าจอส่งชื่อผู้ใช้มา
-        const userRes = userName
-            ? await client.query(`SELECT id FROM sa_user WHERE user_name = $1 LIMIT 1`, [userName]) : { rows: [] };
-        const createdById = userRes.rows[0]?.id || null;
-
-        let checkNo = body.check_no || null;
-
-        // If linked to a checkbook, auto-assign check_no and advance next_check_no
-        if (body.checkbook_id) {
-            const cbRes = await client.query(
-                `SELECT next_check_no, end_check_no FROM cm_checkbook WHERE id = $1 AND status = 'Active'`,
-                [body.checkbook_id]);
-            if (cbRes.rows.length === 0) {
-                await client.query('ROLLBACK');
-                return res.status(400).json({ error: 'ไม่พบสมุดเช็คหรือสถานะไม่ใช่ Active' });
-            }
-            const { next_check_no, end_check_no } = cbRes.rows[0];
-            if (!checkNo) checkNo = next_check_no;
-
-            // Advance next_check_no numerically (pad to same width)
-            const nextNum = parseInt(next_check_no, 10);
-            if (!isNaN(nextNum)) {
-                const padLen = next_check_no.length;
-                const newNext = (nextNum + 1).toString().padStart(padLen, '0');
-                await client.query(
-                    `UPDATE cm_checkbook SET next_check_no = $1, updated_at = NOW() WHERE id = $2`,
-                    [newNext, body.checkbook_id]);
-
-                // Mark as Used if next exceeds end
-                if (parseInt(newNext, 10) > parseInt(end_check_no, 10)) {
-                    await client.query(
-                        `UPDATE cm_checkbook SET status = 'Used', updated_at = NOW() WHERE id = $1`,
-                        [body.checkbook_id]);
-                }
-            }
-        }
-
-        const result = await client.query(`
-            INSERT INTO cm_payment
-                (payment_date, bank_account_id, payment_method_id, payment_method_type,
-                 payee_type, payee_id, payee_code, payee_name_th,
-                 amount_lc, amount_fc, currency_code, exchange_rate,
-                 check_no, check_date, checkbook_id, remark, created_by)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
-            RETURNING *`,
-            [
-                body.payment_date,
-                body.bank_account_id   || null,
-                body.payment_method_id || null,
-                body.payment_method_type || 'TRANSFER',
-                body.payee_type   || 'VENDOR',
-                body.payee_id     || null,
-                body.payee_code   || null,
-                body.payee_name_th || null,
-                body.amount_lc    || 0,
-                body.amount_fc    || 0,
-                body.currency_code || await getBaseCurrencyCode(client),
-                body.exchange_rate || 1,
-                checkNo,
-                body.check_date || null,
-                body.checkbook_id || null,
-                body.remark || null,
-                createdById,
-            ]);
-
-        await client.query('COMMIT');
-        res.status(201).json(result.rows[0]);
-    } catch (err) {
-        await client.query('ROLLBACK');
-        res.status(500).json({ error: err.message });
-    } finally { client.release(); }
-};
-
-// PUT /clear
 const clearPayment = async (req, res) => {
     const { id } = req.params;
     const { clearing_date, clearing_note } = req.body;

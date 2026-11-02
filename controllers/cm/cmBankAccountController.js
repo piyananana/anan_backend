@@ -1,3 +1,4 @@
+const { normalizeTaxBranch } = require('../../utils/taxBranch');
 const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 // controllers/cm/cmBankAccountController.js
 //
@@ -26,6 +27,17 @@ const ensureColumns = async (pool) => {
     await pool.query(`ALTER TABLE cm_bank_account ADD COLUMN IF NOT EXISTS cm_type VARCHAR(20) NOT NULL DEFAULT 'BANK'`);
     await pool.query(`ALTER TABLE cm_bank_account ADD COLUMN IF NOT EXISTS currency_code VARCHAR(10) NOT NULL DEFAULT 'THB'`);
     await pool.query(`ALTER TABLE cm_bank_account ADD COLUMN IF NOT EXISTS is_check_account BOOLEAN NOT NULL DEFAULT FALSE`);
+    // เลขประจำตัวผู้เสียภาษี/สาขาของธนาคารเจ้าของบัญชี — ผู้ขายในรายงานภาษีซื้อของค่าธรรมเนียมธนาคาร (CM 70)
+    await pool.query(`ALTER TABLE cm_bank_account ADD COLUMN IF NOT EXISTS tax_id VARCHAR(20)`);
+    await pool.query(`ALTER TABLE cm_bank_account ADD COLUMN IF NOT EXISTS tax_branch_code VARCHAR(5)`);
+};
+
+// บันทึกเลขผู้เสียภาษี/สาขา (สาขา 5 หลัก, 00000 = สำนักงานใหญ่)
+const saveTaxFields = async (db, id, body) => {
+  const branch = normalizeTaxBranch(body.tax_branch_code);
+  if (branch.error) throw Object.assign(new Error(branch.error), { status: 400 });
+  await db.query(`UPDATE cm_bank_account SET tax_id = $1, tax_branch_code = $2 WHERE id = $3`,
+    [(body.tax_id || '').trim() || null, branch.value, id]);
 };
 
 const BASE_SELECT = `
@@ -70,6 +82,7 @@ const fetchActiveRows = async (req, res) => {
 const fetchRow = async (req, res) => {
   const { id } = req.params;
   try {
+    await ensureColumns(req.dbPool);
     const result = await req.dbPool.query(`${BASE_SELECT} WHERE ba.id = $1`, [id]);
     if (result.rows.length === 0) return res.status(404).json({ message: 'Not found.' });
     res.json(result.rows[0]);
@@ -87,6 +100,8 @@ const createRow = async (req, res) => {
     gl_account_id, is_active, remark
   } = req.body;
   const userId = req.headers.userid;
+  const branchCheck = normalizeTaxBranch(req.body.tax_branch_code);
+  if (branchCheck.error) return res.status(400).json({ error: branchCheck.error });
   try {
     await ensureColumns(req.dbPool);
     const result = await req.dbPool.query(
@@ -104,9 +119,11 @@ const createRow = async (req, res) => {
         gl_account_id || null, is_active ?? true, remark || null, userId
       ]
     );
-    res.status(201).json(result.rows[0]);
+    await saveTaxFields(req.dbPool, result.rows[0].id, req.body);
+    res.status(201).json((await req.dbPool.query(`${BASE_SELECT} WHERE ba.id = $1`, [result.rows[0].id])).rows[0]);
   } catch (err) {
     console.error('Error creating cm_bank_account:', err);
+    if (err.status === 400) return res.status(400).json({ error: err.message });
     if (err.code === '23505') return res.status(409).json({ error: 'รหัสบัญชีธนาคารนี้มีอยู่แล้ว' });
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -121,6 +138,8 @@ const updateRow = async (req, res) => {
     gl_account_id, is_active, remark
   } = req.body;
   const userId = req.headers.userid;
+  const branchCheck = normalizeTaxBranch(req.body.tax_branch_code);
+  if (branchCheck.error) return res.status(400).json({ error: branchCheck.error });
   try {
     await ensureColumns(req.dbPool);
     const result = await req.dbPool.query(
@@ -141,9 +160,11 @@ const updateRow = async (req, res) => {
       ]
     );
     if (result.rows.length === 0) return res.status(404).json({ message: 'Not found.' });
-    res.json(result.rows[0]);
+    await saveTaxFields(req.dbPool, id, req.body);
+    res.json((await req.dbPool.query(`${BASE_SELECT} WHERE ba.id = $1`, [id])).rows[0]);
   } catch (err) {
     console.error('Error updating cm_bank_account:', err);
+    if (err.status === 400) return res.status(400).json({ error: err.message });
     if (err.code === '23505') return res.status(409).json({ error: 'รหัสบัญชีธนาคารนี้มีอยู่แล้ว' });
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -171,4 +192,4 @@ const deleteRow = async (req, res) => {
   }
 };
 
-module.exports = { fetchRows, fetchActiveRows, fetchRow, createRow, updateRow, deleteRow };
+module.exports = { fetchRows, fetchActiveRows, fetchRow, createRow, updateRow, deleteRow, ensureColumns };

@@ -1,6 +1,6 @@
 // controllers/cm/cmBankFxRevaluationController.js
 const { today: todayYmd, ymd } = require('../../utils/dateUtil');
-const { BASE_CURRENCY_CODE_SQL, getBaseCurrency } = require('../../utils/baseCurrency');
+const { BASE_CURRENCY_CODE_SQL, getBaseCurrency, getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 'use strict';
 
@@ -86,9 +86,31 @@ const calcAccountBalance = async (client, accountId, asOfDate, excludeRevalId = 
     }
     latestRevalQuery += ` ORDER BY r.revaluation_date DESC, r.id DESC LIMIT 1`;
     const lastReval = await client.query(latestRevalQuery, qParams);
+    // ยอดยกมา (cm_bank_opening_balance) — จุดเริ่มเมื่อไม่มีการปรับมูลค่าก่อนหน้า หรือวันยกมาหลังการปรับมูลค่าครั้งล่าสุด
+    // (เดิมไม่นับยอดยกมาเลย ทำให้ยอดเงินตราต่างประเทศและผลต่างอัตราแลกเปลี่ยนผิด)
+    await require('./cmBankOpeningBalanceController').ensureTable(client);
+    const ob = (await client.query(`
+        SELECT ob.as_of_date, ob.opening_balance AS lc,
+               COALESCE(ob.opening_balance_fc, CASE WHEN ba.currency_code = $3 THEN ob.opening_balance ELSE 0 END) AS fc
+          FROM cm_bank_opening_balance ob JOIN cm_bank_account ba ON ba.id = ob.bank_account_id
+         WHERE ob.bank_account_id = $1 AND ob.as_of_date <= $2`, [accountId, asOfDate, await getBaseCurrencyCode(client)])).rows[0];
+    const lrRow = lastReval.rows[0];
+    const obIsCheckpoint = ob && (!lrRow || new Date(ob.as_of_date) > new Date(lrRow.revaluation_date));
 
     let balanceFc, balanceLcBook;
-    if (lastReval.rows.length > 0) {
+    if (obIsCheckpoint) {
+        const movRes = await client.query(`
+            SELECT COALESCE(SUM(net_fc), 0) AS net_fc, COALESCE(SUM(net_lc), 0) AS net_lc
+            FROM (
+                SELECT amount_fc AS net_fc, amount_lc AS net_lc FROM cm_receipt
+                 WHERE bank_account_id = $1 AND status != 'Voided' AND receipt_date > $2 AND receipt_date <= $3
+                UNION ALL
+                SELECT -amount_fc, -amount_lc FROM cm_payment
+                 WHERE bank_account_id = $1 AND status != 'Voided' AND payment_date > $2 AND payment_date <= $3
+            ) t`, [accountId, ob.as_of_date, asOfDate]);
+        balanceFc     = parseFloat(ob.fc) + parseFloat(movRes.rows[0].net_fc);
+        balanceLcBook = parseFloat(ob.lc) + parseFloat(movRes.rows[0].net_lc);
+    } else if (lastReval.rows.length > 0) {
         const lr = lastReval.rows[0];
         const lastDate = lr.revaluation_date;
         const movRes = await client.query(`
