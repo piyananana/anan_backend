@@ -8,6 +8,7 @@ const { ensureSalespersonTable, saveDocSalespersons, loadSalespersons } = requir
 const { AR_CHECK_TYPES, ensureCreditSchema, arDocAmount, assertCreditForPost, loadCreditApprovals } = require('../../utils/creditCheck');
 const { resolveArAccountId, postedArAccountId, postedArAccountSql } = require('../../utils/arAccount');
 const { ensureDepositRefColumns, saveDepositRef } = require('../../utils/depositRef');
+const { headerDims, lineDims, ensureDetailDimColumns, detailDimParams, assertRequiredDims } = require('../../utils/glDims');
 
 // ตรวจวงเงินเครดิตก่อนโพสต์ (ตั้งหนี้/เพิ่มหนี้/ลดหนี้) — เกินวงเงินและยังไม่ได้รับอนุมัติที่ครอบคลุมยอด = throw CREDIT_LIMIT
 const checkArCreditForPost = async (client, header, id, row) => {
@@ -418,7 +419,9 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
     await client.query(`UPDATE ar_transaction SET gl_doc_no=$1 WHERE id=$2`, [glDocNo, headerId]);
 
     // Build GL detail lines
+    // มิติ: บรรทัดรายได้/ส่วนลดของแต่ละบรรทัดเอกสารใช้มิติของบรรทัดนั้น (ช่องว่างใช้ของหัวเอกสาร) บรรทัดอื่นใช้มิติหัวเอกสาร
     const glDetails = [];
+    const hDims = headerDims(header);
 
     if (isRevenueBased) {
         // ===== Invoice / Debit Note (30,35) / Credit Note (50,55) =====
@@ -436,6 +439,7 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
         // ถ้าไม่ได้ตั้งค่า: CR Revenue = ยอดสุทธิ (หลังหักส่วนลดแล้ว)
         for (const d of details) {
             if (d.revenue_account_id) {
+                const dims = lineDims(d, hDims);
                 const discFc = Number(d.discount_amount_fc) || 0;
                 const discLc = discFc * exchangeRate;
                 const netLc  = Number(d.subtotal_lc) || 0;
@@ -453,6 +457,7 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
                             credit_lc: grossLc,
                             debit_fc: 0,
                             credit_fc: grossFc,
+                            dims,
                         });
                     }
                     // บรรทัดส่วนลด: DR ส่วนลดรายได้
@@ -463,6 +468,7 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
                         credit_lc: 0,
                         debit_fc: discFc,
                         credit_fc: 0,
+                        dims,
                     });
                 } else if (netLc !== 0) {
                     // ไม่มีบัญชีส่วนลด: CR รายได้สุทธิ
@@ -473,6 +479,7 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
                         credit_lc: netLc,
                         debit_fc: 0,
                         credit_fc: netFc,
+                        dims,
                     });
                 }
             }
@@ -870,50 +877,8 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
         [totalDbLc, totalCrLc, totalDbFc, totalCrFc, glEntryId]
     );
 
-    // inject header-level dimensions ลงทุก GL line
-    const hDim1 = header.dim1_id || null;
-    const hDim2 = header.dim2_id || null;
-    const hDim3 = header.dim3_id || null;
-    const hDim4 = header.dim4_id || null;
-    const hDim5 = header.dim5_id || null;
-
-    // Validate required dimensions ก่อน insert GL lines
-    {
-        const dimTypeRes = await client.query(
-            `SELECT type_code, slot_no FROM gl_dimension_type WHERE is_active = true`
-        );
-        const slotByType = {};
-        for (const r of dimTypeRes.rows) slotByType[r.type_code] = r.slot_no;
-
-        const headerDims = { 1: hDim1, 2: hDim2, 3: hDim3, 4: hDim4, 5: hDim5 };
-        const accountIds = [...new Set(glDetails.map(r => r.account_id).filter(Boolean))];
-
-        if (accountIds.length > 0) {
-            const accRes = await client.query(
-                `SELECT id, account_code FROM gl_account WHERE id = ANY($1::int[])`, [accountIds]
-            );
-            const accCodeMap = {};
-            for (const r of accRes.rows) accCodeMap[r.id] = r.account_code;
-
-            const errors = [];
-            for (const accountId of accountIds) {
-                const rulesRes = await client.query(
-                    `SELECT type_code FROM gl_account_dim_rule WHERE account_id = $1 AND is_required = true`,
-                    [accountId]
-                );
-                for (const rule of rulesRes.rows) {
-                    const slot = slotByType[rule.type_code];
-                    if (!slot) continue;
-                    if (!headerDims[slot]) {
-                        errors.push(`บัญชี ${accCodeMap[accountId] || accountId}: ต้องระบุ ${rule.type_code}`);
-                    }
-                }
-            }
-            if (errors.length > 0) {
-                throw new Error(`Dimension ไม่ครบ:\n${errors.join('\n')}`);
-            }
-        }
-    }
+    // ตรวจมิติที่บัญชีบังคับ (gl_account_dim_rule) ต่อบรรทัดรายการบัญชี ก่อน insert
+    await assertRequiredDims(client, glDetails, hDims);
 
     const detailSql = `
         INSERT INTO gl_entry_detail
@@ -928,7 +893,7 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
             glEntryId, lineNo++, row.account_id, row.description,
             row.debit_lc, row.credit_lc, row.debit_fc, row.credit_fc,
             row.branch_id || null,
-            hDim1, hDim2, hDim3, hDim4, hDim5,
+            ...(row.dims || hDims),
         ]);
     }
 
@@ -1217,14 +1182,16 @@ const createTransaction = async (req, res) => {
         // ใบมัดจำอ้างอิงใบสั่งขาย (utils/depositRef.js)
         await saveDepositRef(client, 'ar', newHeaderId, header);
 
-        // Insert details
+        // Insert details — revenue_account_id = บัญชีที่ใช้ลงบัญชีของบรรทัด (เลือกได้ ค่าเริ่มต้นจากประเภทเอกสาร) + มิติของบรรทัด
+        await ensureDetailDimColumns(client, 'ar_transaction_detail');
         const detailSql = `
             INSERT INTO ar_transaction_detail
             (header_id, line_no, item_code, item_name, description,
              quantity, unit_code, unit_price_fc, discount_percent, discount_amount_fc,
              subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
-             revenue_account_id, subtotal_lc, vat_amount_lc, total_amount_lc, is_deferred_vat)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+             revenue_account_id, subtotal_lc, vat_amount_lc, total_amount_lc, is_deferred_vat,
+             dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
             RETURNING id
         `;
         let lineNo = 1;
@@ -1238,7 +1205,8 @@ const createTransaction = async (req, res) => {
                 d.vat_amount_fc || 0, d.total_amount_fc || 0,
                 d.revenue_account_id || null,
                 d.subtotal_lc || 0, d.vat_amount_lc || 0, d.total_amount_lc || 0,
-                d.is_deferred_vat || false
+                d.is_deferred_vat || false,
+                ...detailDimParams(d)
             ]);
         }
 
@@ -1410,13 +1378,15 @@ const updateTransaction = async (req, res) => {
 
         // Replace details
         await client.query('DELETE FROM ar_transaction_detail WHERE header_id=$1', [id]);
+        await ensureDetailDimColumns(client, 'ar_transaction_detail');
         const detailSql = `
             INSERT INTO ar_transaction_detail
             (header_id, line_no, item_code, item_name, description,
              quantity, unit_code, unit_price_fc, discount_percent, discount_amount_fc,
              subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
-             revenue_account_id, subtotal_lc, vat_amount_lc, total_amount_lc, is_deferred_vat)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+             revenue_account_id, subtotal_lc, vat_amount_lc, total_amount_lc, is_deferred_vat,
+             dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
         `;
         let lineNo = 1;
         for (const d of (details || [])) {
@@ -1429,7 +1399,8 @@ const updateTransaction = async (req, res) => {
                 d.vat_amount_fc || 0, d.total_amount_fc || 0,
                 d.revenue_account_id || null,
                 d.subtotal_lc || 0, d.vat_amount_lc || 0, d.total_amount_lc || 0,
-                d.is_deferred_vat || false
+                d.is_deferred_vat || false,
+                ...detailDimParams(d)
             ]);
         }
 
