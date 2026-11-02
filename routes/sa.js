@@ -20,6 +20,7 @@ const saModuleApproverController = require('../controllers/sa/saModuleApproverCo
 const saSmtpConfigController     = require('../controllers/sa/saSmtpConfigController');
 const saDashboardController      = require('../controllers/sa/saDashboardController');
 const saUserAuditLogController   = require('../controllers/sa/saUserAuditLogController');
+const saSystemResetController = require('../controllers/sa/saSystemResetController');
 const saAttachmentController     = require('../controllers/sa/saAttachmentController');
 // const saOrganizationController = require('../controllers/sa/saOrganizationController');
 
@@ -204,6 +205,10 @@ router.get('/user_audit_log',              saAuthController.injectUserRole, saUs
 router.get('/user_audit_log/users',        saAuthController.injectUserRole, saUserAuditLogController.getUsers);
 router.get('/user_audit_log/counts',       saAuthController.requireDeveloper, saUserAuditLogController.getCounts);
 router.delete('/user_audit_log/reset',     saAuthController.requireDeveloper, saUserAuditLogController.deleteLog);
+
+// For saSystemResetController — ล้างธุรกรรมทุกโมดูลเพื่อเริ่มต้นใหม่ (ผู้พัฒนาระบบเท่านั้น)
+router.get('/system_reset/counts', saAuthController.requireDeveloper, saSystemResetController.getCounts);
+router.post('/system_reset',       saAuthController.requireDeveloper, saSystemResetController.resetAll);
 
 // For saAttachmentController — ไฟล์แนบท้ายรายการ (generic, ใช้ร่วมกันได้ทุกโมดูล) — batch ต้องมาก่อน route เปล่า
 // ด้านล่างไม่ได้ เพราะเป็นคนละ path segment (/attachment/batch vs /attachment) จึงไม่ชนกัน
