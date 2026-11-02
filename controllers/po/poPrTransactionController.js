@@ -540,6 +540,7 @@ const fetchConvertibleLines = async (req, res) => {
         const { search } = req.query;
         let query = `
             SELECT t.id AS header_id, t.doc_no, t.doc_date, t.status, t.currency_code, t.exchange_rate,
+                   t.dim1_id, t.dim2_id, t.dim3_id, t.dim4_id, t.dim5_id,
                    dt.id AS detail_id, dt.line_no, dt.item_id, dt.item_code, dt.item_name, dt.uom_id,
                    dt.qty_requested, dt.estimated_unit_cost, u.uom_code,
                    COALESCE((
