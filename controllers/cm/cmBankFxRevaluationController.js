@@ -2,6 +2,7 @@
 const { today: todayYmd, ymd } = require('../../utils/dateUtil');
 const { BASE_CURRENCY_CODE_SQL, getBaseCurrency, getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
+const { headerDims, assertRequiredDims } = require('../../utils/glDims');
 'use strict';
 
 const ensureTables = async (client) => {
@@ -43,6 +44,12 @@ const ensureTables = async (client) => {
             ADD COLUMN IF NOT EXISTS void_reason TEXT,
             ADD COLUMN IF NOT EXISTS voided_by VARCHAR(100),
             ADD COLUMN IF NOT EXISTS voided_at TIMESTAMP`);
+    // มิติ (ใช้กับทุกบรรทัดของรายการบัญชีที่ตีราคา) — user-approved 2026-11-02
+    await client.query(`
+        ALTER TABLE cm_bank_fx_revaluation
+            ADD COLUMN IF NOT EXISTS dim1_id INTEGER, ADD COLUMN IF NOT EXISTS dim2_id INTEGER,
+            ADD COLUMN IF NOT EXISTS dim3_id INTEGER, ADD COLUMN IF NOT EXISTS dim4_id INTEGER,
+            ADD COLUMN IF NOT EXISTS dim5_id INTEGER`);
 };
 
 const generateGlDocNo = async (client, glDocId, date) => {
@@ -315,8 +322,8 @@ const createRow = async (req, res) => {
         const hRes = await client.query(`
             INSERT INTO cm_bank_fx_revaluation
                 (revaluation_date, description, gl_doc_id, fx_gain_account_id, fx_loss_account_id,
-                 total_gain_loss, status, created_by)
-            VALUES ($1,$2,$3,$4,$5,0,'Draft',$6)
+                 total_gain_loss, status, created_by, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+            VALUES ($1,$2,$3,$4,$5,0,'Draft',$6,$7,$8,$9,$10,$11)
             RETURNING *`,
             [
                 body.revaluation_date,
@@ -325,6 +332,7 @@ const createRow = async (req, res) => {
                 body.fx_gain_account_id || null,
                 body.fx_loss_account_id || null,
                 createdBy,
+                ...headerDims(body),
             ]);
         const revalId = hRes.rows[0].id;
 
@@ -375,11 +383,12 @@ const updateRow = async (req, res) => {
             UPDATE cm_bank_fx_revaluation
             SET revaluation_date     = $1, description          = $2,
                 gl_doc_id            = $3, fx_gain_account_id   = $4,
-                fx_loss_account_id   = $5, updated_at           = NOW()
+                fx_loss_account_id   = $5, updated_at           = NOW(),
+                dim1_id = $7, dim2_id = $8, dim3_id = $9, dim4_id = $10, dim5_id = $11
             WHERE id = $6`,
             [body.revaluation_date, body.description || null,
              body.gl_doc_id || null, body.fx_gain_account_id || null,
-             body.fx_loss_account_id || null, id]);
+             body.fx_loss_account_id || null, id, ...headerDims(body)]);
 
         // Recalculate lines
         await client.query(`DELETE FROM cm_bank_fx_revaluation_line WHERE revaluation_id = $1`, [id]);
@@ -531,6 +540,9 @@ const postRow = async (req, res) => {
                 glDetails.push({ account_id: l.gl_account_id, description: desc, debit_lc: 0, credit_lc: absAmt });
             }
         }
+        // มิติของรายการตีราคาลงทุกบรรทัด + ตรวจมิติที่บัญชีบังคับ (เหมือน AR/AP/IM/CM)
+        const hDims = headerDims(reval);
+        await assertRequiredDims(client, glDetails, hDims);
         const totalDebitLc  = Math.round(glDetails.reduce((s, d) => s + d.debit_lc, 0) * 100) / 100;
         const totalCreditLc = Math.round(glDetails.reduce((s, d) => s + d.credit_lc, 0) * 100) / 100;
 
@@ -552,9 +564,10 @@ const postRow = async (req, res) => {
         let lineNo = 1;
         for (const d of glDetails) {
             await client.query(`
-                INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
-                VALUES ($1,$2,$3,$4,$5,$6,$5,$6)`,
-                [glEntryId, lineNo++, d.account_id, d.description, d.debit_lc, d.credit_lc]);
+                INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc,
+                                             dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$5,$6,$7,$8,$9,$10,$11)`,
+                [glEntryId, lineNo++, d.account_id, d.description, d.debit_lc, d.credit_lc, ...hDims]);
         }
 
         // 9. Update revaluation
@@ -640,8 +653,10 @@ const voidRow = (req, res) => runAction(req, res, 'void', async (client, reval, 
              orig.currency_id, orig.total_credit_lc, orig.total_debit_lc, glUserOf(req)]);
         rvEntryId = rvHRes.rows[0].id;
         await client.query(`
-            INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
-            SELECT $1, line_no, account_id, 'ยกเลิก: ' || COALESCE(description, ''), credit_lc, debit_lc, credit_lc, debit_lc
+            INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc,
+                                         dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+            SELECT $1, line_no, account_id, 'ยกเลิก: ' || COALESCE(description, ''), credit_lc, debit_lc, credit_lc, debit_lc,
+                   dim1_id, dim2_id, dim3_id, dim4_id, dim5_id
               FROM gl_entry_detail WHERE header_id = $2 ORDER BY line_no`,
             [rvEntryId, reval.gl_entry_id]);
     }
