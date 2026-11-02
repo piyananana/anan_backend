@@ -10,6 +10,7 @@
 
 const { today: todayYmd } = require('../../utils/dateUtil');
 const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
+const { headerDims, lineDims, ensureDetailDimColumns, detailDimParams, assertRequiredDims } = require('../../utils/glDims');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { checkCmPeriodOpen } = require('./cmPeriodCheckHelper');
 const { ensureCheckbookColumns, assignCheckNumbers } = require('../../utils/cmCheckbook');
@@ -74,17 +75,22 @@ const normalizeAmounts = async (client, header, details, applies, payments, whts
     return sys;
 };
 
-// บรรทัดรายการ: ยอดก่อน VAT + VAT (10/20), ผู้ขาย/ใบกำกับต่อบรรทัด (40)
-const insertDetail = (client, headerId, lineNo, d) => client.query(`
+// บรรทัดรายการ: ยอดก่อน VAT + VAT (10/20), ผู้ขาย/ใบกำกับต่อบรรทัด (40), มิติของบรรทัด (ว่าง = หัวเอกสาร — utils/glDims.js)
+const insertDetail = async (client, headerId, lineNo, d) => {
+    await ensureDetailDimColumns(client, 'cm_transaction_detail');
+    return client.query(`
     INSERT INTO cm_transaction_detail (header_id, line_no, description, expense_account_id, amount_lc, amount_fc,
            entered_amount_fc, vat_type, vat_rate, vat_amount_fc, vat_amount_lc,
-           seller_name, seller_tax_id, seller_branch_code, tax_invoice_no, tax_invoice_date)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, [
+           seller_name, seller_tax_id, seller_branch_code, tax_invoice_no, tax_invoice_date,
+           dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`, [
     headerId, lineNo, d.description || null, d.expense_account_id || null, d.amount_lc || 0, d.amount_fc || 0,
     d.entered_amount_fc ?? d.amount_fc ?? 0, d.vat_type || 'NOVAT', d.vat_rate || 0, d.vat_amount_fc || 0, d.vat_amount_lc || 0,
     d.seller_name || null, d.seller_tax_id || null, d.seller_branch_code || null,
     (d.tax_invoice_no || '').trim() || null, (d.tax_invoice_no || '').trim() ? (d.tax_invoice_date || null) : null,
+    ...detailDimParams(d),
 ]);
+};
 
 // Post: งวด CM ต้องเปิด (เดิมตรวจเฉพาะที่หน้าจอ)
 const assertCmPeriodOpen = async (client, docDate) => {
@@ -316,13 +322,17 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
     const totalAmountFc = Number(header.total_amount_fc) || totalAmountLc;
     const exchangeRate  = Number(header.exchange_rate) || 1;
 
+    // มิติ: บรรทัดรายรับ/รายจ่าย/ค่าใช้จ่ายของแต่ละบรรทัดเอกสาร (10/20/40) ใช้มิติของบรรทัด (ช่องว่างใช้ของหัวเอกสาร)
+    // บรรทัดอื่นใช้มิติหัวเอกสาร
     const glDetails = [];
-    const pushLine = (accountId, description, debitLc, creditLc, debitFc, creditFc) => {
+    const hDims = headerDims(header);
+    const pushLine = (accountId, description, debitLc, creditLc, debitFc, creditFc, dims = null) => {
         if (!accountId) throw new Error(`ไม่พบบัญชี GL สำหรับรายการ: ${description}`);
         glDetails.push({
             account_id: Number(accountId), description,
             debit_lc: debitLc || 0, credit_lc: creditLc || 0,
             debit_fc: debitFc || 0, credit_fc: creditFc || 0,
+            ...(dims ? { dims } : {}),
         });
     };
 
@@ -341,7 +351,7 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
         // รายจ่ายหลายบรรทัด: Dr ค่าใช้จ่ายต่อบรรทัด (ก่อน VAT) + Dr ภาษีซื้อ / Cr ภาษีหัก ณ ที่จ่ายค้างจ่าย + Cr ช่องทางจ่าย
         for (const d of details) {
             pushLine(d.expense_account_id || header.gl_account_id || setup.expense_account_id,
-                d.description || `รายจ่าย ${docNo}`, Number(d.amount_lc) || 0, 0, Number(d.amount_fc) || 0, 0);
+                d.description || `รายจ่าย ${docNo}`, Number(d.amount_lc) || 0, 0, Number(d.amount_fc) || 0, 0, lineDims(d, hDims));
         }
         if (vatLc || vatFc) {
             if (!setup.vat_input_account_id) throw new Error('ยังไม่ได้ตั้งค่าบัญชีภาษีซื้อในการตั้งค่าบัญชี CM ของประเภทเอกสารนี้');
@@ -367,7 +377,7 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
         }
         for (const d of details) {
             pushLine(d.expense_account_id || header.gl_account_id || setup.revenue_account_id,
-                d.description || `รายรับ ${docNo}`, 0, Number(d.amount_lc) || 0, 0, Number(d.amount_fc) || 0);
+                d.description || `รายรับ ${docNo}`, 0, Number(d.amount_lc) || 0, 0, Number(d.amount_fc) || 0, lineDims(d, hDims));
         }
         if (vatLc || vatFc) {
             if (!setup.vat_output_account_id) throw new Error('ยังไม่ได้ตั้งค่าบัญชีภาษีขายในการตั้งค่าบัญชี CM ของประเภทเอกสารนี้');
@@ -400,7 +410,7 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
         // เบิกเงินสดย่อย: Dr บัญชีค่าใช้จ่ายตามรายการ / Cr บัญชีพักเบิกเงินสดย่อย
         // ค่าใช้จ่ายต่อบรรทัด (ก่อน VAT) + ภาษีซื้อของใบเสร็จที่มีใบกำกับภาษี / Cr เงินสดย่อยเต็มจำนวนที่เบิก
         for (const d of details) {
-            pushLine(d.expense_account_id, d.description || `เบิกเงินสดย่อย ${docNo}`, Number(d.amount_lc) || 0, 0, Number(d.amount_fc) || 0, 0);
+            pushLine(d.expense_account_id, d.description || `เบิกเงินสดย่อย ${docNo}`, Number(d.amount_lc) || 0, 0, Number(d.amount_fc) || 0, 0, lineDims(d, hDims));
         }
         if (vatLc || vatFc) {
             if (!setup.vat_input_account_id) throw new Error('ยังไม่ได้ตั้งค่าบัญชีภาษีซื้อในการตั้งค่าบัญชี CM ของประเภทเอกสารนี้');
@@ -494,44 +504,8 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
     const glHeaderId = glHeaderRes.rows[0].id;
     await client.query(`UPDATE cm_transaction SET gl_doc_no=$1 WHERE id=$2`, [glDocNo, headerId]);
 
-    // Dimension validation — เหมือน apTransactionController.js/arTransactionController.js:
-    // ใช้ dim ระดับหัวเอกสารแปะลงทุก GL line ที่สร้าง แล้วตรวจสอบว่าครบตาม gl_account_dim_rule ของแต่ละบัญชีหรือไม่
-    const hDim1 = header.dim1_id || null;
-    const hDim2 = header.dim2_id || null;
-    const hDim3 = header.dim3_id || null;
-    const hDim4 = header.dim4_id || null;
-    const hDim5 = header.dim5_id || null;
-    {
-        const dimTypeRes = await client.query(
-            `SELECT type_code, slot_no FROM gl_dimension_type WHERE is_active = true`
-        );
-        const slotByType = {};
-        for (const r of dimTypeRes.rows) slotByType[r.type_code] = r.slot_no;
-        const accountIds = [...new Set(glDetails.map(r => r.account_id).filter(Boolean))];
-        if (accountIds.length > 0) {
-            const accRes = await client.query(
-                `SELECT id, account_code FROM gl_account WHERE id = ANY($1::int[])`, [accountIds]
-            );
-            const accCodeMap = {};
-            for (const r of accRes.rows) accCodeMap[r.id] = r.account_code;
-            const headerDims = { 1: hDim1, 2: hDim2, 3: hDim3, 4: hDim4, 5: hDim5 };
-            const errors = [];
-            for (const accountId of accountIds) {
-                const rulesRes = await client.query(
-                    `SELECT type_code FROM gl_account_dim_rule WHERE account_id = $1 AND is_required = true`,
-                    [accountId]
-                );
-                for (const rule of rulesRes.rows) {
-                    const slot = slotByType[rule.type_code];
-                    if (!slot) continue;
-                    if (!headerDims[slot]) {
-                        errors.push(`บัญชี ${accCodeMap[accountId] || accountId}: ต้องระบุ ${rule.type_code}`);
-                    }
-                }
-            }
-            if (errors.length > 0) throw new Error(`Dimension ไม่ครบ:\n${errors.join('\n')}`);
-        }
-    }
+    // ตรวจมิติที่บัญชีบังคับ (gl_account_dim_rule) ต่อบรรทัดรายการบัญชี — เหมือน AR/AP/IM
+    await assertRequiredDims(client, glDetails, hDims);
 
     let lineNo = 1;
     for (const l of glDetails) {
@@ -541,7 +515,7 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
              dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
         `, [glHeaderId, lineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc, l.debit_fc, l.credit_fc,
-            hDim1, hDim2, hDim3, hDim4, hDim5]);
+            ...(l.dims || hDims)]);
     }
 
     return glHeaderId;
