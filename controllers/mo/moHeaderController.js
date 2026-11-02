@@ -28,6 +28,7 @@ const { today } = require('../../utils/dateUtil');
 const { getBaseCurrency } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const DA = require('../../utils/docApproval');
+const { headerDims, assertRequiredDims } = require('../../utils/glDims');
 const KIND = 'MO';
 
 const ensureMoHeaderTable = async (client) => {
@@ -623,13 +624,14 @@ const updateTransaction = async (req, res) => {
                 due_date         = $9,
                 description      = $10,
                 updated_by       = $11,
-                updated_at       = NOW()
+                updated_at       = NOW(),
+                dim1_id = $13, dim2_id = $14, dim3_id = $15, dim4_id = $16, dim5_id = $17
             WHERE id = $12
         `, [
             header.bom_header_id || null, header.warehouse_id, header.order_qty, header.uom_id || null,
             header.issue_method || 'EXPLICIT', header.costing_method || 'ACTUAL', header.costing_mode || 'OVERHEAD_PERCENT',
             header.overhead_percent ?? 0, header.due_date || null, header.description || null,
-            header.updated_by || null, id,
+            header.updated_by || null, id, ...headerDims(header),
         ]);
 
         await client.query(`DELETE FROM mo_component_detail WHERE header_id = $1`, [id]);
@@ -773,6 +775,9 @@ const postMoGlEntry = async (client, { mo, glDocId, date, description, lines, do
     const totalDebit = r2(rows.reduce((t, l) => t + l.debit, 0));
     const totalCredit = r2(rows.reduce((t, l) => t + l.credit, 0));
     if (Math.abs(totalDebit - totalCredit) >= 0.005) throw new Error(`รายการบัญชีไม่สมดุล (Dr ${totalDebit} / Cr ${totalCredit})`);
+    // ตรวจมิติที่บัญชีบังคับ (gl_account_dim_rule) — มิติของใบสั่งผลิตลงทุกบรรทัด เหมือนโมดูลอื่น
+    const moDims = headerDims(mo);
+    await assertRequiredDims(client, rows, moDims);
     const glEntryId = (await client.query(`
         INSERT INTO gl_entry_header
         (doc_id, doc_no, doc_date, posting_date, period_id, description,
@@ -788,8 +793,7 @@ const postMoGlEntry = async (client, { mo, glDocId, date, description, lines, do
             INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc,
                                          dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
             VALUES ($1,$2,$3,$4,$5,$6,0,0,$7,$8,$9,$10,$11)
-        `, [glEntryId, lineNo++, l.account_id, description, l.debit, l.credit,
-            mo.dim1_id || null, mo.dim2_id || null, mo.dim3_id || null, mo.dim4_id || null, mo.dim5_id || null]);
+        `, [glEntryId, lineNo++, l.account_id, description, l.debit, l.credit, ...moDims]);
     }
     return glEntryId;
 };
@@ -1179,13 +1183,15 @@ const explodeSubAssembly = async (req, res) => {
             INSERT INTO mo_header
                 (doc_id, doc_no, doc_code, doc_date, bom_header_id, warehouse_id, order_qty, uom_id,
                  issue_method, costing_method, costing_mode, overhead_percent, due_date,
-                 parent_mo_id, parent_mo_detail_id, branch_id, created_by, updated_by)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17)
+                 parent_mo_id, parent_mo_detail_id, branch_id, created_by, updated_by,
+                 dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17,$18,$19,$20,$21,$22)
             RETURNING id
         `, [
             parentMo.doc_id, docNo, parentMo.doc_code, docDate, bom.id, parentMo.warehouse_id, remainingQty, bom.output_uom_id,
             bom.issue_method, bom.costing_method, bom.costing_mode, bom.overhead_percent, due_date || null,
             parentMo.id, comp.id, parentMo.branch_id || null, userName,
+            ...headerDims(parentMo), // ใบสั่งผลิตย่อยใช้มิติของใบแม่เป็นค่าเริ่มต้น (แก้ได้ตอนร่าง)
         ]);
         const childId = hRes.rows[0].id;
 
