@@ -60,9 +60,9 @@ router.post('/gl_entry', glEntryController.createTransaction);
 router.put('/gl_entry/:id', glEntryController.updateTransaction);
 router.delete('/gl_entry/:id', glEntryController.deleteTransaction);
 router.post('/gl_entry/reverse/:id', glEntryController.reverseTransaction);
-// Developer-only: reset transaction data
-router.get('/gl_reset_transactions/counts', glResetController.getCounts);
-router.delete('/gl_reset_transactions', glResetController.resetTransactions);
+// Developer-only: reset GL master data (ธุรกรรมล้างที่ /api/sa/system_reset)
+router.get('/gl_reset_master/counts', glResetController.getCounts);
+router.delete('/gl_reset_master', glResetController.resetMasterData);
 // Router สำหรับสร้างรายงานทางการเงิน (Financial Report Engine)
 router.get('/gl_financial_report_master_list', glFinancialReportEngineController.getReportMasterList);
 router.post('/gl_financial_report_engine', glFinancialReportEngineController.generateFinancialReport);

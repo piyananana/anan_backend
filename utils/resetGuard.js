@@ -69,4 +69,36 @@ async function rejectIfTransactions(req, res) {
     return false;
 }
 
-module.exports = { GROUPS, PRICE_CHANGE_HEADER, existingTables, transactionTotal, rejectIfTransactions };
+// FK ที่อ้างถึง parentTable แบบไม่ CASCADE และคอลัมน์เป็นค่าว่างได้ (ข้อมูลหลัก/การตั้งค่าของทุกโมดูล รวมตัวเอง เช่น parent_id)
+// ใช้ตอนลบข้อมูลหลักที่ถูกอ้างอิงกว้าง (ผังบัญชี, งวดบัญชี) — ล้างช่องอ้างอิงเป็น NULL ก่อนลบ
+async function nullableRefs(db, parentTable) {
+    const r = await db.query(`
+        SELECT c.conrelid::regclass::text AS tbl, a.attname AS col
+          FROM pg_constraint c
+          JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+         WHERE c.contype = 'f' AND c.confrelid = $1::regclass AND c.confdeltype <> 'c'
+           AND array_length(c.conkey, 1) = 1 AND NOT a.attnotnull
+         ORDER BY 1, 2`, [parentTable]);
+    return r.rows;
+}
+
+// จำนวนแถวที่ยังอ้างอิง parentTable (ไม่นับตัวเอง)
+async function countRefs(db, parentTable) {
+    const refs = (await nullableRefs(db, parentTable)).filter(x => x.tbl !== parentTable);
+    if (refs.length === 0) return 0;
+    const r = await db.query(
+        `SELECT ${refs.map(x => `(SELECT COUNT(*) FROM ${x.tbl} WHERE ${x.col} IS NOT NULL)`).join(' + ')} AS n`);
+    return Number(r.rows[0].n);
+}
+
+// ล้างช่องอ้างอิงเป็น NULL — คืน { 'table.column': rows }
+async function clearRefs(db, parentTable) {
+    const out = {};
+    for (const x of await nullableRefs(db, parentTable)) {
+        const r = await db.query(`UPDATE ${x.tbl} SET ${x.col} = NULL WHERE ${x.col} IS NOT NULL`);
+        if (r.rowCount) out[`${x.tbl}.${x.col}`] = r.rowCount;
+    }
+    return out;
+}
+
+module.exports = { GROUPS, PRICE_CHANGE_HEADER, existingTables, transactionTotal, rejectIfTransactions, countRefs, clearRefs };
