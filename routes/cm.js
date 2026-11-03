@@ -140,8 +140,9 @@ router.get('/cm_report/check_register',      cmReportController.getCheckRegister
 // cm_pre_close_check
 router.get('/cm_pre_close_check', cmPreCloseCheckController.runChecks);
 
-// cm_reset
-router.post('/cm_reset', cmResetController.resetData);
+// cm_reset_master — ล้างข้อมูลหลัก CM (ธุรกรรมล้างที่ /api/sa/system_reset)
+router.get('/cm_reset_master/counts', cmResetController.getCounts);
+router.delete('/cm_reset_master',       cmResetController.resetMasterData);
 
 // cm_bank_gl_reconcile
 router.get('/cm_bank_gl_reconcile', cmBankGlReconcileController.getReport);
