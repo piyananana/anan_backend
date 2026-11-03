@@ -57,8 +57,8 @@ router.post('/ap_vendor_balance/import/validate',         apVendorBalanceImportC
 router.post('/ap_vendor_balance/import/confirm',          apVendorBalanceImportController.confirmImport);
 
 // ── AP Reset ───────────────────────────────────────────────────────────────
-router.get('/ap_reset_transactions/counts', apResetController.getCounts);
-router.delete('/ap_reset_transactions',     apResetController.resetTransactions);
+router.get('/ap_reset_master/counts', apResetController.getCounts);
+router.delete('/ap_reset_master',     apResetController.resetMasterData);
 
 // ── Aging Report ──────────────────────────────────────────────────────────
 router.get('/ap_aging_report',           apAgingReportController.getAgingReport);
