@@ -137,8 +137,8 @@ router.post('/ar_allowance_run/:id/void',    arAllowanceRunController.voidRun);
 router.put('/ar_allowance_run/:id/reverse', arAllowanceRunController.reverseRun);
 router.delete('/ar_allowance_run/:id',       arAllowanceRunController.deleteRun);
 
-// Developer-only: reset AR transaction data
-router.get('/ar_reset_transactions/counts', arResetController.getCounts);
-router.delete('/ar_reset_transactions', arResetController.resetTransactions);
+// Developer-only: reset AR master data (ธุรกรรมล้างที่ /api/sa/system_reset)
+router.get('/ar_reset_master/counts', arResetController.getCounts);
+router.delete('/ar_reset_master', arResetController.resetMasterData);
 
 module.exports = router;

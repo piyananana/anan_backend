@@ -1,4 +1,6 @@
-// controllers/ar/arResetController.js
+// controllers/ar/arResetController.js — ล้างข้อมูลหลัก/การตั้งค่าของ AR (เครื่องมือผู้พัฒนาระบบ)
+// ธุรกรรมล้างที่หน้าจอ "ล้างธุรกรรมทุกโมดูล" (saSystemResetController) — ต้องไม่มีธุรกรรมค้างก่อนจึงจะล้างที่นี่ได้
+const { transactionTotal, rejectIfTransactions } = require('../../utils/resetGuard');
 
 async function _checkDeveloper(req) {
     const userId = req.headers['userid'];
@@ -28,40 +30,24 @@ async function _countTable(pool, tableName, whereClause = '') {
     }
 }
 
-// GET /ar_reset_transactions/counts
+// GET /ar_reset_master/counts
 const getCounts = async (req, res) => {
     if (!(await _checkDeveloper(req))) {
         return res.status(403).json({ message: 'ต้องการสิทธิ์ผู้พัฒนาระบบ' });
     }
     try {
         const [
-            headerCount, detailCount, applyCount, paymentCount, vatCount,
+            transactionsTotal,
             customerCount, customerGroupCount, collectorCount,
-            glAccountSetupCount, allowanceRuleCount, fxRevalCount, allowanceRunCount,
+            glAccountSetupCount, allowanceRuleCount,
         ] = await Promise.all([
-            _countTable(req.dbPool, 'ar_transaction'),
-            _countTable(req.dbPool, 'ar_transaction_detail'),
-            _countTable(req.dbPool, 'ar_transaction_apply'),
-            _countTable(req.dbPool, 'ar_transaction_payment'),
-            _countTable(req.dbPool, 'vt_transaction', "module_code = 'AR'"),
+            transactionTotal(req.dbPool),
             _countTable(req.dbPool, 'ar_customer'),
             _countTable(req.dbPool, 'ar_customer_group'),
             _countTable(req.dbPool, 'ar_collector'),
             _countTable(req.dbPool, 'ar_gl_account_setup'),
             _countTable(req.dbPool, 'ar_allowance_rule'),
-            _countTable(req.dbPool, 'ar_fx_revaluation'),
-            _countTable(req.dbPool, 'ar_allowance_run'),
         ]);
-
-        let arDocCount = 0;
-        try {
-            const docResult = await req.dbPool.query(`
-                SELECT COUNT(*) FROM sa_doc_number_branch dnb
-                JOIN sa_module_document md ON md.id = dnb.doc_id
-                WHERE md.sys_module = '11' AND dnb.next_running_number > 1
-            `);
-            arDocCount = parseInt(docResult.rows[0].count, 10);
-        } catch (_) {}
 
         let customerRunning = null;
         try {
@@ -85,19 +71,12 @@ const getCounts = async (req, res) => {
         } catch (_) {}
 
         res.json({
-            ar_transaction:         headerCount,
-            ar_transaction_detail:  detailCount,
-            ar_transaction_apply:   applyCount,
-            ar_transaction_payment: paymentCount,
-            vt_transaction:         vatCount,
-            ar_doc_number_rows:     arDocCount,
+            transactions_total:     transactionsTotal,
             ar_customer:            customerCount,
             ar_customer_group:      customerGroupCount,
             ar_collector:           collectorCount,
             ar_gl_account_setup:    glAccountSetupCount,
             ar_allowance_rule:      allowanceRuleCount,
-            ar_fx_revaluation:      fxRevalCount,
-            ar_allowance_run:       allowanceRunCount,
             ar_customer_running:    customerRunning,
             ar_year_end_setup_configured: yearEndConfigured,
         });
@@ -107,15 +86,14 @@ const getCounts = async (req, res) => {
     }
 };
 
-// DELETE /ar_reset_transactions
-const resetTransactions = async (req, res) => {
+// DELETE /ar_reset_master
+const resetMasterData = async (req, res) => {
     if (!(await _checkDeveloper(req))) {
         return res.status(403).json({ message: 'ต้องการสิทธิ์ผู้พัฒนาระบบ' });
     }
+    if (await rejectIfTransactions(req, res)) return;
 
     const {
-        deleteTransactions = true,
-        resetDocNumbers = false,
         resetCustomers = false,
         resetCustomerGroups = false,
         resetCollectors = false,
@@ -130,8 +108,7 @@ const resetTransactions = async (req, res) => {
         const deleted = {};
         const errors = {};
 
-        // ดำเนินการแบบ savepoint แยกกลุ่ม เพื่อไม่ให้ FK constraint ของกลุ่มหนึ่ง
-        // ทำให้ทั้ง transaction ล้มเหลว
+        // savepoint แยกขั้นตอน — ขั้นตอนที่ติด FK (เช่น ลบกลุ่มลูกค้าโดยไม่ลบลูกค้า) ล้มเฉพาะขั้นตอนนั้น และแจ้งใน errors
         const runStep = async (key, fn) => {
             await client.query(`SAVEPOINT sp_${key}`);
             try {
@@ -144,65 +121,7 @@ const resetTransactions = async (req, res) => {
             }
         };
 
-        // ปิดสิ้นปี: ลบประวัติ FX Revaluation / Allowance Run ก่อน
-        // เพื่อไม่ชน FK กับ ar_transaction เมื่อ deleteTransactions=true ด้วย
-        if (resetYearEndSetup) {
-            await runStep('ar_fx_revaluation', async () => {
-                const detailR = await client.query(`DELETE FROM ar_fx_revaluation_detail RETURNING id`);
-                const headerR = await client.query(`DELETE FROM ar_fx_revaluation RETURNING id`);
-                deleted.ar_fx_revaluation_detail = detailR.rowCount;
-                deleted.ar_fx_revaluation = headerR.rowCount;
-            });
-            await runStep('ar_allowance_run', async () => {
-                const detailR = await client.query(`DELETE FROM ar_allowance_run_detail RETURNING id`);
-                const headerR = await client.query(`DELETE FROM ar_allowance_run RETURNING id`);
-                deleted.ar_allowance_run_detail = detailR.rowCount;
-                deleted.ar_allowance_run = headerR.rowCount;
-            });
-        }
-
-        if (deleteTransactions) {
-            // ลบตามลำดับ FK: apply/payment/detail → vt_transaction → header
-            const tables = [
-                ['ar_transaction_apply',   'ar_transaction_apply'],
-                ['ar_transaction_payment', 'ar_transaction_payment'],
-                ['ar_transaction_detail',  'ar_transaction_detail'],
-            ];
-            for (const [key, table] of tables) {
-                try {
-                    const r = await client.query(`DELETE FROM ${table} RETURNING id`);
-                    deleted[key] = r.rowCount;
-                } catch (_) { deleted[key] = 0; }
-            }
-            // vt_transaction เฉพาะ AR
-            try {
-                const r = await client.query(`DELETE FROM vt_transaction WHERE module_code = 'AR' RETURNING id`);
-                deleted.vt_transaction = r.rowCount;
-            } catch (_) { deleted.vt_transaction = 0; }
-            // header ต้องลบหลังสุด
-            try {
-                const r = await client.query(`DELETE FROM ar_transaction RETURNING id`);
-                deleted.ar_transaction = r.rowCount;
-            } catch (_) { deleted.ar_transaction = 0; }
-        }
-
-        if (resetDocNumbers) {
-            try {
-                await client.query(`
-                    UPDATE sa_doc_number_branch SET next_running_number = 1
-                    WHERE doc_id IN (SELECT id FROM sa_module_document WHERE sys_module = '11')
-                `);
-                await client.query(`
-                    UPDATE sa_module_document SET next_running_number = 1
-                    WHERE sys_module = '11'
-                `);
-                deleted.doc_numbers_reset = true;
-            } catch (_) {
-                deleted.doc_numbers_reset = false;
-            }
-        }
-
-        // ลูกค้า (และข้อมูลย่อย: ที่อยู่/ผู้ติดต่อ/บัญชีธนาคาร/เงื่อนไขวางบิล-รับชำระ — ลบตาม CASCADE)
+        // ลูกค้า (และข้อมูลย่อย: ที่อยู่/ผู้ติดต่อ/บัญชีธนาคาร/เงื่อนไขวางบิล-รับชำระ/พนักงานขาย — ลบตาม CASCADE)
         // ลบก่อนกลุ่มลูกค้า/ผู้วางบิล เพื่อให้ FK customer_group_id, billing/collection_collector_id ว่างก่อน
         if (resetCustomers) {
             await runStep('ar_customer', async () => {
@@ -270,15 +189,16 @@ const resetTransactions = async (req, res) => {
         }
 
         await client.query('COMMIT');
-        console.log('AR reset completed:', deleted, errors);
-        res.json({ message: 'ดำเนินการสำเร็จ', deleted, errors });
+        console.log('AR master reset completed:', deleted, errors);
+        const failed = Object.keys(errors).length > 0;
+        res.json({ message: failed ? 'ดำเนินการแล้ว แต่บางรายการล้างไม่สำเร็จ' : 'ดำเนินการสำเร็จ', deleted, errors });
     } catch (error) {
         await client.query('ROLLBACK');
-        console.error('Error resetting AR transactions:', error);
+        console.error('Error resetting AR master data:', error);
         res.status(500).json({ message: error.message });
     } finally {
         client.release();
     }
 };
 
-module.exports = { getCounts, resetTransactions };
+module.exports = { getCounts, resetMasterData };
