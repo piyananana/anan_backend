@@ -1,5 +1,8 @@
-// controllers/im/imResetController.js — มิเรอร์ arResetController.js/apResetController.js
+// controllers/im/imResetController.js — ล้างข้อมูลหลัก/การตั้งค่าของ IM และ MO (เครื่องมือผู้พัฒนาระบบ)
+// ธุรกรรม (เอกสาร IM, สต็อกคงเหลือ, นับสต็อก, เปลี่ยนราคา, ใบสั่งผลิต ฯลฯ) ล้างที่หน้าจอ "ล้างธุรกรรมทุกโมดูล"
+// (saSystemResetController) — ต้องไม่มีธุรกรรมค้างก่อนจึงจะล้างที่นี่ได้
 'use strict';
+const { transactionTotal, rejectIfTransactions, clearRefs } = require('../../utils/resetGuard');
 
 async function _checkDeveloper(req) {
     const userId = req.headers['userid'];
@@ -14,45 +17,38 @@ async function _checkDeveloper(req) {
     }
 }
 
-async function _countTable(pool, tableName, whereClause = '') {
+async function _countTable(pool, tableName) {
     try {
         const exists = await pool.query(
             "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1",
             [tableName]
         );
         if (exists.rowCount === 0) return 0;
-        const sql = `SELECT COUNT(*) FROM ${tableName}${whereClause ? ' WHERE ' + whereClause : ''}`;
-        const r = await pool.query(sql);
+        const r = await pool.query(`SELECT COUNT(*) FROM ${tableName}`);
         return parseInt(r.rows[0].count, 10);
     } catch (_) {
         return 0;
     }
 }
 
-// GET /im_reset_transactions/counts
+// GET /im_reset_master/counts
 const getCounts = async (req, res) => {
     if (!(await _checkDeveloper(req))) {
         return res.status(403).json({ message: 'ต้องการสิทธิ์ผู้พัฒนาระบบ' });
     }
     try {
         const [
-            txCount, txDetailCount, stockLayerCount, stockLayerConsCount, stockBalanceCount,
-            stockCountCount, stockCountDetailCount, periodClosingCount, openingBalanceBatchCount,
-            bomHeaderCount, priceListCount, priceChangeHeaderCount, itemCount, itemCategoryCount, uomCount, warehouseCount,
+            transactionsTotal,
+            bomHeaderCount, workCenterCount, moGlSetupCount,
+            priceListCount, priceGroupCount, itemCount, itemCategoryCount, uomCount, warehouseCount,
             locationCount, glAccountSetupCount,
         ] = await Promise.all([
-            _countTable(req.dbPool, 'im_transaction'),
-            _countTable(req.dbPool, 'im_transaction_detail'),
-            _countTable(req.dbPool, 'im_stock_layer'),
-            _countTable(req.dbPool, 'im_stock_layer_consumption'),
-            _countTable(req.dbPool, 'im_stock_balance'),
-            _countTable(req.dbPool, 'im_stock_count'),
-            _countTable(req.dbPool, 'im_stock_count_detail'),
-            _countTable(req.dbPool, 'im_period_closing'),
-            _countTable(req.dbPool, 'im_opening_balance_batch'),
+            transactionTotal(req.dbPool),
             _countTable(req.dbPool, 'mo_bom_header'),
+            _countTable(req.dbPool, 'mo_work_center'),
+            _countTable(req.dbPool, 'mo_gl_account_setup'),
             _countTable(req.dbPool, 'im_price_list'),
-            _countTable(req.dbPool, 'im_price_change_header'),
+            _countTable(req.dbPool, 'im_price_group'),
             _countTable(req.dbPool, 'im_item'),
             _countTable(req.dbPool, 'im_item_category'),
             _countTable(req.dbPool, 'im_uom'),
@@ -61,30 +57,12 @@ const getCounts = async (req, res) => {
             _countTable(req.dbPool, 'im_gl_account_setup'),
         ]);
 
-        let imDocCount = 0;
-        try {
-            const r = await req.dbPool.query(`
-                SELECT COUNT(*) FROM sa_doc_number_branch dnb
-                JOIN sa_module_document md ON md.id = dnb.doc_id
-                WHERE md.sys_module = '31' AND dnb.next_running_number > 1
-            `);
-            imDocCount = parseInt(r.rows[0].count, 10);
-        } catch (_) {}
-
         let itemRunning = null;
         try {
             const r = await req.dbPool.query(
                 `SELECT is_auto_numbering, next_running_number FROM im_item_running ORDER BY id LIMIT 1`
             );
             itemRunning = r.rows[0] || null;
-        } catch (_) {}
-
-        let stockCountRunning = null;
-        try {
-            const r = await req.dbPool.query(
-                `SELECT is_auto_numbering, next_running_number FROM im_stock_count_running ORDER BY id LIMIT 1`
-            );
-            stockCountRunning = r.rows[0] || null;
         } catch (_) {}
 
         let accountingSettingConfigured = false;
@@ -100,27 +78,19 @@ const getCounts = async (req, res) => {
         } catch (_) {}
 
         res.json({
-            im_transaction:             txCount,
-            im_transaction_detail:      txDetailCount,
-            im_stock_layer:             stockLayerCount,
-            im_stock_layer_consumption: stockLayerConsCount,
-            im_stock_balance:           stockBalanceCount,
-            im_stock_count:             stockCountCount,
-            im_stock_count_detail:      stockCountDetailCount,
-            im_period_closing:          periodClosingCount,
-            im_opening_balance_batch:   openingBalanceBatchCount,
-            im_doc_number_rows:         imDocCount,
-            mo_bom_header:              bomHeaderCount,
-            im_price_list:              priceListCount,
-            im_price_change_header:     priceChangeHeaderCount,
-            im_item:                    itemCount,
-            im_item_category:           itemCategoryCount,
-            im_uom:                     uomCount,
-            im_warehouse:               warehouseCount,
-            im_location:                locationCount,
-            im_gl_account_setup:        glAccountSetupCount,
-            im_item_running:            itemRunning,
-            im_stock_count_running:     stockCountRunning,
+            transactions_total:  transactionsTotal,
+            mo_bom_header:       bomHeaderCount,
+            mo_work_center:      workCenterCount,
+            mo_gl_account_setup: moGlSetupCount,
+            im_price_list:       priceListCount,
+            im_price_group:      priceGroupCount,
+            im_item:             itemCount,
+            im_item_category:    itemCategoryCount,
+            im_uom:              uomCount,
+            im_warehouse:        warehouseCount,
+            im_location:         locationCount,
+            im_gl_account_setup: glAccountSetupCount,
+            im_item_running:     itemRunning,
             im_accounting_setting_configured: accountingSettingConfigured,
         });
     } catch (error) {
@@ -129,18 +99,19 @@ const getCounts = async (req, res) => {
     }
 };
 
-// DELETE /im_reset_transactions
-const resetTransactions = async (req, res) => {
+// DELETE /im_reset_master
+const resetMasterData = async (req, res) => {
     if (!(await _checkDeveloper(req))) {
         return res.status(403).json({ message: 'ต้องการสิทธิ์ผู้พัฒนาระบบ' });
     }
+    if (await rejectIfTransactions(req, res)) return;
 
     const {
-        deleteTransactions = true,
-        resetDocNumbers = false,
         resetBom = false,
-        resetPriceChange = false,
+        resetWorkCenters = false,
+        resetMoGlSetup = false,
         resetPriceList = false,
+        resetPriceGroups = false,
         resetItems = false,
         resetItemCategories = false,
         resetUom = false,
@@ -156,9 +127,7 @@ const resetTransactions = async (req, res) => {
         const deleted = {};
         const errors = {};
 
-        // ดำเนินการแบบ savepoint แยกทุกขั้นตอน (ไม่ใช่แค่กลุ่ม master data เหมือน AR/AP เดิม) เพราะ IM มี FK
-        // graph ซับซ้อนกว่า (item/warehouse/location/bom/price_list/transaction/stock_count เชื่อมกันหลายทาง)
-        // — ถ้าขั้นตอนไหน error โดยไม่คาดคิด จะไม่ทำให้ transaction ทั้งหมด abort จนขั้นตอนอื่นพลอยล้มเหลวไปด้วย
+        // savepoint แยกขั้นตอน — ขั้นตอนที่ติด FK (เช่น ลบหน่วยนับโดยไม่ลบสินค้า) ล้มเฉพาะขั้นตอนนั้น และแจ้งใน errors
         const runStep = async (key, fn) => {
             await client.query(`SAVEPOINT sp_${key}`);
             try {
@@ -171,134 +140,77 @@ const resetTransactions = async (req, res) => {
             }
         };
 
-        if (deleteTransactions) {
-            // im_stock_count.im_transaction_id อ้างอิง im_transaction แบบไม่มี CASCADE — ต้องลบชุดนับสต็อกก่อนเสมอ
-            await runStep('im_stock_count', async () => {
-                const d = await client.query(`DELETE FROM im_stock_count_detail RETURNING id`);
-                const h = await client.query(`DELETE FROM im_stock_count RETURNING id`);
-                deleted.im_stock_count_detail = d.rowCount;
-                deleted.im_stock_count = h.rowCount;
-            });
-            // ประวัติปิดงวดสินค้าคงคลัง (คำนวณจากธุรกรรมในงวดนั้นๆ) — ล้างทิ้งเพื่อไม่ให้ค้างเป็นข้อมูลเก่า
-            await runStep('im_period_closing', async () => {
-                const r = await client.query(`DELETE FROM im_period_closing RETURNING period_id`);
-                deleted.im_period_closing = r.rowCount;
-            });
-            // consumption อ้างอิง layer แบบไม่มี CASCADE — ลบก่อน layer เสมอ
-            await runStep('im_stock_layer', async () => {
-                const c = await client.query(`DELETE FROM im_stock_layer_consumption RETURNING id`);
-                const l = await client.query(`DELETE FROM im_stock_layer RETURNING id`);
-                deleted.im_stock_layer_consumption = c.rowCount;
-                deleted.im_stock_layer = l.rowCount;
-            });
-            await runStep('im_stock_balance', async () => {
-                const r = await client.query(`DELETE FROM im_stock_balance RETURNING item_id`);
-                deleted.im_stock_balance = r.rowCount;
-            });
-            await runStep('im_transaction', async () => {
-                const d = await client.query(`DELETE FROM im_transaction_detail RETURNING id`);
-                const h = await client.query(`DELETE FROM im_transaction RETURNING id`);
-                deleted.im_transaction_detail = d.rowCount;
-                deleted.im_transaction = h.rowCount;
-            });
-            await runStep('im_opening_balance_batch', async () => {
-                const r = await client.query(`DELETE FROM im_opening_balance_batch RETURNING id`);
-                deleted.im_opening_balance_batch = r.rowCount;
-            });
-        }
-
-        if (resetDocNumbers) {
-            await runStep('im_doc_numbers', async () => {
-                await client.query(`
-                    UPDATE sa_doc_number_branch SET next_running_number = 1
-                    WHERE doc_id IN (SELECT id FROM sa_module_document WHERE sys_module = '31')
-                `);
-                await client.query(`
-                    UPDATE sa_module_document SET next_running_number = 1
-                    WHERE sys_module = '31'
-                `);
-                deleted.doc_numbers_reset = true;
-            });
-        }
-
-        // สูตรการผลิต (BOM) — mo_bom_header.parent_item_id / mo_bom_detail.component_item_id อ้างอิง im_item
-        // แบบไม่มี CASCADE จึงต้องลบก่อน "สินค้า" เสมอ ถ้ายังมี BOM ค้างอยู่ การลบสินค้าจะถูกบล็อก (BOM ย้ายไปอยู่
-        // ใต้โมดูล MO แล้ว แต่การล้างข้อมูลยังทำที่หน้าจอ IM Reset นี้เหมือนเดิม เพราะ BOM ยังผูกกับ im_item อยู่)
+        // สูตรการผลิต (BOM) — รายการวัตถุดิบ/ผลผลิต/ขั้นตอนลบตาม CASCADE; อ้างอิงสินค้า/หน่วยนับ/ศูนย์งาน
+        // จึงต้องลบก่อนสามอย่างนั้นเสมอ
         if (resetBom) {
             await runStep('mo_bom', async () => {
-                const d = await client.query(`DELETE FROM mo_bom_detail RETURNING id`);
-                const h = await client.query(`DELETE FROM mo_bom_header RETURNING id`);
-                deleted.mo_bom_detail = d.rowCount;
-                deleted.mo_bom_header = h.rowCount;
+                deleted.mo_bom_header = (await client.query(`DELETE FROM mo_bom_header`)).rowCount;
             });
         }
 
-        // ธุรกรรมการเปลี่ยนแปลงราคา (im_price_change_header/detail) — im_price_list_detail.source_price_change_id
-        // อ้างอิง im_price_change_header แบบไม่มี CASCADE (แค่ trace ย้อนกลับ ไม่ใช่ความสัมพันธ์ parent-child จริง)
-        // ต้องล้างคอลัมน์นี้ก่อนเสมอ ไม่เช่นนั้นจะลบ header ไม่ได้ — ล้างแยกจาก resetPriceList ด้านล่างเพราะอยากให้
-        // ลบ "ธุรกรรม" กับ "ราคาที่มีผลแล้ว" เป็นอิสระจากกันได้ (ไม่บังคับว่าเลือกอันหนึ่งต้องเลือกอีกอันด้วย)
-        if (resetPriceChange) {
-            await runStep('im_price_change', async () => {
-                await client.query(`
-                    UPDATE im_price_list_detail SET source_price_change_id = NULL
-                    WHERE source_price_change_id IS NOT NULL
-                `);
-                const d = await client.query(`DELETE FROM im_price_change_detail RETURNING id`);
-                const h = await client.query(`DELETE FROM im_price_change_header RETURNING id`);
-                deleted.im_price_change_detail = d.rowCount;
-                deleted.im_price_change_header = h.rowCount;
+        if (resetWorkCenters) {
+            await runStep('mo_work_center', async () => {
+                deleted.mo_work_center = (await client.query(`DELETE FROM mo_work_center`)).rowCount;
             });
         }
 
-        // ราคาขาย (Price List) — im_price_list_detail.item_id อ้างอิง im_item แบบไม่มี CASCADE เช่นกัน
-        // im_price_change_header.price_list_id อ้างอิง im_price_list แบบ NOT NULL ไม่มี CASCADE ด้วย — ถ้ายังมี
-        // ธุรกรรมเปลี่ยนแปลงราคาอ้างอิงลิสต์นี้อยู่ (ไม่ได้เลือก resetPriceChange ด้วย) ขั้นตอนนี้จะลบไม่ได้
+        if (resetMoGlSetup) {
+            await runStep('mo_gl_account_setup', async () => {
+                deleted.mo_gl_account_setup = (await client.query(`DELETE FROM mo_gl_account_setup`)).rowCount;
+            });
+        }
+
+        // ราคาขาย (Price List) — ลูกค้า/ผู้ขายที่ผูกราคาไว้ถูกล้างเป็นค่าว่าง, รายการราคาลบตาม CASCADE
         if (resetPriceList) {
             await runStep('im_price_list', async () => {
-                const d = await client.query(`DELETE FROM im_price_list_detail RETURNING id`);
-                const h = await client.query(`DELETE FROM im_price_list RETURNING id`);
-                deleted.im_price_list_detail = d.rowCount;
-                deleted.im_price_list = h.rowCount;
+                Object.assign(deleted, await clearRefs(client, 'im_price_list'));
+                deleted.im_price_list = (await client.query(`DELETE FROM im_price_list`)).rowCount;
             });
         }
 
-        // สินค้า — im_uom_conversion/im_item_warehouse มี ON DELETE CASCADE จาก im_item อยู่แล้ว ไม่ต้องลบแยก
+        // กลุ่มราคา — ถ้ายังมีราคาขายอ้างอิงอยู่ (ไม่ได้เลือกราคาขายด้วย) จะล้างช่องกลุ่มราคาในราคาขายเป็นค่าว่าง
+        if (resetPriceGroups) {
+            await runStep('im_price_group', async () => {
+                Object.assign(deleted, await clearRefs(client, 'im_price_group'));
+                deleted.im_price_group = (await client.query(`DELETE FROM im_price_group`)).rowCount;
+            });
+        }
+
+        // สินค้า — คลัง/หน่วยนับทางเลือกของสินค้าลบตาม CASCADE; ถ้ายังมี BOM หรือรายการราคาขายอ้างอิงจะล้มและแจ้งใน errors
         if (resetItems) {
             await runStep('im_item', async () => {
-                const r = await client.query(`DELETE FROM im_item RETURNING id`);
-                deleted.im_item = r.rowCount;
+                deleted.im_item = (await client.query(`DELETE FROM im_item`)).rowCount;
             });
         }
 
-        // หมวดหมู่สินค้า — ต้องลบสินค้าที่อ้างอิง category_id ก่อน (เลือก "สินค้า" ด้วย) ไม่เช่นนั้นจะลบไม่ได้
+        // หมวดหมู่สินค้า — ล้างช่องอ้างอิง (หมวดแม่, หมวดของสินค้า/ตำแหน่งจัดเก็บที่ยังเหลือ) เป็นค่าว่างก่อนลบ
         if (resetItemCategories) {
             await runStep('im_item_category', async () => {
-                const r = await client.query(`DELETE FROM im_item_category RETURNING id`);
-                deleted.im_item_category = r.rowCount;
+                Object.assign(deleted, await clearRefs(client, 'im_item_category'));
+                deleted.im_item_category = (await client.query(`DELETE FROM im_item_category`)).rowCount;
             });
         }
 
-        // หน่วยนับ — ต้องลบสินค้า (base_uom_id) และหน่วยนับทางเลือกก่อน (เลือก "สินค้า" ด้วย)
+        // หน่วยนับ — สินค้าบังคับมีหน่วยนับหลัก ต้องลบสินค้าก่อน (เลือก "สินค้า" ด้วย)
         if (resetUom) {
             await runStep('im_uom', async () => {
-                const r = await client.query(`DELETE FROM im_uom RETURNING id`);
-                deleted.im_uom = r.rowCount;
+                deleted.im_uom = (await client.query(`DELETE FROM im_uom`)).rowCount;
             });
         }
 
-        // คลังสินค้า+ตำแหน่งจัดเก็บ — im_location มี ON DELETE CASCADE จาก im_warehouse อยู่แล้ว ลบคลังพอ
-        // ต้องเคลียร์สินค้า/ธุรกรรม/สต็อกคงเหลือ/ชุดนับสต็อกที่อ้างอิงคลัง-ตำแหน่งนี้ก่อน ไม่เช่นนั้นจะลบไม่ได้
+        // คลังสินค้า + ตำแหน่งจัดเก็บ (ลบตาม CASCADE) — ลบการตั้งค่าสินค้ารายคลังด้วย และล้างคลัง/ตำแหน่งเริ่มต้นของสินค้าเป็นค่าว่าง
         if (resetWarehouses) {
             await runStep('im_warehouse', async () => {
-                const r = await client.query(`DELETE FROM im_warehouse RETURNING id`);
-                deleted.im_warehouse = r.rowCount;
+                deleted.im_item_warehouse = (await client.query(`DELETE FROM im_item_warehouse`)).rowCount;
+                Object.assign(deleted, await clearRefs(client, 'im_location'));
+                Object.assign(deleted, await clearRefs(client, 'im_warehouse'));
+                deleted.im_warehouse = (await client.query(`DELETE FROM im_warehouse`)).rowCount;
             });
         }
 
         if (resetGlAccountSetup) {
             await runStep('im_gl_account_setup', async () => {
-                const r = await client.query(`DELETE FROM im_gl_account_setup RETURNING id`);
-                deleted.im_gl_account_setup = r.rowCount;
+                deleted.im_gl_account_setup = (await client.query(`DELETE FROM im_gl_account_setup`)).rowCount;
             });
         }
 
@@ -320,7 +232,7 @@ const resetTransactions = async (req, res) => {
             });
         }
 
-        // ตั้งค่ารหัสอัตโนมัติ (สินค้า + ชุดนับสต็อก) — คืนค่าเป็นค่าเริ่มต้นของแต่ละตาราง
+        // ตั้งค่ารหัสสินค้าอัตโนมัติ — คืนค่าเป็นค่าเริ่มต้น (เลขที่ชุดนับสต็อกรีเซ็ตที่หน้าจอกลางพร้อมเลขที่เอกสาร)
         if (resetItemRunning) {
             await runStep('im_item_running', async () => {
                 await client.query(`
@@ -332,28 +244,19 @@ const resetTransactions = async (req, res) => {
                 `);
                 deleted.im_item_running_reset = true;
             });
-            await runStep('im_stock_count_running', async () => {
-                await client.query(`
-                    UPDATE im_stock_count_running SET
-                        is_auto_numbering = true, format_prefix = 'CNT',
-                        format_separator = '-', format_suffix_date = '',
-                        running_length = 6, next_running_number = 1,
-                        updated_at = NOW()
-                `);
-                deleted.im_stock_count_running_reset = true;
-            });
         }
 
         await client.query('COMMIT');
-        console.log('IM reset completed:', deleted, errors);
-        res.json({ message: 'ดำเนินการสำเร็จ', deleted, errors });
+        console.log('IM master reset completed:', deleted, errors);
+        const failed = Object.keys(errors).length > 0;
+        res.json({ message: failed ? 'ดำเนินการแล้ว แต่บางรายการล้างไม่สำเร็จ' : 'ดำเนินการสำเร็จ', deleted, errors });
     } catch (error) {
         await client.query('ROLLBACK');
-        console.error('Error resetting IM transactions:', error);
+        console.error('Error resetting IM master data:', error);
         res.status(500).json({ message: error.message });
     } finally {
         client.release();
     }
 };
 
-module.exports = { getCounts, resetTransactions };
+module.exports = { getCounts, resetMasterData };

@@ -222,9 +222,9 @@ router.get('/im_item_running/preview_code', imItemRunningController.previewCode)
 router.get('/im_item_running',              imItemRunningController.fetchConfig);
 router.post('/im_item_running',             imItemRunningController.saveConfig);
 
-// im_reset_transactions (เครื่องมือผู้พัฒนาระบบ — ล้างข้อมูลธุรกรรม/ข้อมูลหลักของ IM)
-router.get('/im_reset_transactions/counts', imResetController.getCounts);
-router.delete('/im_reset_transactions',     imResetController.resetTransactions);
+// im_reset_master (เครื่องมือผู้พัฒนาระบบ — ล้างข้อมูลหลัก IM/MO; ธุรกรรมล้างที่ /api/sa/system_reset)
+router.get('/im_reset_master/counts', imResetController.getCounts);
+router.delete('/im_reset_master',     imResetController.resetMasterData);
 
 // imPrintFormController — แบบฟอร์มพิมพ์ (ออกแบบ + พิมพ์ + ประวัติการพิมพ์)
 router.get('/print_form_source',                 imPrintFormController.fetchSources);
