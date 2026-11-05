@@ -279,7 +279,10 @@ const markApproved = (client, id, userName) => client.query(`
 // PUT submit (Draft → Submitted / ไม่มีผู้อนุมัติ + ให้ผ่าน → Approved)
 const submitRun = approvalAction('submitting', 'ส่งอนุมัติสำเร็จ', async (client, run, { menuId, userName }) => {
     if (run.status !== 'Draft') throw DA.httpErr(400, 'ส่งอนุมัติได้เฉพาะเอกสาร Draft เท่านั้น');
-    const q = await DA.buildQueue(client, { kind: KIND, recordId: run.id, menuId });
+    // วงเงินอนุมัติจ่ายของผู้อนุมัติ เทียบกับยอดจ่ายรวมของรอบ (สกุลเงินหลัก) — คำนวณจากรายการจริง
+    const total = (await client.query(`
+        SELECT COALESCE(SUM(payment_amount_lc), 0)::float AS t FROM ap_payment_run_detail WHERE run_id=$1`, [run.id])).rows[0].t;
+    const q = await DA.buildQueue(client, { kind: KIND, recordId: run.id, menuId, paymentAmount: total });
     await client.query(`
         UPDATE ap_payment_run SET status='Submitted', approval_mode=$1, updated_at=NOW(), updated_by=$2 WHERE id=$3`,
         [q.mode, userName, run.id]);
