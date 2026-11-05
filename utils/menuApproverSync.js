@@ -28,6 +28,10 @@ const ensureMenuApproverSchema = async (pool) => {
         await pool.query(`ALTER TABLE sa_module_approver ADD COLUMN IF NOT EXISTS approval_limit NUMERIC(18,2) DEFAULT 0`);
     } catch (_) { /* ignore */ }
     try {
+        // วงเงินอนุมัติจ่าย (เอกสารจ่ายเงิน AP/CM) — แยกจาก approval_limit ของวงเงินเครดิต; 0 = ไม่มีวงเงินจ่าย (อนุมัติจ่ายไม่ได้)
+        await pool.query(`ALTER TABLE sa_module_approver ADD COLUMN IF NOT EXISTS payment_limit NUMERIC(18,2) DEFAULT 0`);
+    } catch (_) { /* ignore */ }
+    try {
         await pool.query(`ALTER TABLE sa_module_approver DROP CONSTRAINT IF EXISTS sa_module_approver_module_code_doc_category_approval_level_key`);
     } catch (_) { /* ignore */ }
     try {

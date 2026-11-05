@@ -63,7 +63,9 @@ const migrateLegacy = async (db) => {
 // สร้างคิวใหม่ (ลบคิวเดิมของเอกสารนี้) — คืน { mode, count, total }; count 0 = ไม่มีผู้อนุมัติและเมนูตั้ง "ให้ผ่าน"
 //   alwaysDocType: แยกคิวตาม doc_code เสมอ (AP ตั้งหนี้ / วงเงินเครดิต) แทนที่จะดู sa_menu.uses_doc_type
 //   filter(approvers, all): กรองผู้อนุมัติก่อนใส่คิว (วงเงินเครดิต: ตัดคนที่วงเงินอนุมัติไม่พอ) — โยน error เองได้
-const buildQueue = async (client, { kind, recordId, menuId, docCode = null, alwaysDocType = false, filter = null }) => {
+//   paymentAmount: ยอดเอกสารจ่ายเงิน (สกุลเงินหลัก) — ใช้วงเงินอนุมัติจ่าย (payment_limit) ตาม paymentChain
+const buildQueue = async (client, { kind, recordId, menuId, docCode = null, alwaysDocType = false, filter = null,
+                                    paymentAmount = null }) => {
   if (!menuId) throw httpErr(400, 'ต้องระบุ menu_id');
   const menu = (await client.query(
     `SELECT approval_mode, uses_doc_type, no_approver_action FROM sa_menu WHERE id=$1`, [menuId])).rows[0] || {};
@@ -71,12 +73,14 @@ const buildQueue = async (client, { kind, recordId, menuId, docCode = null, alwa
   const docType = alwaysDocType || menu.uses_doc_type ? docCode : null;
   await syncMenuApprovers(client, menuId, docType);
   const all = (await client.query(`
-    SELECT a.approval_level, a.approver_user_id, u.user_name, COALESCE(a.approval_limit, 0)::float AS approval_limit
+    SELECT a.approval_level, a.approver_user_id, u.user_name, COALESCE(a.approval_limit, 0)::float AS approval_limit,
+           COALESCE(a.payment_limit, 0)::float AS payment_limit
       FROM sa_module_approver a JOIN sa_user u ON u.id = a.approver_user_id
      WHERE a.menu_id=$1 AND a.doc_type IS NOT DISTINCT FROM $2 AND a.is_active=true
      ORDER BY a.approval_level`, [menuId, docType])).rows;
   if (!all.length && isNoApproverBlocked(menu)) throw httpErr(400, NO_APPROVER_BLOCK_MSG);
-  const approvers = filter ? filter(all) : all;
+  let approvers = filter ? filter(all) : all;
+  if (paymentAmount != null && all.length) approvers = paymentChain(approvers, mode, paymentAmount);
   await client.query(`DELETE FROM doc_approval WHERE doc_kind=$1 AND record_id=$2`, [kind, recordId]);
   for (const a of approvers) {
     await client.query(`
@@ -84,6 +88,24 @@ const buildQueue = async (client, { kind, recordId, menuId, docCode = null, alwa
       VALUES ($1,$2,$3,$4,$5,'Pending')`, [kind, recordId, a.approver_user_id, a.user_name, a.approval_level]);
   }
   return { mode, count: approvers.length, total: all.length };
+};
+
+// วงเงินอนุมัติจ่าย (ผู้ใช้กำหนด 2026-11-05) — ผู้อนุมัติ payment_limit 0 = ไม่มีวงเงินจ่าย ไม่เข้าคิวเอกสารจ่าย
+//   ALL: ไล่ขั้นตามลำดับ หยุดที่คนแรกที่วงเงินพอ (คนก่อนหน้าวงเงินไม่พอก็อนุมัติเป็นขั้นกลั่นกรอง)
+//   ANY: เฉพาะคนที่วงเงินพอ คนใดคนหนึ่งอนุมัติ
+//   ไม่มีใครวงเงินพอ = ขออนุมัติไม่ได้ (แม้เมนูตั้ง "ให้ผ่าน") — คิวว่างทั้งคิวยังเป็นไปตาม no_approver_action
+const fmtAmount = (n) => Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const paymentChain = (approvers, mode, amount) => {
+  const amt = Math.round(Number(amount || 0) * 100) / 100;
+  const withLimit = approvers.filter(a => a.payment_limit > 0);
+  const firstEnough = withLimit.findIndex(a => a.payment_limit >= amt);
+  if (firstEnough < 0) {
+    throw httpErr(400, `ไม่มีผู้อนุมัติที่มีวงเงินอนุมัติจ่ายเพียงพอสำหรับยอด ${fmtAmount(amt)} — `
+      + 'กรุณาตั้ง "วงเงินอนุมัติจ่าย" ของผู้อนุมัติที่หน้าจอตั้งค่าผู้อนุมัติ');
+  }
+  return mode === 'ANY'
+    ? withLimit.filter(a => a.payment_limit >= amt)
+    : withLimit.slice(0, firstEnough + 1);
 };
 
 // อนุมัติลำดับของผู้ใช้นี้ — คืน true เมื่ออนุมัติครบ (ANY: คนแรกที่อนุมัติ)
@@ -136,5 +158,5 @@ const myTurnSql = (alias, kindParam, userParam, modeCol = 'approval_mode') => `E
           AND a2.sequence_no < a.sequence_no AND a2.status='Pending')))`;
 
 module.exports = {
-  httpErr, ensureDocApprovalSchema, buildQueue, approveStep, rejectStep, skipPending, loadApprovals, myTurnSql,
+  httpErr, ensureDocApprovalSchema, buildQueue, paymentChain, approveStep, rejectStep, skipPending, loadApprovals, myTurnSql,
 };

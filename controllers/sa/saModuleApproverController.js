@@ -27,7 +27,7 @@ const fetchByMenu = async (req, res) => {
 
         const result = await client.query(`
             SELECT a.id, a.approval_level, a.approver_user_id, a.is_active, a.doc_type,
-                   a.signature_image, a.approval_limit,
+                   a.signature_image, a.approval_limit, a.payment_limit,
                    u.user_name  AS approver_username,
                    u.first_name AS approver_first_name,
                    u.last_name  AS approver_last_name,
@@ -47,9 +47,10 @@ const fetchByMenu = async (req, res) => {
 };
 
 // PUT /sa_module_approver/reorder
-// { menu_id, doc_type, items: [{approver_user_id, is_active, signature_image, approval_limit}, ...] }
+// { menu_id, doc_type, items: [{approver_user_id, is_active, signature_image, approval_limit, payment_limit}, ...] }
 // ลำดับใน items[] คือลำดับการอนุมัติใหม่ (index 0 = ลำดับที่ 1); is_active ใช้ "งดอนุมัติ" คนนั้นชั่วคราว
-// signature_image = ลายเซ็น (base64 data URL, null = ยังไม่มี); approval_limit = วงเงินอนุมัติ (0 = ไม่จำกัด)
+// signature_image = ลายเซ็น (base64 data URL, null = ยังไม่มี); approval_limit = วงเงินอนุมัติเกินวงเงินเครดิต (0 = ไม่จำกัด)
+// payment_limit = วงเงินอนุมัติจ่าย (0 = ไม่มีวงเงินจ่าย)
 // doc_type ไม่ระบุ = แก้ไขคิวระดับเมนู
 const reorder = async (req, res) => {
     const { menu_id, items } = req.body;
@@ -72,10 +73,11 @@ const reorder = async (req, res) => {
         for (let i = 0; i < items.length; i++) {
             await client.query(
                 `UPDATE sa_module_approver SET approval_level = $1, is_active = $2,
-                        signature_image = $3, approval_limit = $4
+                        signature_image = $3, approval_limit = $4, payment_limit = $8
                  WHERE menu_id=$5 AND doc_type IS NOT DISTINCT FROM $6 AND approver_user_id=$7`,
                 [i + 1, items[i].is_active ?? true, items[i].signature_image || null,
-                 items[i].approval_limit ?? 0, menu_id, docType, items[i].approver_user_id]);
+                 items[i].approval_limit ?? 0, menu_id, docType, items[i].approver_user_id,
+                 items[i].payment_limit ?? 0]);
         }
         await client.query('COMMIT');
         res.status(200).json({ message: 'บันทึกลำดับผู้อนุมัติสำเร็จ' });
