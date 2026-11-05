@@ -147,6 +147,17 @@ router.get('/ap_remittance_advice/:payment_id',     apRemittanceAdviceController
 // ── AP Bulk Payment ────────────────────────────────────────────────────────────
 router.get('/ap_bulk_payment/eligible',             apBulkPaymentController.getEligibleInvoices);
 router.post('/ap_bulk_payment/preview',             apBulkPaymentController.previewBulkPayment);
-router.post('/ap_bulk_payment/run',                 apBulkPaymentController.runBulkPayment);
+// ชุดจ่ายแบบกลุ่ม — ต้องผ่านการอนุมัติก่อนจ่าย (ไม่มีการจ่ายทันทีแล้ว)
+router.get('/ap_bulk_payment/my_pending',           apBulkPaymentController.fetchMyPending);
+router.get('/ap_bulk_payment/batches',              apBulkPaymentController.listBatches);
+router.post('/ap_bulk_payment/batches',             apBulkPaymentController.createBatch);
+router.get('/ap_bulk_payment/batches/:id',          apBulkPaymentController.getBatch);
+router.delete('/ap_bulk_payment/batches/:id',       apBulkPaymentController.deleteBatch);
+router.put('/ap_bulk_payment/batches/:id/submit',   apBulkPaymentController.submitBatch);
+router.put('/ap_bulk_payment/batches/:id/approve',  apBulkPaymentController.approveBatch);
+router.put('/ap_bulk_payment/batches/:id/reject',   apBulkPaymentController.rejectBatch);
+router.put('/ap_bulk_payment/batches/:id/reverse',  apBulkPaymentController.reverseBatch);
+router.post('/ap_bulk_payment/batches/:id/preview', apBulkPaymentController.previewBatch);
+router.put('/ap_bulk_payment/batches/:id/pay',      apBulkPaymentController.payBatch);
 
 module.exports = router;
