@@ -67,6 +67,11 @@ const updateGroupMenu = async (req, res) => {
             }
             const insertQuery = `INSERT INTO sa_group_menu (group_id, menu_id, can_view, can_create, can_edit, can_delete, can_approve, can_print, can_export) VALUES ${valuePlaceholders.join(', ')}`;
             await client.query(insertQuery, queryParams);
+            // สิทธิ์ "อนุมัติ" ให้ได้เฉพาะเมนูที่มีขั้นตอนอนุมัติ (sa_menu.requires_approval)
+            await client.query(
+                `UPDATE sa_group_menu gm SET can_approve = false FROM sa_menu m
+                  WHERE gm.group_id = $1 AND m.id = gm.menu_id AND gm.can_approve AND NOT COALESCE(m.requires_approval, false)`,
+                [groupId]);
         }
 
         await client.query('COMMIT');
