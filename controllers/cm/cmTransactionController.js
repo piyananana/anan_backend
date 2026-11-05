@@ -8,7 +8,7 @@
 // AR/AP ตอน Post เท่านั้น (ดู postCmReceiptsHelper ใน arTransactionController.js และ
 // postCmPaymentHelper ใน apTransactionController.js) จึงไม่ผ่าน createTransaction/postGlEntry เลย
 
-const { today: todayYmd } = require('../../utils/dateUtil');
+const { today: todayYmd, ymd } = require('../../utils/dateUtil');
 const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { headerDims, lineDims, ensureDetailDimColumns, detailDimParams, assertRequiredDims } = require('../../utils/glDims');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
@@ -21,6 +21,18 @@ const {
 } = require('./cmTransactionTax');
 
 const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+
+// บังคับขออนุมัติก่อน Post: 20 รายจ่าย, 30 เติมเงินสดย่อย, 40 เบิกเงินสดย่อย, 50 โอนเงินระหว่างบัญชี
+// Draft → Submitted → Approved → Posted (ปฏิเสธ/ถอย → Draft) — คิวผู้อนุมัติของเมนูแยกตามประเภทเอกสาร (doc_code)
+// ที่ตารางกลาง doc_approval (utils/docApproval.js, doc_kind 'CM_TXN') พร้อมวงเงินอนุมัติจ่ายเทียบกับยอดเอกสาร (สกุลเงินหลัก)
+const DA = require('../../utils/docApproval');
+const KIND = 'CM_TXN';
+const APPROVAL_TYPES = ['20', '30', '40', '50'];
+const MUST_APPROVE_MSG = 'เอกสารประเภทนี้ต้องส่งขออนุมัติและได้รับอนุมัติก่อน Post';
+const ensureApprovalSchema = async (db) => {
+    await db.query(`ALTER TABLE cm_transaction ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL'`);
+    await DA.ensureDocApprovalSchema(db);
+};
 
 // ยอดของเอกสาร: ยอดรวมมาจากบรรทัด (40 = รายการเบิก, 30 = ใบเบิกที่เติม, 10/20 = ช่องทางรับ/จ่าย) — ยอดบาทคิดที่ backend
 // ปัดทศนิยม 2 ตำแหน่ง ส่วนต่างจากการปัดเศษลงบรรทัดสุดท้าย เพื่อให้รายการบัญชีสมดุลเสมอ (เดิมคิดที่หน้าจอแบบไม่ปัดเศษ
@@ -565,7 +577,9 @@ const CM_REVERSE_INFO_SQL = `
 const queryCmReverseInfo = async (db, id) => { await ensureBankItemColumns(db); return db.query(CM_REVERSE_INFO_SQL, [id]); };
 
 // ถอยเป็นร่าง (Posted → Draft): งวด CM ของเอกสารและงวด GL ของรายการบัญชียังเปิด และไม่มีใบเติมเงินอ้างอิง
+// Submitted / Approved → Draft (ถอนคำขออนุมัติ): ทำได้เสมอ ยังไม่มีรายการบัญชี
 const getCmReverseBlock = (r) => {
+    if (['Submitted', 'Approved'].includes(r.status)) return null;
     if (r.status !== 'Posted') return { code: 'NOT_REVERSIBLE' };
     if (r.cm_status !== 'OPEN' || (r.gl_period_status && r.gl_period_status !== 'OPEN')) return { code: 'PERIOD_CLOSED' };
     if (r.applied_by) return { code: 'APPLIED', ref: r.applied_by };
@@ -642,6 +656,7 @@ const fetchRowById = async (pool, id) => {
         void_block: vBlock ? vBlock.code : null,
         void_block_ref: vBlock ? (vBlock.ref || null) : null,
         reverse_history: await getReverseHistory(pool, 'cm_transaction', Number(id)),
+        approvals: await DA.loadApprovals(pool, KIND, Number(id)).catch(() => []),
     };
 };
 
@@ -789,6 +804,7 @@ const createTransaction = async (req, res) => {
         await resolveParty(client, header);
         const sys = await normalizeAmounts(client, header, details || [], applies || [], payments || [], whts || []);
         if (action === 'Post') {
+            if (APPROVAL_TYPES.includes(sys)) throw new Error(MUST_APPROVE_MSG);
             await assertCmPeriodOpen(client, header.doc_date);
             assertTaxPostable(header, sys);
             if (sys === '40') assertVoucherLinesPostable(details || []);
@@ -914,6 +930,7 @@ const updateTransaction = async (req, res) => {
         await resolveParty(client, header);
         const sys = await normalizeAmounts(client, header, details || [], applies || [], payments || [], whts || []);
         if (action === 'Post') {
+            if (APPROVAL_TYPES.includes(sys)) throw new Error(MUST_APPROVE_MSG);
             await assertCmPeriodOpen(client, header.doc_date);
             assertTaxPostable(header, sys);
             if (sys === '40') assertVoucherLinesPostable(details || []);
@@ -1127,6 +1144,9 @@ const reverseTransaction = async (req, res) => {
             return res.status(400).json({ message: cmBlockMessage(block), code: block.code, ref: block.ref || null });
         }
 
+        // ถอยเป็นร่างแล้วต้องขออนุมัติใหม่ — ผู้อนุมัติที่ยังไม่ตัดสินถูกข้าม
+        await DA.ensureDocApprovalSchema(client);
+        await DA.skipPending(client, KIND, Number(id));
         if (info.gl_entry_id) {
             // ตัดการอ้างอิงก่อนลบรายการบัญชี
             await client.query(`UPDATE cm_transaction SET gl_entry_id=NULL WHERE id=$1`, [id]);
@@ -1196,7 +1216,140 @@ const deleteTransaction = async (req, res) => {
     }
 };
 
+// --- ส่งขออนุมัติ / อนุมัติ / ปฏิเสธ (20/30/40/50) ---
+const approvalAction = (label, okMsg, work) => async (req, res) => {
+    const ctx = {
+        userId: Number(req.headers['userid']) || null, userName: req.headers['username'] || null,
+        menuId: req.body?.menu_id, remarks: req.body?.remarks,
+    };
+    if (label !== 'submitting' && !ctx.userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
+    await ensureTables(req.dbPool);
+    await ensureApprovalSchema(req.dbPool);
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        const tx = (await client.query(`
+            SELECT t.*, d.sys_doc_type, d.doc_code
+              FROM cm_transaction t JOIN sa_module_document d ON d.id = t.doc_id
+             WHERE t.id = $1 FOR UPDATE OF t`, [req.params.id])).rows[0];
+        if (!tx) throw DA.httpErr(404, 'Not found');
+        const msg = await work(client, tx, ctx);
+        await client.query('COMMIT');
+        res.status(200).json({ message: msg || okMsg });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        if (!error.status) console.error(`Error ${label} cm_transaction:`, error);
+        res.status(error.status || 500).json({ message: error.message || 'Internal server error' });
+    } finally {
+        client.release();
+    }
+};
+
+const markApproved = (client, id, userName) => client.query(`
+    UPDATE cm_transaction SET status='Approved', updated_at=NOW(), updated_by=$1 WHERE id=$2`, [userName, id]);
+
+// Draft → Submitted (ไม่มีผู้อนุมัติ + ให้ผ่าน → Approved ทันที) — วงเงินอนุมัติจ่ายเทียบกับยอดเอกสารสกุลเงินหลัก
+const submitTransaction = approvalAction('submitting', 'ส่งอนุมัติสำเร็จ', async (client, tx, { menuId, userName }) => {
+    if (!menuId) throw DA.httpErr(400, 'ต้องระบุ menu_id');
+    if (tx.status !== 'Draft') throw DA.httpErr(400, 'ส่งอนุมัติได้เฉพาะเอกสาร Draft เท่านั้น');
+    if (!APPROVAL_TYPES.includes(tx.sys_doc_type)) throw DA.httpErr(400, 'เอกสารประเภทนี้ไม่ต้องขออนุมัติ — Post ได้ทันที');
+    const q = await DA.buildQueue(client, {
+        kind: KIND, recordId: tx.id, menuId, docCode: tx.doc_code, alwaysDocType: true,
+        paymentAmount: Number(tx.total_amount_lc) || 0,
+    });
+    await client.query(`
+        UPDATE cm_transaction SET status='Submitted', approval_mode=$1, updated_at=NOW(), updated_by=$2 WHERE id=$3`,
+        [q.mode, userName, tx.id]);
+    if (q.count === 0) {
+        await markApproved(client, tx.id, userName);
+        return 'ส่งอนุมัติสำเร็จ (ข้ามขั้นตอนอนุมัติ)';
+    }
+});
+
+// Submitted → Approved เมื่ออนุมัติครบ (หรือคนใดคนหนึ่งถ้า ANY)
+const approveTransaction = approvalAction('approving', 'อนุมัติสำเร็จ', async (client, tx, { userId, userName, remarks }) => {
+    if (tx.status !== 'Submitted') throw DA.httpErr(400, 'อนุมัติได้เฉพาะเอกสาร Submitted เท่านั้น');
+    const done = await DA.approveStep(client, { kind: KIND, recordId: tx.id, userId, mode: tx.approval_mode, remarks });
+    if (done) await markApproved(client, tx.id, userName);
+});
+
+// Submitted → Draft (ปฏิเสธ = ส่งกลับไปเป็นร่างให้ผู้ส่งแก้ไขหรือลบเอง)
+const rejectTransaction = approvalAction('rejecting', 'ปฏิเสธและส่งกลับไปเป็นร่างสำเร็จ', async (client, tx, { userId, userName, remarks }) => {
+    if (tx.status !== 'Submitted') throw DA.httpErr(400, 'ปฏิเสธได้เฉพาะเอกสาร Submitted เท่านั้น');
+    await DA.rejectStep(client, { kind: KIND, recordId: tx.id, userId, remarks });
+    await client.query(`UPDATE cm_transaction SET status='Draft', updated_at=NOW(), updated_by=$1 WHERE id=$2`, [userName, tx.id]);
+});
+
+// --- PUT /:id/post — Post เอกสารที่อนุมัติแล้ว จากข้อมูลที่บันทึกไว้ (แก้ไขไม่ได้หลังส่งขออนุมัติ) ---
+const postTransaction = async (req, res) => {
+    const { id } = req.params;
+    const userName = req.headers['username'] || null;
+    await ensureTables(req.dbPool);
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        const row = (await client.query(`
+            SELECT t.*, d.sys_doc_type FROM cm_transaction t JOIN sa_module_document d ON d.id = t.doc_id
+             WHERE t.id = $1 FOR UPDATE OF t`, [id])).rows[0];
+        if (!row) throw DA.httpErr(404, 'Not found');
+        if (row.status !== 'Approved') throw DA.httpErr(400, 'Post ได้เฉพาะเอกสารที่อนุมัติแล้ว');
+        const header = { ...row, doc_date: ymd(row.doc_date), tax_invoice_date: row.tax_invoice_date ? ymd(row.tax_invoice_date) : null };
+        const details = (await client.query(`SELECT * FROM cm_transaction_detail WHERE header_id=$1 ORDER BY line_no`, [id])).rows;
+        const applies = (await client.query(`SELECT * FROM cm_transaction_apply WHERE transaction_id=$1 ORDER BY id`, [id])).rows;
+        const payments = (await client.query(`SELECT * FROM cm_transaction_payment WHERE header_id=$1 ORDER BY line_no`, [id])).rows;
+        const whts = (await client.query(`SELECT * FROM cm_transaction_wht WHERE header_id=$1 ORDER BY id`, [id])).rows;
+        const sys = await normalizeAmounts(client, header, details, applies, payments, whts);
+        // ยอดต้องเท่ากับที่ผ่านการอนุมัติ (ยอดที่คำนวณซ้ำจากรายการ)
+        if (Math.abs(round2(header.total_amount_lc) - round2(row.total_amount_lc)) > 0.005) {
+            throw DA.httpErr(400, `ยอดเอกสาร (${header.total_amount_lc}) ไม่ตรงกับยอดที่อนุมัติ (${row.total_amount_lc}) — กรุณาถอยเป็นร่างแล้วขออนุมัติใหม่`);
+        }
+        await assertCmPeriodOpen(client, header.doc_date);
+        assertTaxPostable(header, sys);
+        if (sys === '40') assertVoucherLinesPostable(details);
+
+        const glEntryId = await postGlEntry(
+            client, id, { ...header, created_by: userName || row.updated_by || row.created_by },
+            details, applies, payments, row.doc_no, row.gl_doc_no
+        );
+        await client.query(`UPDATE cm_transaction SET status='Posted', gl_entry_id=$1, updated_at=NOW(), updated_by=$2 WHERE id=$3`,
+            [glEntryId, userName, id]);
+        if (['20', '30'].includes(sys)) await assignCheckNumbers(client, 'cm_transaction_payment', id, 'cm_transaction_id');
+        await syncCmBankItems(client, id, glEntryId);
+        await insertCmVt(client, id, sys);
+
+        await client.query('COMMIT');
+        res.status(200).json(await fetchRowById(req.dbPool, id));
+    } catch (error) {
+        await client.query('ROLLBACK');
+        if (!error.status) console.error('Error posting cm_transaction:', error);
+        res.status(error.status || 500).json({ message: error.message || 'Internal server error' });
+    } finally {
+        client.release();
+    }
+};
+
+// --- GET /my_pending — เอกสารที่ถึงคิวผู้ใช้นี้อนุมัติ (กระดิ่งหน้า Home) ---
+const fetchMyPending = async (req, res) => {
+    const userId = Number(req.headers['userid']);
+    if (!userId) return res.status(401).json({ message: 'ต้องระบุ UserId' });
+    try {
+        await ensureTables(req.dbPool);
+        await ensureApprovalSchema(req.dbPool);
+        const r = await req.dbPool.query(`
+            SELECT t.id, t.doc_no, t.doc_date, t.description, t.counterparty_name,
+                   t.total_amount_lc::float AS total_amount_lc, t.updated_by AS submitted_by
+              FROM cm_transaction t
+             WHERE t.status = 'Submitted' AND ${DA.myTurnSql('t', '$1', '$2')}
+             ORDER BY t.doc_date DESC, t.id DESC`, [KIND, userId]);
+        res.status(200).json(r.rows);
+    } catch (error) {
+        console.error('Error fetching cm_transaction pending approvals:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    }
+};
+
 module.exports = {
     fetchRows, fetchRow, fetchReceiptView, fetchPaymentView, fetchOpenVouchers,
     createTransaction, updateTransaction, voidTransaction, reverseTransaction, deleteTransaction,
+    submitTransaction, approveTransaction, rejectTransaction, postTransaction, fetchMyPending,
 };

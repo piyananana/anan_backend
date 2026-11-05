@@ -83,6 +83,12 @@ router.put('/cm_payment/:id/void',     cmPaymentController.voidPayment);
 // cm_transaction — หน้าจอธุรกรรม CM รวม (10 รายรับ, 15 รายรับจาก AR, 20 รายจ่าย, 25 รายจ่ายจาก AP,
 // 30 เติมเงินสดย่อย, 40 เบิกเงินสดย่อย, 50 โอนเงินระหว่างบัญชี, 70 ค่าธรรมเนียมธนาคาร, 90 ดอกเบี้ย)
 router.get('/cm_transaction/open_vouchers',   cmTransactionController.fetchOpenVouchers);
+router.get('/cm_transaction/my_pending',      cmTransactionController.fetchMyPending);
+// ขออนุมัติ (20/30/40/50 ต้องอนุมัติก่อน Post) — Post เอกสารที่อนุมัติแล้วผ่าน /post
+router.put('/cm_transaction/:id/submit',      cmTransactionController.submitTransaction);
+router.put('/cm_transaction/:id/approve',     cmTransactionController.approveTransaction);
+router.put('/cm_transaction/:id/reject',      cmTransactionController.rejectTransaction);
+router.put('/cm_transaction/:id/post',        cmTransactionController.postTransaction);
 router.get('/cm_transaction/receipt_view/:id', cmTransactionController.fetchReceiptView);
 router.get('/cm_transaction/payment_view/:id', cmTransactionController.fetchPaymentView);
 router.get('/cm_transaction',                 cmTransactionController.fetchRows);

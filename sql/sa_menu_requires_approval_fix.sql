@@ -8,13 +8,13 @@ BEGIN;
 UPDATE sa_menu SET requires_approval = true
  WHERE target_path IN ('QuoteTransactionScreen',     -- ใบเสนอราคา (QUOTE)
                        'ImPriceChangeScreen',        -- ธุรกรรมเปลี่ยนแปลงราคา (IM_PRICE)
-                       'ImStockCountSummaryScreen')  -- สรุปผลการตรวจนับและปรับยอด (IM_COUNT)
+                       'ImStockCountSummaryScreen',  -- สรุปผลการตรวจนับและปรับยอด (IM_COUNT)
+                       'CmTransactionScreen')        -- ธุรกรรม CM: 20/30/40/50 ต้องอนุมัติก่อน Post (CM_TXN, 2026-11-05)
    AND requires_approval IS DISTINCT FROM true;
 
 -- ปิด: เปิดไว้แต่ไม่มีเอกสารให้ขออนุมัติ
 UPDATE sa_menu SET requires_approval = false
- WHERE target_path IN ('CmTransactionScreen',          -- ธุรกรรม CM ไม่มีขั้นตอนอนุมัติ
-                       'PoReplenishmentReportScreen')  -- สร้างใบขอซื้อเป็นร่าง ส่งอนุมัติที่เมนูใบขอซื้อ
+ WHERE target_path IN ('PoReplenishmentReportScreen')  -- สร้างใบขอซื้อเป็นร่าง ส่งอนุมัติที่เมนูใบขอซื้อ
    AND requires_approval IS DISTINCT FROM false;
 
 COMMIT;
