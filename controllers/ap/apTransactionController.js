@@ -89,6 +89,24 @@ const ensureApprovalSchema = async (pool) => {
     await DA.ensureDocApprovalSchema(pool);
 };
 
+// บังคับขออนุมัติก่อน Post: RA(70) เสมอ, Payment(80) เว้นแต่เลขที่อ้างอิงชี้ไปที่เอกสารที่ผ่านการอนุมัติมาแล้ว
+// (RA ที่ Post แล้วของเจ้าหนี้รายเดียวกัน หรือชุดขออนุมัติจ่าย ap_payment_run ที่อนุมัติแล้ว) — พิมพ์เลขอ้างอิงอื่นเพื่อข้ามขั้นอนุมัติไม่ได้
+const requiresApproval = async (db, sysDocType, { refNo, vendorId }) => {
+    if (sysDocType === '70') return true;
+    if (sysDocType !== '80') return false;
+    const ref = (refNo || '').trim();
+    if (!ref) return true;
+    const src = await db.query(`
+        SELECT 1 FROM ap_transaction t JOIN sa_module_document d ON d.id = t.doc_id
+         WHERE t.doc_no = $1 AND d.sys_doc_type = '70' AND t.status = 'Posted' AND t.vendor_id = $2
+        UNION ALL
+        SELECT 1 FROM ap_payment_run WHERE run_number = $1 AND status IN ('Approved', 'Completed')
+        LIMIT 1`, [ref, vendorId]);
+    return src.rows.length === 0;
+};
+const MUST_APPROVE_MSG = 'เอกสารประเภทนี้ต้องส่งขออนุมัติและได้รับอนุมัติก่อน Post '
+    + '(ใบจ่ายชำระที่อ้างอิงใบแจ้งชำระ/ชุดขออนุมัติจ่ายที่อนุมัติแล้วเท่านั้นที่ Post ได้ทันที)';
+
 // เลขที่/วันที่ใบกำกับภาษีของผู้ขาย — รายงานภาษีซื้อแสดงค่านี้ (ว่าง = fallback เลขที่/วันที่เอกสาร ตาม vatReportController)
 const ensureTaxInvoiceColumns = async (q) => {
     await q.query(`ALTER TABLE ap_transaction ADD COLUMN IF NOT EXISTS tax_invoice_no VARCHAR(50)`);
@@ -1337,6 +1355,8 @@ const createTransaction = async (req, res) => {
             );
             if (periodRes.rows.length === 0)
                 throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่เอกสาร ${header.doc_date}`);
+            const sdt = (await client.query(`SELECT sys_doc_type FROM sa_module_document WHERE id=$1`, [header.doc_id])).rows[0]?.sys_doc_type || '';
+            if (await requiresApproval(client, sdt, { refNo: header.ref_no, vendorId: header.vendor_id })) throw new Error(MUST_APPROVE_MSG);
         }
 
         const periodRes = await client.query(
@@ -1712,11 +1732,13 @@ const submitTransaction = approvalAction('submitting', 'ส่งอนุมั
     if (tx.status !== 'Draft') throw DA.httpErr(400, 'ส่งอนุมัติได้เฉพาะเอกสาร Draft เท่านั้น');
     const consLock = await consignmentLockMessage(client, tx.id);
     if (consLock) throw Object.assign(DA.httpErr(400, consLock), { code: 'CONSIGNMENT' });
-    const isRa = tx.sys_doc_type === '70';
-    const isPaymentNoRef = tx.sys_doc_type === '80' && (!tx.ref_no || !tx.ref_no.trim());
-    if (!isRa && !isPaymentNoRef) throw DA.httpErr(400, 'เอกสารประเภทนี้ไม่รองรับการขออนุมัติ');
+    if (!(await requiresApproval(client, tx.sys_doc_type, { refNo: tx.ref_no, vendorId: tx.vendor_id }))) {
+        throw DA.httpErr(400, 'เอกสารประเภทนี้ไม่รองรับการขออนุมัติ');
+    }
+    // ใบจ่ายชำระ (80) ใช้วงเงินอนุมัติจ่ายของผู้อนุมัติ เทียบกับยอดจ่ายสุทธิสกุลเงินหลัก; RA(70) ไม่มีวงเงิน
     const q = await DA.buildQueue(client, {
         kind: KIND, recordId: tx.id, menuId, docCode: tx.doc_code || tx.d_doc_code, alwaysDocType: true,
+        paymentAmount: tx.sys_doc_type === '80' ? Number(tx.total_amount_lc) || 0 : null,
     });
     await client.query(`
         UPDATE ap_transaction SET status='Submitted', approval_mode=$1, updated_at=NOW(), updated_by=$2 WHERE id=$3`,
@@ -1757,6 +1779,13 @@ const postTransaction = async (req, res) => {
         }
         const consLock = await consignmentLockMessage(client, id);
         if (consLock) { await client.query('ROLLBACK'); return res.status(400).json({ message: consLock, code: 'CONSIGNMENT' }); }
+        if (tx.status === 'Draft') {
+            const sdt = (await client.query(`SELECT sys_doc_type FROM sa_module_document WHERE id=$1`, [tx.doc_id])).rows[0]?.sys_doc_type || '';
+            if (await requiresApproval(client, sdt, { refNo: tx.ref_no, vendorId: tx.vendor_id })) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ message: MUST_APPROVE_MSG });
+            }
+        }
 
         const periodRes = await client.query(
             `SELECT id FROM gl_posting_period
