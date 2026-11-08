@@ -1,10 +1,179 @@
 // C:\\flutter_project\\aaa_backend\\services\\saBackupService.js
 const pool = require('../config/db');
 const schedule = require('node-schedule');
-const { exec } = require('child_process');
+const { execFile } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const dbService = require('./saDatabaseService');
+
+const BACKUP_DIR = path.join(__dirname, '..', 'backups');
+
+// หาโปรแกรม pg_dump / pg_restore / psql: PG_BIN_PATH ใน .env > C:\Program Files\PostgreSQL\<เวอร์ชันสูงสุด>\bin
+// (Windows) > PATH — เครื่องที่ติดตั้ง PostgreSQL ใหม่มักไม่ได้เพิ่มโฟลเดอร์ bin ลง PATH
+const pgTool = (name) => {
+    const exe = process.platform === 'win32' ? `${name}.exe` : name;
+    const dirs = [];
+    if (process.env.PG_BIN_PATH) dirs.push(process.env.PG_BIN_PATH);
+    if (process.platform === 'win32') {
+        for (const root of [process.env.ProgramFiles, process.env['ProgramFiles(x86)']]) {
+            const pgRoot = root && path.join(root, 'PostgreSQL');
+            if (!pgRoot || !fs.existsSync(pgRoot)) continue;
+            const versions = fs.readdirSync(pgRoot)
+                .filter(v => /^\d+(\.\d+)?$/.test(v))
+                .sort((a, b) => parseFloat(b) - parseFloat(a));
+            for (const v of versions) dirs.push(path.join(pgRoot, v, 'bin'));
+        }
+    }
+    for (const dir of dirs) {
+        const full = path.join(dir, exe);
+        if (fs.existsSync(full)) return full;
+    }
+    return name;
+};
+
+// รันโปรแกรมแบบส่ง argument เป็น array (ไม่ผ่าน shell — path ที่มีช่องว่างไม่ต้อง quote) คืน { error, stdout, stderr }
+const runTool = (name, args, password) => new Promise((resolve) => {
+    const bin = pgTool(name);
+    execFile(bin, args, { env: { ...process.env, PGPASSWORD: password }, maxBuffer: 50 * 1024 * 1024 },
+        (error, stdout, stderr) => {
+            if (error && error.code === 'ENOENT') {
+                error.message = `ไม่พบโปรแกรม ${name} (${bin}) — ติดตั้ง PostgreSQL หรือตั้ง PG_BIN_PATH ใน .env ให้ชี้ไปที่โฟลเดอร์ bin ของ PostgreSQL`;
+            }
+            resolve({ error, stdout: String(stdout || ''), stderr: String(stderr || '').trim() });
+        });
+});
+
+const connArgs = (o) => ['-U', o.user, '-h', o.host, '-p', String(o.port), '-d', o.database];
+
+// ข้อความ error ที่อ่านได้: เอาบรรทัด error ของ PostgreSQL (ตัดความยาว) ถ้าไม่มีใช้ข้อความของ process
+const toolError = (res, fallback) => {
+    const lines = res.stderr.split(/\r?\n/).filter(Boolean);
+    const msg = lines.length ? lines.slice(0, 10).join('\n') : (res.error && res.error.message) || '';
+    return new Error(msg ? `${fallback}\n${msg}` : fallback);
+};
+
+const timestampForFile = () => {
+    const now = new Date();
+    return now.getFullYear().toString() +
+        '-' + (now.getMonth() + 1).toString().padStart(2, '0') +
+        '-' + now.getDate().toString().padStart(2, '0') +
+        'T' + now.getHours().toString().padStart(2, '0') +
+        '-' + now.getMinutes().toString().padStart(2, '0') +
+        '-' + now.getSeconds().toString().padStart(2, '0');
+};
+
+// format 'custom' = ไฟล์ .backup (pg_restore ต้องเป็นเวอร์ชันเดียวกันหรือใหม่กว่า pg_dump)
+// format 'plain' = ไฟล์ .sql คำสั่ง SQL ล้วน ใช้ย้ายข้ามเครื่องที่ PostgreSQL ต่างเวอร์ชันได้ (psql / pgAdmin เวอร์ชันใดก็รันได้)
+// plain ไม่ใส่ owner/สิทธิ์ เพื่อให้รันบนเครื่องที่ไม่มี role เดียวกันได้ (custom ตัดตอน restore ด้วย --no-owner --no-privileges อยู่แล้ว)
+const dumpArgs = (o, filePath, format = 'custom') => format === 'plain'
+    ? ['-Fp', '--clean', '--if-exists', '--no-owner', '--no-privileges', ...connArgs(o), '-f', filePath]
+    : ['-Fc', '--clean', '--if-exists', ...connArgs(o), '-f', filePath];
+
+const backupExt = (format) => (format === 'plain' ? '.sql' : '.backup');
+const isBackupFileName = (file) => file.endsWith('.backup') || file.endsWith('.sql');
+
+// ไฟล์ SQL ที่ได้จาก pg_dump แบบ plain (pg_dump หรือ pgAdmin ใส่หัวไฟล์ "-- PostgreSQL database dump")
+const isPlainDump = (filePath) => {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+        const buf = Buffer.alloc(4096);
+        const n = fs.readSync(fd, buf, 0, 4096, 0);
+        return buf.toString('utf8', 0, n).includes('PostgreSQL database dump');
+    } finally {
+        fs.closeSync(fd);
+    }
+};
+
+// ไฟล์ในโฟลเดอร์ backups เท่านั้น (กันชื่อไฟล์แบบ ../)
+const backupFilePath = (filename) => {
+    const filePath = path.join(BACKUP_DIR, filename || '');
+    if (!filePath.startsWith(BACKUP_DIR + path.sep) || !fs.existsSync(filePath)) {
+        throw new Error('ไม่พบไฟล์สำรองข้อมูล');
+    }
+    return filePath;
+};
+
+// เวอร์ชัน archive ในหัวไฟล์ (byte 5-6 หลัง 'PGDMP') -> เวอร์ชัน PostgreSQL ขั้นต่ำของ pg_restore ที่อ่านไฟล์ได้
+const ARCHIVE_MIN_PG = { '1.15': 16, '1.16': 17 };
+
+const archiveVersion = (filePath) => {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+        const buf = Buffer.alloc(8);
+        fs.readSync(fd, buf, 0, 8, 0);
+        if (buf.toString('latin1', 0, 5) !== 'PGDMP') return null;
+        return `${buf[5]}.${buf[6]}`;
+    } finally {
+        fs.closeSync(fd);
+    }
+};
+
+// pg_restore ที่เก่ากว่า pg_dump ที่สร้างไฟล์จะอ่านไฟล์ไม่ได้ ("unsupported version (1.16) in file header")
+// ตรวจก่อนล้าง schema เพื่อไม่ให้ฐานข้อมูลปลายทางถูกล้างทิ้งทั้งที่ restore ไม่ได้
+const checkRestoreToolVersion = async (filePath, password) => {
+    const ver = archiveVersion(filePath);
+    const need = ARCHIVE_MIN_PG[ver];
+    if (!need) return;
+    const res = await runTool('pg_restore', ['--version'], password);
+    if (res.error) throw toolError(res, 'เรียกโปรแกรม pg_restore ไม่สำเร็จ');
+    const m = res.stdout.match(/\)\s*(\d+)/);
+    const have = m ? parseInt(m[1], 10) : 0;
+    if (have && have < need) {
+        throw new Error(
+            `ไฟล์สำรองข้อมูลนี้สร้างด้วย PostgreSQL ${need} (archive ${ver}) ` +
+            `แต่เครื่องนี้ใช้ pg_restore เวอร์ชัน ${have} (${pgTool('pg_restore')}) ซึ่งอ่านไฟล์ไม่ได้\n` +
+            `แก้ไข: ติดตั้ง PostgreSQL ${need} ขึ้นไป หรือตั้ง PG_BIN_PATH ใน .env ให้ชี้ไปที่โฟลเดอร์ bin ของ PostgreSQL ${need} ขึ้นไป`);
+    }
+};
+
+// รันไฟล์ .sql ด้วย psql แบบทำต่อเมื่อเจอ error (เหมือน pgAdmin) — error ที่เจอส่งกลับเป็นคำเตือน
+// เช่น ไฟล์จาก PostgreSQL 17 ลงเครื่อง 16 จะมี error "transaction_timeout" ซึ่งไม่กระทบข้อมูล
+// psql จบด้วย exit code ไม่เป็น 0 เฉพาะกรณีร้ายแรง (เชื่อมต่อไม่ได้ / หลุดกลางทาง) จึงถือว่าล้มเหลว
+const restorePlain = async (o, filePath) => {
+    const res = await runTool('psql', ['-q', '-X', ...connArgs(o), '-f', filePath], o.password);
+    if (res.stderr) console.error(`psql restore stderr (${o.database}):\n${res.stderr}`);
+    if (res.error) throw toolError(res, `Restore ไปยังฐานข้อมูล ${o.database} ไม่สำเร็จ`);
+    const lines = res.stderr.split(/\r?\n/);
+    const errors = lines.filter(l => /ERROR:|error:/.test(l));
+    if (!errors.length) return { message: 'Restore สำเร็จ', warnings: [] };
+    const warnings = lines
+        .filter(l => /ERROR:|error:|DETAIL:|HINT:/.test(l))
+        .map(l => l.replace(/^psql:.*?:(\d+):\s*/, 'บรรทัด $1: '))
+        .slice(0, 50);
+    return { message: `Restore สำเร็จ แต่มีข้อผิดพลาด ${errors.length} รายการ`, warnings };
+};
+
+// ล้าง schema public แล้ว pg_restore ไฟล์ลงฐานข้อมูล — คืน { message, warnings }
+// pg_restore จบด้วย exit code 1 แม้มี error เล็กน้อยแล้วทำต่อจนจบ ("errors ignored on restore: N")
+// กรณีนั้นถือว่าสำเร็จพร้อมคำเตือน (ส่งรายการ error กลับไปแสดง) — ล้มเหลวจริงเฉพาะเมื่อ pg_restore หยุดกลางทาง
+const restoreArchive = async (dbConfig, filePath) => {
+    const o = dbConfig.options;
+    const plain = archiveVersion(filePath) === null;
+    if (plain && !isPlainDump(filePath)) {
+        throw new Error('ไฟล์ที่เลือกไม่ใช่ไฟล์สำรองข้อมูลของ PostgreSQL (.backup หรือ .sql จาก pg_dump) หรือไฟล์เสียระหว่างคัดลอก');
+    }
+    if (!plain) await checkRestoreToolVersion(filePath, o.password);
+    const drop = await runTool('psql', [...connArgs(o), '-v', 'ON_ERROR_STOP=1', '-c', 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'], o.password);
+    if (drop.error) {
+        console.error(`drop schema error (${o.database}):`, drop.stderr || drop.error.message);
+        throw toolError(drop, `ล้าง schema public ของฐานข้อมูล ${o.database} ไม่สำเร็จ (ผู้ใช้ ${o.user} ต้องเป็นเจ้าของ schema หรือ superuser)`);
+    }
+
+    if (plain) return restorePlain(o, filePath);
+
+    const res = await runTool('pg_restore', ['--no-owner', '--no-privileges', ...connArgs(o), filePath], o.password);
+    if (res.stderr) console.error(`pg_restore stderr (${o.database}):\n${res.stderr}`);
+    if (!res.error) return { message: 'Restore สำเร็จ', warnings: [] };
+
+    const ignored = res.stderr.match(/errors ignored on restore:\s*(\d+)/);
+    if (ignored) {
+        const warnings = res.stderr.split(/\r?\n/)
+            .filter(l => /error:|ERROR:|DETAIL:|HINT:|Command was:/.test(l) && !/errors ignored on restore/.test(l))
+            .slice(0, 50);
+        return { message: `Restore สำเร็จ แต่มีข้อผิดพลาด ${ignored[1]} รายการ`, warnings };
+    }
+    throw toolError(res, `Restore ไปยังฐานข้อมูล ${o.database} ไม่สำเร็จ`);
+};
 
 class BackupService {
     static runningJobs = {};
@@ -18,85 +187,25 @@ class BackupService {
     // ฟังก์ชันสำหรับสั่ง pg_dump
     static async runPgDump(databaseName, scheduleType) {
         console.log(`Running pg_dump for ${scheduleType} database: ${databaseName}`);
-        
-        try {
-            const now = new Date();
-            const timestamp = now.getFullYear().toString() +
-                              '-' + (now.getMonth() + 1).toString().padStart(2, '0') +
-                              '-' + now.getDate().toString().padStart(2, '0') +
-                              'T' + now.getHours().toString().padStart(2, '0') +
-                              '-' + now.getMinutes().toString().padStart(2, '0') +
-                              '-' + now.getSeconds().toString().padStart(2, '0');
+        if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR);
+        const filePath = path.join(BACKUP_DIR, `${databaseName}_Backup_${scheduleType}_${timestampForFile()}.backup`);
 
-            const backupDir = path.join(__dirname, '..', 'backups');
-            if (!fs.existsSync(backupDir)) {
-                fs.mkdirSync(backupDir);
-            }
-            const filename = `${databaseName}_Backup_${scheduleType}_${timestamp}.backup`;
-            const filePath = path.join(backupDir, filename);
-
-            const dbConfig = await dbService.getPool(databaseName);
-            const pgDumpCmd = `pg_dump -Fc --clean --if-exists -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} -f "${filePath}"`;
-
-            return new Promise((resolve, reject) => {
-                const child = exec(pgDumpCmd, { env: { ...process.env, PGPASSWORD: dbConfig.options.password } }, (error, stdout, stderr) => {
-                    if (error) {
-                        console.error(`exec error: ${error}`);
-                        return reject(new Error('Backup command failed.'));
-                    }
-                    if (stderr) {
-                        console.error(`stderr: ${stderr}`);
-                    }
-                    console.log(`stdout: ${stdout}`);
-                    console.log(`Backup completed successfully: ${filePath}`);
-                    resolve(filePath);
-                });
-                return child;
-            });
-        } catch (error) {
-            console.error('Error in runPgDump:', error);
-            throw new Error('Failed to run pg_dump due to internal error.');
+        const dbConfig = await dbService.getPool(databaseName);
+        const res = await runTool('pg_dump', dumpArgs(dbConfig.options, filePath), dbConfig.options.password);
+        if (res.error) {
+            console.error('pg_dump error:', res.stderr || res.error.message);
+            throw toolError(res, 'สำรองข้อมูลไม่สำเร็จ');
         }
+        console.log(`Backup completed successfully: ${filePath}`);
+        return filePath;
     }
 
     // ฟังก์ชันสำหรับสั่ง pg_restore
     static async runPgRestore(req, filename) {
         console.log(`Running pg_restore for file: ${filename}`);
-
-        const databaseName = req.header('X-Database-Name');
-        const dbConfig = await dbService.getPool(databaseName);
-        const backupDir = path.join(__dirname, '..', 'backups');
-        const filePath = path.join(backupDir, filename);
-        
-        if (!fs.existsSync(filePath)) {
-            throw new Error('Backup file not found.');
-        }
-
-        const dropSchemaCmd = `psql -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"`;
-        const restoreCmd = `pg_restore -Fc --no-owner --no-privileges -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} "${filePath}"`;
-        const env = { ...process.env, PGPASSWORD: dbConfig.options.password };
-
-        return new Promise((resolve, reject) => {
-            exec(dropSchemaCmd, { env }, (dropError, dropStdout, dropStderr) => {
-                if (dropError) {
-                    console.error(`drop schema error: ${dropError}`);
-                    return reject(new Error('Failed to drop schema before restore.'));
-                }
-                console.log(`Schema dropped and recreated for: ${dbConfig.options.database}`);
-                exec(restoreCmd, { env }, (error, stdout, stderr) => {
-                    if (error) {
-                        console.error(`exec error: ${error}`);
-                        return reject(new Error('Restore command failed.'));
-                    }
-                    if (stderr) {
-                        console.error(`stderr: ${stderr}`);
-                    }
-                    console.log(`stdout: ${stdout}`);
-                    console.log(`Restore completed successfully from: ${filePath}`);
-                    resolve('Restore completed successfully.');
-                });
-            });
-        });
+        const filePath = backupFilePath(filename);
+        const dbConfig = await dbService.getPool(req.header('X-Database-Name'));
+        return restoreArchive(dbConfig, filePath);
     }
 
     // เพิ่มฟังก์ชันสำหรับ Instant Backup
@@ -106,42 +215,30 @@ class BackupService {
         }
 
         const databaseName = req.headers['x-database-name'];
+        const format = req.body && req.body.format === 'plain' ? 'plain' : 'custom';
         this.instantBackupStatus.isRunning = true;
         this.instantBackupStatus.status = 'กำลังทำงาน';
         this.instantBackupStatus.lastBackup = 'กำลังดำเนินการ...';
-        
+
         console.log('Starting instant backup...');
 
         try {
-            // const now = new Date();
-            // const timestamp = now.toISOString().replace(/[:.]/g, '-');
-            var now = new Date();
-            let timestamp = now.getFullYear().toString() +
-                              '-' + (now.getMonth() + 1).toString().padStart(2, '0') +
-                              '-' + now.getDate().toString().padStart(2, '0') +
-                              'T' + now.getHours().toString().padStart(2, '0') +
-                              '-' + now.getMinutes().toString().padStart(2, '0') +
-                              '-' + now.getSeconds().toString().padStart(2, '0');
-            const backupDir = path.join(__dirname, '..', 'backups');
-            const filename = `${databaseName}_instant_backup_${timestamp}.backup`;
-            const filePath = path.join(backupDir, filename);
-
+            if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR);
+            const filePath = path.join(BACKUP_DIR, `${databaseName}_instant_backup_${timestampForFile()}${backupExt(format)}`);
             const dbConfig = await dbService.getPool(databaseName);
-            const pgDumpCmd = `pg_dump -Fc --clean --if-exists -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} -f "${filePath}"`;
-            // สร้าง environment object เพื่อส่งรหัสผ่าน
-            const options = {
-                env: { ...process.env, PGPASSWORD: dbConfig.options.password },
-            };
 
-            this.instantBackupProcess = exec(pgDumpCmd, options, (error, stdout, stderr) => {
+            const bin = pgTool('pg_dump');
+            this.instantBackupProcess = execFile(bin, dumpArgs(dbConfig.options, filePath, format),
+                { env: { ...process.env, PGPASSWORD: dbConfig.options.password }, maxBuffer: 50 * 1024 * 1024 },
+                (error, stdout, stderr) => {
                 this.instantBackupProcess = null;
-                if (error) {
-                    console.error(`Instant backup failed: ${error}`);
-                    this.instantBackupStatus.isRunning = false;
-                    this.instantBackupStatus.status = 'ล้มเหลว';
-                    throw new Error('Instant backup failed.');
-                }
                 this.instantBackupStatus.isRunning = false;
+                if (error) {
+                    // ห้าม throw ใน callback — จะทำให้ server ล่ม
+                    console.error(`Instant backup failed (${bin}):`, String(stderr || '').trim() || error.message);
+                    if (this.instantBackupStatus.status !== 'ถูกยกเลิก') this.instantBackupStatus.status = 'ล้มเหลว';
+                    return;
+                }
                 this.instantBackupStatus.status = 'สำเร็จ';
                 var now = new Date();
                 let timestamp = now.getFullYear().toString() +
@@ -178,40 +275,9 @@ class BackupService {
 
     static async restoreFromInstantBackup(req, filename) {
         console.log(`Running instant restore for file: ${filename}`);
-        const databaseName = req.header('X-Database-Name');
-        const dbConfig = await dbService.getPool(databaseName);
-        const backupDir = path.join(__dirname, '..', 'backups');
-        const filePath = path.join(backupDir, filename);
-
-        if (!fs.existsSync(filePath)) {
-            throw new Error('Instant backup file not found.');
-        }
-
-        const dropSchemaCmd = `psql -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"`;
-        const restoreCmd = `pg_restore -Fc --no-owner --no-privileges -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} "${filePath}"`;
-        const env = { ...process.env, PGPASSWORD: dbConfig.options.password };
-
-        return new Promise((resolve, reject) => {
-            exec(dropSchemaCmd, { env }, (dropError, dropStdout, dropStderr) => {
-                if (dropError) {
-                    console.error(`drop schema error: ${dropError}`);
-                    return reject(new Error('Failed to drop schema before restore.'));
-                }
-                console.log(`Schema dropped and recreated for: ${dbConfig.options.database}`);
-                exec(restoreCmd, { env }, (error, stdout, stderr) => {
-                    if (error) {
-                        console.error(`exec error: ${error}`);
-                        return reject(new Error('Restore command failed.'));
-                    }
-                    if (stderr) {
-                        console.error(`stderr: ${stderr}`);
-                    }
-                    console.log(`stdout: ${stdout}`);
-                    console.log(`Restore completed successfully from: ${filePath}`);
-                    resolve('Instant restore completed successfully.');
-                });
-            });
-        });
+        const filePath = backupFilePath(filename);
+        const dbConfig = await dbService.getPool(req.header('X-Database-Name'));
+        return restoreArchive(dbConfig, filePath);
     }
 
     // ฟังก์ชันสำหรับตั้งค่า job ทั้งหมดเมื่อ Server เริ่มต้น
@@ -382,10 +448,10 @@ class BackupService {
             const files = fs.readdirSync(backupDir).filter(file => {
                 if (scheduleType === 'instant') {
                     var str = `${databaseName}_instant_backup_`;
-                    return file.startsWith(str) && file.endsWith('.backup');
+                    return file.startsWith(str) && isBackupFileName(file);
                 } else {
                     var str = `${databaseName}_Backup_${scheduleType}_`;
-                    return file.startsWith(str) && file.endsWith('.backup');
+                    return file.startsWith(str) && isBackupFileName(file);
                 }
             }).sort().reverse();
             return files;
@@ -415,25 +481,15 @@ class BackupService {
     // Restore จากไฟล์ที่ upload มาจาก client ไปยัง targetDatabase ที่ระบุ
     static async runPgRestoreFromUpload(uploadedFilePath, targetDatabaseName) {
         console.log(`Restoring uploaded file to database: ${targetDatabaseName}`);
-        const dbConfig = await dbService.getPool(targetDatabaseName);
-        const dropSchemaCmd = `psql -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"`;
-        const restoreCmd = `pg_restore -Fc --no-owner --no-privileges -U ${dbConfig.options.user} -d ${dbConfig.options.database} -h ${dbConfig.options.host} -p ${dbConfig.options.port} "${uploadedFilePath}"`;
-        const env = { ...process.env, PGPASSWORD: dbConfig.options.password };
-
-        return new Promise((resolve, reject) => {
-            exec(dropSchemaCmd, { env }, (dropErr) => {
-                if (dropErr) {
-                    fs.unlink(uploadedFilePath, () => {});
-                    return reject(new Error('Failed to drop schema before restore.'));
-                }
-                exec(restoreCmd, { env }, (err) => {
-                    fs.unlink(uploadedFilePath, () => {}); // ลบ temp file เสมอ
-                    if (err) return reject(new Error('Restore command failed.'));
-                    console.log(`Restore from upload completed to: ${targetDatabaseName}`);
-                    resolve('Restore completed successfully.');
-                });
-            });
-        });
+        try {
+            // restoreArchive ตรวจชนิดไฟล์ (.backup / .sql) ก่อนล้าง schema
+            const dbConfig = await dbService.getPool(targetDatabaseName);
+            const result = await restoreArchive(dbConfig, uploadedFilePath);
+            console.log(`Restore from upload completed to: ${targetDatabaseName}`);
+            return result;
+        } finally {
+            fs.unlink(uploadedFilePath, () => {}); // ลบ temp file เสมอ
+        }
     }
 
     static async getFilePath(filename) {

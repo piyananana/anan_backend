@@ -74,7 +74,7 @@ const restoreBackup = async (req, res) => {
     const { filename } = req.body;
     try {
         const result = await saBackupService.runPgRestore(req, filename);
-        res.json({ message: result });
+        res.json(result); // { message, warnings }
     } catch (error) {
         console.error('Error restoring backup:', error);
         res.status(500).json({ message: error.message });
@@ -136,7 +136,7 @@ const restoreFromInstantBackup = async (req, res) => {
     const { filename } = req.body;
     try {
         const result = await saBackupService.restoreFromInstantBackup(req, filename);
-        res.json({ message: result });
+        res.json(result); // { message, warnings }
     } catch (error) {
         console.error('Error restoring instant backup:', error);
         res.status(500).json({ message: error.message });
@@ -154,7 +154,7 @@ const restoreFromUpload = async (req, res) => {
     }
     try {
         const result = await saBackupService.runPgRestoreFromUpload(req.file.path, targetDatabase);
-        res.json({ message: result });
+        res.json(result); // { message, warnings }
     } catch (error) {
         console.error('Error restoring from upload:', error);
         res.status(500).json({ message: error.message });
