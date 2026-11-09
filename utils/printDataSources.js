@@ -140,6 +140,24 @@ const customerPhones = (cust) => {
 };
 
 const customerFields = (cust, snapshot) => {
+  // ขายเงินสด: ระบุชื่อผู้ซื้อในเอกสาร = ใช้ชื่อ ที่อยู่ เลขผู้เสียภาษี สาขาของผู้ซื้อทั้งชุดแทนลูกค้าเงินสด
+  // (กฎเดียวกับรายงานภาษีขาย — ช่องที่ว่างพิมพ์ว่าง ไม่ใช้ข้อมูลของลูกค้าเงินสด)
+  if (s(snapshot.bill_to_name)) {
+    const [line1, ...rest] = s(snapshot.bill_to_address).split(/\r?\n/);
+    const code = s(snapshot.bill_to_branch);
+    const taxId = s(snapshot.bill_to_tax_id);
+    return {
+      customer_code: s(snapshot.customer_code) || s(cust?.customer_code),
+      customer_name: s(snapshot.bill_to_name), customer_name_en: s(snapshot.bill_to_name),
+      customer_address: s(snapshot.bill_to_address).replace(/\s*\r?\n\s*/g, ' '),
+      customer_address1: s(line1), customer_address2: rest.map(s).filter(Boolean).join(' '),
+      ...customerPhones(null),
+      customer_tax_id: taxId, customer_branch_code: code,
+      customer_branch_label: taxBranchTh(code), customer_branch_label_en: taxBranchEn(code),
+      customer_tax_id_branch: [taxId, taxBranchTh(code)].filter(Boolean).join(' '),
+      customer_tax_id_branch_en: [taxId, taxBranchEn(code)].filter(Boolean).join(' '),
+    };
+  }
   const addr = thaiAddress(cust?.addr);
   const code = s(cust?.tax_branch_code);
   const taxId = s(cust?.tax_id);
@@ -272,6 +290,86 @@ const depositFields = (deps, t, lc, currency, base) => {
   };
 };
 
+// ขายเงินสด ('33') — วิธีรับชำระ (สกุลเงินเอกสาร) ภาษีถูกหัก ณ ที่จ่าย เงินที่รับมา/เงินทอน และใบเสร็จที่สร้างตอน Post
+// ใบแจ้งหนี้ AR ที่สร้างจากขายเงินสดพิมพ์ข้อมูลเดียวกันจากเอกสาร IM ต้นทาง เอกสารอื่นได้ค่าว่าง/0
+// เครื่องหมาย (cash_mark ฯลฯ) ใช้ 'X' สำหรับช่องติ๊กในแบบฟอร์มพิมพ์สำเร็จ — ฟอนต์ THSarabun ไม่มีเครื่องหมาย ✓
+const PAYMENT_FIELDS = [
+  f('receipt_no', 'เลขที่ใบเสร็จรับเงิน', 'Receipt no.', 'payment'),
+  f('receipt_date', 'วันที่ใบเสร็จรับเงิน', 'Receipt date', 'payment', 'date'),
+  f('payment_methods', 'วิธีรับชำระ (ชื่อ + จำนวนเงิน)', 'Payment methods (name + amount)', 'payment'),
+  f('payment_methods_en', 'วิธีรับชำระ (อังกฤษ)', 'Payment methods (EN)', 'payment'),
+  f('paid_amount', 'ยอดรับชำระรวม', 'Total paid', 'payment', 'money'),
+  f('cash_amount', 'รับเป็นเงินสด', 'Paid in cash', 'payment', 'money'),
+  f('check_amount', 'รับเป็นเช็ค', 'Paid by cheque', 'payment', 'money'),
+  f('transfer_amount', 'รับเป็นเงินโอน', 'Paid by transfer', 'payment', 'money'),
+  f('qr_amount', 'รับผ่าน QR/พร้อมเพย์', 'Paid by QR/PromptPay', 'payment', 'money'),
+  f('card_amount', 'รับเป็นบัตรเครดิต/เดบิต', 'Paid by card', 'payment', 'money'),
+  f('other_amount', 'รับชำระวิธีอื่น', 'Paid by other methods', 'payment', 'money'),
+  f('cash_mark', 'เครื่องหมาย X เงินสด', 'X mark: cash', 'payment'),
+  f('check_mark', 'เครื่องหมาย X เช็ค', 'X mark: cheque', 'payment'),
+  f('transfer_mark', 'เครื่องหมาย X เงินโอน/QR', 'X mark: transfer/QR', 'payment'),
+  f('card_mark', 'เครื่องหมาย X บัตร', 'X mark: card', 'payment'),
+  f('check_details', 'รายละเอียดเช็ค (เลขที่ ธนาคาร สาขา)', 'Cheque details (no., bank, branch)', 'payment'),
+  f('check_details_en', 'รายละเอียดเช็ค (อังกฤษ)', 'Cheque details (EN)', 'payment'),
+  f('payment_refs', 'เลขที่อ้างอิงการชำระ', 'Payment reference nos.', 'payment'),
+  f('card_details', 'บัตร (ประเภท + 4 หลักท้าย)', 'Card (type + last 4 digits)', 'payment'),
+  f('wht_amount', 'ภาษีที่ลูกค้าหัก ณ ที่จ่าย', 'Withholding tax deducted', 'payment', 'money'),
+  f('wht_certificate_nos', 'เลขที่หนังสือรับรองการหักภาษี', 'WHT certificate nos.', 'payment'),
+  f('cash_received', 'รับเงินมา', 'Cash received', 'payment', 'money'),
+  f('change_amount', 'เงินทอน', 'Change', 'payment', 'money'),
+];
+const PAY_TYPE_TH = { CASH: 'เงินสด', CHECK: 'เช็ค', TRANSFER: 'เงินโอน', MOBILE_BANKING: 'เงินโอน', QR_CODE: 'QR/พร้อมเพย์',
+  CREDIT_CARD: 'บัตรเครดิต', DEBIT_CARD: 'บัตรเดบิต', BILL_OF_EXCHANGE: 'ตั๋วแลกเงิน', OTHER: 'อื่นๆ' };
+const PAY_TYPE_EN = { CASH: 'Cash', CHECK: 'Cheque', TRANSFER: 'Transfer', MOBILE_BANKING: 'Transfer', QR_CODE: 'QR/PromptPay',
+  CREDIT_CARD: 'Credit card', DEBIT_CARD: 'Debit card', BILL_OF_EXCHANGE: 'Bill of exchange', OTHER: 'Other' };
+const money2 = (v) => Number(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+// p = { pays, whts, rate, cash_received, change_amount, receipt_no, receipt_date } หรือ undefined
+const paymentFields = (p) => {
+  const pays = p?.pays || [];
+  const sumOf = (types) => round2(pays.filter(x => types.includes(x.payment_method_type)).reduce((t, x) => t + num(x.amount_fc), 0));
+  const label = (x, map) => `${map[x.payment_method_type] || s(x.payment_method_name)} ${money2(num(x.amount_fc))}`;
+  const checks = pays.filter(x => x.payment_method_type === 'CHECK');
+  const checkText = (no, bank, br) => checks.map(x => [s(x.ref_no) && `${no} ${s(x.ref_no)}`, s(x.drawer_bank_name) && `${bank} ${s(x.drawer_bank_name)}`,
+    s(x.drawer_bank_branch) && `${br} ${s(x.drawer_bank_branch)}`].filter(Boolean).join(' ')).filter(Boolean).join(', ');
+  const cash = sumOf(['CASH']), check = sumOf(['CHECK']), transfer = sumOf(['TRANSFER', 'MOBILE_BANKING']), qr = sumOf(['QR_CODE']);
+  const card = sumOf(['CREDIT_CARD', 'DEBIT_CARD']), other = sumOf(['BILL_OF_EXCHANGE', 'OTHER']);
+  const whts = p?.whts || [];
+  const rate = num(p?.rate) || 1;
+  return {
+    receipt_no: s(p?.receipt_no), receipt_date: p?.receipt_date || '',
+    payment_methods: pays.map(x => label(x, PAY_TYPE_TH)).join(', '),
+    payment_methods_en: pays.map(x => label(x, PAY_TYPE_EN)).join(', '),
+    paid_amount: round2(cash + check + transfer + qr + card + other),
+    cash_amount: cash, check_amount: check, transfer_amount: transfer, qr_amount: qr, card_amount: card, other_amount: other,
+    cash_mark: cash ? 'X' : '', check_mark: check ? 'X' : '', transfer_mark: transfer || qr ? 'X' : '', card_mark: card ? 'X' : '',
+    check_details: checkText('เลขที่', 'ธนาคาร', 'สาขา'), check_details_en: checkText('No.', 'Bank', 'Branch'),
+    payment_refs: pays.map(x => s(x.ref_no)).filter(Boolean).join(', '),
+    card_details: pays.filter(x => ['CREDIT_CARD', 'DEBIT_CARD'].includes(x.payment_method_type))
+      .map(x => [s(x.card_type), s(x.card_last4) && `xxxx${s(x.card_last4)}`].filter(Boolean).join(' ')).filter(Boolean).join(', '),
+    wht_amount: round2(whts.reduce((t, w) => t + num(w.wht_amount_lc), 0) / rate),
+    wht_certificate_nos: whts.map(w => s(w.certificate_no)).filter(Boolean).join(', '),
+    cash_received: round2(num(p?.cash_received)), change_amount: round2(num(p?.change_amount)),
+  };
+};
+// ข้อมูลรับชำระของเอกสาร IM (ขายเงินสด) — Map(im_id → p) ตาราง/คอลัมน์ยังไม่มี = ว่าง
+const loadCashSalePayments = async (db, imIds) => {
+  const ids = [...new Set(imIds.filter(Boolean))];
+  const out = new Map();
+  if (!ids.length || !(await db.query(`SELECT to_regclass('im_transaction_payment') IS NOT NULL AS ok`)).rows[0].ok) return out;
+  const heads = (await db.query(`
+      SELECT t.id, t.exchange_rate::float AS rate, to_jsonb(t)->>'cash_received' AS cash_received, to_jsonb(t)->>'change_amount' AS change_amount,
+             rc.doc_no AS receipt_no, ${ymdSql('rc.doc_date')} AS receipt_date
+        FROM im_transaction t
+        LEFT JOIN ar_transaction rc ON rc.id = (to_jsonb(t)->>'linked_ar_receipt_id')::int AND rc.status = 'Posted'
+       WHERE t.id = ANY($1::int[])`, [ids])).rows;
+  const pays = (await db.query(`SELECT * FROM im_transaction_payment WHERE header_id = ANY($1::int[]) ORDER BY header_id, line_no, id`, [ids])).rows;
+  const whts = (await db.query(`SELECT * FROM im_transaction_wht WHERE header_id = ANY($1::int[]) ORDER BY header_id, line_no, id`, [ids])).rows;
+  for (const h of heads) {
+    out.set(h.id, { ...h, pays: pays.filter(x => x.header_id === h.id), whts: whts.filter(x => x.header_id === h.id) });
+  }
+  return out;
+};
+
 // อัตรา VAT ที่พิมพ์หัวเอกสาร — อัตราสูงสุดของรายการที่มี VAT (ปกติทุกรายการอัตราเดียวกัน)
 const headerVatRate = (lines) => lines.reduce((m, l) => Math.max(m, l.vat_amount ? num(l.vat_rate) : 0), 0);
 
@@ -282,7 +380,7 @@ const SALES_INVOICE = {
   name_en: 'Delivery Note / Tax Invoice',
   // module = รหัสใน key, sys_module ตาม sa_module_document
   docTypes: [
-    { module: 'IM', sys_module: '31', sys_doc_types: ['30', '31', '32'] },
+    { module: 'IM', sys_module: '31', sys_doc_types: ['30', '31', '32', '33'] },
     { module: 'AR', sys_module: '11', sys_doc_types: ['10'] },
   ],
   fields: [
@@ -377,6 +475,7 @@ const SALES_INVOICE = {
     f('vat_after_deposit_lc', 'ภาษีหลังหักมัดจำ (สกุลเงินหลัก)', 'VAT after deposit (base currency)', 'deposit', 'money'),
     f('total_after_deposit_lc', 'รวมทั้งสิ้นหลังหักมัดจำ (สกุลเงินหลัก)', 'Grand total after deposit (base currency)', 'deposit', 'money'),
     f('amount_text_after_deposit_lc', 'จำนวนเงินตัวอักษรหลังหักมัดจำ (สกุลเงินหลัก)', 'Amount in words after deposit (base currency)', 'deposit'),
+    ...PAYMENT_FIELDS,
     ...PRINT_FIELDS,
     f('line_no', 'ลำดับ', 'No.', 'line', 'number', 'L'),
     f('item_code', 'รหัสสินค้า', 'Item code', 'line', 'text', 'L'),
@@ -462,7 +561,9 @@ const SALES_INVOICE = {
                t.currency_code, t.exchange_rate::float AS exchange_rate, COALESCE(NULLIF(t.linked_ar_doc_no, ''), ar.doc_no) AS linked_ar_doc_no,
                t.customer_id, t.customer_code, t.customer_name_th, t.branch_id, t.price_includes_vat,
                COALESCE(t.bill_discount_percent, 0)::float AS bill_discount_percent, COALESCE(t.cash_discount_amount, 0)::float AS cash_discount_amount,
-               d.doc_code, d.doc_name_thai, d.doc_name_eng,
+               d.doc_code, d.doc_name_thai, d.doc_name_eng, d.sys_doc_type,
+               to_jsonb(t)->>'bill_to_name' AS bill_to_name, to_jsonb(t)->>'bill_to_address' AS bill_to_address,
+               to_jsonb(t)->>'bill_to_tax_id' AS bill_to_tax_id, to_jsonb(t)->>'bill_to_branch' AS bill_to_branch,
                so.id AS so_id, so.doc_no AS so_doc_no, ${ymdSql('so.doc_date')} AS so_doc_date,
                so.approved_by AS so_approved_by, ${ymdSql('so.approved_at')} AS so_approved_at,
                to_jsonb(t)->>'customer_po_no' AS po_no, to_jsonb(t)->>'customer_po_date' AS po_date,
@@ -489,6 +590,8 @@ const SALES_INVOICE = {
                t.subtotal_lc::float AS subtotal_lc, t.discount_amount_lc::float AS discount_amount_lc,
                t.before_vat_lc::float AS before_vat_lc, t.vat_amount_lc::float AS vat_amount_lc, t.total_amount_lc::float AS total_amount_lc,
                d.doc_code, d.doc_name_thai, d.doc_name_eng, c.credit_term_days,
+               to_jsonb(t)->>'bill_to_name' AS bill_to_name, to_jsonb(t)->>'bill_to_address' AS bill_to_address,
+               to_jsonb(t)->>'bill_to_tax_id' AS bill_to_tax_id, to_jsonb(t)->>'bill_to_branch' AS bill_to_branch,
                (t.due_date - t.doc_date) AS due_days,
                im.id AS im_id, im.doc_no AS im_doc_no, ${ymdSql('im.doc_date')} AS im_doc_date,
                to_jsonb(t)->>'customer_po_no' AS po_no, to_jsonb(t)->>'customer_po_date' AS po_date,
@@ -543,6 +646,7 @@ const SALES_INVOICE = {
           FROM ar_transaction_apply a JOIN ar_transaction dep ON dep.id = a.applied_to_id
          WHERE a.transaction_id = ANY($1::int[]) AND a.apply_type = 'inv_advance'`, arIds);
     const arSp = await loadSalespersonNames(db, 'ar_transaction_salesperson', arIds);
+    const cashPays = await loadCashSalePayments(db, [...imHeads.filter(h => h.sys_doc_type === '33').map(h => h.id), ...arHeads.map(h => h.im_id)]);
 
     const imLines = imIds.length ? (await db.query(`
         SELECT dt.header_id, dt.line_no, COALESCE(NULLIF(dt.item_code, ''), it.item_code) AS item_code,
@@ -651,7 +755,9 @@ const SALES_INVOICE = {
       const subLc = lines.reduce((a, l) => a + l.amount_lc, 0);
       const vatLc = lines.reduce((a, l) => a + l.vat_amount_lc, 0);
       const sp = imSp.get(h.id) || {};
-      const days = h.credit_term_days || 0;
+      // ขายเงินสด: รับเงินครบวันเดียวกัน — เงื่อนไข "เงินสด" ครบกำหนดวันที่เอกสาร
+      const isCashSale = h.sys_doc_type === '33';
+      const days = isCashSale ? 0 : (h.credit_term_days || 0);
       const imT = {
         subtotal: gross, discount: gross - sub, beforeVat: sub, vat, total: sub + vat, vatRate: headerVatRate(lines),
         qty: lines.reduce((a, l) => a + l.qty, 0),
@@ -662,7 +768,7 @@ const SALES_INVOICE = {
           ...(branches.get(h.branch_id) || branches.get(0)),
           ...companyTaxFields(companyTaxId, branches.get(h.branch_id) || branches.get(0)),
           ...customerFields(customers.get(h.customer_id), h),
-          doc_no: s(h.doc_no), doc_date: h.doc_date, due_date: h.ar_due_date || h.calc_due_date,
+          doc_no: s(h.doc_no), doc_date: h.doc_date, due_date: isCashSale ? h.doc_date : (h.ar_due_date || h.calc_due_date),
           ...creditFields(days),
           doc_type_code: s(h.doc_code), doc_type_name: s(h.doc_name_thai), doc_type_name_en: s(h.doc_name_eng) || s(h.doc_name_thai),
           ref_no: s(h.ref_no),
@@ -677,6 +783,7 @@ const SALES_INVOICE = {
           ...billDiscountFields(h, lines),
           ...totalsFields(imT, curOf(h), base, imLc),
           ...depositFields(imDeps.get(h.id), imT, imLc, curOf(h), base),
+          ...paymentFields(cashPays.get(h.id)),
         },
         lines,
       });
@@ -720,6 +827,7 @@ const SALES_INVOICE = {
           ...billDiscountFields(h, lines),
           ...totalsFields(arT, curOf(h), base, arLc),
           ...depositFields(arDeps.get(h.id), arT, arLc, curOf(h), base),
+          ...paymentFields(h.im_id ? cashPays.get(h.im_id) : null),
         },
         lines,
       });

@@ -400,7 +400,7 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
                 s.check_account_id, s.transfer_account_id, s.credit_card_account_id,
                 s.debit_card_account_id, s.qr_code_account_id, s.mobile_banking_account_id,
                 s.bill_of_exchange_account_id,
-                s.fx_gain_account_id, s.fx_loss_account_id
+                s.fx_gain_account_id, s.fx_loss_account_id, s.wht_account_id
          FROM ar_gl_account_setup s
          JOIN sa_module_document d ON d.doc_code = s.doc_code
          WHERE d.id = $1 LIMIT 1`,
@@ -424,6 +424,7 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
     const defaultRevenueAccountId = Number(setup.revenue_account_id)        || null;
     const fxGainAccountId         = Number(setup.fx_gain_account_id)        || null;
     const fxLossAccountId         = Number(setup.fx_loss_account_id)        || null;
+    const whtAccountId            = Number(setup.wht_account_id)            || null; // ภาษีถูกหัก ณ ที่จ่าย (รับชำระ)
     const exchangeRate        = Number(header.exchange_rate) || 1;
 
     // Resolve created_by เป็น integer user_id (gl_entry_header.created_by เป็น INT FK)
@@ -737,6 +738,20 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
         const totalCnAtInvRate = cnDeductions.reduce((s, a) =>
             s + (Number(a.applied_amount_fc) || 0) * (invoiceRateMap[a.applied_to_id] || 1), 0);
 
+        // ภาษีที่ลูกค้าหัก ณ ที่จ่าย — Dr ภาษีถูกหัก ณ ที่จ่าย (ยอดเงินที่รับ = ยอดตัดหนี้ − มัดจำ − ลดหนี้ − WHT)
+        const totalWhtLc = round2((header._whts || []).reduce((s, w) => s + (Number(w.wht_amount_lc) || 0), 0));
+        if (totalWhtLc > 0) {
+            if (!whtAccountId) throw new Error('ยังไม่ได้ตั้งค่าบัญชีภาษีถูกหัก ณ ที่จ่าย ในการตั้งค่ารหัสบัญชีของประเภทเอกสารรับชำระนี้');
+            glDetails.push({
+                account_id: whtAccountId,
+                description: `ภาษีถูกหัก ณ ที่จ่าย ${docNo}`,
+                debit_lc: totalWhtLc,
+                credit_lc: 0,
+                debit_fc: round2(totalWhtLc / exchangeRate),
+                credit_fc: 0,
+            });
+        }
+
         // DR: Cash/Bank Account — แยกตามวิธีรับชำระ (ถ้ามี) ถ้าไม่มีใช้ cash_account_id เดียว
         // totalDebit = header.total_amount_lc = cash component only
         // (Flutter คำนวณ total = invoiceApplied - advanceDeducted - cnDeducted แล้วส่งมา)
@@ -772,10 +787,10 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
         // ล้างเข้าบัญชีลูกหนี้ที่ใบแจ้งหนี้/ใบลดหนี้แต่ละใบลงไว้ (ไม่มีใบอ้างอิงใช้บัญชีของใบรับชำระ)
         const arCreditLc = totalInvoiceAtInvRate > 0
             ? (totalInvoiceAtInvRate - totalCnAtInvRate)
-            : totalDebit;
+            : totalDebit + totalWhtLc;
         const arCreditFc = totalInvoiceAppliedFc > 0
             ? (totalInvoiceAppliedFc - totalCnDeductedFc)
-            : (Number(header.total_amount_fc) || 0);
+            : (Number(header.total_amount_fc) || 0) + round2(totalWhtLc / exchangeRate);
         if (arAccountId && arCreditLc > 0) {
             const byAccount = new Map(); // account_id → { lc, fc }
             const addTo = (acc, lc, fc) => {
@@ -982,7 +997,7 @@ const appliedTargetIds = async (client, transactionId) => (await client.query(
 const AR_REVERSE_INFO_SQL = `
     SELECT t.id, t.doc_no, t.status, t.gl_entry_id, d.sys_doc_type,
            p.ar_status, gp.gl_status AS gl_period_status,
-           EXISTS (SELECT 1 FROM im_transaction i WHERE i.linked_ar_transaction_id = t.id) AS from_im,
+           EXISTS (SELECT 1 FROM im_transaction i WHERE i.linked_ar_transaction_id = t.id OR i.linked_ar_receipt_id = t.id) AS from_im,
            (SELECT string_agg(DISTINCT s.doc_no, ', ')
               FROM ar_transaction_apply a JOIN ar_transaction s ON s.id = a.transaction_id
              WHERE a.applied_to_id = t.id AND a.transaction_id <> t.id
@@ -1005,7 +1020,12 @@ const AR_REVERSE_INFO_SQL = `
       LEFT JOIN gl_posting_period gp ON gp.id = g.period_id
      WHERE t.id = $1`;
 // คอลัมน์ของรายการธนาคาร (cm_receipt/cm_payment) ที่ subquery cm_cleared ใช้ — เพิ่มก่อนอ่านเสมอ
-const queryARReverseInfo = async (db, id) => { await ensureBankItemColumns(db); return db.query(AR_REVERSE_INFO_SQL, [id]); };
+// im_transaction.linked_ar_receipt_id = ใบเสร็จที่ขายเงินสด ('33') สร้างให้ (from_im)
+const queryARReverseInfo = async (db, id) => {
+    await ensureBankItemColumns(db);
+    await db.query(`ALTER TABLE im_transaction ADD COLUMN IF NOT EXISTS linked_ar_receipt_id INTEGER`);
+    return db.query(AR_REVERSE_INFO_SQL, [id]);
+};
 
 // เงื่อนไขที่ใช้ร่วมกันระหว่างถอยกับยกเลิก: มีเอกสารอื่นอ้างอิงอยู่
 const getArDependentBlock = (r) => {
@@ -1056,9 +1076,17 @@ const getArVoidBlockById = async (db, id) => {
 };
 
 // ใช้จาก IM: ใบแจ้งหนี้/ลดหนี้ที่เอกสาร IM สร้างให้ — สถานะ, เหตุที่ถอย/ยกเลิกไม่ได้ (ไม่นับ IM_SOURCE), งวดยังเปิดหรือไม่
-const getArLinkedState = async (db, id) => {
+// exceptId = ใบเสร็จที่เอกสาร IM เดียวกันสร้างให้ (ขายเงินสด) — ไม่นับเป็นเอกสารอ้างอิง เพราะถอย/ยกเลิกไปพร้อมกัน
+const getArLinkedState = async (db, id, exceptId = null) => {
     const info = (await queryARReverseInfo(db, id)).rows[0];
     if (!info) return null;
+    if (exceptId && info.applied_by) {
+        info.applied_by = (await db.query(`
+            SELECT string_agg(DISTINCT s.doc_no, ', ') AS v
+              FROM ar_transaction_apply a JOIN ar_transaction s ON s.id = a.transaction_id
+             WHERE a.applied_to_id = $1 AND a.transaction_id NOT IN ($1, $2) AND s.status NOT IN ('Void', 'Deleted')`,
+            [id, exceptId])).rows[0].v;
+    }
     const b = info.status === 'Posted' ? getArDependentBlock({ ...info, from_im: false }) : null;
     return {
         status: info.status, doc_no: info.doc_no, gl_entry_id: info.gl_entry_id,
@@ -1127,32 +1155,62 @@ const ensurePaymentTable = async (client) => {
     `);
 };
 
+// --- ภาษีหัก ณ ที่จ่ายของใบรับชำระ (ar_transaction_wht ตาม migrations/20260415_add_wht_and_ar_gl_setup.sql) ---
+// ยอดเป็นสกุลเงินบาท (_lc) เหมือน ap_transaction_wht; wht_code/wht_name = snapshot ของ cd_wht_type ตอนบันทึก
+const ensureArWhtTable = async (client) => {
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS ar_transaction_wht (
+            id              SERIAL PRIMARY KEY,
+            header_id       INT NOT NULL REFERENCES ar_transaction(id) ON DELETE CASCADE,
+            line_no         INT NOT NULL DEFAULT 1,
+            wht_type_id     INT REFERENCES cd_wht_type(id) ON DELETE SET NULL,
+            wht_code        VARCHAR(20),
+            wht_name        VARCHAR(200),
+            income_type     VARCHAR(20),
+            wht_rate        NUMERIC(5,2),
+            base_amount_lc  NUMERIC(18,4) NOT NULL DEFAULT 0,
+            wht_amount_lc   NUMERIC(18,4) NOT NULL DEFAULT 0
+        )`);
+    await client.query(`ALTER TABLE ar_transaction_wht
+        ADD COLUMN IF NOT EXISTS certificate_no VARCHAR(50),
+        ADD COLUMN IF NOT EXISTS description TEXT`);
+    await client.query(`ALTER TABLE ar_transaction ADD COLUMN IF NOT EXISTS wht_amount_lc NUMERIC(18,4) NOT NULL DEFAULT 0`);
+};
+// เก็บเฉพาะใบรับชำระ ('80') — ประเภทอื่นล้างทิ้ง; คืนรายการที่เก็บ (ใช้ลงบัญชีต่อ)
+const saveArWhts = async (client, headerId, docId, whts) => {
+    await ensureArWhtTable(client);
+    await client.query(`DELETE FROM ar_transaction_wht WHERE header_id=$1`, [headerId]);
+    const t = await client.query(`SELECT sys_doc_type FROM sa_module_document WHERE id=$1`, [docId]);
+    const rows = t.rows[0]?.sys_doc_type === '80' ? (whts || []).filter(w => Number(w.wht_amount_lc) > 0) : [];
+    let lineNo = 1;
+    for (const w of rows) {
+        if (Number(w.base_amount_lc) < 0) throw Object.assign(new Error('ฐานภาษีหัก ณ ที่จ่ายต้องไม่ติดลบ'), { status: 400 });
+        await client.query(`
+            INSERT INTO ar_transaction_wht (header_id, line_no, wht_type_id, wht_code, wht_name, income_type, wht_rate, base_amount_lc, wht_amount_lc,
+                certificate_no, description)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+            [headerId, lineNo++, w.wht_type_id || null, w.wht_code || null, w.wht_name || null, w.income_type || null, Number(w.wht_rate) || 0,
+             Number(w.base_amount_lc) || 0, Number(w.wht_amount_lc) || 0, w.certificate_no || null, w.description || null]);
+    }
+    const total = round2(rows.reduce((s, w) => s + (Number(w.wht_amount_lc) || 0), 0));
+    await client.query(`UPDATE ar_transaction SET wht_amount_lc=$1 WHERE id=$2`, [total, headerId]);
+    return rows;
+};
+
 // --- 1. Create Transaction (Draft/Post) ---
-const createTransaction = async (req, res) => {
-    const { header, details, applies, payments, action } = req.body; // action: 'Draft' | 'Post'
-    await ensureArSalesperson(req.dbPool);
-    await ensureCreditSchema(req.dbPool);
-    await ensureArDiscountColumns(req.dbPool);
-    const client = await req.dbPool.connect();
-    try {
-        await client.query('BEGIN');
-        await applyArSalesDiscounts(client, header, details);
+// ตารางที่การสร้างเอกสาร AR ใช้ — เรียกก่อนเปิด transaction (API) หรือด้วย client ของผู้เรียก (เอกสาร IM)
+const ensureArCreateSchema = async (db) => {
+    await ensureArSalesperson(db);
+    await ensureCreditSchema(db);
+    await ensureArDiscountColumns(db);
+};
 
-        // Validate period for Post
-        if (action === 'Post') {
-            const periodRes = await client.query(
-                `SELECT id FROM gl_posting_period
-                 WHERE $1::date BETWEEN period_start_date AND period_end_date
-                 AND gl_status = 'OPEN' LIMIT 1`,
-                [header.doc_date]
-            );
-            if (periodRes.rows.length === 0)
-                throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่เอกสาร ${header.doc_date}`);
-            // เอกสารใหม่ยังไม่มีคำขออนุมัติ — เกินวงเงินต้องบันทึกร่างแล้วขออนุมัติก่อน
-            await checkArCreditForPost(client, header, 0, null);
-        }
+// สร้างเอกสาร AR (ร่าง/โพสต์) ภายใน transaction ของผู้เรียก — ใช้ทั้ง API และขายเงินสดของ IM ('33' สร้างใบเสร็จรับชำระ)
+const insertArTransaction = async (client, { header, details, applies, payments, whts, salespersons, action }) => {
+    await applyArSalesDiscounts(client, header, details);
 
-        // Find period_id (always needed)
+    // Validate period for Post
+    if (action === 'Post') {
         const periodRes = await client.query(
             `SELECT id FROM gl_posting_period
              WHERE $1::date BETWEEN period_start_date AND period_end_date
@@ -1161,183 +1219,207 @@ const createTransaction = async (req, res) => {
         );
         if (periodRes.rows.length === 0)
             throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่เอกสาร ${header.doc_date}`);
-        const periodId = periodRes.rows[0].id;
+        // เอกสารใหม่ยังไม่มีคำขออนุมัติ — เกินวงเงินต้องบันทึกร่างแล้วขออนุมัติก่อน
+        await checkArCreditForPost(client, header, 0, null);
+    }
 
-        // Generate doc_no
-        let finalDocNo = header.doc_no;
-        if (!finalDocNo || finalDocNo === 'AUTO') {
-            finalDocNo = await generateDocNo(client, header.doc_id, header.doc_date, header.branch_id);
-            if (!finalDocNo) throw new Error('Auto numbering failed or manual doc_no required');
-        }
+    // Find period_id (always needed)
+    const periodRes = await client.query(
+        `SELECT id FROM gl_posting_period
+         WHERE $1::date BETWEEN period_start_date AND period_end_date
+         AND gl_status = 'OPEN' LIMIT 1`,
+        [header.doc_date]
+    );
+    if (periodRes.rows.length === 0)
+        throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่เอกสาร ${header.doc_date}`);
+    const periodId = periodRes.rows[0].id;
 
-        const status = action === 'Post' ? 'Posted' : 'Draft';
+    // Generate doc_no
+    let finalDocNo = header.doc_no;
+    if (!finalDocNo || finalDocNo === 'AUTO') {
+        finalDocNo = await generateDocNo(client, header.doc_id, header.doc_date, header.branch_id);
+        if (!finalDocNo) throw new Error('Auto numbering failed or manual doc_no required');
+    }
 
-        // Ensure date columns exist
-        await client.query(`
-            ALTER TABLE ar_transaction
-            ADD COLUMN IF NOT EXISTS billing_date DATE,
-            ADD COLUMN IF NOT EXISTS expected_payment_date DATE,
-            ADD COLUMN IF NOT EXISTS customer_po_no VARCHAR(50),
-            ADD COLUMN IF NOT EXISTS customer_po_date DATE,
-            ADD COLUMN IF NOT EXISTS price_includes_vat BOOLEAN NOT NULL DEFAULT false
-        `);
+    const status = action === 'Post' ? 'Posted' : 'Draft';
 
-        // Insert header
-        const headerSql = `
-            INSERT INTO ar_transaction
-            (doc_id, doc_no, doc_date, due_date, period_id,
-             customer_id, customer_code, customer_name_th,
-             ar_account_id, currency_id, currency_code, exchange_rate,
-             subtotal_fc, discount_amount_fc, before_vat_fc, vat_amount_fc, total_amount_fc,
-             subtotal_lc, discount_amount_lc, before_vat_lc, vat_amount_lc, total_amount_lc,
-             paid_amount_lc, balance_amount_lc,
-             ref_no, ref_doc_id, ref_doc_no, description, status,
-             dim1_id, dim2_id, dim3_id, dim4_id, dim5_id,
-             branch_id, created_by,
-             billing_date, expected_payment_date, customer_po_no, customer_po_date)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
-                    $13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
-                    $25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,
-                    $37,$38,$39,$40)
-            RETURNING id
-        `;
-        const hRes = await client.query(headerSql, [
-            header.doc_id, finalDocNo, header.doc_date, header.due_date || null, periodId,
-            header.customer_id, header.customer_code || null, header.customer_name_th || null,
-            header.ar_account_id || null, header.currency_id || null, header.currency_code || await getBaseCurrencyCode(client),
-            header.exchange_rate || 1,
-            header.subtotal_fc || 0, header.discount_amount_fc || 0,
-            header.before_vat_fc || 0, header.vat_amount_fc || 0, header.total_amount_fc || 0,
-            header.subtotal_lc || 0, header.discount_amount_lc || 0,
-            header.before_vat_lc || 0, header.vat_amount_lc || 0, header.total_amount_lc || 0,
-            0, header.total_amount_lc || 0,
-            header.ref_no || null, header.ref_doc_id || null, header.ref_doc_no || null,
-            header.description || null, status,
-            header.dim1_id || null, header.dim2_id || null,
-            header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
-            header.branch_id || null, header.created_by || null,
-            header.billing_date || null, header.expected_payment_date || null,
-            (header.customer_po_no || '').trim() || null, header.customer_po_date || null,
+    // Ensure date columns exist
+    await client.query(`
+        ALTER TABLE ar_transaction
+        ADD COLUMN IF NOT EXISTS billing_date DATE,
+        ADD COLUMN IF NOT EXISTS expected_payment_date DATE,
+        ADD COLUMN IF NOT EXISTS customer_po_no VARCHAR(50),
+        ADD COLUMN IF NOT EXISTS customer_po_date DATE,
+        ADD COLUMN IF NOT EXISTS price_includes_vat BOOLEAN NOT NULL DEFAULT false
+    `);
+
+    // Insert header
+    const headerSql = `
+        INSERT INTO ar_transaction
+        (doc_id, doc_no, doc_date, due_date, period_id,
+         customer_id, customer_code, customer_name_th,
+         ar_account_id, currency_id, currency_code, exchange_rate,
+         subtotal_fc, discount_amount_fc, before_vat_fc, vat_amount_fc, total_amount_fc,
+         subtotal_lc, discount_amount_lc, before_vat_lc, vat_amount_lc, total_amount_lc,
+         paid_amount_lc, balance_amount_lc,
+         ref_no, ref_doc_id, ref_doc_no, description, status,
+         dim1_id, dim2_id, dim3_id, dim4_id, dim5_id,
+         branch_id, created_by,
+         billing_date, expected_payment_date, customer_po_no, customer_po_date)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
+                $13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
+                $25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,
+                $37,$38,$39,$40)
+        RETURNING id
+    `;
+    const hRes = await client.query(headerSql, [
+        header.doc_id, finalDocNo, header.doc_date, header.due_date || null, periodId,
+        header.customer_id, header.customer_code || null, header.customer_name_th || null,
+        header.ar_account_id || null, header.currency_id || null, header.currency_code || await getBaseCurrencyCode(client),
+        header.exchange_rate || 1,
+        header.subtotal_fc || 0, header.discount_amount_fc || 0,
+        header.before_vat_fc || 0, header.vat_amount_fc || 0, header.total_amount_fc || 0,
+        header.subtotal_lc || 0, header.discount_amount_lc || 0,
+        header.before_vat_lc || 0, header.vat_amount_lc || 0, header.total_amount_lc || 0,
+        0, header.total_amount_lc || 0,
+        header.ref_no || null, header.ref_doc_id || null, header.ref_doc_no || null,
+        header.description || null, status,
+        header.dim1_id || null, header.dim2_id || null,
+        header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
+        header.branch_id || null, header.created_by || null,
+        header.billing_date || null, header.expected_payment_date || null,
+        (header.customer_po_no || '').trim() || null, header.customer_po_date || null,
+    ]);
+    const newHeaderId = hRes.rows[0].id;
+    await saveDocSalespersons(client, 'ar_transaction_salesperson', 'header_id', newHeaderId, salespersons);
+    // ราคาที่กรอกรวม VAT (ยอดที่เก็บทุกช่องเป็นยอดก่อน VAT เหมือนเดิม — ดู lib/utils/vat_calc.dart)
+    await client.query(`UPDATE ar_transaction SET price_includes_vat=$1 WHERE id=$2`, [header.price_includes_vat === true, newHeaderId]);
+    await saveArBillDiscount(client, newHeaderId, header);
+    // ใบมัดจำอ้างอิงใบสั่งขาย (utils/depositRef.js)
+    await saveDepositRef(client, 'ar', newHeaderId, header);
+
+    // Insert details — revenue_account_id = บัญชีที่ใช้ลงบัญชีของบรรทัด (เลือกได้ ค่าเริ่มต้นจากประเภทเอกสาร) + มิติของบรรทัด
+    await ensureDetailDimColumns(client, 'ar_transaction_detail');
+    const detailSql = `
+        INSERT INTO ar_transaction_detail
+        (header_id, line_no, item_code, item_name, description,
+         quantity, unit_code, unit_price_fc, discount_percent, discount_amount_fc,
+         subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
+         revenue_account_id, subtotal_lc, vat_amount_lc, total_amount_lc, is_deferred_vat,
+         dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, discount_text, line_discount_amount, bill_discount_amount)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)
+        RETURNING id
+    `;
+    let lineNo = 1;
+    for (const d of (details || [])) {
+        await client.query(detailSql, [
+            newHeaderId, lineNo++,
+            d.item_code || null, d.item_name || null, d.description || null,
+            d.quantity ?? 1, d.unit_code || null,
+            d.unit_price_fc || 0, d.discount_percent || 0, d.discount_amount_fc || 0,
+            d.subtotal_fc || 0, d.vat_type || 'VAT7', d.vat_rate ?? 7,
+            d.vat_amount_fc || 0, d.total_amount_fc || 0,
+            d.revenue_account_id || null,
+            d.subtotal_lc || 0, d.vat_amount_lc || 0, d.total_amount_lc || 0,
+            d.is_deferred_vat || false,
+            ...detailDimParams(d),
+            d.discount_text || null, Number(d.line_discount_amount) || 0, Number(d.bill_discount_amount) || 0,
         ]);
-        const newHeaderId = hRes.rows[0].id;
-        await saveDocSalespersons(client, 'ar_transaction_salesperson', 'header_id', newHeaderId, req.body.salespersons);
-        // ราคาที่กรอกรวม VAT (ยอดที่เก็บทุกช่องเป็นยอดก่อน VAT เหมือนเดิม — ดู lib/utils/vat_calc.dart)
-        await client.query(`UPDATE ar_transaction SET price_includes_vat=$1 WHERE id=$2`, [header.price_includes_vat === true, newHeaderId]);
-        await saveArBillDiscount(client, newHeaderId, header);
-        // ใบมัดจำอ้างอิงใบสั่งขาย (utils/depositRef.js)
-        await saveDepositRef(client, 'ar', newHeaderId, header);
+    }
 
-        // Insert details — revenue_account_id = บัญชีที่ใช้ลงบัญชีของบรรทัด (เลือกได้ ค่าเริ่มต้นจากประเภทเอกสาร) + มิติของบรรทัด
-        await ensureDetailDimColumns(client, 'ar_transaction_detail');
-        const detailSql = `
-            INSERT INTO ar_transaction_detail
-            (header_id, line_no, item_code, item_name, description,
-             quantity, unit_code, unit_price_fc, discount_percent, discount_amount_fc,
-             subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
-             revenue_account_id, subtotal_lc, vat_amount_lc, total_amount_lc, is_deferred_vat,
-             dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, discount_text, line_discount_amount, bill_discount_amount)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)
-            RETURNING id
-        `;
-        let lineNo = 1;
-        for (const d of (details || [])) {
-            await client.query(detailSql, [
-                newHeaderId, lineNo++,
-                d.item_code || null, d.item_name || null, d.description || null,
-                d.quantity ?? 1, d.unit_code || null,
-                d.unit_price_fc || 0, d.discount_percent || 0, d.discount_amount_fc || 0,
-                d.subtotal_fc || 0, d.vat_type || 'VAT7', d.vat_rate ?? 7,
-                d.vat_amount_fc || 0, d.total_amount_fc || 0,
-                d.revenue_account_id || null,
-                d.subtotal_lc || 0, d.vat_amount_lc || 0, d.total_amount_lc || 0,
-                d.is_deferred_vat || false,
-                ...detailDimParams(d),
-                d.discount_text || null, Number(d.line_discount_amount) || 0, Number(d.bill_discount_amount) || 0,
-            ]);
-        }
+    // Insert apply records (for Receipt/CN/DN-35) — invoice applies and advance deductions
+    for (const a of (applies || [])) {
+        const applyType = a.apply_type || 'invoice';
+        await client.query(`
+            INSERT INTO ar_transaction_apply
+            (transaction_id, applied_to_id, applied_amount_lc, applied_amount_fc, applied_date, apply_type, created_by)
+            VALUES ($1,$2,$3,$4,$5,$6,$7)
+        `, [newHeaderId, a.applied_to_id, a.applied_amount_lc || 0, a.applied_amount_fc || 0,
+            header.doc_date, applyType, header.created_by || null]);
 
-        // Insert apply records (for Receipt/CN/DN-35) — invoice applies and advance deductions
-        for (const a of (applies || [])) {
-            const applyType = a.apply_type || 'invoice';
-            await client.query(`
-                INSERT INTO ar_transaction_apply
-                (transaction_id, applied_to_id, applied_amount_lc, applied_amount_fc, applied_date, apply_type, created_by)
-                VALUES ($1,$2,$3,$4,$5,$6,$7)
-            `, [newHeaderId, a.applied_to_id, a.applied_amount_lc || 0, a.applied_amount_fc || 0,
-                header.doc_date, applyType, header.created_by || null]);
+    }
+    // Recalculate invoice balances (ใช้ applied_amount_fc × invoice.exchange_rate เพื่อความถูกต้องสำหรับ FC)
+    const createdAffectedIds = [...new Set(
+        (applies || []).filter(a => !['bc_invoice','bc_advance','bc_cn'].includes(a.apply_type || 'invoice'))
+                       .map(a => a.applied_to_id).filter(Boolean)
+    )];
+    // ใบแจ้งหนี้ที่หักมัดจำเอง — คำนวณยอดคงค้างของตัวเองด้วย
+    if ((applies || []).some(a => a.apply_type === 'inv_advance')) createdAffectedIds.push(newHeaderId);
+    await recalcInvoiceBalances(client, createdAffectedIds);
 
-        }
-        // Recalculate invoice balances (ใช้ applied_amount_fc × invoice.exchange_rate เพื่อความถูกต้องสำหรับ FC)
-        const createdAffectedIds = [...new Set(
-            (applies || []).filter(a => !['bc_invoice','bc_advance','bc_cn'].includes(a.apply_type || 'invoice'))
-                           .map(a => a.applied_to_id).filter(Boolean)
-        )];
-        // ใบแจ้งหนี้ที่หักมัดจำเอง — คำนวณยอดคงค้างของตัวเองด้วย
-        if ((applies || []).some(a => a.apply_type === 'inv_advance')) createdAffectedIds.push(newHeaderId);
-        await recalcInvoiceBalances(client, createdAffectedIds);
+    // Insert payment rows (ar_transaction_payment)
+    await ensurePaymentTable(client);
+    let pmLineNo = 1;
+    for (const p of (payments || [])) {
+        await client.query(`
+            INSERT INTO ar_transaction_payment
+            (header_id, line_no, payment_method_id, payment_method_code, payment_method_name,
+             payment_method_type, cm_bank_account_id, gl_account_id,
+             amount_lc, amount_fc, ref_no, payment_date, remark,
+             drawer_bank_name, drawer_bank_branch, drawer_account_no,
+             card_type, card_last4, approval_code, terminal_id, batch_no,
+             created_by)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+        `, [
+            newHeaderId, pmLineNo++,
+            p.payment_method_id || null, p.payment_method_code || null, p.payment_method_name || null,
+            p.payment_method_type || 'CASH', p.cm_bank_account_id || null, p.gl_account_id || null,
+            p.amount_lc || 0, p.amount_fc || 0,
+            p.ref_no || null, p.payment_date || header.doc_date, p.remark || null,
+            p.drawer_bank_name || null, p.drawer_bank_branch || null, p.drawer_account_no || null,
+            p.card_type || null, p.card_last4 || null, p.approval_code || null,
+            p.terminal_id || null, p.batch_no || null,
+            header.created_by || null
+        ]);
+    }
+    const savedWhts = await saveArWhts(client, newHeaderId, header.doc_id, whts);
 
-        // Insert payment rows (ar_transaction_payment)
-        await ensurePaymentTable(client);
-        let pmLineNo = 1;
-        for (const p of (payments || [])) {
-            await client.query(`
-                INSERT INTO ar_transaction_payment
-                (header_id, line_no, payment_method_id, payment_method_code, payment_method_name,
-                 payment_method_type, cm_bank_account_id, gl_account_id,
-                 amount_lc, amount_fc, ref_no, payment_date, remark,
-                 drawer_bank_name, drawer_bank_branch, drawer_account_no,
-                 card_type, card_last4, approval_code, terminal_id, batch_no,
-                 created_by)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
-            `, [
-                newHeaderId, pmLineNo++,
-                p.payment_method_id || null, p.payment_method_code || null, p.payment_method_name || null,
-                p.payment_method_type || 'CASH', p.cm_bank_account_id || null, p.gl_account_id || null,
-                p.amount_lc || 0, p.amount_fc || 0,
-                p.ref_no || null, p.payment_date || header.doc_date, p.remark || null,
-                p.drawer_bank_name || null, p.drawer_bank_branch || null, p.drawer_account_no || null,
-                p.card_type || null, p.card_last4 || null, p.approval_code || null,
-                p.terminal_id || null, p.batch_no || null,
-                header.created_by || null
-            ]);
-        }
+    // Post: create GL entry & VAT records
+    let glEntryId = null;
+    if (action === 'Post') {
+        const sysDocTypeRes1 = await client.query(
+            `SELECT sys_doc_type FROM sa_module_document WHERE id = $1 LIMIT 1`, [header.doc_id]
+        );
+        const sysDocType1 = sysDocTypeRes1.rows[0]?.sys_doc_type || '';
+        const isBcPost = sysDocType1 === '70'; // BC ไม่ลงบัญชี GL
 
-        // Post: create GL entry & VAT records
-        let glEntryId = null;
-        if (action === 'Post') {
-            const sysDocTypeRes1 = await client.query(
-                `SELECT sys_doc_type FROM sa_module_document WHERE id = $1 LIMIT 1`, [header.doc_id]
-            );
-            const sysDocType1 = sysDocTypeRes1.rows[0]?.sys_doc_type || '';
-            const isBcPost = sysDocType1 === '70'; // BC ไม่ลงบัญชี GL
-
-            if (!isBcPost) {
-                const headerWithDocNo = { ...header, doc_no: finalDocNo, _applies: applies || [], _payments: payments || [] };
-                glEntryId = await postGlEntry(client, newHeaderId, headerWithDocNo, details || [], finalDocNo);
-                await insertVtRecords(client, newHeaderId, headerWithDocNo, details || [], sysDocType1);
-                for (const part of headerWithDocNo._depositParts || []) await insertDepositVtReversal(client, newHeaderId, headerWithDocNo, part);
-                await insertDeferredVtRecordsForReceipt(client, newHeaderId, headerWithDocNo, applies || []);
-                await client.query(`UPDATE ar_transaction SET gl_entry_id=$1 WHERE id=$2`, [glEntryId, newHeaderId]);
-                // Post CM receipt records for Receipt documents
-                if (['60', '65', '80'].includes(sysDocType1)) await postCmReceiptsHelper(client, newHeaderId, glEntryId);
-                // DN-35, CN-55, RDP-65 ไม่มียอดค้างชำระตัวเอง
-                if (['35', '55', '65'].includes(sysDocType1)) {
-                    await client.query(`UPDATE ar_transaction SET balance_amount_lc=0 WHERE id=$1`, [newHeaderId]);
-                }
-            }
-            // Receipt ที่ระบุเลขที่ใบวางบิล (BC) ใน ref_no → เคลียร์ยอดวางบิล
-            if (sysDocType1 === '80' && header.ref_no) {
-                await client.query(`
-                    UPDATE ar_transaction t SET balance_amount_lc = 0, updated_at = NOW()
-                    FROM sa_module_document d
-                    WHERE t.doc_id = d.id AND d.sys_doc_type = '70'
-                      AND t.doc_no = $1 AND t.status = 'Posted'
-                `, [header.ref_no]);
+        if (!isBcPost) {
+            const headerWithDocNo = { ...header, doc_no: finalDocNo, _applies: applies || [], _payments: payments || [], _whts: savedWhts };
+            glEntryId = await postGlEntry(client, newHeaderId, headerWithDocNo, details || [], finalDocNo);
+            await insertVtRecords(client, newHeaderId, headerWithDocNo, details || [], sysDocType1);
+            for (const part of headerWithDocNo._depositParts || []) await insertDepositVtReversal(client, newHeaderId, headerWithDocNo, part);
+            await insertDeferredVtRecordsForReceipt(client, newHeaderId, headerWithDocNo, applies || []);
+            await client.query(`UPDATE ar_transaction SET gl_entry_id=$1 WHERE id=$2`, [glEntryId, newHeaderId]);
+            // Post CM receipt records for Receipt documents
+            if (['60', '65', '80'].includes(sysDocType1)) await postCmReceiptsHelper(client, newHeaderId, glEntryId);
+            // DN-35, CN-55, RDP-65 ไม่มียอดค้างชำระตัวเอง
+            if (['35', '55', '65'].includes(sysDocType1)) {
+                await client.query(`UPDATE ar_transaction SET balance_amount_lc=0 WHERE id=$1`, [newHeaderId]);
             }
         }
+        // Receipt ที่ระบุเลขที่ใบวางบิล (BC) ใน ref_no → เคลียร์ยอดวางบิล
+        if (sysDocType1 === '80' && header.ref_no) {
+            await client.query(`
+                UPDATE ar_transaction t SET balance_amount_lc = 0, updated_at = NOW()
+                FROM sa_module_document d
+                WHERE t.doc_id = d.id AND d.sys_doc_type = '70'
+                  AND t.doc_no = $1 AND t.status = 'Posted'
+            `, [header.ref_no]);
+        }
+    }
 
+    return { id: newHeaderId, doc_no: finalDocNo };
+};
+
+const createTransaction = async (req, res) => {
+    const { header, details, applies, payments, whts, action } = req.body; // action: 'Draft' | 'Post'
+    await ensureArCreateSchema(req.dbPool);
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        const r = await insertArTransaction(client, { header, details, applies, payments, whts, salespersons: req.body.salespersons, action });
         await client.query('COMMIT');
-        res.status(201).json({ message: 'Success', id: newHeaderId, doc_no: finalDocNo });
+        res.status(201).json({ message: 'Success', id: r.id, doc_no: r.doc_no });
     } catch (err) {
         await client.query('ROLLBACK');
         sendArError(res, err);
@@ -1349,7 +1431,7 @@ const createTransaction = async (req, res) => {
 // --- 2. Update Transaction (Draft only) ---
 const updateTransaction = async (req, res) => {
     const { id } = req.params;
-    const { header, details, applies, payments, action } = req.body;
+    const { header, details, applies, payments, whts, action } = req.body;
     await ensureArSalesperson(req.dbPool);
     await ensureCreditSchema(req.dbPool);
     await ensureArDiscountColumns(req.dbPool);
@@ -1495,6 +1577,7 @@ const updateTransaction = async (req, res) => {
                 header.updated_by || null
             ]);
         }
+        const savedWhts = await saveArWhts(client, id, header.doc_id, whts);
 
         // คำนวณยอดคงค้างของเอกสารที่ apply เดิม (ก่อนลบ) และ apply ใหม่อ้างถึง
         await recalcInvoiceBalances(client, [
@@ -1515,7 +1598,7 @@ const updateTransaction = async (req, res) => {
             if (!isBcUpdate) {
                 const docNoRes = await client.query('SELECT doc_no, gl_doc_no FROM ar_transaction WHERE id=$1', [id]);
                 const docNo = docNoRes.rows[0].doc_no;
-                const headerWithDocNo = { ...header, doc_no: docNo, _applies: applies || [], _payments: payments || [] };
+                const headerWithDocNo = { ...header, doc_no: docNo, _applies: applies || [], _payments: payments || [], _whts: savedWhts };
                 glEntryId = await postGlEntry(client, id, headerWithDocNo, details || [], docNo, docNoRes.rows[0].gl_doc_no);
                 await insertVtRecords(client, id, headerWithDocNo, details || [], sysDocType2);
                 for (const part of headerWithDocNo._depositParts || []) await insertDepositVtReversal(client, id, headerWithDocNo, part);
@@ -1902,6 +1985,9 @@ const fetchRow = async (req, res) => {
             console.warn('ar_transaction_payment query failed (table may not exist):', e.message);
         }
 
+        await ensureArWhtTable(req.dbPool);
+        const whtRows = (await req.dbPool.query(`SELECT * FROM ar_transaction_wht WHERE header_id=$1 ORDER BY line_no, id`, [id])).rows;
+
         const info = (await queryARReverseInfo(req.dbPool, id)).rows[0];
         const rBlock = info ? getArReverseBlock(info) : null;
         const vBlock = info ? getArVoidBlock(info) : null;
@@ -1912,7 +1998,7 @@ const fetchRow = async (req, res) => {
         const creditApprovals = await loadCreditApprovals(req.dbPool, 'AR', Number(id));
 
         res.json({
-            header: hRes.rows[0], details: detailsRes.rows, applies: appliesRes.rows, payments: paymentsRows,
+            header: hRes.rows[0], details: detailsRes.rows, applies: appliesRes.rows, payments: paymentsRows, whts: whtRows,
             reverse_block: rBlock ? rBlock.code : null,
             reverse_block_ref: rBlock ? (rBlock.ref || null) : null,
             void_block: vBlock ? vBlock.code : null,
@@ -2117,11 +2203,12 @@ const fetchBillCollectionByDocNo = async (req, res) => {
 };
 
 module.exports = {
-    createTransaction,
+    createTransaction, insertArTransaction, ensureArCreateSchema,
     updateTransaction,
     voidTransaction,
     voidArDocument,
     buildInvAdvanceGl, insertDepositVtReversal, recalcInvoiceBalances,
+    ensureArWhtTable, saveArWhts,
     getArVoidBlockById,
     getArLinkedState,
     generateDocNo,

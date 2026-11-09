@@ -16,7 +16,7 @@ const { IM_EFFECTIVE_TX, IM_EFFECTIVE_DOC_NO } = require('./imEffectiveTxSql');
 'use strict';
 
 const RECEIVE_TYPES  = ['10', '11', '12', '13', '25', '35', '40']; // GRN, GRB, GRP, Consignment Receipt, DNS, RTC, CNC
-const ISSUE_TYPES     = ['30', '31', '32', '20', '45', '15']; // DLN, DLB, DLP, CNS, DNC, RTS
+const ISSUE_TYPES     = ['30', '31', '32', '33', '20', '45', '15']; // DLN, DLB, DLP, ขายเงินสด, CNS, DNC, RTS
 const WITHDRAW_TYPE   = '60'; // ISS
 const TRANSFER_TYPE   = '70'; // TRF
 const ADJUST_TYPE     = '80'; // AJS

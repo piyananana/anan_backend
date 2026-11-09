@@ -19,6 +19,7 @@ const arBulkBillingController         = require('../controllers/ar/arBulkBilling
 const arReceiptPaymentReportController = require('../controllers/ar/arReceiptPaymentReportController');
 const arCreditLimitReportController    = require('../controllers/ar/arCreditLimitReportController');
 const arFxGainLossReportController     = require('../controllers/ar/arFxGainLossReportController');
+const arWhtReportController            = require('../controllers/ar/arWhtReportController');
 const arResetController          = require('../controllers/ar/arResetController');
 const arYearEndSetupController   = require('../controllers/ar/arYearEndSetupController');
 const arPreCloseCheckController  = require('../controllers/ar/arPreCloseCheckController');
@@ -95,6 +96,7 @@ router.get('/ar_transaction_report',       arTransactionReportController.getTran
 router.get('/ar_movement_report',      arMovementReportController.getMovementReport);
 router.get('/ar_billing_plan_report',   arBillingPlanReportController.getBillingPlanReport);
 router.get('/ar_billing_status_report',   arBillingStatusReportController.getBillingStatusReport);
+router.get('/ar_wht_report',              arWhtReportController.fetchWhtReport);
 router.get('/ar_receipt_payment_report', arReceiptPaymentReportController.getReceiptPaymentReport);
 router.get('/ar_credit_limit_report',   arCreditLimitReportController.getCreditLimitReport);
 router.get('/ar_fx_gain_loss_report',   arFxGainLossReportController.getFxGainLossReport);

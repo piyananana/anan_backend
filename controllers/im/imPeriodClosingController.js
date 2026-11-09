@@ -102,7 +102,7 @@ const ensureImPeriodClosingTable = async (client) => {
 };
 
 const POSTED_STATUSES = `('Posted','Received','Delivered')`; // เอกสารที่ขยับสต็อกแล้ว (Void คืนสต็อกไปแล้ว ไม่นับ)
-const COGS_TYPES = ['30', '31', '32', '35', '40', '45', '60'];
+const COGS_TYPES = ['30', '31', '32', '33', '35', '40', '45', '60'];
 const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 const unitKey = (itemId, whId) => `${itemId}|${whId}`;
 

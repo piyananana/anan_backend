@@ -10,7 +10,8 @@ const { ensureImLocationTable } = require('./imLocationController');
 const { ensureImUomTable } = require('./imUomController');
 const { ensureImStockBalanceTable } = require('./imStockBalanceController');
 const { ensureImStockLayerTable } = require('./imStockLayerController');
-const { fetchSetupByDocCode, resolveTargetDoc } = require('./imGlAccountSetupController');
+const { fetchSetupByDocCode, resolveTargetDoc, resolveReceiptDoc, ensureImGlAccountSetupTable } = require('./imGlAccountSetupController');
+const { deleteBankItems } = require('../../utils/cmBankItems');
 const { fetchMode } = require('./imAccountingSettingController');
 const { resolveItemModes } = require('../../utils/imAccountingMode');
 const { fetchMoGlSetup } = require('../mo/moGlAccountSetupController');
@@ -304,6 +305,7 @@ const ensureImTransactionTable = async (client) => {
             applied_amount_fc NUMERIC(18,2) NOT NULL
         )
     `);
+    await ensureCashSaleSchema(client);
 
     // audit ของการตัดต้นทุนจาก layer เดิม (FIFO/SPECIFIC เมื่อ variance ติดลบ) — ใช้ตอน Void เพื่อคืนค่า remaining_qty ให้ตรงเป๊ะ
     await client.query(`
@@ -503,13 +505,13 @@ const resolveRevenueAccount = async (client, itemId, fallbackAccountId) => {
 };
 
 // ประเภทเอกสาร IM ที่บัญชีคู่เป็นต้นทุน — แยกบรรทัดตามบัญชีต้นทุนของแต่ละสินค้า
-const COGS_COUNTER_TYPES = ['30', '31', '32', '35', '40', '45', '60'];
+const COGS_COUNTER_TYPES = ['30', '31', '32', '33', '35', '40', '45', '60'];
 
 // ประเภทเอกสารที่ลงบัญชีทุกบรรทัดไม่ว่าโหมดใด (บรรทัด Periodic ใช้บัญชีซื้อแทนบัญชีสต็อก) — ประเภทอื่น (ขาย คืน เบิก
 // ปรับยอด) ลงเฉพาะบรรทัด Perpetual เพราะต้นทุนของสต็อก Periodic คำนวณตอนปิดงวด
 const ALWAYS_POST_TYPES = ['10', '13', '90', '95'];
 // ประเภทเอกสารฝั่งขายที่ใส่สินค้าบริการ/ไม่นับสต็อกได้ (user decision 2026-11-08)
-const NON_STOCK_DOC_TYPES = ['30', '31', '32', '35', '40', '45'];
+const NON_STOCK_DOC_TYPES = ['30', '31', '32', '33', '35', '40', '45'];
 
 // หลังบันทึกบรรทัด: ตั้ง is_non_stock ตามประเภทสินค้า — บรรทัดไม่นับสต็อกไม่มีตำแหน่ง/ล็อต/ซีเรียล และจำนวนที่กรอก
 // เก็บเป็น counted_qty ล้วน (system_qty = 0) เพราะไม่มียอดคงเหลือ ประเภทเอกสารอื่นใช้สินค้าไม่นับสต็อกไม่ได้
@@ -534,7 +536,7 @@ const markNonStockLines = async (client, headerId) => {
         WHERE header_id = $1 AND is_non_stock`, [headerId]);
 };
 // เอกสารขายที่มีราคา — ส่วนลดขั้นบันได/ส่วนลดเงิน/ส่วนลดท้ายบิล (user request 2026-11-08)
-const SALES_DISCOUNT_TYPES = ['30', '31', '32', '35', '40', '45'];
+const SALES_DISCOUNT_TYPES = ['30', '31', '32', '33', '35', '40', '45'];
 const imLineQty = (d) => (d.qty != null && Number(d.qty) !== 0 ? Number(d.qty) : (Number(d.counted_qty) || 0) - (Number(d.system_qty) || 0));
 // คำขอจากผู้เรียกเดิม (ส่งแค่ discount_percent ไม่มี discount_text) → ถือ % นั้นเป็นส่วนลดขั้นเดียว
 const legacyStepText = (d) => {
@@ -857,6 +859,7 @@ const resolveCounterAccount = (sysDocType, setup) => {
         case '30': // DLN — ส่งสินค้า (ธรรมดา/พร้อมตั้งหนี้/รอตั้งหนี้): รับรู้เป็นต้นทุนขาย ใช้บัญชีเดียวกับ ISS
         case '31':
         case '32':
+        case '33': // ขายเงินสด
         case '35': // รับคืนสินค้า (RTC) / ลดหนี้ลูกหนี้ (CNC) / เพิ่มหนี้ลูกหนี้ (DNC) — กลับรายการต้นทุนขายเดียวกัน
         case '40': // (บวก=คืนของ ลด COGS, ลบ=ส่งเพิ่ม เพิ่ม COGS — ทิศทางมาจากเครื่องหมายของ qty ใน postGlEntry เอง)
         case '45': // บัญชีจริงต่อบรรทัด: สินค้า → หมวดสินค้า → setup (ดู resolveCogsAccount)
@@ -1100,8 +1103,10 @@ const insertImVtLine = async (client, {
     moduleCode, vatType, vatRate, docId, headerId, detailId, docNo, docDate,
     baseLc, vatLc, entityIdField, entityId, entityName, entityTaxId, createdByUserId, vatSign,
     baseFc = baseLc, vatFc = vatLc, currencyId = null, exchangeRate = 1, taxInvoiceNo = null, taxInvoiceDate = null,
+    entityBranchCode, // ส่งมา = สาขาตามที่ระบุในเอกสาร (ผู้ซื้อขายเงินสด) แทนสาขาของลูกค้า
 }) => {
     if (!vatType || vatType === 'NOVAT' || Number(vatLc) === 0) return;
+    const ownBranch = entityBranchCode !== undefined;
     await client.query(`
         INSERT INTO vt_transaction
         (module_code, vat_type, doc_id, source_header_id, source_detail_id,
@@ -1110,7 +1115,7 @@ const insertImVtLine = async (client, {
          currency_id, exchange_rate, ${entityIdField}, entity_name, entity_tax_id, entity_branch_code, created_by,
          tax_invoice_no, tax_invoice_date)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$15,$16,$17,$18,$11,$12,$13,
-                ${branchCodeSql(entityIdField === 'customer_id' ? 'ar_customer' : 'ap_vendor', '$11')},$14,$19,$20)
+                ${ownBranch ? '$21' : branchCodeSql(entityIdField === 'customer_id' ? 'ar_customer' : 'ap_vendor', '$11')},$14,$19,$20)
     `, [
         moduleCode, vatType, docId, headerId, detailId,
         docNo, docDate, vatRate,
@@ -1118,6 +1123,7 @@ const insertImVtLine = async (client, {
         entityId, entityName || '', entityTaxId || null, createdByUserId,
         baseFc * vatSign, vatFc * vatSign, currencyId || 1, Number(exchangeRate) || 1,
         taxInvoiceNo || null, taxInvoiceDate || null,
+        ...(ownBranch ? [entityBranchCode || null] : []),
     ]);
 };
 
@@ -1437,6 +1443,11 @@ const postArBillFromDln = async (client, { header, details, docNo, advances = []
     `, [header.customer_id]);
     const customerRow = customerRes.rows[0];
     if (!customerRow) throw new Error('ไม่พบลูกค้าที่ระบุ');
+    // ขายเงินสด: ผู้ซื้อที่ระบุในเอกสาร (ชื่อ/เลขผู้เสียภาษี/สาขา) ใช้แทนข้อมูลลูกค้าเงินสดในใบแจ้งหนี้และรายงานภาษีขาย
+    const billTo = cleanBillTo(header);
+    const entityName = billTo.bill_to_name || customerRow.customer_name_th;
+    const entityTaxId = billTo.bill_to_name ? billTo.bill_to_tax_id : customerRow.tax_id;
+    const entityBranchCode = billTo.bill_to_name ? billTo.bill_to_branch : undefined;
 
     // บัญชีลูกหนี้ — ลำดับเดียวกับ postGlEntry ของ AR: ลูกค้า > กลุ่มลูกค้า > ประเภทเอกสาร AR (utils/arAccount.js)
     const arAccountId = await resolveArAccountId(client, { customerId: header.customer_id, docId: arDocId });
@@ -1505,7 +1516,7 @@ const postArBillFromDln = async (client, { header, details, docNo, advances = []
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$20,$21,$25,$22,$23,$24,$26,$9,$10,$11,$11,$12,$13,$14,$15,'Posted',$16,$16,$17,$18,$19,$27,$28,$29)
         RETURNING id
     `, [
-        arDocId, arDocNo, header.doc_date, periodId, header.customer_id, customerRow.customer_code, customerRow.customer_name_th,
+        arDocId, arDocNo, header.doc_date, periodId, header.customer_id, customerRow.customer_code, entityName,
         arAccountId,
         totalSubtotal, totalVat, totalAmount,
         header.ref_no || null, header.doc_id, docNo, `ใบแจ้งหนี้จากการส่งสินค้า ${docNo}`, createdByUserId,
@@ -1516,6 +1527,7 @@ const postArBillFromDln = async (client, { header, details, docNo, advances = []
     ]);
     const arTransactionId = arHeaderRes.rows[0].id;
     await setAutoDocDims(client, 'ar_transaction', arTransactionId, header);
+    if (billTo.bill_to_name) await saveArBillTo(client, arTransactionId, billTo);
     await ensureArDiscountColumns(client);
     await client.query(`UPDATE ar_transaction SET bill_discount_percent=$1, cash_discount_amount=$2 WHERE id=$3`,
         [Number(header.bill_discount_percent) || 0, Number(header.cash_discount_amount) || 0, arTransactionId]);
@@ -1536,7 +1548,7 @@ const postArBillFromDln = async (client, { header, details, docNo, advances = []
             detailId: detailRes.rows[0].id, docNo: arDocNo, docDate: header.doc_date,
             baseLc: l.subtotal, vatLc: l.vatAmount, entityIdField: 'customer_id', entityId: header.customer_id,
             baseFc: l.subtotalFc, vatFc: l.vatFc, currencyId: header.currency_id, exchangeRate: docExchangeRate,
-            entityName: customerRow.customer_name_th, entityTaxId: customerRow.tax_id, createdByUserId, vatSign: 1,
+            entityName, entityTaxId, entityBranchCode, createdByUserId, vatSign: 1,
         });
     }
 
@@ -1571,8 +1583,8 @@ const postArBillFromDln = async (client, { header, details, docNo, advances = []
     const adv = await applyImAdvances(client, {
         module: 'AR', advances, billId: arTransactionId, billTotalFc: totalAmountFc, setup: arSetup, vatAccountId, createdBy: header.created_by,
         billHeader: { doc_id: arDocId, doc_no: arDocNo, doc_date: header.doc_date, currency_id: await resolveDocCurrencyId(client, header), currency_code: docCurrencyCode,
-            exchange_rate: docExchangeRate, customer_id: header.customer_id, customer_name_th: customerRow.customer_name_th,
-            customer_tax_id: customerRow.tax_id, created_by: createdByUserId },
+            exchange_rate: docExchangeRate, customer_id: header.customer_id, customer_name_th: entityName,
+            customer_tax_id: entityTaxId, created_by: createdByUserId },
     });
     if (adv) {
         const arLine = arGlDetails.find(l => l.account_id === arAccountId && l.debit_lc > 0);
@@ -2186,7 +2198,7 @@ const postDetailLines = async (client, headerId, header, docNo) => {
             touchedPoIds.add(poTransactionId);
         }
         // DLN ('30'/'31'/'32') ที่อ้างอิงบรรทัด SO — มิเรอร์ GRN/PO block ข้างบนทุกประการ ฝั่งขาย
-        if (['30', '31', '32'].includes(sysDocType) && d.ref_so_detail_id) {
+        if (['30', '31', '32', '33'].includes(sysDocType) && d.ref_so_detail_id) {
             const { soTransactionId } = await validateSoDeliverableQty(client, {
                 refSoDetailId: d.ref_so_detail_id, requestedQty: Math.abs(varianceQty), customerId: header.customer_id,
                 currencyCode: header.currency_code || await getBaseCurrencyCode(client),
@@ -2257,6 +2269,7 @@ const postDetailLines = async (client, headerId, header, docNo) => {
     let glEntryId = null;
     let linkedApTransactionId = null;
     let linkedArTransactionId = null;
+    let linkedArReceiptId = null;
     if (sysDocType === '11') {
         // ตั้งหนี้ตามราคาที่กรอก ไม่ใช่ต้นทุนสต็อก (สินค้า STANDARD ตีมูลค่าสต็อกที่ต้นทุนมาตรฐาน) — ส่วนต่างระหว่าง
         // ราคาซื้อกับมูลค่าสต็อกลงบัญชีผลต่างต้นทุนใน postApBillFromGrn (กลไกเดียวกับ '12' ตอน Post AP/GL)
@@ -2299,14 +2312,22 @@ const postDetailLines = async (client, headerId, header, docNo) => {
         linkedArTransactionId = await postArCreditDebitNoteFromIm(client, {
             header, details: updatedDetails, docNo, isCredit: false,
         });
-    } else if (sysDocType === '31') {
+    } else if (sysDocType === '31' || sysDocType === CASH_SALE_TYPE) {
         // DLN Billing — ต้นทุนขาย (Dr COGS/Cr คลัง) ถูกระงับใน Periodic เหมือน '30'/ISS ทุกประการ (คำนวณรวมตอนปิดงวด
         // แทน) แต่ใบแจ้งหนี้ลูกหนี้ (Dr AR/Cr รายได้+ภาษี) ต้อง Post เสมอไม่ว่าโหมดใด เพราะเป็นภาระผูกพันจริงกับลูกค้า
         // ไม่ใช่การตีมูลค่าสต็อก — มิเรอร์ '11' ที่ ap_transaction ก็ Post เสมอไม่สนโหมดเช่นกัน
+        // ขายเงินสด ('33') ลงต้นทุนขายทางเดียวกันทุกประการ + ใบเสร็จรับชำระ AR อัตโนมัติที่ตัดใบแจ้งหนี้นั้น
         if (needsImGl(sysDocType, updatedDetails)) {
             glEntryId = await postGlEntry(client, headerId, header, updatedDetails, docNo, sysDocType);
         }
-        linkedArTransactionId = await postArBillFromDln(client, { header, details: updatedDetails, docNo, advances: await loadImAdvances(client, headerId) });
+        const advances = await loadImAdvances(client, headerId);
+        if (sysDocType === '31') {
+            linkedArTransactionId = await postArBillFromDln(client, { header, details: updatedDetails, docNo, advances });
+        } else {
+            const csHeader = { ...header, ...(await loadCashSaleHeader(client, headerId)) };
+            linkedArTransactionId = await postArBillFromDln(client, { header: csHeader, details: updatedDetails, docNo, advances });
+            linkedArReceiptId = await postArReceiptForCashSale(client, { headerId, header: csHeader, invoiceId: linkedArTransactionId, docNo });
+        }
     } else if (sysDocType === '32') {
         // DLN รอตั้งหนี้ — Stage 1 (Post IM): ต้นทุนขาย Post ทันที (มิเรอร์ '30', ระงับเฉพาะใน Periodic) เพราะต้นทุน
         // คำนวณจาก stock ledger เอง ไม่ขึ้นกับราคาขาย/ใบแจ้งหนี้ที่ยังไม่ออกเลย — ต่างจาก GRN '12' ที่ราคาซื้อจากผู้ขาย
@@ -2335,6 +2356,9 @@ const postDetailLines = async (client, headerId, header, docNo) => {
         UPDATE im_transaction SET status='Posted', gl_entry_id=$1, linked_ap_transaction_id=$2, linked_ar_transaction_id=$3,
             total_qty=$4, total_value_lc=$5, updated_at=NOW() WHERE id=$6
     `, [glEntryId, linkedApTransactionId, linkedArTransactionId, totalQty, totalValue, headerId]);
+    if (linkedArReceiptId) {
+        await client.query(`UPDATE im_transaction SET linked_ar_receipt_id=$1 WHERE id=$2`, [linkedArReceiptId, headerId]);
+    }
     if (linkedArTransactionId) {
         await copyImSalespersonsToAr(client, headerId, linkedArTransactionId);
     }
@@ -2349,6 +2373,197 @@ const postDetailLines = async (client, headerId, header, docNo) => {
         await refreshMoStatus(client, moId);
     }
     return glEntryId;
+};
+
+// ===== ขายเงินสด ('33') =====
+// ต้นทุนขายเหมือน '31' ทุกประการ + ใบแจ้งหนี้ AR (postArBillFromDln) + ใบเสร็จรับชำระ AR ที่ตัดใบแจ้งหนี้นั้นเต็มยอดคงค้าง
+// (หลังหักมัดจำ) ในการ Post ครั้งเดียว — วิธีรับชำระ/ภาษีถูกหัก ณ ที่จ่าย เก็บที่เอกสาร IM จนถึงตอน Post
+// ผู้ซื้อ (bill_to_*) ทับข้อมูลลูกค้าเงินสดในใบแจ้งหนี้ ใบเสร็จ และรายงานภาษีขาย; เงินที่รับมา/เงินทอน เก็บไว้พิมพ์
+const CASH_SALE_TYPE = '33';
+const BILL_TO_COLS = `ADD COLUMN IF NOT EXISTS bill_to_name VARCHAR(200), ADD COLUMN IF NOT EXISTS bill_to_address TEXT,
+        ADD COLUMN IF NOT EXISTS bill_to_tax_id VARCHAR(20), ADD COLUMN IF NOT EXISTS bill_to_branch VARCHAR(10)`;
+const ensureCashSaleSchema = async (db) => {
+    await db.query(`ALTER TABLE im_transaction ${BILL_TO_COLS},
+        ADD COLUMN IF NOT EXISTS cash_received NUMERIC(18,2) NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS change_amount NUMERIC(18,2) NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS linked_ar_receipt_id INTEGER,
+        ADD COLUMN IF NOT EXISTS linked_ar_receipt_doc_no VARCHAR(50)`);
+    await db.query(`ALTER TABLE ar_transaction ${BILL_TO_COLS}`);
+    await db.query(`
+        CREATE TABLE IF NOT EXISTS im_transaction_payment (
+            id                  SERIAL PRIMARY KEY,
+            header_id           INTEGER NOT NULL REFERENCES im_transaction(id) ON DELETE CASCADE,
+            line_no             INTEGER NOT NULL DEFAULT 1,
+            payment_method_id   INTEGER REFERENCES cm_payment_method(id),
+            payment_method_code VARCHAR(50),
+            payment_method_name VARCHAR(200),
+            payment_method_type VARCHAR(30) NOT NULL DEFAULT 'CASH',
+            cm_bank_account_id  INTEGER REFERENCES cm_bank_account(id),
+            gl_account_id       INTEGER REFERENCES gl_account(id),
+            amount_fc           NUMERIC(18,4) NOT NULL DEFAULT 0,
+            ref_no              VARCHAR(100),
+            remark              TEXT,
+            drawer_bank_name    VARCHAR(100),
+            drawer_bank_branch  VARCHAR(100),
+            drawer_account_no   VARCHAR(50),
+            card_type           VARCHAR(20),
+            card_last4          CHAR(4),
+            approval_code       VARCHAR(20),
+            terminal_id         VARCHAR(20),
+            batch_no            VARCHAR(20)
+        )`);
+    // ยอดเป็นสกุลเงินบาทเหมือน ar_transaction_wht
+    await db.query(`
+        CREATE TABLE IF NOT EXISTS im_transaction_wht (
+            id             SERIAL PRIMARY KEY,
+            header_id      INTEGER NOT NULL REFERENCES im_transaction(id) ON DELETE CASCADE,
+            line_no        INTEGER NOT NULL DEFAULT 1,
+            wht_type_id    INTEGER REFERENCES cd_wht_type(id) ON DELETE SET NULL,
+            wht_code       VARCHAR(20),
+            wht_name       VARCHAR(200),
+            income_type    VARCHAR(20),
+            wht_rate       NUMERIC(5,2),
+            base_amount_lc NUMERIC(18,4) NOT NULL DEFAULT 0,
+            wht_amount_lc  NUMERIC(18,4) NOT NULL DEFAULT 0,
+            certificate_no VARCHAR(50),
+            description    TEXT
+        )`);
+};
+const cleanBillTo = (h) => {
+    const t = (v) => (v == null ? '' : String(v)).trim() || null;
+    return { bill_to_name: t(h.bill_to_name), bill_to_address: t(h.bill_to_address), bill_to_tax_id: t(h.bill_to_tax_id), bill_to_branch: t(h.bill_to_branch) };
+};
+const saveArBillTo = (client, arId, b) => client.query(
+    `UPDATE ar_transaction SET bill_to_name=$1, bill_to_address=$2, bill_to_tax_id=$3, bill_to_branch=$4 WHERE id=$5`,
+    [b.bill_to_name, b.bill_to_address, b.bill_to_tax_id, b.bill_to_branch, arId]);
+// ไม่ระบุลูกค้า = ลูกค้าเงินสดที่ตั้งไว้ที่ประเภทเอกสาร (หน้าตั้งค่าบัญชี IM)
+const defaultCashCustomer = async (client, docId) => {
+    await ensureImGlAccountSetupTable(client);
+    const r = await client.query(`
+        SELECT s.default_customer_id FROM sa_module_document d JOIN im_gl_account_setup s ON s.doc_code = d.doc_code WHERE d.id = $1`, [docId]);
+    return r.rows[0]?.default_customer_id || null;
+};
+// บันทึกข้อมูลขายเงินสด — ประเภทอื่นไม่เก็บ; payments/whts ที่ไม่ได้ส่งมา (undefined) ไม่แตะของเดิม
+// วิธีรับชำระกรอกเป็นสกุลเงินเอกสาร (amount_fc), ภาษีถูกหัก ณ ที่จ่ายเป็นเงินบาท (wht_amount_lc) เหมือนใบเสร็จ AR
+const saveImCashSale = async (client, headerId, { header = {}, payments, whts } = {}) => {
+    const t = (await client.query(`
+        SELECT d.sys_doc_type FROM im_transaction t JOIN sa_module_document d ON d.id = t.doc_id WHERE t.id = $1`, [headerId])).rows[0];
+    if (t?.sys_doc_type !== CASH_SALE_TYPE) return;
+    const bad = (m) => Object.assign(new Error(m), { status: 400 });
+    if (Array.isArray(payments)) {
+        await client.query(`DELETE FROM im_transaction_payment WHERE header_id = $1`, [headerId]);
+        let lineNo = 1;
+        for (const p of payments) {
+            const fc = round2(Number(p.amount_fc) || 0);
+            if (fc < 0) throw bad('ยอดรับชำระต้องไม่ติดลบ');
+            if (!fc) continue;
+            await client.query(`
+                INSERT INTO im_transaction_payment
+                (header_id, line_no, payment_method_id, payment_method_code, payment_method_name, payment_method_type,
+                 cm_bank_account_id, gl_account_id, amount_fc, ref_no, remark,
+                 drawer_bank_name, drawer_bank_branch, drawer_account_no, card_type, card_last4, approval_code, terminal_id, batch_no)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`, [
+                headerId, lineNo++, p.payment_method_id || null, p.payment_method_code || null, p.payment_method_name || null,
+                p.payment_method_type || 'CASH', p.cm_bank_account_id || null, p.gl_account_id || null, fc, p.ref_no || null, p.remark || null,
+                p.drawer_bank_name || null, p.drawer_bank_branch || null, p.drawer_account_no || null,
+                p.card_type || null, p.card_last4 || null, p.approval_code || null, p.terminal_id || null, p.batch_no || null,
+            ]);
+        }
+    }
+    if (Array.isArray(whts)) {
+        await client.query(`DELETE FROM im_transaction_wht WHERE header_id = $1`, [headerId]);
+        let lineNo = 1;
+        for (const w of whts.filter(x => Number(x.wht_amount_lc) > 0)) {
+            if (Number(w.base_amount_lc) < 0) throw bad('ฐานภาษีหัก ณ ที่จ่ายต้องไม่ติดลบ');
+            await client.query(`
+                INSERT INTO im_transaction_wht (header_id, line_no, wht_type_id, wht_code, wht_name, income_type, wht_rate,
+                    base_amount_lc, wht_amount_lc, certificate_no, description)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+                [headerId, lineNo++, w.wht_type_id || null, w.wht_code || null, w.wht_name || null, w.income_type || null, Number(w.wht_rate) || 0,
+                 round2(w.base_amount_lc), round2(w.wht_amount_lc), w.certificate_no || null, w.description || null]);
+        }
+    }
+    // เงินที่รับมา (ไม่กรอก = 0 ไม่คิดเงินทอน) ต้องไม่น้อยกว่ายอดที่รับเป็นเงินสด — เงินทอน = ส่วนเกิน
+    const cashFc = round2((await client.query(`
+        SELECT COALESCE(SUM(amount_fc), 0) AS v FROM im_transaction_payment WHERE header_id = $1 AND payment_method_type = 'CASH'`,
+        [headerId])).rows[0].v);
+    const received = round2(Number(header.cash_received) || 0);
+    if (received < 0) throw bad('เงินที่รับมาต้องไม่ติดลบ');
+    if (received && received < cashFc - 0.005) throw bad(`เงินที่รับมา (${received}) น้อยกว่ายอดรับชำระด้วยเงินสด (${cashFc})`);
+    const b = cleanBillTo(header);
+    await client.query(`
+        UPDATE im_transaction SET bill_to_name=$1, bill_to_address=$2, bill_to_tax_id=$3, bill_to_branch=$4, cash_received=$5, change_amount=$6
+         WHERE id=$7`, [b.bill_to_name, b.bill_to_address, b.bill_to_tax_id, b.bill_to_branch, received, received ? round2(received - cashFc) : 0, headerId]);
+};
+const loadCashSaleHeader = async (client, headerId) => (await client.query(`
+    SELECT bill_to_name, bill_to_address, bill_to_tax_id, bill_to_branch, linked_ar_doc_no, linked_ar_receipt_doc_no,
+           bill_discount_percent, cash_discount_amount
+      FROM im_transaction WHERE id = $1`, [headerId])).rows[0];
+const loadImCashSaleLines = async (db, headerId) => {
+    if (!(await db.query(`SELECT to_regclass('im_transaction_payment') IS NOT NULL AS ok`)).rows[0].ok) return { payments: [], whts: [] };
+    return {
+        payments: (await db.query(`SELECT * FROM im_transaction_payment WHERE header_id = $1 ORDER BY line_no, id`, [headerId])).rows,
+        whts: (await db.query(`SELECT * FROM im_transaction_wht WHERE header_id = $1 ORDER BY line_no, id`, [headerId])).rows,
+    };
+};
+// ใบเสร็จรับชำระ AR อัตโนมัติ: ตัดใบแจ้งหนี้ที่เพิ่งสร้างเต็มยอดคงค้าง (หลังหักมัดจำ) — วิธีรับชำระ + ภาษีถูกหัก ณ ที่จ่าย
+// ต้องรวมเท่ายอดคงค้างพอดี สร้างผ่าน insertArTransaction ของ AR (ลงบัญชี ตัดยอด รายการรับเงินผ่านธนาคาร เหมือนบันทึกใน AR)
+// ยอดคงค้าง 0 (มัดจำครอบคลุมทั้งหมด) = ไม่สร้างใบเสร็จ
+const postArReceiptForCashSale = async (client, { headerId, header, invoiceId, docNo }) => {
+    const ar = require('../ar/arTransactionController');
+    const bad = (m) => Object.assign(new Error(m), { status: 400 });
+    // ขายเงินสดรับเงินวันเดียวกัน — ใบแจ้งหนี้ครบกำหนดวันที่เอกสาร (ใบพิมพ์/อายุหนี้แสดงเงื่อนไข "เงินสด")
+    const inv = (await client.query(`UPDATE ar_transaction SET due_date = doc_date WHERE id = $1 RETURNING *`, [invoiceId])).rows[0];
+    const rate = Number(inv.exchange_rate) || 1;
+    const advFc = Number((await client.query(`
+        SELECT COALESCE(SUM(applied_amount_fc), 0) AS v FROM ar_transaction_apply WHERE transaction_id = $1 AND apply_type = 'inv_advance'`,
+        [invoiceId])).rows[0].v);
+    const dueFc = round2(Number(inv.total_amount_fc) - advFc);
+    const { payments, whts } = await loadImCashSaleLines(client, headerId);
+    const payFc = round2(payments.reduce((s, p) => s + Number(p.amount_fc), 0));
+    const whtLc = round2(whts.reduce((s, w) => s + Number(w.wht_amount_lc), 0));
+    if (dueFc <= 0) {
+        if (payFc || whtLc) throw bad('เงินมัดจำครอบคลุมยอดขายทั้งหมดแล้ว ไม่ต้องระบุวิธีรับชำระ');
+        return null;
+    }
+    const whtFc = round2(whtLc / rate);
+    if (Math.abs(payFc + whtFc - dueFc) > 0.01) {
+        throw bad(`ยอดรับชำระ (${payFc.toFixed(2)}) + ภาษีถูกหัก ณ ที่จ่าย (${whtFc.toFixed(2)}) ต้องเท่ากับยอดที่ต้องชำระ (${dueFc.toFixed(2)})`);
+    }
+    // ยอดเงินบาท: ตัดหนี้ตามอัตราของใบแจ้งหนี้ (อัตราเดียวกัน ไม่มีกำไร/ขาดทุนอัตราแลกเปลี่ยน) — บรรทัดสุดท้ายรับเศษปัดให้ลงตัว
+    const appliedLc = round2(dueFc * rate);
+    const cashLc = round2(appliedLc - whtLc);
+    let restLc = cashLc;
+    const pays = payments.map((p, i) => {
+        const lc = i === payments.length - 1 ? round2(restLc) : round2(Number(p.amount_fc) * rate);
+        restLc -= lc;
+        return { ...p, amount_fc: Number(p.amount_fc), amount_lc: lc, payment_date: header.doc_date };
+    });
+    const rcDoc = await resolveReceiptDoc(client, header.doc_code);
+    await ar.ensureArCreateSchema(client);
+    const cashFc = round2(dueFc - whtFc);
+    const r = await ar.insertArTransaction(client, {
+        header: {
+            doc_id: rcDoc.id, doc_no: header.linked_ar_receipt_doc_no || 'AUTO', doc_date: header.doc_date, due_date: header.doc_date,
+            customer_id: inv.customer_id, customer_code: inv.customer_code, customer_name_th: inv.customer_name_th,
+            ar_account_id: inv.ar_account_id, currency_id: inv.currency_id, currency_code: inv.currency_code, exchange_rate: rate,
+            subtotal_fc: cashFc, total_amount_fc: cashFc, subtotal_lc: cashLc, total_amount_lc: cashLc,
+            ref_doc_id: header.doc_id, ref_doc_no: docNo, description: `รับชำระจากการขายเงินสด ${docNo}`,
+            dim1_id: header.dim1_id, dim2_id: header.dim2_id, dim3_id: header.dim3_id, dim4_id: header.dim4_id, dim5_id: header.dim5_id,
+            branch_id: header.branch_id, created_by: header.updated_by || header.created_by,
+        },
+        details: [],
+        applies: [{ applied_to_id: invoiceId, applied_amount_fc: dueFc, applied_amount_lc: appliedLc, apply_type: 'invoice' }],
+        payments: pays, whts, action: 'Post',
+    });
+    const billTo = cleanBillTo(header);
+    if (billTo.bill_to_name) await saveArBillTo(client, r.id, billTo);
+    return r.id;
+};
+// ถอยเป็นร่าง: ลบใบเสร็จ (รายการรับเงินผ่านธนาคารที่ยังไม่เคลียร์ + ที่ removeLinkedBill ลบ) คืนเลขที่ไว้ใช้ซ้ำ
+const removeLinkedReceipt = async (client, receiptId) => {
+    await deleteBankItems(client, 'AR', receiptId);
+    return removeLinkedBill(client, 'ar_transaction', 'AR', receiptId);
 };
 
 // --- Fetch helpers ---
@@ -2367,6 +2582,8 @@ const fetchRowById = async (pool, id) => {
                refpo.doc_no AS ref_po_doc_no,
                refso.doc_no AS ref_so_doc_no,
                refmo.doc_no AS ref_mo_doc_no,
+               (SELECT x.doc_no FROM ar_transaction x WHERE x.id = t.linked_ar_transaction_id) AS linked_ar_invoice_no,
+               (SELECT x.doc_no FROM ar_transaction x WHERE x.id = (to_jsonb(t)->>'linked_ar_receipt_id')::int) AS linked_ar_receipt_no,
                dim1.value_name_thai AS dim1_name, dim2.value_name_thai AS dim2_name, dim3.value_name_thai AS dim3_name,
                dim4.value_name_thai AS dim4_name, dim5.value_name_thai AS dim5_name
         FROM im_transaction t
@@ -2409,7 +2626,7 @@ const fetchRowById = async (pool, id) => {
           FROM im_transaction_advance a JOIN ${advTable} x ON x.id = a.advance_id
          WHERE a.header_id = $1 ORDER BY a.id`, [id])).rows : [];
     return {
-        ...hRes.rows[0], details: dRes.rows, advances,
+        ...hRes.rows[0], details: dRes.rows, advances, ...(await loadImCashSaleLines(pool, id)),
         salespersons: await loadSalespersons(pool, 'im_transaction_salesperson', 'header_id', id),
         credit_approvals: await loadCreditApprovals(pool, 'IM', Number(id)),
         ...(await computeImBlocks(pool, id)),
@@ -2503,7 +2720,7 @@ const fetchReturnableDocs = async (req, res) => {
         await ensureImTransactionTable(client);
         const { family, vendor_id, customer_id, search } = req.query;
         const isDln = family === 'DLN';
-        const sysTypes = isDln ? ['30', '31', '32'] : ['10', '11', '12'];
+        const sysTypes = isDln ? ['30', '31', '32', '33'] : ['10', '11', '12'];
         const statuses = isDln ? ['Posted', 'Delivered'] : ['Posted', 'Received'];
         let query = `
             SELECT t.id, t.doc_no, t.doc_date, t.status, t.vendor_id, t.vendor_code, t.vendor_name_th,
@@ -2614,7 +2831,7 @@ const insertAndPostAdjustment = async (client, {
     currencyId, currencyCode, exchangeRate,
     dim1Id, dim2Id, dim3Id, dim4Id, dim5Id, branchId, createdBy,
     lines, action, glDocNo, salespersons, customerPoNo, customerPoDate, priceIncludesVat = false, vendorInvoiceDate = null, advances,
-    billDiscountPercent = 0, cashDiscountAmount = 0,
+    billDiscountPercent = 0, cashDiscountAmount = 0, cashSale,
 }) => {
     let resolvedDocId = docId;
     let resolvedDocCode = docCode;
@@ -2657,7 +2874,8 @@ const insertAndPostAdjustment = async (client, {
     if (resolvedSysDocType === '11' && !refNo) {
         throw new Error('กรุณาระบุเลขที่ใบกำกับสินค้าผู้ขาย สำหรับเอกสารประเภทรับสินค้า+ตั้งหนี้อัตโนมัติ');
     }
-    if (['30', '31', '32', '35', '40', '45'].includes(resolvedSysDocType) && !customerId) {
+    if (resolvedSysDocType === CASH_SALE_TYPE && !customerId) customerId = await defaultCashCustomer(client, resolvedDocId);
+    if (['30', '31', '32', '33', '35', '40', '45'].includes(resolvedSysDocType) && !customerId) {
         throw new Error('กรุณาระบุลูกค้า สำหรับเอกสารประเภทนี้');
     }
     // '15'/'35' (คืนสินค้าผู้ขาย/รับคืนจากลูกค้า) — บังคับอ้างอิงเอกสารต้นฉบับ (GRN/DLN) เสมอ เพื่อติดตามจำนวนคืน
@@ -2666,7 +2884,7 @@ const insertAndPostAdjustment = async (client, {
         if (!refImTransactionId) {
             throw new Error('กรุณาระบุเอกสารต้นฉบับที่จะคืน สำหรับเอกสารประเภทนี้');
         }
-        const refFamily = resolvedSysDocType === '15' ? ['10', '11', '12'] : ['30', '31', '32'];
+        const refFamily = resolvedSysDocType === '15' ? ['10', '11', '12'] : ['30', '31', '32', '33'];
         const refStatuses = resolvedSysDocType === '15' ? ['Posted', 'Received'] : ['Posted', 'Delivered'];
         const refRes = await client.query(`
             SELECT t.vendor_id, t.customer_id, t.status, d.sys_doc_type FROM im_transaction t
@@ -2799,6 +3017,7 @@ const insertAndPostAdjustment = async (client, {
     // พนักงานขาย — บันทึกก่อน Post เพื่อให้ใบแจ้งหนี้ AR อัตโนมัติคัดลอกไปได้
     await saveImSalespersons(client, newHeaderId, salespersons);
     await saveImAdvances(client, newHeaderId, advances);
+    await saveImCashSale(client, newHeaderId, cashSale);
 
     if ((action || 'Post') === 'Post') {
         const headerForPost = {
@@ -2848,6 +3067,7 @@ const createTransaction = async (req, res) => {
             lines: details, action, salespersons: req.body.salespersons, priceIncludesVat: header.price_includes_vat === true,
             advances: req.body.advances, vendorInvoiceDate: header.vendor_invoice_date || null,
             billDiscountPercent: header.bill_discount_percent, cashDiscountAmount: header.cash_discount_amount,
+            cashSale: { header, payments: req.body.payments, whts: req.body.whts },
         });
 
         await client.query('COMMIT');
@@ -2936,7 +3156,7 @@ const updateTransaction = async (req, res) => {
     try {
         await client.query('BEGIN');
         const existing = await client.query(`
-            SELECT t.status, t.exchange_rate, t.credit_status, t.price_includes_vat, d.sys_doc_type FROM im_transaction t
+            SELECT t.status, t.exchange_rate, t.credit_status, t.price_includes_vat, t.doc_id, d.sys_doc_type FROM im_transaction t
             JOIN sa_module_document d ON d.id = t.doc_id WHERE t.id=$1
         `, [id]);
         if (existing.rows.length === 0) throw new Error('Not found');
@@ -3002,7 +3222,10 @@ const updateTransaction = async (req, res) => {
         if (existing.rows[0].sys_doc_type === '11' && !header.ref_no) {
             throw new Error('กรุณาระบุเลขที่ใบกำกับสินค้าผู้ขาย สำหรับเอกสารประเภทรับสินค้า+ตั้งหนี้อัตโนมัติ');
         }
-        if (['30', '31', '32', '35', '40', '45'].includes(existing.rows[0].sys_doc_type) && !header.customer_id) {
+        if (existing.rows[0].sys_doc_type === CASH_SALE_TYPE && !header.customer_id) {
+            header.customer_id = await defaultCashCustomer(client, existing.rows[0].doc_id);
+        }
+        if (['30', '31', '32', '33', '35', '40', '45'].includes(existing.rows[0].sys_doc_type) && !header.customer_id) {
             throw new Error('กรุณาระบุลูกค้า สำหรับเอกสารประเภทนี้');
         }
         if (['15', '35'].includes(existing.rows[0].sys_doc_type)) {
@@ -3010,7 +3233,7 @@ const updateTransaction = async (req, res) => {
             if (!header.ref_im_transaction_id) {
                 throw new Error('กรุณาระบุเอกสารต้นฉบับที่จะคืน สำหรับเอกสารประเภทนี้');
             }
-            const refFamily = sysType === '15' ? ['10', '11', '12'] : ['30', '31', '32'];
+            const refFamily = sysType === '15' ? ['10', '11', '12'] : ['30', '31', '32', '33'];
             const refStatuses = sysType === '15' ? ['Posted', 'Received'] : ['Posted', 'Delivered'];
             const refRes = await client.query(`
                 SELECT t.vendor_id, t.customer_id, t.status, d.sys_doc_type FROM im_transaction t
@@ -3091,6 +3314,7 @@ const updateTransaction = async (req, res) => {
 
         await saveImSalespersons(client, id, req.body.salespersons);
         await saveImAdvances(client, id, req.body.advances);
+        await saveImCashSale(client, id, { header, payments: req.body.payments, whts: req.body.whts });
         await client.query(`DELETE FROM im_transaction_detail WHERE header_id=$1`, [id]);
         await ensureImLineGlColumns(client);
         // unit_cost (LC) คำนวณจาก unit_cost_fc * exchange_rate ของเอกสารนี้ — มิเรอร์ insertAndPostAdjustment ทุกประการ
@@ -3349,6 +3573,7 @@ const IM_POSTED_STATUSES = ['Posted', 'Received', 'Delivered'];
 
 const imBlockInfoSql = (hasStockCount) => `
     SELECT t.id, t.doc_no, t.status, t.gl_entry_id, t.linked_ap_transaction_id, t.linked_ar_transaction_id,
+           (to_jsonb(t)->>'linked_ar_receipt_id')::int AS linked_ar_receipt_id,
            d.sys_doc_type, p.gl_status, p.im_status, gp.gl_status AS gl_entry_period_status,
            ${hasStockCount ? `(SELECT string_agg(c.count_no, ', ') FROM im_stock_count c
              WHERE c.im_transaction_id = t.id AND c.status = 'Closed')` : 'NULL::text'} AS stock_count,
@@ -3394,6 +3619,7 @@ const IM_BLOCK_MESSAGES = {
     INSUFFICIENT_STOCK:  'ยอดคงเหลือปัจจุบันไม่พอสำหรับย้อนรายการ',
     AP_LINKED:           'ใบตั้งหนี้ที่สร้างจากเอกสารนี้ถอยหรือยกเลิกไม่ได้',
     AR_LINKED:           'ใบแจ้งหนี้ที่สร้างจากเอกสารนี้ถอยหรือยกเลิกไม่ได้',
+    AR_RECEIPT_LINKED:   'ใบเสร็จรับชำระที่สร้างจากเอกสารนี้ถอยหรือยกเลิกไม่ได้',
 };
 const imBlockMessage = (b) => IM_BLOCK_MESSAGES[b.code] + (b.ref ? ` (${b.ref})` : '');
 
@@ -3406,10 +3632,14 @@ const computeImBlocks = async (db, id, opts = {}) => {
     const posted = IM_POSTED_STATUSES.includes(r.status);
     const ap = r.linked_ap_transaction_id
         ? await require('../ap/apTransactionController').getApLinkedState(db, r.linked_ap_transaction_id) : null;
+    // ขายเงินสด: ใบเสร็จที่สร้างให้ตัดใบแจ้งหนี้อยู่ — ไม่นับเป็นเอกสารอ้างอิงของใบแจ้งหนี้ (ถอย/ยกเลิกไปพร้อมกัน)
     const ar = r.linked_ar_transaction_id
-        ? await require('../ar/arTransactionController').getArLinkedState(db, r.linked_ar_transaction_id) : null;
+        ? await require('../ar/arTransactionController').getArLinkedState(db, r.linked_ar_transaction_id, r.linked_ar_receipt_id) : null;
+    const rc = r.linked_ar_receipt_id
+        ? await require('../ar/arTransactionController').getArLinkedState(db, r.linked_ar_receipt_id) : null;
     const apLive = ap?.status === 'Posted' ? ap : null;
     const arLive = ar?.status === 'Posted' ? ar : null;
+    const rcLive = rc?.status === 'Posted' ? rc : null;
 
     const sourceBlock = () => {
         if (r.stock_count && !opts.ignoreStockCount) return { code: 'STOCK_COUNT', ref: r.stock_count };
@@ -3418,6 +3648,7 @@ const computeImBlocks = async (db, id, opts = {}) => {
     };
     const billBlock = () => {
         if (apLive?.block) return { code: 'AP_LINKED', ref: `${apLive.doc_no}: ${apLive.block.message}` };
+        if (rcLive?.block) return { code: 'AR_RECEIPT_LINKED', ref: `${rcLive.doc_no}: ${rcLive.block.message}` };
         if (arLive?.block) return { code: 'AR_LINKED', ref: `${arLive.doc_no}: ${arLive.block.message}` };
         return null;
     };
@@ -3438,7 +3669,7 @@ const computeImBlocks = async (db, id, opts = {}) => {
     else {
         const periodOpen = r.gl_status === 'OPEN' && r.im_status === 'OPEN'
             && (!r.gl_entry_period_status || r.gl_entry_period_status === 'OPEN')
-            && (!apLive || apLive.periodOpen) && (!arLive || arLive.periodOpen);
+            && (!apLive || apLive.periodOpen) && (!arLive || arLive.periodOpen) && (!rcLive || rcLive.periodOpen);
         reverse = sourceBlock() || (!periodOpen ? { code: 'PERIOD_CLOSED' } : dependentBlock());
     }
     const voidB = !posted ? { code: 'NOT_POSTED' } : (sourceBlock() || dependentBlock());
@@ -3508,6 +3739,11 @@ const reverseToDraft = async (req, res) => {
         const to = blocks.reverse_to;
 
         let apDocNo = tx.linked_ap_doc_no, arDocNo = tx.linked_ar_doc_no, glDocNo = tx.gl_doc_no;
+        // ขายเงินสด: ลบใบเสร็จก่อนใบแจ้งหนี้ที่ใบเสร็จตัดอยู่ เก็บเลขที่ไว้ใช้ซ้ำ
+        if (tx.linked_ar_receipt_id) {
+            const rcDocNo = (await removeLinkedReceipt(client, tx.linked_ar_receipt_id)) || tx.linked_ar_receipt_doc_no;
+            await client.query(`UPDATE im_transaction SET linked_ar_receipt_id=NULL, linked_ar_receipt_doc_no=$1 WHERE id=$2`, [rcDocNo, id]);
+        }
         if (tx.linked_ap_transaction_id) apDocNo = (await removeLinkedBill(client, 'ap_transaction', 'AP', tx.linked_ap_transaction_id)) || apDocNo;
         if (tx.linked_ar_transaction_id) arDocNo = (await removeLinkedBill(client, 'ar_transaction', 'AR', tx.linked_ar_transaction_id)) || arDocNo;
         if (to === 'Draft') {
@@ -3562,6 +3798,10 @@ const voidImDocument = async (client, id, { reason, userId, userName, ignoreStoc
     if (tx.linked_ap_transaction_id) {
         const r = await require('../ap/apTransactionController').voidApDocument(client, tx.linked_ap_transaction_id, billArgs);
         if (r.message) return { message: r.message, code: r.code };
+    }
+    if (tx.linked_ar_receipt_id) { // ขายเงินสด: ยกเลิกใบเสร็จก่อน ใบแจ้งหนี้จึงไม่มีเอกสารตัดอยู่
+        const r = await require('../ar/arTransactionController').voidArDocument(client, tx.linked_ar_receipt_id, billArgs);
+        if (r.error) return { message: r.error, code: r.code };
     }
     if (tx.linked_ar_transaction_id) {
         const r = await require('../ar/arTransactionController').voidArDocument(client, tx.linked_ar_transaction_id, billArgs);
@@ -3684,7 +3924,7 @@ const deleteTransaction = async (req, res) => {
 //   → { mode (ค่าเริ่มต้นของบริษัท), items: { [item_id]: { mode, to_mode, inventory, to_inventory, purchases, to_purchases, cogs, revenue } } }
 // mode/to_mode = โหมดของสินค้าในคลังต้นทาง/ปลายทาง (สินค้า → หมวดสินค้า → คลัง → ค่าเริ่มต้น) แบบเดียวกับ applyLineModes
 // ใช้ resolver ชุดเดียวกับ postGlEntry/postApBillFromGrn/postArBillFromDln (ไม่ throw — บัญชีที่หาไม่เจอส่ง null)
-const AR_DOC_FOR_IM = { '31': '10', '32': '10', '35': '50', '40': '50', '45': '30' };
+const AR_DOC_FOR_IM = { '31': '10', '32': '10', '33': '10', '35': '50', '40': '50', '45': '30' };
 const AP_DOC_FOR_IM = { '11': '10', '12': '10', '15': '30', '20': '30', '25': '50' };
 const fetchGlAccounts = async (req, res) => {
     const client = await req.dbPool.connect();

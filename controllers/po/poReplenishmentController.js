@@ -74,7 +74,7 @@ const fetchSuggestions = async (req, res) => {
                 FROM im_transaction_detail dt
                 JOIN im_transaction t ON t.id = dt.header_id
                 JOIN sa_module_document d ON d.id = t.doc_id
-                WHERE d.sys_doc_type IN ('30', '31', '32')
+                WHERE d.sys_doc_type IN ('30', '31', '32', '33')
                   AND t.status IN ('Posted', 'Delivered')
                   AND t.warehouse_id = ANY($1::int[])
                   AND t.doc_date > ($2::date - $3::integer) AND t.doc_date <= $2::date
