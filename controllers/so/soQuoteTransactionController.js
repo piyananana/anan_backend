@@ -20,7 +20,7 @@ const { ensureSalespersonTable, saveDocSalespersons, loadSalespersons } = requir
 // พนักงานขายของใบเสนอราคา (รายชื่อ — สัดส่วนอยู่ที่ข้อมูลลูกค้า)
 const ensureDocSalesperson = (db) => ensureSalespersonTable(db, 'quote_transaction_salesperson', 'quote_transaction', 'header_id');
 const { ensureSoTransactionTable } = require('./soTransactionController');
-const { addSalesPriceColumns } = require('../../utils/vatCalc');
+const { addSalesPriceColumns, applyOrderSalesDiscounts, orderDiscountParams, saveOrderBillDiscount } = require('../../utils/vatCalc');
 // lazy — soTransactionController export ครบหลังโหลดเสร็จ (require วนกัน)
 const soLineValues = (...a) => require('./soTransactionController').soLineValues(...a);
 const saveSoTotals = (...a) => require('./soTransactionController').saveSoTotals(...a);
@@ -235,6 +235,9 @@ const createTransaction = async (req, res) => {
             header.branch_id || null, userName, header.price_includes_vat === true,
         ]);
         const headerId = hRes.rows[0].id;
+        // ส่วนลดขั้นบันได + เงินของรายการ + ท้ายบิล (% และเงินสด) ปันเข้ารายการ — เหมือนใบสั่งขาย
+        applyOrderSalesDiscounts(header, details, d => d.qty_quoted);
+        await saveOrderBillDiscount(client, 'quote_transaction', headerId, header);
 
         let lineNo = 1, totalQty = 0;
         const amts = [];
@@ -247,10 +250,10 @@ const createTransaction = async (req, res) => {
             await client.query(`
                 INSERT INTO quote_transaction_detail
                 (header_id, line_no, item_id, item_code, item_name, uom_id, qty_quoted, unit_price_fc, total_value_lc, description,
-                 discount_percent, vat_type, vat_rate)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                 discount_percent, vat_type, vat_rate, discount_text, line_discount_amount, bill_discount_amount, discount_amount)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
             `, [headerId, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                qty, price, amt.netLc, d.description || null, discountPercent, vatType, vatRate]);
+                qty, price, amt.netLc, d.description || null, discountPercent, vatType, vatRate, ...orderDiscountParams(d)]);
         }
         await saveSoTotals(client, headerId, totalQty, amts, 'quote_transaction');
         await saveDocSalespersons(client, 'quote_transaction_salesperson', 'header_id', headerId, req.body.salespersons);
@@ -261,7 +264,7 @@ const createTransaction = async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error creating quote_transaction:', error);
-        res.status(500).json({ message: error.message || 'Internal server error' });
+        res.status(error.status || 500).json({ message: error.message || 'Internal server error' });
     } finally { client.release(); }
 };
 
@@ -319,6 +322,9 @@ const updateTransaction = async (req, res) => {
             await client.query(`DELETE FROM quote_transaction_detail WHERE id = ANY($1::int[])`, [removedIds]);
         }
 
+        applyOrderSalesDiscounts(header, details, d => d.qty_quoted);
+        await saveOrderBillDiscount(client, 'quote_transaction', id, header);
+
         let lineNo = 1, totalQty = 0;
         const amts = [];
         for (const d of details) {
@@ -332,18 +338,19 @@ const updateTransaction = async (req, res) => {
                 await client.query(`
                     UPDATE quote_transaction_detail SET
                         line_no=$1, item_id=$2, item_code=$3, item_name=$4, uom_id=$5, qty_quoted=$6,
-                        unit_price_fc=$7, total_value_lc=$8, description=$9, discount_percent=$11, vat_type=$12, vat_rate=$13
+                        unit_price_fc=$7, total_value_lc=$8, description=$9, discount_percent=$11, vat_type=$12, vat_rate=$13,
+                        discount_text=$14, line_discount_amount=$15, bill_discount_amount=$16, discount_amount=$17
                     WHERE id=$10
                 `, [lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                    qty, price, value, d.description || null, d.id, discountPercent, vatType, vatRate]);
+                    qty, price, value, d.description || null, d.id, discountPercent, vatType, vatRate, ...orderDiscountParams(d)]);
             } else {
                 await client.query(`
                     INSERT INTO quote_transaction_detail
                     (header_id, line_no, item_id, item_code, item_name, uom_id, qty_quoted, unit_price_fc, total_value_lc, description,
-                     discount_percent, vat_type, vat_rate)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                     discount_percent, vat_type, vat_rate, discount_text, line_discount_amount, bill_discount_amount, discount_amount)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
                 `, [id, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                    qty, price, value, d.description || null, discountPercent, vatType, vatRate]);
+                    qty, price, value, d.description || null, discountPercent, vatType, vatRate, ...orderDiscountParams(d)]);
             }
         }
         await saveSoTotals(client, id, totalQty, amts, 'quote_transaction');
@@ -355,7 +362,7 @@ const updateTransaction = async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error updating quote_transaction:', error);
-        res.status(500).json({ message: error.message || 'Internal server error' });
+        res.status(error.status || 500).json({ message: error.message || 'Internal server error' });
     } finally { client.release(); }
 };
 

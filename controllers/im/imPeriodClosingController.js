@@ -8,6 +8,7 @@
 const { fetchSettingRow } = require('./imAccountingSettingController');
 const { getBaseCurrency } = require('../../utils/baseCurrency');
 const { resolveItemModes } = require('../../utils/imAccountingMode');
+const { ensureImPriceColumns } = require('../../utils/vatCalc');
 
 // คัดลอกจาก imTransactionController.js — เป็นธรรมเนียมของโปรเจกต์นี้ให้แต่ละ controller มีสำเนาของตัวเอง
 // (เหมือน ap/ar/cm/gl) แทนที่จะ require ข้ามกัน เพื่อเลี่ยง circular require กับ imAccountingSettingController.js
@@ -146,7 +147,8 @@ const computeClosing = async (client, periodId) => {
           FROM im_transaction_detail d
           JOIN im_transaction t ON t.id = d.header_id
           JOIN sa_module_document md ON md.id = t.doc_id
-         WHERE t.status IN ${POSTED_STATUSES} AND t.doc_date BETWEEN $1 AND $2`, [period.s, period.e])).rows;
+         WHERE t.status IN ${POSTED_STATUSES} AND t.doc_date BETWEEN $1 AND $2
+           AND NOT d.is_non_stock`, [period.s, period.e])).rows;
 
     const units = new Set(Object.keys(valueAtEnd).filter(k => Math.abs(valueAtEnd[k]) >= 0.005));
     for (const l of lines) {
@@ -330,6 +332,7 @@ const computeClosing = async (client, periodId) => {
 
 const calculatePreview = async (req, res) => {
     const { periodId } = req.params;
+    await ensureImPriceColumns(req.dbPool); // is_non_stock
     const client = await req.dbPool.connect();
     try {
         await ensureImPeriodClosingTable(client);
@@ -346,6 +349,7 @@ const calculatePreview = async (req, res) => {
 const confirmClose = async (req, res) => {
     const { periodId } = req.params;
     const userName = req.headers.username || null;
+    await ensureImPriceColumns(req.dbPool); // is_non_stock
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');

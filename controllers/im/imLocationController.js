@@ -41,8 +41,18 @@ const ensureImLocationTable = async (client) => {
     await client.query(`ALTER TABLE im_location ADD COLUMN IF NOT EXISTS updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()`).catch(() => {});
     await client.query(`ALTER TABLE im_location ADD COLUMN IF NOT EXISTS created_by    VARCHAR(100)`).catch(() => {});
     await client.query(`ALTER TABLE im_location ADD COLUMN IF NOT EXISTS updated_by    VARCHAR(100)`).catch(() => {});
+    // ตำแหน่งจัดเก็บหลักของคลัง — มีได้ 1 ตำแหน่งต่อคลัง (เฉพาะ BIN) ใช้เป็นตำแหน่งเริ่มต้นของรายการในเอกสาร IM ใหม่
+    await client.query(`ALTER TABLE im_location ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT false`).catch(() => {});
+    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS im_location_one_default ON im_location (warehouse_id) WHERE is_default`).catch(() => {});
     await client.query(`CREATE INDEX IF NOT EXISTS idx_im_location_warehouse ON im_location(warehouse_id)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_im_location_parent    ON im_location(parent_id)`);
+};
+
+// ตั้งเป็นตำแหน่งหลักของคลัง (ยกเลิกตำแหน่งหลักเดิมของคลังเดียวกัน) — GROUP หรือที่ปิดใช้งานเป็นตำแหน่งหลักไม่ได้
+const saveDefaultFlag = async (client, id, warehouseId, isDefault, locationType, isActive) => {
+    const flag = isDefault === true && locationType === 'BIN' && isActive !== false;
+    if (flag) await client.query(`UPDATE im_location SET is_default = false WHERE warehouse_id = $1 AND is_default AND id <> $2`, [warehouseId, id]);
+    await client.query(`UPDATE im_location SET is_default = $2 WHERE id = $1`, [id, flag]);
 };
 
 const LOCATION_SELECT = `
@@ -106,7 +116,7 @@ const addRow = async (req, res) => {
     const client = await req.dbPool.connect();
     const {
         warehouse_id, location_code, location_name, parent_id, location_type,
-        category_id, is_active, sort_order,
+        category_id, is_active, sort_order, is_default,
     } = req.body;
     const userName = req.headers.username || null;
     try {
@@ -157,6 +167,7 @@ const addRow = async (req, res) => {
                 userName,
             ]
         );
+        await saveDefaultFlag(client, result.rows[0].id, warehouse_id, is_default, finalType, is_active);
         const newRow = await client.query(`${LOCATION_SELECT} WHERE l.id = $1`, [result.rows[0].id]);
         res.status(201).json(newRow.rows[0]);
     } catch (error) {
@@ -168,7 +179,7 @@ const addRow = async (req, res) => {
 const updateRow = async (req, res) => {
     const { id } = req.params;
     const client = await req.dbPool.connect();
-    const { location_code, location_name, parent_id, location_type, category_id, is_active, sort_order } = req.body;
+    const { location_code, location_name, parent_id, location_type, category_id, is_active, sort_order, is_default } = req.body;
     const userName = req.headers.username || null;
     try {
         await ensureImLocationTable(client);
@@ -226,6 +237,7 @@ const updateRow = async (req, res) => {
             ]
         );
         if (result.rows.length === 0) return res.status(404).json({ message: 'ไม่พบตำแหน่งจัดเก็บ' });
+        await saveDefaultFlag(client, id, warehouseId, is_default, finalType, is_active);
         const updated = await client.query(`${LOCATION_SELECT} WHERE l.id = $1`, [id]);
         res.status(200).json(updated.rows[0]);
     } catch (error) {

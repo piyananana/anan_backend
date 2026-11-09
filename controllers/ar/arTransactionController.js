@@ -9,6 +9,7 @@ const { AR_CHECK_TYPES, ensureCreditSchema, arDocAmount, assertCreditForPost, lo
 const { resolveArAccountId, postedArAccountId, postedArAccountSql } = require('../../utils/arAccount');
 const { ensureDepositRefColumns, saveDepositRef } = require('../../utils/depositRef');
 const { headerDims, lineDims, ensureDetailDimColumns, detailDimParams, assertRequiredDims } = require('../../utils/glDims');
+const { computeSalesDiscounts, calcLineAmounts, ensureArDiscountColumns } = require('../../utils/vatCalc');
 
 // ตรวจวงเงินเครดิตก่อนโพสต์ (ตั้งหนี้/เพิ่มหนี้/ลดหนี้) — เกินวงเงินและยังไม่ได้รับอนุมัติที่ครอบคลุมยอด = throw CREDIT_LIMIT
 const checkArCreditForPost = async (client, header, id, row) => {
@@ -25,6 +26,47 @@ const sendArError = (res, err) => res.status(err.status || 500).json({
 
 // พนักงานขายของเอกสาร (รายชื่อ — สัดส่วนอยู่ที่ข้อมูลลูกค้า) — ใบแจ้งหนี้/เพิ่มหนี้/ลดหนี้
 const ensureArSalesperson = (db) => ensureSalespersonTable(db, 'ar_transaction_salesperson', 'ar_transaction', 'header_id');
+
+// ส่วนลดเอกสารขาย (ใบแจ้งหนี้/ใบเพิ่มหนี้/ใบลดหนี้ที่มีรายการ): ขั้นบันได "10+5+2" + เงินของรายการ + ส่วนลดท้ายบิล % และเงินสด
+// ปันส่วนเข้ารายการ (utils/vatCalc.computeSalesDiscounts) — ยอดเงินทุกช่องหน้าจอคำนวณมา ฝั่งนี้คำนวณซ้ำเพื่อเก็บ
+// ส่วนประกอบของส่วนลดและตรวจว่าส่วนลดรวมก่อน VAT ตรงกัน, ประเภทอื่นล้างค่า
+const AR_SALES_DISCOUNT_TYPES = ['10', '30', '50'];
+const applyArSalesDiscounts = async (client, header, details) => {
+    const sysDocType = (await client.query(`SELECT sys_doc_type FROM sa_module_document WHERE id=$1`, [header.doc_id])).rows[0]?.sys_doc_type;
+    if (!AR_SALES_DISCOUNT_TYPES.includes(String(sysDocType))) {
+        header.bill_discount_percent = 0;
+        header.cash_discount_amount = 0;
+        for (const d of details || []) { d.discount_text = null; d.line_discount_amount = 0; d.bill_discount_amount = 0; }
+        return;
+    }
+    // หน้าจอเดิมส่งเฉพาะ discount_percent — ถือเป็นส่วนลดขั้นเดียว
+    const rows = (details || []).map(d => ({
+        item_code: d.item_code,
+        discount_text: d.discount_text !== undefined ? d.discount_text : (Number(d.discount_percent) ? String(Number(d.discount_percent)) : ''),
+        line_discount_amount: d.line_discount_amount,
+    }));
+    computeSalesDiscounts(rows, {
+        billDiscountPercent: header.bill_discount_percent, cashDiscountAmount: header.cash_discount_amount,
+        priceOf: (r) => details[rows.indexOf(r)].unit_price_fc, qtyOf: (r) => details[rows.indexOf(r)].quantity ?? 1,
+    });
+    rows.forEach((r, i) => {
+        const d = details[i];
+        const a = calcLineAmounts({ qty: d.quantity ?? 1, price: d.unit_price_fc, discountAmount: r.discount_amount,
+            vatRate: d.vat_rate, noVat: d.vat_type === 'NOVAT', priceIncludesVat: header.price_includes_vat === true });
+        if (Math.abs(a.discount - (Number(d.discount_amount_fc) || 0)) > 0.05) {
+            const err = new Error(`${d.item_code || `รายการที่ ${i + 1}`}: ยอดส่วนลด (${Number(d.discount_amount_fc || 0).toFixed(2)}) ไม่ตรงกับที่คำนวณได้ (${a.discount.toFixed(2)}) — กรุณาเปิดเอกสารใหม่แล้วบันทึกอีกครั้ง`);
+            err.status = 400;
+            throw err;
+        }
+        d.discount_text = r.discount_text;
+        d.line_discount_amount = r.line_discount_amount;
+        d.bill_discount_amount = r.bill_discount_amount;
+        d.discount_percent = r.discount_percent;
+    });
+};
+const saveArBillDiscount = (client, id, header) => client.query(
+    `UPDATE ar_transaction SET bill_discount_percent=$1, cash_discount_amount=$2 WHERE id=$3`,
+    [Number(header.bill_discount_percent) || 0, Number(header.cash_discount_amount) || 0, id]);
 
 // --- Helper: Generate Document Number (supports per-branch counter) ---
 const generateDocNo = async (client, docId, date, branchId = null) => {
@@ -1090,9 +1132,11 @@ const createTransaction = async (req, res) => {
     const { header, details, applies, payments, action } = req.body; // action: 'Draft' | 'Post'
     await ensureArSalesperson(req.dbPool);
     await ensureCreditSchema(req.dbPool);
+    await ensureArDiscountColumns(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
+        await applyArSalesDiscounts(client, header, details);
 
         // Validate period for Post
         if (action === 'Post') {
@@ -1179,6 +1223,7 @@ const createTransaction = async (req, res) => {
         await saveDocSalespersons(client, 'ar_transaction_salesperson', 'header_id', newHeaderId, req.body.salespersons);
         // ราคาที่กรอกรวม VAT (ยอดที่เก็บทุกช่องเป็นยอดก่อน VAT เหมือนเดิม — ดู lib/utils/vat_calc.dart)
         await client.query(`UPDATE ar_transaction SET price_includes_vat=$1 WHERE id=$2`, [header.price_includes_vat === true, newHeaderId]);
+        await saveArBillDiscount(client, newHeaderId, header);
         // ใบมัดจำอ้างอิงใบสั่งขาย (utils/depositRef.js)
         await saveDepositRef(client, 'ar', newHeaderId, header);
 
@@ -1190,8 +1235,8 @@ const createTransaction = async (req, res) => {
              quantity, unit_code, unit_price_fc, discount_percent, discount_amount_fc,
              subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
              revenue_account_id, subtotal_lc, vat_amount_lc, total_amount_lc, is_deferred_vat,
-             dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+             dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, discount_text, line_discount_amount, bill_discount_amount)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)
             RETURNING id
         `;
         let lineNo = 1;
@@ -1206,7 +1251,8 @@ const createTransaction = async (req, res) => {
                 d.revenue_account_id || null,
                 d.subtotal_lc || 0, d.vat_amount_lc || 0, d.total_amount_lc || 0,
                 d.is_deferred_vat || false,
-                ...detailDimParams(d)
+                ...detailDimParams(d),
+                d.discount_text || null, Number(d.line_discount_amount) || 0, Number(d.bill_discount_amount) || 0,
             ]);
         }
 
@@ -1306,9 +1352,11 @@ const updateTransaction = async (req, res) => {
     const { header, details, applies, payments, action } = req.body;
     await ensureArSalesperson(req.dbPool);
     await ensureCreditSchema(req.dbPool);
+    await ensureArDiscountColumns(req.dbPool);
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');
+        await applyArSalesDiscounts(client, header, details);
 
         // Check status
         const checkRes = await client.query('SELECT status, credit_status, credit_amount FROM ar_transaction WHERE id=$1 FOR UPDATE', [id]);
@@ -1375,6 +1423,7 @@ const updateTransaction = async (req, res) => {
 
         await saveDocSalespersons(client, 'ar_transaction_salesperson', 'header_id', id, req.body.salespersons);
         await saveDepositRef(client, 'ar', id, header);
+        await saveArBillDiscount(client, id, header);
 
         // Replace details
         await client.query('DELETE FROM ar_transaction_detail WHERE header_id=$1', [id]);
@@ -1385,8 +1434,8 @@ const updateTransaction = async (req, res) => {
              quantity, unit_code, unit_price_fc, discount_percent, discount_amount_fc,
              subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
              revenue_account_id, subtotal_lc, vat_amount_lc, total_amount_lc, is_deferred_vat,
-             dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+             dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, discount_text, line_discount_amount, bill_discount_amount)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)
         `;
         let lineNo = 1;
         for (const d of (details || [])) {
@@ -1400,7 +1449,8 @@ const updateTransaction = async (req, res) => {
                 d.revenue_account_id || null,
                 d.subtotal_lc || 0, d.vat_amount_lc || 0, d.total_amount_lc || 0,
                 d.is_deferred_vat || false,
-                ...detailDimParams(d)
+                ...detailDimParams(d),
+                d.discount_text || null, Number(d.line_discount_amount) || 0, Number(d.bill_discount_amount) || 0,
             ]);
         }
 

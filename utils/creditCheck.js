@@ -105,7 +105,8 @@ const imDocAmount = (sysDocType, details, exchangeRate = 1, priceIncludesVat = f
   const sum = (details || []).reduce((s, d) => {
     const q = d.qty != null && Number(d.qty) !== 0 ? Number(d.qty) : (Number(d.counted_qty) || 0) - (Number(d.system_qty) || 0);
     const vat = !d.vat_type || d.vat_type === 'NOVAT' ? 0 : (Number(d.vat_rate) || 0);
-    const a = calcLineAmounts({ qty: Math.abs(q), price: d.unit_price, discountPercent: d.discount_percent, vatRate: vat, priceIncludesVat });
+    const a = calcLineAmounts({ qty: Math.abs(q), price: d.unit_price, discountPercent: d.discount_percent, discountAmount: d.discount_amount ?? null,
+      vatRate: vat, priceIncludesVat });
     if (priceIncludesVat && vat) return s + round2(a.total * rate);
     const lc = round2(a.net * rate);
     return s + lc + round2(lc * vat / 100);
@@ -117,7 +118,8 @@ const imDocAmount = (sysDocType, details, exchangeRate = 1, priceIncludesVat = f
 // SO: Σ ยอดรวม VAT หลังส่วนลดเป็นบาท (บรรทัดต้องมี qty_ordered, unit_price_fc, discount_percent, vat_type, vat_rate)
 const soDocAmount = (details, exchangeRate = 1, priceIncludesVat = false) =>
   round2((details || []).reduce((s, d) => s + lineAmountsLc({
-    qty: d.qty_ordered, price: d.unit_price_fc, discount_percent: d.discount_percent, vat_type: d.vat_type, vat_rate: d.vat_rate,
+    qty: d.qty_ordered, price: d.unit_price_fc, discount_percent: d.discount_percent, discount_amount: d.discount_amount ?? null,
+    vat_type: d.vat_type, vat_rate: d.vat_rate,
   }, exchangeRate, priceIncludesVat).totalLc, 0));
 
 // อนุมัติแล้วใช้ได้กับยอดนี้ไหม (ยอดไม่เพิ่มจากที่อนุมัติ)

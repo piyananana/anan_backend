@@ -1,5 +1,6 @@
 // controllers/im/imStockBalanceByItemReportController.js
 const { today } = require('../../utils/dateUtil');
+const { ensureImPriceColumns } = require('../../utils/vatCalc');
 const { IM_EFFECTIVE_TX } = require('./imEffectiveTxSql');
 // รายงานสินค้าคงเหลือตามตำแหน่งที่เก็บ — ยอดคงเหลือ ณ วันที่สิ้นสุดที่เลือก แยกตาม item/warehouse/location/lot/serial
 //
@@ -31,6 +32,7 @@ const getStockBalanceByItemReport = async (req, res) => {
     } = req.query;
     const dateTo = date_to || today();
 
+    await ensureImPriceColumns(req.dbPool); // is_non_stock — บรรทัดบริการไม่ใช่สต็อก
     const client = await req.dbPool.connect();
     try {
         const params = [dateTo];
@@ -93,7 +95,7 @@ const getStockBalanceByItemReport = async (req, res) => {
                     dt.item_id, dt.qty * t.sign AS qty, dt.total_value_lc * t.sign AS total_value_lc, dt.lot_no, dt.serial_no
                 FROM ${IM_EFFECTIVE_TX} t
                 JOIN sa_module_document d ON d.id = t.doc_id
-                JOIN im_transaction_detail dt ON dt.header_id = t.id
+                JOIN im_transaction_detail dt ON dt.header_id = t.id AND NOT dt.is_non_stock
                 WHERE t.eff_date <= $1::date
 
                 UNION ALL
@@ -105,7 +107,7 @@ const getStockBalanceByItemReport = async (req, res) => {
                     dt.item_id, -dt.qty * t.sign AS qty, -dt.total_value_lc * t.sign AS total_value_lc, dt.lot_no, dt.serial_no
                 FROM ${IM_EFFECTIVE_TX} t
                 JOIN sa_module_document d ON d.id = t.doc_id
-                JOIN im_transaction_detail dt ON dt.header_id = t.id
+                JOIN im_transaction_detail dt ON dt.header_id = t.id AND NOT dt.is_non_stock
                 WHERE t.eff_date <= $1::date
                   AND d.sys_doc_type = '70'
                   AND t.to_warehouse_id IS NOT NULL

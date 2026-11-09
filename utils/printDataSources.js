@@ -52,7 +52,7 @@ const PRINT_FIELDS = [
 
 const ymdSql = (col) => `to_char(${col}, 'YYYY-MM-DD')`;
 const num = (v) => (v === null || v === undefined ? 0 : Number(v));
-const { calcLineAmounts, netUnitPriceSql, ensureImPriceColumns } = require('./vatCalc');
+const { calcLineAmounts, netUnitPriceSql, ensureImPriceColumns, ensureArDiscountColumns } = require('./vatCalc');
 const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 const s = (v) => (v === null || v === undefined ? '' : String(v).trim());
 
@@ -357,6 +357,10 @@ const SALES_INVOICE = {
     f('amount_text_lc', 'จำนวนเงินตัวอักษร (สกุลเงินหลัก)', 'Amount in words (base currency)', 'total'),
     f('amount_text_lc_en', 'จำนวนเงินตัวอักษร (สกุลเงินหลัก อังกฤษ)', 'Amount in words (base currency, EN)', 'total'),
     f('line_count', 'จำนวนรายการ', 'Line count', 'total', 'number'),
+    f('bill_discount_percent', 'ส่วนลดท้ายบิล %', 'Bill discount %', 'total', 'number'),
+    f('bill_discount_amount', 'ส่วนลดท้ายบิล (จาก %)', 'Bill discount (from %)', 'total', 'money'),
+    f('cash_discount_amount', 'ส่วนลดเงินสดท้ายบิล', 'Cash discount', 'total', 'money'),
+    f('line_discount_total', 'ส่วนลดรายการรวม (ก่อนส่วนลดท้ายบิล)', 'Line discounts total (before bill discounts)', 'total', 'money'),
     f('deposit_doc_nos', 'เลขที่ใบรับเงินมัดจำที่หัก', 'Deducted deposit receipt no.', 'deposit'),
     f('deposit_doc_date', 'วันที่ใบรับเงินมัดจำที่หัก (ใบล่าสุด)', 'Deducted deposit receipt date (latest)', 'deposit', 'date'),
     f('deposit_amount', 'หักเงินมัดจำ (ก่อนภาษี)', 'Less deposit (before VAT)', 'deposit', 'money'),
@@ -387,6 +391,10 @@ const SALES_INVOICE = {
     f('unit_price', 'ราคาต่อหน่วย', 'Unit price', 'line', 'money', 'L'),
     f('discount_percent', 'ส่วนลด %', 'Discount %', 'line', 'number', 'L'),
     f('discount_amount', 'ส่วนลด', 'Discount', 'line', 'money', 'L'),
+    f('discount_text', 'ส่วนลดขั้นบันได (เช่น 10+5)', 'Step discount (e.g. 10+5)', 'line', 'text', 'L'),
+    f('line_discount_amount', 'ส่วนลดเงินของรายการ', 'Line discount amount', 'line', 'money', 'L'),
+    f('line_own_discount', 'ส่วนลดของรายการ (ขั้นบันได + เงิน)', 'Line discount (steps + amount)', 'line', 'money', 'L'),
+    f('bill_discount_share', 'ส่วนลดท้ายบิลที่ปันส่วน', 'Allocated bill discount', 'line', 'money', 'L'),
     f('amount', 'จำนวนเงิน', 'Amount', 'line', 'money', 'L'),
     f('vat_rate', 'อัตราภาษี (%)', 'VAT rate (%)', 'line', 'number', 'L'),
     f('vat_amount', 'ภาษี', 'VAT', 'line', 'money', 'L'),
@@ -443,6 +451,7 @@ const SALES_INVOICE = {
   // ข้อมูลพิมพ์ต่อเอกสาร: Map(key → { header, lines })
   loadDocs: async (db, keys) => {
     await ensureImPriceColumns(db);
+    await ensureArDiscountColumns(db);
     const ids = (m) => keys.filter(k => k.startsWith(m + ':')).map(k => Number(k.split(':')[1])).filter(Boolean);
     const imIds = ids('IM');
     const arIds = ids('AR');
@@ -452,6 +461,7 @@ const SALES_INVOICE = {
         SELECT t.id, t.doc_no, ${ymdSql('t.doc_date')} AS doc_date, t.ref_no, t.ref_doc_no, t.description,
                t.currency_code, t.exchange_rate::float AS exchange_rate, COALESCE(NULLIF(t.linked_ar_doc_no, ''), ar.doc_no) AS linked_ar_doc_no,
                t.customer_id, t.customer_code, t.customer_name_th, t.branch_id, t.price_includes_vat,
+               COALESCE(t.bill_discount_percent, 0)::float AS bill_discount_percent, COALESCE(t.cash_discount_amount, 0)::float AS cash_discount_amount,
                d.doc_code, d.doc_name_thai, d.doc_name_eng,
                so.id AS so_id, so.doc_no AS so_doc_no, ${ymdSql('so.doc_date')} AS so_doc_date,
                so.approved_by AS so_approved_by, ${ymdSql('so.approved_at')} AS so_approved_at,
@@ -473,6 +483,7 @@ const SALES_INVOICE = {
         SELECT t.id, t.doc_no, ${ymdSql('t.doc_date')} AS doc_date, ${ymdSql('t.due_date')} AS due_date, t.ref_no, t.ref_doc_no,
                t.description, t.currency_code, t.exchange_rate::float AS exchange_rate,
                t.customer_id, t.customer_code, t.customer_name_th, t.branch_id, t.price_includes_vat,
+               COALESCE(t.bill_discount_percent, 0)::float AS bill_discount_percent, COALESCE(t.cash_discount_amount, 0)::float AS cash_discount_amount,
                t.subtotal_fc::float AS subtotal_fc, t.discount_amount_fc::float AS discount_amount_fc,
                t.before_vat_fc::float AS before_vat_fc, t.vat_amount_fc::float AS vat_amount_fc, t.total_amount_fc::float AS total_amount_fc,
                t.subtotal_lc::float AS subtotal_lc, t.discount_amount_lc::float AS discount_amount_lc,
@@ -537,8 +548,10 @@ const SALES_INVOICE = {
         SELECT dt.header_id, dt.line_no, COALESCE(NULLIF(dt.item_code, ''), it.item_code) AS item_code,
                COALESCE(NULLIF(dt.item_name, ''), it.item_name_th) AS item_name, dt.description,
                ABS(dt.qty)::float AS qty, COALESCE(dt.unit_price, 0)::float AS unit_price, COALESCE(dt.discount_percent, 0)::float AS discount_percent,
+               dt.discount_amount::float AS disc_amount_entered, dt.discount_text, COALESCE(dt.line_discount_amount, 0)::float AS line_discount_amount,
+               COALESCE(dt.bill_discount_amount, 0)::float AS bill_discount_amount,
                COALESCE(dt.vat_type, 'NOVAT') AS vat_type, COALESCE(dt.vat_rate, 0)::float AS vat_rate, dt.is_free,
-               u.uom_code, u.uom_name_th, u.uom_name_en, it.item_name_en
+               u.uom_code, u.uom_name_th, u.uom_name_en, it.item_name_en, COALESCE(dt.is_non_stock, false) AS is_service
           FROM im_transaction_detail dt LEFT JOIN im_uom u ON u.id = dt.uom_id
           LEFT JOIN im_item it ON it.id = dt.item_id
          WHERE dt.header_id = ANY($1::int[]) ORDER BY dt.header_id, dt.line_no, dt.id`, [imIds])).rows : [];
@@ -546,13 +559,15 @@ const SALES_INVOICE = {
         SELECT dt.header_id, dt.line_no, dt.item_code, dt.item_name, dt.description, dt.quantity::float AS qty,
                dt.unit_code, u.uom_name_th, u.uom_name_en, dt.unit_price_fc::float AS unit_price,
                COALESCE(dt.discount_percent, 0)::float AS discount_percent, COALESCE(dt.discount_amount_fc, 0)::float AS discount_amount,
+               dt.discount_text, COALESCE(dt.line_discount_amount, 0)::float AS line_discount_amount,
+               COALESCE(dt.bill_discount_amount, 0)::float AS bill_discount_amount, dt.vat_type,
                dt.subtotal_fc::float AS amount, COALESCE(dt.vat_rate, 0)::float AS vat_rate,
                COALESCE(dt.vat_amount_fc, 0)::float AS vat_amount, dt.total_amount_fc::float AS line_total,
                COALESCE(dt.subtotal_lc, 0)::float AS amount_lc, COALESCE(dt.vat_amount_lc, 0)::float AS vat_amount_lc,
                COALESCE(dt.total_amount_lc, 0)::float AS line_total_lc,
-               it.item_name_en
+               it.item_name_en, COALESCE(it.item_type, 'STOCK') <> 'STOCK' AS is_service
           FROM ar_transaction_detail dt
-          LEFT JOIN LATERAL (SELECT x.item_name_en FROM im_item x WHERE x.item_code = dt.item_code AND dt.item_code <> '' LIMIT 1) it ON TRUE
+          LEFT JOIN LATERAL (SELECT x.item_name_en, x.item_type FROM im_item x WHERE x.item_code = dt.item_code AND dt.item_code <> '' LIMIT 1) it ON TRUE
           LEFT JOIN LATERAL (SELECT * FROM im_uom x WHERE x.uom_code = dt.unit_code LIMIT 1) u ON TRUE
          WHERE dt.header_id = ANY($1::int[]) ORDER BY dt.header_id, dt.line_no, dt.id`, [arIds])).rows : [];
     // ใบแจ้งหนี้ AR ที่สร้างจากใบส่งสินค้า: รายการ AR ไม่มีรหัส/ชื่อสินค้า — เติมจากรายการใบส่งสินค้าตามลำดับเดียวกัน
@@ -560,7 +575,7 @@ const SALES_INVOICE = {
     const srcImLines = srcImIds.length ? (await db.query(`
         SELECT dt.header_id, COALESCE(NULLIF(dt.item_code, ''), it.item_code) AS item_code,
                COALESCE(NULLIF(dt.item_name, ''), it.item_name_th) AS item_name, it.item_name_en,
-               u.uom_code, u.uom_name_th, u.uom_name_en
+               u.uom_code, u.uom_name_th, u.uom_name_en, dt.description, COALESCE(dt.is_non_stock, false) AS is_service
           FROM im_transaction_detail dt LEFT JOIN im_uom u ON u.id = dt.uom_id
           LEFT JOIN im_item it ON it.id = dt.item_id
          WHERE dt.header_id = ANY($1::int[]) ORDER BY dt.header_id, dt.line_no, dt.id`, [srcImIds])).rows : [];
@@ -569,17 +584,35 @@ const SALES_INVOICE = {
       item_code: s(l.item_code) || src.item_code, item_name: s(l.item_name) || src.item_name,
       item_name_en: s(l.item_name_en) || src.item_name_en,
       uom_code: src.uom_code, uom_name_th: s(l.uom_name_th) || src.uom_name_th, uom_name_en: s(l.uom_name_en) || src.uom_name_en,
+      // รายการบริการของใบส่งสินค้า: หมายเหตุของรายการใบส่งสินค้าพิมพ์แทนชื่อ (ดู lineCommon)
+      is_service: l.is_service || src.is_service,
+      description: src.is_service && s(src.description) ? src.description : l.description,
     });
 
     const lineCommon = (l, i) => {
-      const name = s(l.item_name);
       const desc = s(l.description);
-      const nameEn = s(l.item_name_en) || name;
+      // สินค้าบริการ/ไม่นับสต็อกที่มีหมายเหตุ: พิมพ์หมายเหตุแทนชื่อสินค้า (user request 2026-11-08) ไม่มีหมายเหตุใช้ชื่อตามเดิม
+      const asRemark = l.is_service && !!desc;
+      const name = asRemark ? desc : s(l.item_name);
+      const nameEn = asRemark ? desc : (s(l.item_name_en) || name);
       const join = (n) => (n && desc && desc !== n && desc !== name ? `${n} ${desc}` : (n || desc));
       return {
         line_no: i + 1, item_code: s(l.item_code), item_name: name || desc, item_name_en: nameEn || desc, description: desc,
         item_desc: join(name), item_desc_en: join(nameEn),
         unit: s(l.uom_name_th) || s(l.uom_code) || s(l.unit_code), unit_en: s(l.uom_name_en) || s(l.uom_code) || s(l.unit_code),
+      };
+    };
+    // ส่วนลดท้ายบิล: % และเงินสด (ยอดก่อน VAT) — ส่วนที่ปันเข้ารายการรวมกัน = ส่วนลดจาก % + เงินสด
+    const billDiscountFields = (h, lines) => {
+      // ยอดที่ปันเข้ารายการ (ก่อน VAT) แยกเป็นส่วนลดเงินสด / ส่วนลด % ตามสัดส่วนของยอดที่กรอก (ราคาไม่รวม VAT = ตรงเป๊ะ)
+      const shareEx = round2(lines.reduce((t, l) => t + (l.bill_discount_share || 0), 0));
+      const shareEntered = lines.reduce((t, l) => t + (l.bill_discount_entered || 0), 0);
+      const cashEx = shareEntered > 0 ? round2(Math.min(h.cash_discount_amount, shareEntered) * shareEx / shareEntered) : 0;
+      return {
+        bill_discount_percent: h.bill_discount_percent || 0,
+        bill_discount_amount: round2(shareEx - cashEx),
+        cash_discount_amount: cashEx,
+        line_discount_total: round2(lines.reduce((t, l) => t + (l.line_own_discount || 0), 0)),
       };
     };
     const creditFields = (days) => ({
@@ -594,7 +627,10 @@ const SALES_INVOICE = {
         // ราคาที่กรอก (ส่วนลด/ราคารวม VAT ตามหัวเอกสาร) — พิมพ์ราคาต่อหน่วยก่อน VAT, ส่วนลดและยอดก่อน VAT
         const vr = l.vat_type === 'NOVAT' ? 0 : l.vat_rate;
         const incl = h.price_includes_vat === true && vr > 0;
-        const a = calcLineAmounts({ qty: l.qty, price: l.unit_price, discountPercent: l.discount_percent, vatRate: vr, priceIncludesVat: incl });
+        const a = calcLineAmounts({ qty: l.qty, price: l.unit_price, discountPercent: l.discount_percent, discountAmount: l.disc_amount_entered,
+          vatRate: vr, priceIncludesVat: incl });
+        // ส่วนลดในหน่วยก่อน VAT (ราคารวม VAT แปลงด้วยสัดส่วนเดียวกับ calcLineAmounts)
+        const exVat = (v) => round2(incl ? v * 100 / (100 + vr) : v);
         const amount = a.net;
         const vat = a.vat;
         const amountLc = round2(amount * rate);
@@ -602,6 +638,8 @@ const SALES_INVOICE = {
         return {
           ...lineCommon(l, i), qty: l.qty, unit_price: incl ? round2(l.unit_price * 100 / (100 + vr)) : l.unit_price,
           discount_percent: l.discount_percent, discount_amount: a.discount, gross_amount: a.gross,
+          discount_text: s(l.discount_text), line_discount_amount: exVat(l.line_discount_amount),
+          line_own_discount: round2(a.discount - exVat(l.bill_discount_amount)), bill_discount_share: exVat(l.bill_discount_amount), bill_discount_entered: l.bill_discount_amount,
           amount, vat_rate: vr, vat_amount: vat, line_total: round2(amount + vat),
           amount_lc: amountLc, vat_amount_lc: vatLc, line_total_lc: round2(amountLc + vatLc),
           free_label: l.is_free ? 'ของแถม' : '', free_label_en: l.is_free ? 'Free' : '',
@@ -636,6 +674,7 @@ const SALES_INVOICE = {
           warehouse_name: s(h.warehouse_name_th), warehouse_name_en: s(h.warehouse_name_en) || s(h.warehouse_name_th),
           ...currencyFields(currencies, curOf(h)), currency_code: curOf(h), exchange_rate: rate,
           line_count: lines.length,
+          ...billDiscountFields(h, lines),
           ...totalsFields(imT, curOf(h), base, imLc),
           ...depositFields(imDeps.get(h.id), imT, imLc, curOf(h), base),
         },
@@ -645,8 +684,13 @@ const SALES_INVOICE = {
 
     for (const h of arHeads) {
       const srcLines = h.im_id ? srcImLines.filter(x => x.header_id === h.im_id) : [];
+      // ส่วนประกอบส่วนลดเก็บในหน่วยราคาที่กรอก — ราคารวม VAT แปลงเป็นยอดก่อน VAT ตามอัตราของบรรทัด (เหมือนเอกสาร IM)
+      const exVat = (l, v) => round2(h.price_includes_vat && l.vat_type !== 'NOVAT' ? v * 100 / (100 + l.vat_rate) : v);
       const lines = arLines.filter(l => l.header_id === h.id).map((l, i) => ({
         ...lineCommon(fillFromIm(l, srcLines[i]), i), qty: l.qty, unit_price: l.unit_price, discount_percent: l.discount_percent,
+        discount_text: s(l.discount_text), line_discount_amount: exVat(l, l.line_discount_amount),
+        line_own_discount: round2(l.discount_amount - exVat(l, l.bill_discount_amount)), bill_discount_share: exVat(l, l.bill_discount_amount),
+        bill_discount_entered: l.bill_discount_amount,
         discount_amount: l.discount_amount, amount: l.amount, vat_rate: l.vat_amount ? l.vat_rate : 0,
         vat_amount: l.vat_amount, line_total: l.line_total, free_label: '', free_label_en: '',
         amount_lc: l.amount_lc, vat_amount_lc: l.vat_amount_lc, line_total_lc: l.line_total_lc,
@@ -673,6 +717,7 @@ const SALES_INVOICE = {
           warehouse_name: '', warehouse_name_en: '',
           ...currencyFields(currencies, curOf(h)), currency_code: curOf(h), exchange_rate: h.exchange_rate || 1,
           line_count: lines.length,
+          ...billDiscountFields(h, lines),
           ...totalsFields(arT, curOf(h), base, arLc),
           ...depositFields(arDeps.get(h.id), arT, arLc, curOf(h), base),
         },

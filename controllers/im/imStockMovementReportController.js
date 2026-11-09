@@ -1,5 +1,6 @@
 // controllers/im/imStockMovementReportController.js
 const { today } = require('../../utils/dateUtil');
+const { ensureImPriceColumns } = require('../../utils/vatCalc');
 const { IM_EFFECTIVE_TX, IM_EFFECTIVE_DOC_NO } = require('./imEffectiveTxSql');
 // รายงานสินค้าคงเหลือและการเคลื่อนไหว — จัดกลุ่ม คลัง > หมวดหมู่ > สินค้า (1 "การ์ด" ต่อ สินค้า+คลัง) พร้อมยอดสะสม
 // (running balance) ต่อบรรทัด
@@ -34,6 +35,7 @@ const getStockMovementReport = async (req, res) => {
     const dateFrom = date_from || today();
     const dateTo   = date_to   || today();
 
+    await ensureImPriceColumns(req.dbPool); // is_non_stock — บรรทัดบริการไม่ใช่สต็อก
     const client = await req.dbPool.connect();
     try {
         const params = [dateFrom, dateTo];
@@ -74,7 +76,7 @@ const getStockMovementReport = async (req, res) => {
                     dt.lot_no, dt.serial_no, dt.line_no, dt.is_free
                 FROM ${IM_EFFECTIVE_TX} t
                 JOIN sa_module_document d ON d.id = t.doc_id
-                JOIN im_transaction_detail dt ON dt.header_id = t.id
+                JOIN im_transaction_detail dt ON dt.header_id = t.id AND NOT dt.is_non_stock
                 WHERE t.eff_date <= $2::date
 
                 UNION ALL
@@ -88,7 +90,7 @@ const getStockMovementReport = async (req, res) => {
                     dt.lot_no, dt.serial_no, dt.line_no, dt.is_free
                 FROM ${IM_EFFECTIVE_TX} t
                 JOIN sa_module_document d ON d.id = t.doc_id
-                JOIN im_transaction_detail dt ON dt.header_id = t.id
+                JOIN im_transaction_detail dt ON dt.header_id = t.id AND NOT dt.is_non_stock
                 WHERE t.eff_date <= $2::date
                   AND d.sys_doc_type = '${TRANSFER_TYPE}'
                   AND t.to_warehouse_id IS NOT NULL

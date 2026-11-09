@@ -20,7 +20,7 @@ const { branchCodeSql } = require('../../utils/taxBranch');
 const { IM_CHECK_TYPES, ensureCreditSchema, imDocAmount, assertCreditForPost, loadCreditApprovals } = require('../../utils/creditCheck');
 const { resolveArAccountId } = require('../../utils/arAccount');
 const { resolveApAccountId } = require('../../utils/apAccount');
-const { calcLineAmounts, netUnitPrice, netUnitPriceSql, ensureSoPriceColumns, ensurePoPriceColumns } = require('../../utils/vatCalc');
+const { calcLineAmounts, netUnitPrice, netUnitPriceSql, ensureSoPriceColumns, ensurePoPriceColumns, computeSalesDiscounts, ensureArDiscountColumns } = require('../../utils/vatCalc');
 const { headerDims, lineDims, ensureDetailDimColumns, detailDimParams, assertRequiredDims } = require('../../utils/glDims');
 // บรรทัด IM: บัญชีที่ใช้ลงบัญชีของบรรทัด (เบิกสินค้า '60') + มิติของบรรทัด — utils/glDims.js
 const ensureImLineGlColumns = (db) => ensureDetailDimColumns(db, 'im_transaction_detail', [['gl_account_id', 'INTEGER']]);
@@ -41,7 +41,7 @@ const imLineAmounts = (d, header, price, qty, rate) => {
     const vatType = d.vat_type || 'NOVAT';
     const vatRate = vatType === 'NOVAT' ? 0 : (Number(d.vat_rate) || 0);
     const incl = header.price_includes_vat === true && vatRate > 0;
-    const fc = calcLineAmounts({ qty, price, discountPercent: d.discount_percent, vatRate, priceIncludesVat: incl });
+    const fc = calcLineAmounts({ qty, price, discountPercent: d.discount_percent, discountAmount: d.discount_amount ?? null, vatRate, priceIncludesVat: incl });
     const netLc = round2(fc.net * rate);
     const vatLc = incl ? round2(round2(fc.total * rate) - netLc) : round2(netLc * vatRate / 100);
     const grossLc = round2(fc.gross * rate);
@@ -274,6 +274,21 @@ const ensureImTransactionTable = async (client) => {
     // วันที่ใบกำกับผู้ขาย ('11'/'12') — วันที่/งวดของใบตั้งหนี้ AP อัตโนมัติ + วันที่ใบกำกับในรายงานภาษีซื้อ (ว่าง = วันที่รับสินค้า)
     await client.query(`ALTER TABLE im_transaction ADD COLUMN IF NOT EXISTS vendor_invoice_date DATE`).catch(() => {});
     await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS discount_percent NUMERIC(7,4) NOT NULL DEFAULT 0`).catch(() => {});
+    // บรรทัดสินค้าบริการ/ไม่นับสต็อก (im_item.item_type <> 'STOCK') ในเอกสารฝั่งขาย — ไม่เคลื่อนไหวสต็อก ไม่มีต้นทุน
+    // ลงแค่รายได้ในใบแจ้งหนี้/ใบลดหนี้/ใบเพิ่มหนี้ลูกหนี้ รายงานสต็อกและปิดงวดกรองบรรทัดเหล่านี้ออก (ตั้งค่าตอนบันทึก)
+    await client.query(`ALTER TABLE im_transaction_detail ADD COLUMN IF NOT EXISTS is_non_stock BOOLEAN NOT NULL DEFAULT false`).catch(() => {});
+    // ส่วนลดเอกสารขาย (ดู computeSalesDiscounts ใน utils/vatCalc.js): ขั้นบันได "10+5+2" + ส่วนลดเงินของบรรทัด +
+    // ส่วนที่ปันมาจากส่วนลดท้ายบิล % และส่วนลดเงินสดท้ายบิล — discount_amount = รวมทั้งหมด (หน่วยเดียวกับราคาที่กรอก)
+    // ใช้คำนวณยอดแทน discount_percent เมื่อมีค่า; discount_percent เก็บเป็น % เทียบเท่า (ทศนิยม 8 ตำแหน่ง) ให้ query ที่คิด %
+    await client.query(`ALTER TABLE im_transaction_detail ALTER COLUMN discount_percent TYPE NUMERIC(14,8)`).catch(() => {});
+    await client.query(`ALTER TABLE im_transaction_detail
+        ADD COLUMN IF NOT EXISTS discount_text VARCHAR(40),
+        ADD COLUMN IF NOT EXISTS line_discount_amount NUMERIC(18,4) NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS bill_discount_amount NUMERIC(18,4) NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS discount_amount NUMERIC(18,4)`).catch(() => {});
+    await client.query(`ALTER TABLE im_transaction
+        ADD COLUMN IF NOT EXISTS bill_discount_percent NUMERIC(7,4) NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS cash_discount_amount NUMERIC(18,4) NOT NULL DEFAULT 0`).catch(() => {});
     // เอกสาร AP/AR ที่สร้างอัตโนมัติเก็บตัวเลือกเดียวกัน (คอลัมน์ของ AP/AR เอง — เผื่อยังไม่เคยบันทึกเอกสาร AP/AR หลังเพิ่มคอลัมน์)
     await client.query(`ALTER TABLE ap_transaction ADD COLUMN IF NOT EXISTS price_includes_vat BOOLEAN NOT NULL DEFAULT false`).catch(() => {});
     await client.query(`ALTER TABLE ap_transaction ADD COLUMN IF NOT EXISTS tax_invoice_no VARCHAR(50)`).catch(() => {});
@@ -493,7 +508,81 @@ const COGS_COUNTER_TYPES = ['30', '31', '32', '35', '40', '45', '60'];
 // ประเภทเอกสารที่ลงบัญชีทุกบรรทัดไม่ว่าโหมดใด (บรรทัด Periodic ใช้บัญชีซื้อแทนบัญชีสต็อก) — ประเภทอื่น (ขาย คืน เบิก
 // ปรับยอด) ลงเฉพาะบรรทัด Perpetual เพราะต้นทุนของสต็อก Periodic คำนวณตอนปิดงวด
 const ALWAYS_POST_TYPES = ['10', '13', '90', '95'];
+// ประเภทเอกสารฝั่งขายที่ใส่สินค้าบริการ/ไม่นับสต็อกได้ (user decision 2026-11-08)
+const NON_STOCK_DOC_TYPES = ['30', '31', '32', '35', '40', '45'];
+
+// หลังบันทึกบรรทัด: ตั้ง is_non_stock ตามประเภทสินค้า — บรรทัดไม่นับสต็อกไม่มีตำแหน่ง/ล็อต/ซีเรียล และจำนวนที่กรอก
+// เก็บเป็น counted_qty ล้วน (system_qty = 0) เพราะไม่มียอดคงเหลือ ประเภทเอกสารอื่นใช้สินค้าไม่นับสต็อกไม่ได้
+const markNonStockLines = async (client, headerId) => {
+    const sysDocType = (await client.query(
+        `SELECT d.sys_doc_type FROM im_transaction t JOIN sa_module_document d ON d.id = t.doc_id WHERE t.id = $1`, [headerId]
+    )).rows[0]?.sys_doc_type || '';
+    const res = await client.query(`
+        UPDATE im_transaction_detail dt SET is_non_stock = (COALESCE(i.item_type, 'STOCK') <> 'STOCK')
+        FROM im_item i WHERE i.id = dt.item_id AND dt.header_id = $1
+        RETURNING dt.is_non_stock, i.item_code`, [headerId]);
+    const bad = res.rows.find(r => r.is_non_stock);
+    if (!bad) return;
+    if (!NON_STOCK_DOC_TYPES.includes(sysDocType)) {
+        const err = new Error(`${bad.item_code}: สินค้าบริการ/สินค้าไม่นับสต็อกใช้ได้เฉพาะเอกสารฝั่งขาย (ส่งสินค้า รับคืน ลดหนี้ เพิ่มหนี้ลูกหนี้)`);
+        err.status = 400;
+        throw err;
+    }
+    await client.query(`
+        UPDATE im_transaction_detail SET location_id = NULL, to_location_id = NULL, lot_no = NULL, serial_no = NULL,
+            counted_qty = counted_qty - COALESCE(system_qty, 0), system_qty = 0
+        WHERE header_id = $1 AND is_non_stock`, [headerId]);
+};
+// เอกสารขายที่มีราคา — ส่วนลดขั้นบันได/ส่วนลดเงิน/ส่วนลดท้ายบิล (user request 2026-11-08)
+const SALES_DISCOUNT_TYPES = ['30', '31', '32', '35', '40', '45'];
+const imLineQty = (d) => (d.qty != null && Number(d.qty) !== 0 ? Number(d.qty) : (Number(d.counted_qty) || 0) - (Number(d.system_qty) || 0));
+// คำขอจากผู้เรียกเดิม (ส่งแค่ discount_percent ไม่มี discount_text) → ถือ % นั้นเป็นส่วนลดขั้นเดียว
+const legacyStepText = (d) => {
+    if (d.discount_text === undefined && Number(d.discount_percent)) d.discount_text = String(Number(d.discount_percent));
+};
+// คำนวณส่วนลดบนบรรทัดของคำขอ (แก้ค่าในบรรทัด) ก่อนบันทึก/ตรวจวงเงิน — ประเภทอื่นล้างส่วนลดท้ายบิลและไม่ใช้ discount_amount
+const applySalesDiscountFields = async (client, docId, header, details) => {
+    const sysDocType = (await client.query(`SELECT sys_doc_type FROM sa_module_document WHERE id=$1`, [docId])).rows[0]?.sys_doc_type;
+    if (!SALES_DISCOUNT_TYPES.includes(sysDocType)) {
+        header.bill_discount_percent = 0;
+        header.cash_discount_amount = 0;
+        for (const d of details || []) { d.discount_text = null; d.line_discount_amount = 0; d.bill_discount_amount = 0; d.discount_amount = null; }
+        return;
+    }
+    (details || []).forEach(legacyStepText);
+    computeSalesDiscounts(details || [], {
+        billDiscountPercent: header.bill_discount_percent, cashDiscountAmount: header.cash_discount_amount,
+        priceOf: d => d.unit_price, qtyOf: imLineQty,
+    });
+};
+// คำนวณใหม่จากบรรทัดในฐานข้อมูล (ส่งสินค้ารอตั้งหนี้ '32' แก้ราคา/ตั้งหนี้) — overrides = บรรทัดจากคำขอตาม id,
+// billHeader = { bill_discount_percent, cash_discount_amount } ที่ส่งมา (ไม่ส่ง = ใช้ค่าเดิม)
+const resaveSalesDiscounts = async (client, headerId, overrides = [], billHeader = {}) => {
+    const h = (await client.query(`SELECT bill_discount_percent, cash_discount_amount FROM im_transaction WHERE id=$1`, [headerId])).rows[0];
+    const billPct = billHeader.bill_discount_percent ?? h.bill_discount_percent;
+    const cash = billHeader.cash_discount_amount ?? h.cash_discount_amount;
+    const rows = (await client.query(`SELECT * FROM im_transaction_detail WHERE header_id=$1 ORDER BY line_no, id`, [headerId])).rows;
+    for (const r of rows) {
+        const o = (overrides || []).find(x => Number(x.id) === Number(r.id));
+        if (!o) continue;
+        if (o.discount_text !== undefined) r.discount_text = o.discount_text;
+        else if (o.discount_percent != null) r.discount_text = String(Number(o.discount_percent));
+        if (o.line_discount_amount !== undefined) r.line_discount_amount = o.line_discount_amount;
+    }
+    computeSalesDiscounts(rows, { billDiscountPercent: billPct, cashDiscountAmount: cash, priceOf: d => d.unit_price, qtyOf: imLineQty });
+    await client.query(`UPDATE im_transaction SET bill_discount_percent=$1, cash_discount_amount=$2 WHERE id=$3`,
+        [Number(billPct) || 0, Number(cash) || 0, headerId]);
+    for (const r of rows) {
+        await client.query(`UPDATE im_transaction_detail SET discount_text=$1, line_discount_amount=$2, bill_discount_amount=$3,
+            discount_amount=$4, discount_percent=$5 WHERE id=$6`,
+            [r.discount_text, r.line_discount_amount, r.bill_discount_amount, r.discount_amount, r.discount_percent, r.id]);
+    }
+};
+const salesDiscountParams = (d) => [d.discount_text ?? null, Number(d.line_discount_amount) || 0, Number(d.bill_discount_amount) || 0,
+    d.discount_amount ?? null];
+
 const lineNeedsImGl = (sysDocType, d) => {
+    if (d.is_non_stock) return false; // ไม่มีต้นทุน/สต็อก — รายได้ลงในเอกสาร AR อัตโนมัติ
     if (ALWAYS_POST_TYPES.includes(sysDocType)) return true;
     if (sysDocType === '70') return d.gl_mode !== 'PERIODIC' || d.to_gl_mode !== 'PERIODIC';
     return d.gl_mode !== 'PERIODIC';
@@ -687,6 +776,7 @@ const reverseStockMovement = async (client, headerId) => {
     const isTransfer = headerRes.rows[0]?.sys_doc_type === '70';
 
     for (const d of detailsRes.rows) {
+        if (d.is_non_stock) continue; // ไม่ได้เคลื่อนไหวสต็อกตอน Post
         if (d.costing_method === 'AVG' || d.costing_method === 'STANDARD') {
             const base = { itemId: d.item_id, itemCode: d.item_code, lotNo: d.lot_no, unitCost: Number(d.unit_cost) || 0, costingMethod: d.costing_method };
             await reverseBalanceDelta(client, { ...base, warehouseId, locationId: d.location_id, qty: Number(d.qty) || 0 });
@@ -1391,6 +1481,7 @@ const postArBillFromDln = async (client, { header, details, docNo, advances = []
             subtotalFc, vatFc, totalFc: round2(subtotalFc + vatFc),
             discountPercent: Number(d.discount_percent) || 0, discountFc: amt.fc.discount, discountLc: amt.discountLc,
             grossFc: amt.fc.gross, grossLc: amt.grossLc,
+            discountText: d.discount_text || null, lineDiscountAmount: Number(d.line_discount_amount) || 0, billDiscountAmount: Number(d.bill_discount_amount) || 0,
         });
         totalGrossLc += amt.grossLc; totalGrossFc += amt.fc.gross;
         totalSubtotal += subtotal;
@@ -1425,17 +1516,21 @@ const postArBillFromDln = async (client, { header, details, docNo, advances = []
     ]);
     const arTransactionId = arHeaderRes.rows[0].id;
     await setAutoDocDims(client, 'ar_transaction', arTransactionId, header);
+    await ensureArDiscountColumns(client);
+    await client.query(`UPDATE ar_transaction SET bill_discount_percent=$1, cash_discount_amount=$2 WHERE id=$3`,
+        [Number(header.bill_discount_percent) || 0, Number(header.cash_discount_amount) || 0, arTransactionId]);
 
     let lineNo = 1;
     for (const l of lineRows) {
         const detailRes = await client.query(`
             INSERT INTO ar_transaction_detail
             (header_id, line_no, description, quantity, unit_price_fc, subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
-             revenue_account_id, subtotal_lc, vat_amount_lc, total_amount_lc, discount_percent, discount_amount_fc)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+             revenue_account_id, subtotal_lc, vat_amount_lc, total_amount_lc, discount_percent, discount_amount_fc,
+             discount_text, line_discount_amount, bill_discount_amount)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
             RETURNING id
         `, [arTransactionId, lineNo++, l.itemName || l.itemCode, l.quantity, l.unitPriceFc, l.subtotalFc, l.vatType, l.vatRate, l.vatFc, l.totalFc, l.revenueAccountId,
-            l.subtotal, l.vatAmount, l.total, l.discountPercent, l.discountFc]);
+            l.subtotal, l.vatAmount, l.total, l.discountPercent, l.discountFc, l.discountText, l.lineDiscountAmount, l.billDiscountAmount]);
         await insertImVtLine(client, {
             moduleCode: 'AR', vatType: l.vatType, vatRate: l.vatRate, docId: arDocId, headerId: arTransactionId,
             detailId: detailRes.rows[0].id, docNo: arDocNo, docDate: header.doc_date,
@@ -1822,6 +1917,7 @@ const postArCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
             subtotalFc, vatFc, totalFc: round2(subtotalFc + vatFc),
             discountPercent: Number(d.discount_percent) || 0, discountFc: amt.fc.discount, discountLc: amt.discountLc,
             grossFc: amt.fc.gross, grossLc: amt.grossLc,
+            discountText: d.discount_text || null, lineDiscountAmount: Number(d.line_discount_amount) || 0, billDiscountAmount: Number(d.bill_discount_amount) || 0,
         });
         totalGrossLc += amt.grossLc; totalGrossFc += amt.fc.gross;
         totalSubtotal += subtotal;
@@ -1856,17 +1952,21 @@ const postArCreditDebitNoteFromIm = async (client, { header, details, docNo, isC
     ]);
     const arTransactionId = arHeaderRes.rows[0].id;
     await setAutoDocDims(client, 'ar_transaction', arTransactionId, header);
+    await ensureArDiscountColumns(client);
+    await client.query(`UPDATE ar_transaction SET bill_discount_percent=$1, cash_discount_amount=$2 WHERE id=$3`,
+        [Number(header.bill_discount_percent) || 0, Number(header.cash_discount_amount) || 0, arTransactionId]);
 
     let lineNo = 1;
     for (const l of lineRows) {
         const detailRes = await client.query(`
             INSERT INTO ar_transaction_detail
             (header_id, line_no, description, quantity, unit_price_fc, subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
-             revenue_account_id, subtotal_lc, vat_amount_lc, total_amount_lc, discount_percent, discount_amount_fc)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+             revenue_account_id, subtotal_lc, vat_amount_lc, total_amount_lc, discount_percent, discount_amount_fc,
+             discount_text, line_discount_amount, bill_discount_amount)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
             RETURNING id
         `, [arTransactionId, lineNo++, l.itemName || l.itemCode, l.quantity, l.unitPriceFc, l.subtotalFc, l.vatType, l.vatRate, l.vatFc, l.totalFc, l.revenueAccountId,
-            l.subtotal, l.vatAmount, l.total, l.discountPercent, l.discountFc]);
+            l.subtotal, l.vatAmount, l.total, l.discountPercent, l.discountFc, l.discountText, l.lineDiscountAmount, l.billDiscountAmount]);
         await insertImVtLine(client, {
             moduleCode: 'AR', vatType: l.vatType, vatRate: l.vatRate, docId: arDocId, headerId: arTransactionId,
             detailId: detailRes.rows[0].id, docNo: arDocNo, docDate: header.doc_date,
@@ -2025,7 +2125,7 @@ const postDetailLines = async (client, headerId, header, docNo) => {
         // ถ้ายอดคงเหลือเปลี่ยนก่อนโพสต์ (มีเอกสารอื่นโพสต์ก่อน, สินค้าเดียวกันหลายบรรทัด, ถอยเป็นร่างแล้วโพสต์ใหม่)
         // ต้องคิดเป้าหมายจากยอดปัจจุบัน ไม่งั้นจำนวนที่รับ/จ่ายจริงจะไม่ตรงกับที่กรอก
         let countedQty = d.counted_qty;
-        if (sysDocType !== '80' && item.costing_method !== 'SPECIFIC') {
+        if (sysDocType !== '80' && item.costing_method !== 'SPECIFIC' && !d.is_non_stock) {
             const cur = (await client.query(
                 `SELECT qty_on_hand FROM im_stock_balance WHERE ${STOCK_BALANCE_KEY}`,
                 [item.id, header.warehouse_id, d.location_id || null, d.lot_no || null]
@@ -2060,11 +2160,14 @@ const postDetailLines = async (client, headerId, header, docNo) => {
             continue;
         }
 
-        const { actualUnitCost, balanceQtyBefore, balanceAvgCostBefore, varianceQty } = await applyStockMovement(client, {
-            item, warehouseId: header.warehouse_id, locationId: d.location_id, lotNo: d.lot_no, serialNo: d.serial_no,
-            countedQty, enteredUnitCost: d.unit_cost, docDate: header.doc_date, docCode: header.doc_code,
-            headerId, docNo, detailId: d.id, updatedBy, isFree: d.is_free,
-        });
+        // บรรทัดไม่นับสต็อก: จำนวน = ที่กรอก (counted_qty, system_qty = 0) ไม่ตัดสต็อก ต้นทุน 0
+        const { actualUnitCost, balanceQtyBefore, balanceAvgCostBefore, varianceQty } = d.is_non_stock
+            ? { actualUnitCost: 0, balanceQtyBefore: null, balanceAvgCostBefore: null, varianceQty: Number(d.counted_qty) || 0 }
+            : await applyStockMovement(client, {
+                item, warehouseId: header.warehouse_id, locationId: d.location_id, lotNo: d.lot_no, serialNo: d.serial_no,
+                countedQty, enteredUnitCost: d.unit_cost, docDate: header.doc_date, docCode: header.doc_code,
+                headerId, docNo, detailId: d.id, updatedBy, isFree: d.is_free,
+            });
         // '15'/'35' (คืนสินค้าผู้ขาย/รับคืนจากลูกค้า) ที่อ้างอิงบรรทัดต้นฉบับ — ตรวจคงเหลือที่คืนได้ *หลัง* ทราบ
         // จำนวนจริงที่เคลื่อนไหว (varianceQty) เพื่อเลี่ยงคำนวณ balance-before ซ้ำ ยัง throw ก่อน COMMIT ได้ทันเวลา
         // เพราะทั้งหมดอยู่ใน client transaction เดียวกัน (rollback ทั้งหมดถ้า error)
@@ -2511,6 +2614,7 @@ const insertAndPostAdjustment = async (client, {
     currencyId, currencyCode, exchangeRate,
     dim1Id, dim2Id, dim3Id, dim4Id, dim5Id, branchId, createdBy,
     lines, action, glDocNo, salespersons, customerPoNo, customerPoDate, priceIncludesVat = false, vendorInvoiceDate = null, advances,
+    billDiscountPercent = 0, cashDiscountAmount = 0,
 }) => {
     let resolvedDocId = docId;
     let resolvedDocCode = docCode;
@@ -2656,6 +2760,10 @@ const insertAndPostAdjustment = async (client, {
     if (vendorInvoiceDate) {
         await client.query(`UPDATE im_transaction SET vendor_invoice_date = $1 WHERE id = $2`, [vendorInvoiceDate, newHeaderId]);
     }
+    if (Number(billDiscountPercent) || Number(cashDiscountAmount)) {
+        await client.query(`UPDATE im_transaction SET bill_discount_percent = $1, cash_discount_amount = $2 WHERE id = $3`,
+            [Number(billDiscountPercent) || 0, Number(cashDiscountAmount) || 0, newHeaderId]);
+    }
 
     // unit_cost (LC) เก็บค่าที่ตีมูลค่าสต็อก/โพสต์ GL จริงเสมอ — ถ้าผู้ใช้กรอกราคาเป็นสกุลเงินต่างประเทศ
     // (unit_cost_fc) ให้แปลงเป็นบาทด้วย exchange_rate ของเอกสารนี้ตรงนี้ที่เดียว ส่วนที่เหลือทั้งหมด (FIFO/ถัวเฉลี่ย/
@@ -2671,8 +2779,9 @@ const insertAndPostAdjustment = async (client, {
             (header_id, line_no, item_id, item_code, item_name, location_id, to_location_id, lot_no, serial_no, uom_id,
              system_qty, counted_qty, unit_cost, unit_cost_fc, unit_price, vat_type, vat_rate, ref_im_transaction_detail_id, ref_po_detail_id, ref_so_detail_id, description, is_free,
              ref_mo_component_detail_id, ref_mo_output_detail_id, mo_actual_unit_cost, mo_applied_overhead_unit_cost, discount_percent,
-             gl_account_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33)
+             gl_account_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id,
+             discount_text, line_discount_amount, bill_discount_amount, discount_amount)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37)
         `, [
             newHeaderId, lineNo++, d.item_id, d.item_code || null, d.item_name || null,
             d.location_id || null, d.to_location_id || null, d.lot_no || null, d.serial_no || null, d.uom_id || null,
@@ -2681,9 +2790,11 @@ const insertAndPostAdjustment = async (client, {
             d.ref_im_transaction_detail_id || null, d.ref_po_detail_id || null, d.ref_so_detail_id || null, d.description || null, d.is_free === true,
             d.ref_mo_component_detail_id || null, d.ref_mo_output_detail_id || null, d.mo_actual_unit_cost ?? null,
             d.mo_applied_overhead_unit_cost ?? null, Number(d.discount_percent) || 0,
-            Number(d.gl_account_id) || null, ...detailDimParams(d),
+            Number(d.gl_account_id) || null, ...detailDimParams(d), ...salesDiscountParams(d),
         ]);
     }
+
+    await markNonStockLines(client, newHeaderId);
 
     // พนักงานขาย — บันทึกก่อน Post เพื่อให้ใบแจ้งหนี้ AR อัตโนมัติคัดลอกไปได้
     await saveImSalespersons(client, newHeaderId, salespersons);
@@ -2714,6 +2825,7 @@ const createTransaction = async (req, res) => {
     try {
         await client.query('BEGIN');
         await ensureImTransactionTable(client);
+        await applySalesDiscountFields(client, header.doc_id, header, details);
         // เอกสารใหม่ยังไม่มีคำขออนุมัติ — เกินวงเงินต้องบันทึกร่างแล้วขออนุมัติก่อน
         if ((action || 'Post') === 'Post') {
             await checkImCreditForPost(client, { docId: header.doc_id, customerId: header.customer_id, details, id: 0, row: null, exchangeRate: header.exchange_rate,
@@ -2735,6 +2847,7 @@ const createTransaction = async (req, res) => {
             customerPoNo: header.customer_po_no, customerPoDate: header.customer_po_date,
             lines: details, action, salespersons: req.body.salespersons, priceIncludesVat: header.price_includes_vat === true,
             advances: req.body.advances, vendorInvoiceDate: header.vendor_invoice_date || null,
+            billDiscountPercent: header.bill_discount_percent, cashDiscountAmount: header.cash_discount_amount,
         });
 
         await client.query('COMMIT');
@@ -2867,10 +2980,11 @@ const updateTransaction = async (req, res) => {
             for (const d of details || []) {
                 if (!d.id) continue;
                 await client.query(
-                    `UPDATE im_transaction_detail SET unit_price=$1, discount_percent=COALESCE($4, discount_percent) WHERE id=$2 AND header_id=$3`,
-                    [d.unit_price ?? null, d.id, id, d.discount_percent ?? null]
+                    `UPDATE im_transaction_detail SET unit_price=$1 WHERE id=$2 AND header_id=$3`,
+                    [d.unit_price ?? null, d.id, id]
                 );
             }
+            await resaveSalesDiscounts(client, id, details, header);
             await saveImSalespersons(client, id, req.body.salespersons);
             await saveImAdvances(client, id, req.body.advances);
             await client.query('COMMIT');
@@ -2945,6 +3059,10 @@ const updateTransaction = async (req, res) => {
             const md = await refDims(client, { refMoId: header.ref_mo_id, refPoId: header.ref_po_id, refSoId: header.ref_so_id });
             if (md) Object.assign(header, md);
         }
+        {
+            const docIdRes = await client.query(`SELECT doc_id FROM im_transaction WHERE id=$1`, [id]);
+            await applySalesDiscountFields(client, docIdRes.rows[0].doc_id, header, details);
+        }
 
         await client.query(`
             UPDATE im_transaction SET
@@ -2955,7 +3073,8 @@ const updateTransaction = async (req, res) => {
                 currency_id=$18, currency_code=$19, exchange_rate=$20,
                 dim1_id=$21, dim2_id=$22, dim3_id=$23, dim4_id=$24, dim5_id=$25,
                 branch_id=$26, updated_by=$27, updated_at=NOW(), ref_mo_id=$29,
-                customer_po_no=$30, customer_po_date=$31, price_includes_vat=$32, vendor_invoice_date=$33
+                customer_po_no=$30, customer_po_date=$31, price_includes_vat=$32, vendor_invoice_date=$33,
+                bill_discount_percent=$34, cash_discount_amount=$35
             WHERE id=$28
         `, [
             header.doc_date, periodId, header.warehouse_id, header.to_warehouse_id || null,
@@ -2967,7 +3086,7 @@ const updateTransaction = async (req, res) => {
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
             header.branch_id || null, header.updated_by || null, id, header.ref_mo_id || null,
             (header.customer_po_no || '').trim() || null, header.customer_po_date || null, header.price_includes_vat === true,
-            header.vendor_invoice_date || null,
+            header.vendor_invoice_date || null, Number(header.bill_discount_percent) || 0, Number(header.cash_discount_amount) || 0,
         ]);
 
         await saveImSalespersons(client, id, req.body.salespersons);
@@ -2984,8 +3103,9 @@ const updateTransaction = async (req, res) => {
                 (header_id, line_no, item_id, item_code, item_name, location_id, to_location_id, lot_no, serial_no, uom_id,
                  system_qty, counted_qty, unit_cost, unit_cost_fc, unit_price, vat_type, vat_rate, ref_im_transaction_detail_id, ref_po_detail_id, ref_so_detail_id, description, is_free,
                  ref_mo_component_detail_id, ref_mo_output_detail_id, discount_percent,
-                 gl_account_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
+                 gl_account_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id,
+                 discount_text, line_discount_amount, bill_discount_amount, discount_amount)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35)
             `, [
                 id, lineNo++, d.item_id, d.item_code || null, d.item_name || null,
                 d.location_id || null, d.to_location_id || null, d.lot_no || null, d.serial_no || null, d.uom_id || null,
@@ -2993,9 +3113,10 @@ const updateTransaction = async (req, res) => {
                 d.vat_type || null, d.vat_rate ?? null,
                 d.ref_im_transaction_detail_id || null, d.ref_po_detail_id || null, d.ref_so_detail_id || null, d.description || null, d.is_free === true,
                 d.ref_mo_component_detail_id || null, d.ref_mo_output_detail_id || null, Number(d.discount_percent) || 0,
-                Number(d.gl_account_id) || null, ...detailDimParams(d),
+                Number(d.gl_account_id) || null, ...detailDimParams(d), ...salesDiscountParams(d),
             ]);
         }
+        await markNonStockLines(client, id);
 
         await client.query('COMMIT');
         const full = await fetchRowById(req.dbPool, id);
@@ -3185,11 +3306,12 @@ const postBillingForDln = async (req, res) => {
             for (const l of lines) {
                 if (!l.id) continue;
                 await client.query(
-                    `UPDATE im_transaction_detail SET unit_price=$1, vat_type=$2, vat_rate=$3, discount_percent=COALESCE($6, discount_percent) WHERE id=$4 AND header_id=$5`,
-                    [l.unit_price ?? null, l.vat_type ?? null, l.vat_rate ?? null, l.id, id, l.discount_percent ?? null]
+                    `UPDATE im_transaction_detail SET unit_price=$1, vat_type=$2, vat_rate=$3 WHERE id=$4 AND header_id=$5`,
+                    [l.unit_price ?? null, l.vat_type ?? null, l.vat_rate ?? null, l.id, id]
                 );
             }
         }
+        await resaveSalesDiscounts(client, id, Array.isArray(lines) ? lines : [], req.body || {});
 
         const detailsRes = await client.query(`SELECT * FROM im_transaction_detail WHERE header_id=$1 ORDER BY line_no`, [id]);
         // พนักงานขายที่แก้ในหน้าจอพร้อมกับการออกใบแจ้งหนี้ (ไม่บังคับ Save แยกก่อน เหมือนราคาขาย)

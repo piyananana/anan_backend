@@ -39,7 +39,7 @@ const DOCS = {
         SELECT t.id, t.status, t.customer_id, t.credit_status, t.credit_amount, t.exchange_rate, t.doc_code, t.price_includes_vat
           FROM so_transaction t WHERE t.id = $1`, [id])).rows[0];
       if (r) {
-        const details = (await db.query(`SELECT qty_ordered, unit_price_fc, discount_percent, vat_type, vat_rate
+        const details = (await db.query(`SELECT qty_ordered, unit_price_fc, discount_percent, discount_amount, vat_type, vat_rate
           FROM so_transaction_detail WHERE header_id=$1`, [id])).rows;
         r.amount = C.soDocAmount(details, r.exchange_rate, r.price_includes_vat);
       }

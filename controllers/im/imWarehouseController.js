@@ -31,6 +31,16 @@ const ensureImWarehouseTable = async (client) => {
     // โหมดบัญชีสินค้าของคลัง (NULL = ค่าเริ่มต้นของบริษัท; สินค้า/หมวดสินค้าที่ตั้งโหมดไว้มีผลก่อน) + บัญชีซื้อสินค้าสำหรับ Periodic
     await client.query(`ALTER TABLE im_warehouse ADD COLUMN IF NOT EXISTS accounting_mode VARCHAR(10)`).catch(() => {});
     await client.query(`ALTER TABLE im_warehouse ADD COLUMN IF NOT EXISTS purchases_account_id INTEGER REFERENCES gl_account(id)`).catch(() => {});
+    // คลังหลัก — มีได้คลังเดียวทั้งบริษัท เอกสาร IM ใหม่ทุกประเภทใช้เป็นคลังเริ่มต้น
+    await client.query(`ALTER TABLE im_warehouse ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT false`).catch(() => {});
+    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS im_warehouse_one_default ON im_warehouse ((true)) WHERE is_default`).catch(() => {});
+};
+
+// ตั้งคลังนี้เป็นคลังหลัก (ยกเลิกคลังหลักเดิม) — คลังที่ปิดใช้งานเป็นคลังหลักไม่ได้
+const saveDefaultFlag = async (client, id, isDefault, isActive) => {
+    const flag = isDefault === true && isActive !== false;
+    if (flag) await client.query(`UPDATE im_warehouse SET is_default = false WHERE is_default AND id <> $1`, [id]);
+    await client.query(`UPDATE im_warehouse SET is_default = $2 WHERE id = $1`, [id, flag]);
 };
 
 const WAREHOUSE_SELECT = `
@@ -86,7 +96,7 @@ const fetchRow = async (req, res) => {
 const addRow = async (req, res) => {
     const client = await req.dbPool.connect();
     const { warehouse_code, warehouse_name_th, warehouse_name_en, branch_id, address, is_active, is_consignee,
-            inventory_account_id, purchases_account_id, accounting_mode } = req.body;
+            inventory_account_id, purchases_account_id, accounting_mode, is_default } = req.body;
     const userName = req.headers.username || null;
     try {
         await client.query('BEGIN');
@@ -100,6 +110,7 @@ const addRow = async (req, res) => {
              inventory_account_id || null, purchases_account_id || null, normalizeMode(accounting_mode)]
         );
         const newId = result.rows[0].id;
+        await saveDefaultFlag(client, newId, is_default, is_active);
         await logModeChange(client, { level: 'WAREHOUSE', refId: newId, oldMode: null, newMode: normalizeMode(accounting_mode), changedBy: userName });
         await client.query('COMMIT');
         const newRow = await client.query(`${WAREHOUSE_SELECT} WHERE w.id = $1`, [newId]);
@@ -116,7 +127,7 @@ const updateRow = async (req, res) => {
     const { id } = req.params;
     const client = await req.dbPool.connect();
     const { warehouse_name_th, warehouse_name_en, branch_id, address, is_active, is_consignee,
-            inventory_account_id, purchases_account_id, accounting_mode } = req.body;
+            inventory_account_id, purchases_account_id, accounting_mode, is_default } = req.body;
     const userName = req.headers.username || null;
     try {
         await client.query('BEGIN');
@@ -133,6 +144,7 @@ const updateRow = async (req, res) => {
              inventory_account_id || null, purchases_account_id || null, normalizeMode(accounting_mode)]
         );
         if (result.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'ไม่พบคลังสินค้า' }); }
+        await saveDefaultFlag(client, id, is_default, is_active);
         await logModeChange(client, { level: 'WAREHOUSE', refId: Number(id), oldMode: oldModeRes.rows[0]?.accounting_mode, newMode: normalizeMode(accounting_mode), changedBy: userName });
         await client.query('COMMIT');
         const updated = await client.query(`${WAREHOUSE_SELECT} WHERE w.id = $1`, [id]);

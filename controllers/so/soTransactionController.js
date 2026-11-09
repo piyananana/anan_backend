@@ -17,7 +17,8 @@ const { reasonOf, userIdOf, sendErr, blk } = require('../../utils/docAction');
 const { ensureSalespersonTable, saveDocSalespersons, loadSalespersons } = require('../../utils/docSalesperson');
 const DA = require('../../utils/docApproval');
 const { ensureCreditSchema, assertCreditForPost, soDocAmount, loadCreditApprovals } = require('../../utils/creditCheck');
-const { ensureSoPriceColumns, netUnitPriceSql, orderLineValues, saveOrderTotals } = require('../../utils/vatCalc');
+const { ensureSoPriceColumns, netUnitPriceSql, orderLineValues, saveOrderTotals, applyOrderSalesDiscounts, orderDiscountParams,
+    saveOrderBillDiscount } = require('../../utils/vatCalc');
 const { fetchOrderDeposits } = require('../../utils/depositRef');
 const KIND = 'SO';
 
@@ -243,6 +244,9 @@ const createTransaction = async (req, res) => {
             (header.customer_po_no || '').trim() || null, header.customer_po_date || null, header.price_includes_vat === true,
         ]);
         const headerId = hRes.rows[0].id;
+        // ส่วนลดขั้นบันได + เงินของรายการ + ท้ายบิล (% และเงินสด) ปันเข้ารายการ — ยอดบรรทัดคิดจาก discount_amount
+        applyOrderSalesDiscounts(header, details, d => d.qty_ordered);
+        await saveOrderBillDiscount(client, 'so_transaction', headerId, header);
 
         // อ้างอิงบรรทัดใบเสนอราคา (ถ้ามี) — ตรวจคงเหลือที่แปลงได้ก่อนบันทึกทุกบรรทัด แล้วรีเฟรชสถานะ Quote ต้นทาง
         // ทั้งหมดที่ถูกอ้างอิงหลังบันทึกครบ — มิเรอร์ poTransactionController.js:createTransaction ทุกประการ
@@ -265,11 +269,12 @@ const createTransaction = async (req, res) => {
             const newDetailRes = await client.query(`
                 INSERT INTO so_transaction_detail
                 (header_id, line_no, item_id, item_code, item_name, uom_id, qty_ordered, unit_price_fc, total_value_lc, description, ref_quote_detail_id,
-                 discount_percent, vat_type, vat_rate)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                 discount_percent, vat_type, vat_rate, discount_text, line_discount_amount, bill_discount_amount, discount_amount)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
                 RETURNING id
             `, [headerId, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                qty, price, amt.netLc, d.description || null, d.ref_quote_detail_id || null, discountPercent, vatType, vatRate]);
+                qty, price, amt.netLc, d.description || null, d.ref_quote_detail_id || null, discountPercent, vatType, vatRate,
+                ...orderDiscountParams(d)]);
             if (d.ref_quote_detail_id) {
                 await copyAttachmentsToEntity(client, {
                     dbName, sourceModule: 'quote_transaction_detail', sourceEntityId: d.ref_quote_detail_id,
@@ -288,7 +293,7 @@ const createTransaction = async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error creating so_transaction:', error);
-        res.status(500).json({ message: error.message || 'Internal server error' });
+        res.status(error.status || 500).json({ message: error.message || 'Internal server error' });
     } finally { client.release(); }
 };
 
@@ -331,6 +336,9 @@ const updateTransaction = async (req, res) => {
             (header.customer_po_no || '').trim() || null, header.customer_po_date || null, header.price_includes_vat === true,
         ]);
 
+        applyOrderSalesDiscounts(header, details, d => d.qty_ordered);
+        await saveOrderBillDiscount(client, 'so_transaction', id, header);
+
         const { validateQuoteConvertibleQty, refreshQuoteStatus } = require('./soQuoteTransactionController');
         const affectedQuoteIds = new Set();
         const oldQuoteLines = await client.query(`SELECT DISTINCT qtd.header_id FROM so_transaction_detail sod
@@ -370,19 +378,22 @@ const updateTransaction = async (req, res) => {
                     UPDATE so_transaction_detail SET
                         line_no=$1, item_id=$2, item_code=$3, item_name=$4, uom_id=$5, qty_ordered=$6,
                         unit_price_fc=$7, total_value_lc=$8, description=$9, ref_quote_detail_id=$10,
-                        discount_percent=$12, vat_type=$13, vat_rate=$14
+                        discount_percent=$12, vat_type=$13, vat_rate=$14,
+                        discount_text=$15, line_discount_amount=$16, bill_discount_amount=$17, discount_amount=$18
                     WHERE id=$11
                 `, [lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                    qty, price, value, d.description || null, d.ref_quote_detail_id || null, d.id, discountPercent, vatType, vatRate]);
+                    qty, price, value, d.description || null, d.ref_quote_detail_id || null, d.id, discountPercent, vatType, vatRate,
+                    ...orderDiscountParams(d)]);
             } else {
                 const newDetailRes = await client.query(`
                     INSERT INTO so_transaction_detail
                     (header_id, line_no, item_id, item_code, item_name, uom_id, qty_ordered, unit_price_fc, total_value_lc, description, ref_quote_detail_id,
-                     discount_percent, vat_type, vat_rate)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                     discount_percent, vat_type, vat_rate, discount_text, line_discount_amount, bill_discount_amount, discount_amount)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
                     RETURNING id
                 `, [id, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                    qty, price, value, d.description || null, d.ref_quote_detail_id || null, discountPercent, vatType, vatRate]);
+                    qty, price, value, d.description || null, d.ref_quote_detail_id || null, discountPercent, vatType, vatRate,
+                    ...orderDiscountParams(d)]);
                 if (d.ref_quote_detail_id) {
                     await copyAttachmentsToEntity(client, {
                         dbName, sourceModule: 'quote_transaction_detail', sourceEntityId: d.ref_quote_detail_id,
@@ -402,7 +413,7 @@ const updateTransaction = async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error updating so_transaction:', error);
-        res.status(500).json({ message: error.message || 'Internal server error' });
+        res.status(error.status || 500).json({ message: error.message || 'Internal server error' });
     } finally { client.release(); }
 };
 
@@ -441,7 +452,7 @@ const submitTransaction = approvalAction('submitting', async (client, t, { menuI
     // วงเงินเครดิตลูกค้า (user-approved 2026-10-30): เกินวงเงินและยังไม่ได้รับอนุมัติที่ครอบคลุมยอดนี้ = ส่งอนุมัติไม่ได้
     // ต้องขออนุมัติเกินวงเงินก่อน (utils/creditCheck.js — กลไกเดียวกับใบแจ้งหนี้/ใบส่งสินค้า)
     await ensureCreditSchema(client);
-    const lines = (await client.query(`SELECT qty_ordered, unit_price_fc, discount_percent, vat_type, vat_rate
+    const lines = (await client.query(`SELECT qty_ordered, unit_price_fc, discount_percent, discount_amount, vat_type, vat_rate
         FROM so_transaction_detail WHERE header_id=$1`, [t.id])).rows;
     await assertCreditForPost(client, { customerId: t.customer_id, amount: soDocAmount(lines, t.exchange_rate, t.price_includes_vat), row: t, actionTh: 'ส่งอนุมัติ' });
     const q = await DA.buildQueue(client, { kind: KIND, recordId: t.id, menuId, docCode: t.doc_code });

@@ -1,5 +1,6 @@
 // controllers/im/imStockAgingReportController.js
 const { today } = require('../../utils/dateUtil');
+const { ensureImPriceColumns } = require('../../utils/vatCalc');
 // รายงานอายุสินค้าคงคลัง (Stock Aging Report) — แยกวิธีคำนวณอายุตาม costing_method ของสินค้า เพราะข้อมูลที่มีอยู่
 // จริงต่างกันโดยพื้นฐาน:
 //   - FIFO/SPECIFIC: มี im_stock_layer เก็บเป็นล็อตแยกทุก batch (layer_date, remaining_qty) จึงรู้ "อายุจริง"
@@ -37,6 +38,7 @@ const getStockAgingReport = async (req, res) => {
     } = req.query;
     const asOf = as_of_date || today();
 
+    await ensureImPriceColumns(req.dbPool); // is_non_stock — บรรทัดบริการไม่ใช่สต็อก
     const client = await req.dbPool.connect();
     try {
         const params = [asOf];
@@ -91,14 +93,14 @@ const getStockAgingReport = async (req, res) => {
             WITH last_out AS (
                 SELECT t.warehouse_id, dt.location_id, dt.item_id, MAX(t.doc_date) AS d
                 FROM im_transaction t
-                JOIN im_transaction_detail dt ON dt.header_id = t.id
+                JOIN im_transaction_detail dt ON dt.header_id = t.id AND NOT dt.is_non_stock
                 WHERE t.status IN ('Posted', 'Received', 'Delivered') AND dt.qty < 0
                 GROUP BY t.warehouse_id, dt.location_id, dt.item_id
             ),
             first_in AS (
                 SELECT t.warehouse_id, dt.location_id, dt.item_id, MIN(t.doc_date) AS d
                 FROM im_transaction t
-                JOIN im_transaction_detail dt ON dt.header_id = t.id
+                JOIN im_transaction_detail dt ON dt.header_id = t.id AND NOT dt.is_non_stock
                 WHERE t.status IN ('Posted', 'Received', 'Delivered') AND dt.qty > 0
                 GROUP BY t.warehouse_id, dt.location_id, dt.item_id
             ),
