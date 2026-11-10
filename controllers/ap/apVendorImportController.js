@@ -21,7 +21,7 @@ const TEMPLATE_SHEETS = [
     columns: [
       { key: 'old_vendor_code',    label: 'รหัสเก่าเจ้าหนี้ — ใช้เชื่อมข้อมูลกับ sheet อื่น',    required: true,  example: 'VA0001' },
       { key: 'vendor_name_th',     label: 'ชื่อเจ้าหนี้ (ไทย)',                                   required: true,  example: 'บริษัท XYZ จำกัด' },
-      { key: 'vendor_code',        label: 'รหัสเจ้าหนี้ (ว่างได้ถ้าอัตโนมัติ)',                  required: false, example: 'V001' },
+      { key: 'vendor_code',        label: 'รหัสเจ้าหนี้ (ว่าง = อัตโนมัติ / รหัสเก่า)',                  required: false, example: 'V001' },
       { key: 'vendor_group_code',  label: 'รหัสกลุ่มเจ้าหนี้',                                   required: false, example: 'LOCAL' },
       { key: 'vendor_name_en',     label: 'ชื่อเจ้าหนี้ (อังกฤษ)',                                required: false, example: 'XYZ Co., Ltd.' },
       { key: 'tax_id',             label: 'เลขประจำตัวผู้เสียภาษี',                               required: false, example: '0105555012345' },
@@ -98,8 +98,18 @@ const VENDOR_TYPES = ['individual', 'juristic'];
 const YES_VALUES = ['y', 'yes', 'true', '1', 'ใช่'];
 
 // GET /ap_vendor/import/template
-const getTemplate = (req, res) => {
-  res.json({ sheets: TEMPLATE_SHEETS });
+const getTemplate = async (req, res) => {
+  // การตั้งค่ารหัสอัตโนมัติ — หน้าจอใช้แสดงคำเตือนว่ารหัสเจ้าหนี้ใหม่มาจากไหน
+  let autoNumbering = false, autoGroupCodes = [];
+  if (req.dbPool) {
+    const [runningR, groupsR] = await Promise.all([
+      req.dbPool.query(`SELECT is_auto_numbering FROM ap_vendor_running LIMIT 1`).catch(() => ({ rows: [] })),
+      req.dbPool.query(`SELECT group_code AS code FROM ap_vendor_group WHERE is_active = true AND is_auto_number = true ORDER BY group_code`).catch(() => ({ rows: [] })),
+    ]);
+    autoNumbering = !!runningR.rows[0]?.is_auto_numbering;
+    autoGroupCodes = groupsR.rows.map(r => r.code);
+  }
+  res.json({ sheets: TEMPLATE_SHEETS, auto_numbering: autoNumbering, auto_group_codes: autoGroupCodes });
 };
 
 // GET /ap_vendor/import/template/download
@@ -216,6 +226,21 @@ const validateFile = [
 
       const errors  = [];
       const vendors = new Map();
+      // รหัสที่มีอยู่แล้วในระบบ (ทั้งรหัสเจ้าหนี้และรหัสเก่าเจ้าหนี้) — แจ้งซ้ำตั้งแต่ตอนตรวจสอบ ไม่ปล่อยให้ข้ามตอนยืนยัน
+      const fileOldCodes = [], fileNewCodes = [];
+      for (const row of general.rows) {
+        const o = String(row[general.colIdx['old_vendor_code']] ?? '').trim().toUpperCase();
+        const n = String(row[general.colIdx['vendor_code']] ?? '').trim().toUpperCase();
+        if (o) { fileOldCodes.push(o); fileNewCodes.push(o); }
+        if (n) fileNewCodes.push(n);
+      }
+      const [existNewR, existOldR] = await Promise.all([
+        req.dbPool.query(`SELECT UPPER(vendor_code) AS c FROM ap_vendor WHERE UPPER(vendor_code) = ANY($1::text[])`, [fileNewCodes]),
+        req.dbPool.query(`SELECT UPPER(old_vendor_code) AS c FROM ap_vendor WHERE UPPER(old_vendor_code) = ANY($1::text[])`, [fileOldCodes]),
+      ]);
+      const existingNewCodes = new Set(existNewR.rows.map(r => r.c));
+      const existingOldCodes = new Set(existOldR.rows.map(r => r.c));
+      const newCodeRows = new Map(); // รหัสเจ้าหนี้ใหม่ (ตัวพิมพ์ใหญ่) -> แถวแรกที่ใช้ — กันรหัสซ้ำกันเองในไฟล์
       const order   = [];
 
       // ── Sheet 1: ข้อมูลพื้นฐาน ────────────────────────────────────────────
@@ -226,7 +251,7 @@ const validateFile = [
 
         const oldCode     = get('old_vendor_code');
         const nameTh      = get('vendor_name_th');
-        const vendorCode  = get('vendor_code');
+        let vendorCode  = get('vendor_code');
         const groupCode   = get('vendor_group_code').toUpperCase();
         if (!oldCode && !nameTh && !vendorCode && !groupCode) continue;
 
@@ -252,13 +277,37 @@ const validateFile = [
           if (!resolvedGroup) rowErrors.push({ column: 'vendor_group_code', message: `ไม่พบกลุ่มเจ้าหนี้ "${groupCode}"` });
         }
 
+        // รหัสเก่าเจ้าหนี้ซ้ำกับที่มีอยู่ในระบบ
+        if (existingOldCodes.has(oldCode.toUpperCase())) {
+          rowErrors.push({ column: 'old_vendor_code', message: `รหัสเก่าเจ้าหนี้ "${oldCode}" มีอยู่แล้วในระบบ` });
+        }
+
+        // ไม่ระบุรหัสเจ้าหนี้ และไม่มีรหัสอัตโนมัติ (ทั้งกลุ่ม/หมวดและระบบ) → ใช้รหัสเก่าเจ้าหนี้เป็นรหัสเจ้าหนี้ใหม่
+        const vendorCodeFromOld = !vendorCode && !(resolvedGroup?.is_auto_number ?? false) && !globalAutoNumber;
+        if (vendorCodeFromOld) vendorCode = oldCode;
+
         if (!vendorCode) {
           const groupAuto = resolvedGroup?.is_auto_number ?? false;
           if (!groupAuto && !globalAutoNumber) {
             rowErrors.push({ column: 'vendor_code', message: 'จำเป็นต้องระบุรหัสเจ้าหนี้ (กลุ่มและระบบไม่ได้เปิดรหัสอัตโนมัติ)' });
           }
         } else if (vendorCode.length > 20) {
-          rowErrors.push({ column: 'vendor_code', message: 'รหัสเจ้าหนี้ต้องไม่เกิน 20 ตัวอักษร' });
+          rowErrors.push({ column: vendorCodeFromOld ? 'old_vendor_code' : 'vendor_code', message: vendorCodeFromOld
+            ? `รหัสเก่าเจ้าหนี้ "${vendorCode}" ยาวเกิน 20 ตัวอักษร ใช้เป็นรหัสเจ้าหนี้ใหม่ไม่ได้ — กรุณาระบุรหัสเจ้าหนี้`
+            : 'รหัสเจ้าหนี้ต้องไม่เกิน 20 ตัวอักษร' });
+        }
+        if (vendorCode) {
+          const upper = vendorCode.toUpperCase();
+          if (existingNewCodes.has(upper)) {
+            rowErrors.push({ column: vendorCodeFromOld ? 'old_vendor_code' : 'vendor_code', message: vendorCodeFromOld
+              ? `รหัสเก่าเจ้าหนี้ "${upper}" ซ้ำกับรหัสเจ้าหนี้ที่มีอยู่แล้วในระบบ (ใช้เป็นรหัสเจ้าหนี้ใหม่ไม่ได้)`
+              : `รหัสเจ้าหนี้ "${upper}" มีอยู่แล้วในระบบ` });
+          }
+          if (newCodeRows.has(upper)) {
+            rowErrors.push({ column: vendorCodeFromOld ? 'old_vendor_code' : 'vendor_code', message: `รหัสเจ้าหนี้ "${upper}" ซ้ำกับแถว ${newCodeRows.get(upper)} ในไฟล์` });
+          } else {
+            newCodeRows.set(upper, rowNum);
+          }
         }
 
         const businessTypeCode = get('business_type_code').toUpperCase();

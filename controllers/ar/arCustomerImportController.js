@@ -22,7 +22,7 @@ const TEMPLATE_SHEETS = [
     columns: [
       { key: 'old_customer_code',  label: 'รหัสเก่าลูกหนี้ — ใช้เชื่อมข้อมูลกับ sheet อื่น', required: true,  example: 'CA0001' },
       { key: 'customer_name_th',   label: 'ชื่อลูกหนี้ (ไทย)',                     required: true,  example: 'บริษัท เอบีซี จำกัด' },
-      { key: 'customer_code',      label: 'รหัสลูกหนี้ (ว่างได้ถ้าอัตโนมัติ)',     required: false, example: 'C0001' },
+      { key: 'customer_code',      label: 'รหัสลูกหนี้ (ว่าง = อัตโนมัติ / รหัสเก่า)',required: false, example: 'C0001' },
       { key: 'customer_group_code',label: 'รหัสกลุ่มลูกค้า',                       required: false, example: 'RETAIL' },
       { key: 'customer_name_en',   label: 'ชื่อลูกหนี้ (อังกฤษ)',                  required: false, example: 'ABC Co., Ltd.' },
       { key: 'tax_id',              label: 'เลขประจำตัวผู้เสียภาษี',                required: false, example: '0105555012345' },
@@ -152,8 +152,18 @@ const ACCOUNT_TYPES = ['current', 'savings'];
 const YES_VALUES = ['y', 'yes', 'true', '1', 'ใช่'];
 
 // GET /ar_customer/import/template
-const getTemplate = (req, res) => {
-  res.json({ sheets: TEMPLATE_SHEETS });
+const getTemplate = async (req, res) => {
+  // การตั้งค่ารหัสอัตโนมัติ — หน้าจอใช้แสดงคำเตือนว่ารหัสลูกหนี้ใหม่มาจากไหน
+  let autoNumbering = false, autoGroupCodes = [];
+  if (req.dbPool) {
+    const [runningR, groupsR] = await Promise.all([
+      req.dbPool.query(`SELECT is_auto_numbering FROM ar_customer_running LIMIT 1`).catch(() => ({ rows: [] })),
+      req.dbPool.query(`SELECT group_code AS code FROM ar_customer_group WHERE is_active = true AND is_auto_number = true ORDER BY group_code`).catch(() => ({ rows: [] })),
+    ]);
+    autoNumbering = !!runningR.rows[0]?.is_auto_numbering;
+    autoGroupCodes = groupsR.rows.map(r => r.code);
+  }
+  res.json({ sheets: TEMPLATE_SHEETS, auto_numbering: autoNumbering, auto_group_codes: autoGroupCodes });
 };
 
 // GET /ar_customer/import/template/download — ส่งไฟล์ xlsx เทมเพลตหลาย sheet
@@ -298,6 +308,21 @@ const validateFile = [
 
       const errors = [];          // standalone errors (no matching customer row)
       const customers = new Map(); // customer_name_th -> customer record
+      // รหัสที่มีอยู่แล้วในระบบ (ทั้งรหัสลูกหนี้และรหัสเก่าลูกหนี้) — แจ้งซ้ำตั้งแต่ตอนตรวจสอบ ไม่ปล่อยให้ข้ามตอนยืนยัน
+      const fileOldCodes = [], fileNewCodes = [];
+      for (const row of general.rows) {
+        const o = String(row[general.colIdx['old_customer_code']] ?? '').trim().toUpperCase();
+        const n = String(row[general.colIdx['customer_code']] ?? '').trim().toUpperCase();
+        if (o) { fileOldCodes.push(o); fileNewCodes.push(o); }
+        if (n) fileNewCodes.push(n);
+      }
+      const [existNewR, existOldR] = await Promise.all([
+        req.dbPool.query(`SELECT UPPER(customer_code) AS c FROM ar_customer WHERE UPPER(customer_code) = ANY($1::text[])`, [fileNewCodes]),
+        req.dbPool.query(`SELECT UPPER(old_customer_code) AS c FROM ar_customer WHERE UPPER(old_customer_code) = ANY($1::text[])`, [fileOldCodes]),
+      ]);
+      const existingNewCodes = new Set(existNewR.rows.map(r => r.c));
+      const existingOldCodes = new Set(existOldR.rows.map(r => r.c));
+      const newCodeRows = new Map(); // รหัสลูกหนี้ใหม่ (ตัวพิมพ์ใหญ่) -> แถวแรกที่ใช้ — กันรหัสซ้ำกันเองในไฟล์
       const order = [];
 
       // ── Sheet 1: ข้อมูลทั่วไป ─────────────────────────────────────────────
@@ -308,7 +333,7 @@ const validateFile = [
 
         const oldCode = get('old_customer_code');
         const nameTh = get('customer_name_th');
-        const customerCode = get('customer_code');
+        let customerCode = get('customer_code');
         const groupCode = get('customer_group_code').toUpperCase();
         if (!oldCode && !nameTh && !customerCode && !groupCode) continue; // skip blank row
 
@@ -336,6 +361,15 @@ const validateFile = [
           if (!resolvedGroup) rowErrors.push({ column: 'customer_group_code', message: `ไม่พบกลุ่มลูกค้า "${groupCode}"` });
         }
 
+        // รหัสเก่าลูกหนี้ซ้ำกับที่มีอยู่ในระบบ
+        if (existingOldCodes.has(oldCode.toUpperCase())) {
+          rowErrors.push({ column: 'old_customer_code', message: `รหัสเก่าลูกหนี้ "${oldCode}" มีอยู่แล้วในระบบ` });
+        }
+
+        // ไม่ระบุรหัสลูกหนี้ และไม่มีรหัสอัตโนมัติ (ทั้งกลุ่ม/หมวดและระบบ) → ใช้รหัสเก่าลูกหนี้เป็นรหัสลูกหนี้ใหม่
+        const customerCodeFromOld = !customerCode && !(resolvedGroup?.is_auto_number ?? false) && !globalAutoNumber;
+        if (customerCodeFromOld) customerCode = oldCode;
+
         // customer_code: จำเป็นต้องระบุ เว้นแต่มีรหัสอัตโนมัติ
         if (!customerCode) {
           const groupAuto = resolvedGroup?.is_auto_number ?? false;
@@ -343,7 +377,22 @@ const validateFile = [
             rowErrors.push({ column: 'customer_code', message: 'จำเป็นต้องระบุรหัสลูกหนี้ (กลุ่มและระบบไม่ได้เปิดรหัสอัตโนมัติ)' });
           }
         } else if (customerCode.length > 20) {
-          rowErrors.push({ column: 'customer_code', message: 'รหัสลูกหนี้ต้องไม่เกิน 20 ตัวอักษร' });
+          rowErrors.push({ column: customerCodeFromOld ? 'old_customer_code' : 'customer_code', message: customerCodeFromOld
+            ? `รหัสเก่าลูกหนี้ "${customerCode}" ยาวเกิน 20 ตัวอักษร ใช้เป็นรหัสลูกหนี้ใหม่ไม่ได้ — กรุณาระบุรหัสลูกหนี้`
+            : 'รหัสลูกหนี้ต้องไม่เกิน 20 ตัวอักษร' });
+        }
+        if (customerCode) {
+          const upper = customerCode.toUpperCase();
+          if (existingNewCodes.has(upper)) {
+            rowErrors.push({ column: customerCodeFromOld ? 'old_customer_code' : 'customer_code', message: customerCodeFromOld
+              ? `รหัสเก่าลูกหนี้ "${upper}" ซ้ำกับรหัสลูกหนี้ที่มีอยู่แล้วในระบบ (ใช้เป็นรหัสลูกหนี้ใหม่ไม่ได้)`
+              : `รหัสลูกหนี้ "${upper}" มีอยู่แล้วในระบบ` });
+          }
+          if (newCodeRows.has(upper)) {
+            rowErrors.push({ column: customerCodeFromOld ? 'old_customer_code' : 'customer_code', message: `รหัสลูกหนี้ "${upper}" ซ้ำกับแถว ${newCodeRows.get(upper)} ในไฟล์` });
+          } else {
+            newCodeRows.set(upper, rowNum);
+          }
         }
 
         // business_type_code

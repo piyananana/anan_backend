@@ -28,7 +28,7 @@ const TEMPLATE_SHEETS = [
     columns: [
       { key: 'old_item_code',       label: 'รหัสสินค้าเก่า — ใช้เชื่อมข้อมูลกับ sheet อื่น', required: true,  example: 'IA0001' },
       { key: 'item_name_th',        label: 'ชื่อสินค้า (ไทย)',                              required: true,  example: 'สินค้าตัวอย่าง' },
-      { key: 'item_code',           label: 'รหัสสินค้า (ว่างได้ถ้าอัตโนมัติ)',              required: false, example: 'I001' },
+      { key: 'item_code',           label: 'รหัสสินค้า (ว่าง = อัตโนมัติ / รหัสเก่า)',              required: false, example: 'I001' },
       { key: 'category_code',       label: 'รหัสหมวดหมู่สินค้า',                            required: false, example: 'CAT01' },
       { key: 'item_name_en',        label: 'ชื่อสินค้า (อังกฤษ)',                           required: false, example: 'Sample Item' },
       { key: 'barcode',             label: 'บาร์โค้ด',                                      required: false, example: '' },
@@ -128,8 +128,18 @@ const findPriceLineOverlap = (lines) => {
 };
 
 // GET /im_item/import/template
-const getTemplate = (req, res) => {
-  res.json({ sheets: TEMPLATE_SHEETS });
+const getTemplate = async (req, res) => {
+  // การตั้งค่ารหัสอัตโนมัติ — หน้าจอใช้แสดงคำเตือนว่ารหัสสินค้าใหม่มาจากไหน
+  let autoNumbering = false, autoGroupCodes = [];
+  if (req.dbPool) {
+    const [runningR, groupsR] = await Promise.all([
+      req.dbPool.query(`SELECT is_auto_numbering FROM im_item_running LIMIT 1`).catch(() => ({ rows: [] })),
+      req.dbPool.query(`SELECT category_code AS code FROM im_item_category WHERE is_active = true AND is_auto_number = true AND category_type = 'CATEGORY' ORDER BY category_code`).catch(() => ({ rows: [] })),
+    ]);
+    autoNumbering = !!runningR.rows[0]?.is_auto_numbering;
+    autoGroupCodes = groupsR.rows.map(r => r.code);
+  }
+  res.json({ sheets: TEMPLATE_SHEETS, auto_numbering: autoNumbering, auto_group_codes: autoGroupCodes });
 };
 
 // GET /im_item/import/template/download
@@ -256,6 +266,21 @@ const validateFile = [
 
       const errors = [];
       const items  = new Map();
+      // รหัสที่มีอยู่แล้วในระบบ (ทั้งรหัสสินค้าและรหัสสินค้าเก่า) — แจ้งซ้ำตั้งแต่ตอนตรวจสอบ ไม่ปล่อยให้ข้ามตอนยืนยัน
+      const fileOldCodes = [], fileNewCodes = [];
+      for (const row of general.rows) {
+        const o = String(row[general.colIdx['old_item_code']] ?? '').trim().toUpperCase();
+        const n = String(row[general.colIdx['item_code']] ?? '').trim().toUpperCase();
+        if (o) { fileOldCodes.push(o); fileNewCodes.push(o); }
+        if (n) fileNewCodes.push(n);
+      }
+      const [existNewR, existOldR] = await Promise.all([
+        req.dbPool.query(`SELECT UPPER(item_code) AS c FROM im_item WHERE UPPER(item_code) = ANY($1::text[])`, [fileNewCodes]),
+        req.dbPool.query(`SELECT UPPER(old_item_code) AS c FROM im_item WHERE UPPER(old_item_code) = ANY($1::text[])`, [fileOldCodes]),
+      ]);
+      const existingNewCodes = new Set(existNewR.rows.map(r => r.c));
+      const existingOldCodes = new Set(existOldR.rows.map(r => r.c));
+      const newCodeRows = new Map(); // รหัสสินค้าใหม่ (ตัวพิมพ์ใหญ่) -> แถวแรกที่ใช้ — กันรหัสซ้ำกันเองในไฟล์
       const order  = [];
 
       // ── Sheet 1: ข้อมูลพื้นฐาน ────────────────────────────────────────────
@@ -266,7 +291,7 @@ const validateFile = [
 
         const oldCode  = get('old_item_code');
         const nameTh   = get('item_name_th');
-        const itemCode = get('item_code');
+        let itemCode = get('item_code');
         const categoryCode = get('category_code').toUpperCase();
         if (!oldCode && !nameTh && !itemCode && !categoryCode) continue;
 
@@ -292,13 +317,37 @@ const validateFile = [
           if (!resolvedCategory) rowErrors.push({ column: 'category_code', message: `ไม่พบหมวดหมู่สินค้า "${categoryCode}"` });
         }
 
+        // รหัสสินค้าเก่าซ้ำกับที่มีอยู่ในระบบ
+        if (existingOldCodes.has(oldCode.toUpperCase())) {
+          rowErrors.push({ column: 'old_item_code', message: `รหัสสินค้าเก่า "${oldCode}" มีอยู่แล้วในระบบ` });
+        }
+
+        // ไม่ระบุรหัสสินค้า และไม่มีรหัสอัตโนมัติ (ทั้งกลุ่ม/หมวดและระบบ) → ใช้รหัสสินค้าเก่าเป็นรหัสสินค้าใหม่
+        const itemCodeFromOld = !itemCode && !(resolvedCategory?.is_auto_number ?? false) && !globalAutoNumber;
+        if (itemCodeFromOld) itemCode = oldCode;
+
         if (!itemCode) {
           const categoryAuto = resolvedCategory?.is_auto_number ?? false;
           if (!categoryAuto && !globalAutoNumber) {
             rowErrors.push({ column: 'item_code', message: 'จำเป็นต้องระบุรหัสสินค้า (หมวดหมู่และระบบไม่ได้เปิดรหัสอัตโนมัติ)' });
           }
         } else if (itemCode.length > 30) {
-          rowErrors.push({ column: 'item_code', message: 'รหัสสินค้าต้องไม่เกิน 30 ตัวอักษร' });
+          rowErrors.push({ column: itemCodeFromOld ? 'old_item_code' : 'item_code', message: itemCodeFromOld
+            ? `รหัสสินค้าเก่า "${itemCode}" ยาวเกิน 30 ตัวอักษร ใช้เป็นรหัสสินค้าใหม่ไม่ได้ — กรุณาระบุรหัสสินค้า`
+            : 'รหัสสินค้าต้องไม่เกิน 30 ตัวอักษร' });
+        }
+        if (itemCode) {
+          const upper = itemCode.toUpperCase();
+          if (existingNewCodes.has(upper)) {
+            rowErrors.push({ column: itemCodeFromOld ? 'old_item_code' : 'item_code', message: itemCodeFromOld
+              ? `รหัสสินค้าเก่า "${upper}" ซ้ำกับรหัสสินค้าที่มีอยู่แล้วในระบบ (ใช้เป็นรหัสสินค้าใหม่ไม่ได้)`
+              : `รหัสสินค้า "${upper}" มีอยู่แล้วในระบบ` });
+          }
+          if (newCodeRows.has(upper)) {
+            rowErrors.push({ column: itemCodeFromOld ? 'old_item_code' : 'item_code', message: `รหัสสินค้า "${upper}" ซ้ำกับแถว ${newCodeRows.get(upper)} ในไฟล์` });
+          } else {
+            newCodeRows.set(upper, rowNum);
+          }
         }
 
         const itemTypeRaw = get('item_type').toUpperCase();
