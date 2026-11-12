@@ -5,6 +5,7 @@ const { ensureImItemTable } = require('./imItemController');
 const { ensureImUomTable } = require('./imUomController');
 const { ensureImPriceGroupTable } = require('./imPriceGroupController');
 const { today } = require('../../utils/dateUtil');
+const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 
 const LIST_TYPES = ['SALES', 'PURCHASE'];
 
@@ -227,11 +228,16 @@ const fetchByItem = async (req, res) => {
 // 'SALES'+customerId ตามลำดับ) ตอนเพิ่มรายการ และจาก im_transaction_detail_widget.dart ตอนเพิ่มรายการตรง (ไม่ผ่าน
 // picker PO/SO) ให้ GRN/DLN Billing ('11'/'12' ฝั่งซื้อ, '31'/'32' ฝั่งขาย) เท่านั้น — เอกสาร IM ประเภทอื่นไม่ตั้ง
 // หนี้ AP/AR จากราคานี้เลย (ไม่มีช่องราคาให้กรอก หรือดึงราคามาจาก PO/SO/เอกสารต้นฉบับที่อ้างอิงอยู่แล้ว)
-const resolveItemPrice = async (client, { itemId, listType, vendorId, customerId, uomId, qty, docDate }) => {
+// currencyCode (ถ้าระบุ) = ใช้เฉพาะตารางราคาที่สกุลเงินตรงกับเอกสาร (ตารางที่ไม่ระบุสกุลเงิน = สกุลเงินหลัก) — ลิสต์ของ
+// ลูกค้า/ผู้ขายที่คนละสกุลเงินจะข้ามไปใช้ลิสต์ default แทน (เอกสาร IM ฝั่งขายส่งมาเสมอ, PO/SO/Quote ยังไม่ส่ง)
+const resolveItemPrice = async (client, { itemId, listType, vendorId, customerId, uomId, qty, docDate, currencyCode }) => {
     const partyTable = listType === 'PURCHASE' ? 'ap_vendor' : 'ar_customer';
     const partyId = listType === 'PURCHASE' ? vendorId : customerId;
     const date = docDate || today();
     const q = Number(qty) || 0;
+    const curParams = currencyCode ? [await getBaseCurrencyCode(client), currencyCode] : [];
+    const curSql = (n) => currencyCode
+        ? ` AND COALESCE((SELECT c.currency_code FROM cd_currency c WHERE c.id = pl.currency_id), $${n}) = $${n + 1}` : '';
 
     let priceListId = null;
     if (partyId) {
@@ -239,14 +245,14 @@ const resolveItemPrice = async (client, { itemId, listType, vendorId, customerId
             SELECT pl.id
             FROM ${partyTable} p
             JOIN im_price_list pl ON pl.id = p.price_list_id
-            WHERE p.id = $1 AND pl.is_active = true AND pl.list_type = $2
-        `, [partyId, listType]);
+            WHERE p.id = $1 AND pl.is_active = true AND pl.list_type = $2${curSql(3)}
+        `, [partyId, listType, ...curParams]);
         priceListId = assignedRes.rows[0]?.id || null;
     }
     if (!priceListId) {
         const defaultRes = await client.query(`
-            SELECT id FROM im_price_list WHERE list_type = $1 AND is_active = true AND is_default = true LIMIT 1
-        `, [listType]);
+            SELECT pl.id FROM im_price_list pl WHERE pl.list_type = $1 AND pl.is_active = true AND pl.is_default = true${curSql(2)} LIMIT 1
+        `, [listType, ...curParams]);
         priceListId = defaultRes.rows[0]?.id || null;
     }
     if (!priceListId) return null;
@@ -273,11 +279,11 @@ const resolvePriceHandler = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await ensureImPriceListTable(client);
-        const { item_id, list_type, vendor_id, customer_id, uom_id, qty, doc_date } = req.query;
+        const { item_id, list_type, vendor_id, customer_id, uom_id, qty, doc_date, currency_code } = req.query;
         if (!item_id || !list_type) return res.status(400).json({ message: 'กรุณาระบุ item_id และ list_type' });
         const result = await resolveItemPrice(client, {
             itemId: item_id, listType: list_type, vendorId: vendor_id || null, customerId: customer_id || null,
-            uomId: uom_id || null, qty: qty || 0, docDate: doc_date || null,
+            uomId: uom_id || null, qty: qty || 0, docDate: doc_date || null, currencyCode: currency_code || null,
         });
         res.status(200).json(result || {});
     } catch (error) {

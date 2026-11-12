@@ -2437,6 +2437,52 @@ const saveArBillTo = (client, arId, b) => client.query(
     `UPDATE ar_transaction SET bill_to_name=$1, bill_to_address=$2, bill_to_tax_id=$3, bill_to_branch=$4 WHERE id=$5`,
     [b.bill_to_name, b.bill_to_address, b.bill_to_tax_id, b.bill_to_branch, arId]);
 // ไม่ระบุลูกค้า = ลูกค้าเงินสดที่ตั้งไว้ที่ประเภทเอกสาร (หน้าตั้งค่าบัญชี IM)
+// ราคาขาย/หน่วยของเอกสารขาย ('31'/'32'/'33'/'45') ที่หาได้จากตารางราคา หรือดึงมาจากใบสั่งขาย ต้องใช้ราคานั้น — แก้ได้เฉพาะ
+// ผู้ใช้ระดับ administrator/developer (user decision 2026-11-12) ไม่พบราคาจึงกรอกเองได้ หน้าจอล็อกช่องราคาไว้แล้ว
+// ตรวจซ้ำตอนบันทึกกันการส่งราคาอื่นผ่าน API ราคาตารางราคาใช้จำนวน/หน่วย/ลูกค้า/วันที่/สกุลเงินของบรรทัด (เหมือนหน้าจอ)
+const PRICE_LOCK_TYPES = ['31', '32', '33', '45'];
+const isPriceAdmin = async (client, userName) => {
+    if (!userName) return false;
+    const r = await client.query(`SELECT user_type FROM sa_user WHERE user_name = $1 LIMIT 1`, [userName]);
+    return ['administrator', 'developer'].includes(String(r.rows[0]?.user_type || '').toLowerCase());
+};
+// ราคาที่บรรทัดต้องใช้ (สกุลเงินเอกสาร) — ใบสั่งขาย: ราคาของบรรทัด SO แปลงตามราคารวม/ไม่รวม VAT ของเอกสารนี้ (เหมือน
+// หน้าจอตอนดึงรายการ) / อื่นๆ: ตารางราคา คืน null = ไม่มีราคากำหนด (กรอกเองได้)
+const expectedSalesPrice = async (client, d, { customerId, docDate, currencyCode, priceIncludesVat }) => {
+    if (d.ref_so_detail_id) {
+        const so = (await client.query(`
+            SELECT sod.unit_price_fc, sod.vat_type, soh.price_includes_vat FROM so_transaction_detail sod
+              JOIN so_transaction soh ON soh.id = sod.header_id WHERE sod.id = $1`, [d.ref_so_detail_id])).rows[0];
+        if (!so) return null;
+        let price = Number(so.unit_price_fc) || 0;
+        const rate = d.vat_type && d.vat_type !== 'NOVAT' ? Number(d.vat_rate) || 0 : 0;
+        const soIncl = so.price_includes_vat === true && so.vat_type != null;
+        if (rate && soIncl !== (priceIncludesVat === true)) price = soIncl ? price * 100 / (100 + rate) : price * (100 + rate) / 100;
+        return { price, source: 'SO' };
+    }
+    const { resolveItemPrice } = require('./imPriceListController');
+    const qty = Math.abs(imLineQty(d)) || 1;
+    const r = await resolveItemPrice(client, { itemId: d.item_id, listType: 'SALES', customerId, uomId: d.uom_id || null, qty, docDate, currencyCode });
+    return r && Number(r.unit_price_fc) > 0 ? { price: Number(r.unit_price_fc), source: 'LIST' } : null;
+};
+const assertSalesPrices = async (client, { sysDocType, userName, customerId, docDate, currencyCode, priceIncludesVat, lines }) => {
+    if (!PRICE_LOCK_TYPES.includes(sysDocType) || !customerId) return;
+    if (await isPriceAdmin(client, userName)) return;
+    const cur = currencyCode || await getBaseCurrencyCode(client);
+    const bad = [];
+    for (const d of lines || []) {
+        if (d.is_free || !d.item_id) continue;
+        const exp = await expectedSalesPrice(client, d, { customerId, docDate, currencyCode: cur, priceIncludesVat });
+        if (!exp || Math.abs((Number(d.unit_price) || 0) - exp.price) < 0.005) continue;
+        const code = d.item_code || (await client.query(`SELECT item_code FROM im_item WHERE id = $1`, [d.item_id])).rows[0]?.item_code;
+        bad.push(`${code}: ${exp.source === 'SO' ? 'ใบสั่งขาย' : 'ตารางราคา'} ${round2(exp.price * 10000) / 10000}`);
+    }
+    if (bad.length) {
+        const e = new Error(`ราคาขาย/หน่วยต้องเป็นราคาตามตารางราคาหรือใบสั่งขาย (แก้ราคาได้เฉพาะผู้ดูแลระบบ): ${bad.join(', ')}`);
+        e.status = 400; throw e;
+    }
+};
+
 const defaultCashCustomer = async (client, docId) => {
     await ensureImGlAccountSetupTable(client);
     const r = await client.query(`
@@ -3045,6 +3091,12 @@ const createTransaction = async (req, res) => {
         await client.query('BEGIN');
         await ensureImTransactionTable(client);
         await applySalesDiscountFields(client, header.doc_id, header, details);
+        {
+            const sdt = (await client.query(`SELECT sys_doc_type FROM sa_module_document WHERE id = $1`, [header.doc_id])).rows[0]?.sys_doc_type || '';
+            const customerId = header.customer_id || (sdt === CASH_SALE_TYPE ? await defaultCashCustomer(client, header.doc_id) : null);
+            await assertSalesPrices(client, { sysDocType: sdt, userName: req.headers.username, customerId, docDate: header.doc_date,
+                currencyCode: header.currency_code, priceIncludesVat: header.price_includes_vat, lines: details });
+        }
         // เอกสารใหม่ยังไม่มีคำขออนุมัติ — เกินวงเงินต้องบันทึกร่างแล้วขออนุมัติก่อน
         if ((action || 'Post') === 'Post') {
             await checkImCreditForPost(client, { docId: header.doc_id, customerId: header.customer_id, details, id: 0, row: null, exchangeRate: header.exchange_rate,
@@ -3195,6 +3247,12 @@ const updateTransaction = async (req, res) => {
         // '32' (ส่งสินค้า รอตั้งหนี้) ที่อยู่สถานะ Delivered: แก้ได้แค่เลขที่อ้างอิง + ราคาขายรายบรรทัด — ไม่แตะ
         // จำนวน/สินค้า/คลัง เพราะส่งของจริงไปแล้ว ต้นทุนขายก็ Post ไปแล้วตอน Post IM — มิเรอร์ branch ของ '12'/Received
         if (existing.rows[0].status === 'Delivered' && existing.rows[0].sys_doc_type === '32') {
+            const dbLines = (await client.query(`SELECT dt.*, t.customer_id, t.doc_date::text AS h_doc_date, t.currency_code AS h_currency_code
+                FROM im_transaction_detail dt JOIN im_transaction t ON t.id = dt.header_id WHERE dt.header_id = $1`, [id])).rows;
+            const priceOf = new Map((details || []).filter(d => d.id).map(d => [Number(d.id), d.unit_price]));
+            await assertSalesPrices(client, { sysDocType: '32', userName: req.headers.username, customerId: dbLines[0]?.customer_id,
+                docDate: dbLines[0]?.h_doc_date, currencyCode: dbLines[0]?.h_currency_code, priceIncludesVat: existing.rows[0].price_includes_vat,
+                lines: dbLines.filter(d => priceOf.has(Number(d.id))).map(d => ({ ...d, unit_price: priceOf.get(Number(d.id)) })) });
             await client.query(`UPDATE im_transaction SET ref_no=$1, updated_by=$2, updated_at=NOW(), customer_po_no=$4, customer_po_date=$5 WHERE id=$3`,
                 [header.ref_no || null, header.updated_by || null, id, (header.customer_po_no || '').trim() || null, header.customer_po_date || null]);
             for (const d of details || []) {
@@ -3228,6 +3286,8 @@ const updateTransaction = async (req, res) => {
         if (['30', '31', '32', '33', '35', '40', '45'].includes(existing.rows[0].sys_doc_type) && !header.customer_id) {
             throw new Error('กรุณาระบุลูกค้า สำหรับเอกสารประเภทนี้');
         }
+        await assertSalesPrices(client, { sysDocType: existing.rows[0].sys_doc_type, userName: req.headers.username, customerId: header.customer_id,
+            docDate: header.doc_date, currencyCode: header.currency_code, priceIncludesVat: header.price_includes_vat, lines: details });
         if (['15', '35'].includes(existing.rows[0].sys_doc_type)) {
             const sysType = existing.rows[0].sys_doc_type;
             if (!header.ref_im_transaction_id) {
