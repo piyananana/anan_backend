@@ -159,21 +159,44 @@ const insertVtRecords = async (client, headerId, header, details, sysDocType) =>
 // --- Helper: ยอดหักเงินมัดจำจ่าย (apply_type 'inv_advance' ตอนตั้งหนี้ / 'advance' ตอนจ่ายชำระ) แยกส่วนก่อน VAT และ VAT
 // ตามสัดส่วน VAT ของใบมัดจำ (ใบมัดจำลง Dr เงินมัดจำจ่ายเฉพาะส่วนก่อน VAT และขอคืนภาษีซื้อไปแล้วตอนจ่ายมัดจำ) — ยอดสกุลเงิน
 // หลักคิดที่อัตราของใบมัดจำ (ตรงกับที่ลงบัญชีมัดจำไว้) มิเรอร์ AR user-approved 2026-10-31 ดู project_vat_discount_deposit
+// VAT รอตัดของใบมัดจำ (บรรทัดที่ติ๊ก "VAT รอตัด" — ผู้ขายยังไม่ออกใบกำกับภาษีตอนรับมัดจำ) ตอนจ่ายมัดจำลง Dr ภาษีซื้อรอตัด
+// ยังไม่ขึ้นรายงานภาษีซื้อ ตอนหักมัดจำในใบตั้งหนี้ ใบตั้งหนี้ลงภาษีซื้อเต็มจำนวนตามใบกำกับอยู่แล้ว จึงแค่ล้างบัญชีภาษีซื้อรอตัด (Cr)
+// มิเรอร์ AR (depositDeferredVatSql) ดู project_vat_discount_deposit
+const depositDeferredVatSql = (alias, col = 'vat_amount_lc') => `(SELECT COALESCE(SUM(dt.${col}), 0) FROM ap_transaction_detail dt
+    WHERE dt.header_id = ${alias}.id AND dt.is_deferred_vat = TRUE AND dt.vat_type <> 'NOVAT')`;
 const depositParts = async (client, apply) => {
     const dep = (await client.query(`
         SELECT t.id, t.doc_no, t.vendor_id, t.currency_code, t.exchange_rate, t.status,
                t.total_amount_lc, t.vat_amount_lc, t.balance_amount_lc, d.sys_doc_type,
-               (SELECT dt.vat_rate FROM ap_transaction_detail dt WHERE dt.header_id = t.id AND dt.vat_type <> 'NOVAT' LIMIT 1) AS vat_rate,
-               s.advance_account_id -- บัญชีเงินมัดจำจ่ายที่ใบมัดจำลงไว้ (ล้างบัญชีเดียวกัน)
+               (SELECT dt.vat_rate FROM ap_transaction_detail dt WHERE dt.header_id = t.id AND dt.vat_type <> 'NOVAT'
+                 ORDER BY dt.is_deferred_vat LIMIT 1) AS vat_rate,
+               ${depositDeferredVatSql('t')} AS deferred_vat_lc,
+               -- ฐานภาษีของบรรทัดที่ขอคืนภาษีซื้อไปแล้ว (ใช้เป็นฐานของรายการภาษีซื้อติดลบ)
+               (SELECT COALESCE(SUM(dt.subtotal_lc), 0) FROM ap_transaction_detail dt WHERE dt.header_id = t.id
+                   AND dt.vat_type <> 'NOVAT' AND dt.is_deferred_vat IS NOT TRUE AND COALESCE(dt.vat_amount_lc, 0) <> 0) AS vat_base_lc,
+               s.advance_account_id, -- บัญชีเงินมัดจำจ่ายที่ใบมัดจำลงไว้ (ล้างบัญชีเดียวกัน)
+               s.vat_pending_input_account_id -- บัญชีภาษีซื้อรอตัดที่ใบมัดจำลงไว้
           FROM ap_transaction t JOIN sa_module_document d ON d.id = t.doc_id
           LEFT JOIN ap_gl_account_setup s ON s.doc_code = d.doc_code WHERE t.id = $1`, [apply.applied_to_id])).rows[0];
     if (!dep) throw new Error('ไม่พบใบจ่ายเงินมัดจำที่หัก');
     const fc = Number(apply.applied_amount_fc) || 0;
-    const ratio = Number(dep.total_amount_lc) ? Number(dep.vat_amount_lc) / Number(dep.total_amount_lc) : 0;
+    const total = Number(dep.total_amount_lc) || 0;
+    const pendVat = Number(dep.deferred_vat_lc) || 0;
+    // สัดส่วนต่อยอดมัดจำ: VAT ที่ขอคืนแล้ว / VAT รอตัด / ฐานภาษีของ VAT ที่ขอคืนแล้ว
+    const ratio = total ? (Number(dep.vat_amount_lc) - pendVat) / total : 0;
+    const pendRatio = total ? pendVat / total : 0;
+    const baseRatio = total ? (Number(dep.vat_base_lc) || 0) / total : 0;
     const legLc = round2(fc * (Number(dep.exchange_rate) || 1));
-    const vatLc = round2(legLc * ratio);
-    const vatFc = round2(fc * ratio);
-    return { dep, fc, legLc, vatLc, netLc: round2(legLc - vatLc), vatFc, netFc: round2(fc - vatFc) };
+    const vatLc = round2(legLc * ratio), vatFc = round2(fc * ratio);
+    const pendLc = round2(legLc * pendRatio), pendFc = round2(fc * pendRatio);
+    return { dep, fc, legLc, vatLc, vatFc, pendLc, pendFc, ratio, pendRatio, baseRatio,
+        netLc: round2(legLc - vatLc - pendLc), netFc: round2(fc - vatFc - pendFc),
+        vtBaseLc: vatLc ? round2(legLc * baseRatio) : 0, vtBaseFc: vatLc ? round2(fc * baseRatio) : 0 };
+};
+const depositPendingAccount = (dep) => {
+    const acc = Number(dep.vat_pending_input_account_id) || null;
+    if (!acc) throw new Error(`ใบมัดจำ ${dep.doc_no} มี VAT รอตัด แต่ยังไม่ได้ตั้งค่าบัญชีภาษีซื้อรอตัดบัญชี (VAT รอตัด) ของประเภทเอกสารจ่ายมัดจำ`);
+    return acc;
 };
 
 // ภาษีซื้อของมัดจำที่ถูกหัก — บันทึกติดลบในเอกสารที่หัก (ใบตั้งหนี้หรือใบจ่ายชำระ) เพื่อไม่ให้ภาษีซื้อส่วนมัดจำถูกนับซ้ำ
@@ -192,7 +215,7 @@ const insertDepositVtReversal = async (client, headerId, header, part) => {
     `, [
         'AP', 'INPUT_VAT', header.doc_id, headerId,
         header.doc_no, header.doc_date, part.dep.vat_rate ?? 7,
-        -part.netLc, -part.vatLc, -part.netFc, -part.vatFc,
+        -(part.vtBaseLc ?? part.netLc), -part.vatLc, -(part.vtBaseFc ?? part.netFc), -part.vatFc,
         header.currency_id || null, header.exchange_rate || 1,
         header.vendor_id, header.vendor_name_th || '', header.vendor_tax_id || null,
         header.created_by || null,
@@ -221,6 +244,9 @@ const buildInvAdvanceGl = async (client, invAdvances, { vendorId, currencyCode, 
             debit_lc: 0, credit_lc: part.netLc, debit_fc: 0, credit_fc: part.netFc });
         if (part.vatLc) lines.push({ account_id: vatAccountId, description: `ภาษีซื้อของมัดจำ ${dep.doc_no}`,
             debit_lc: 0, credit_lc: part.vatLc, debit_fc: 0, credit_fc: part.vatFc });
+        // VAT รอตัดของมัดจำ — ล้างบัญชีภาษีซื้อรอตัด (ภาษีส่วนนี้รวมอยู่ในภาษีซื้อเต็มจำนวนของใบนี้แล้ว)
+        if (part.pendLc) lines.push({ account_id: depositPendingAccount(dep), description: `ล้าง VAT รอตัดของมัดจำ ${dep.doc_no}`,
+            debit_lc: 0, credit_lc: part.pendLc, debit_fc: 0, credit_fc: part.pendFc });
         const apLc = round2(part.fc * exchangeRate);
         const fx = round2(apLc - part.legLc); // > 0 = เจ้าหนี้ลดมากกว่ามัดจำที่ล้าง → กำไร
         if (fx !== 0) {
@@ -557,10 +583,15 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
     } else if (isAdvancePayment) {
         // ===== จ่ายเงินมัดจำ (60) =====
         // DR: Advance AP (สุทธิจาก VAT) / DR: VAT ซื้อ (ถ้ามี) / CR: Cash/Bank (เต็มจำนวน)
+        // บรรทัดที่ติ๊ก VAT รอตัด (ผู้ขายยังไม่ออกใบกำกับภาษี) ลง Dr ภาษีซื้อรอตัด ไม่ขึ้นรายงานภาษีซื้อ — ล้างตอนหัก/รับคืนมัดจำ
+        const isPend = (d) => d.is_deferred_vat && (d.vat_type || 'NOVAT') !== 'NOVAT';
         const advanceVatLc = (details || []).reduce((s, d) => s + (Number(d.vat_amount_lc) || 0), 0);
         const advanceVatFc = (details || []).reduce((s, d) => s + (Number(d.vat_amount_fc) || 0), 0);
+        const pendVatLc = round2((details || []).filter(isPend).reduce((s, d) => s + (Number(d.vat_amount_lc) || 0), 0));
+        const pendVatFc = round2((details || []).filter(isPend).reduce((s, d) => s + (Number(d.vat_amount_fc) || 0), 0));
         const advanceNetLc = totalAmount - advanceVatLc;
         const advanceNetFc = (Number(header.total_amount_fc) || 0) - advanceVatFc;
+        if (pendVatLc && !vatPendingAccountId) throw new Error('มีบรรทัด VAT รอตัด — กรุณาตั้งค่าบัญชีภาษีซื้อรอตัดบัญชี (VAT รอตัด) ในการตั้งค่าบัญชี AP ของประเภทเอกสารจ่ายมัดจำ');
 
         if (advanceAccountId) {
             glDetails.push({
@@ -572,14 +603,21 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
                 credit_fc: 0,
             });
         }
-        if (advanceVatLc > 0.005 && vatAccountId) {
+        if (advanceVatLc - pendVatLc > 0.005 && vatAccountId) {
             glDetails.push({
                 account_id: vatAccountId,
                 description: `ภาษีซื้อ (มัดจำ) ${docNo}`,
-                debit_lc: advanceVatLc,
+                debit_lc: round2(advanceVatLc - pendVatLc),
                 credit_lc: 0,
-                debit_fc: advanceVatFc,
+                debit_fc: round2(advanceVatFc - pendVatFc),
                 credit_fc: 0,
+            });
+        }
+        if (pendVatLc) {
+            glDetails.push({
+                account_id: vatPendingAccountId,
+                description: `VAT รอตัด (มัดจำ) ${docNo}`,
+                debit_lc: pendVatLc, credit_lc: 0, debit_fc: pendVatFc, credit_fc: 0,
             });
         }
         const payments60 = header._payments || [];
@@ -626,26 +664,39 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
         }
 
         // คำนวณ VAT ที่ต้อง reverse ตามสัดส่วนของแต่ละใบมัดจำเดิมที่ถูกคืน
+        // VAT รอตัดของใบมัดจำ → Cr บัญชีภาษีซื้อรอตัดของใบมัดจำ (ไม่ใช่กลับรายการภาษีซื้อ)
         let refundVatLc = 0;
         let refundVatFc = 0;
+        const refundPend = new Map(); // account_id → { lc, fc }
         const refundApplies = (header._applies || []).filter(a => (a.apply_type || '') === 'advance_refund');
         for (const a of refundApplies) {
             const advId     = a.applied_to_id;
             const appliedFc = Number(a.applied_amount_fc) || 0;
             if (!advId || appliedFc === 0) continue;
             const advRes = await client.query(
-                `SELECT total_amount_fc, vat_amount_fc, vat_amount_lc FROM ap_transaction WHERE id = $1`, [advId]
+                `SELECT total_amount_fc, vat_amount_fc, vat_amount_lc,
+                        ${depositDeferredVatSql('ap_transaction')} AS pend_lc, ${depositDeferredVatSql('ap_transaction', 'vat_amount_fc')} AS pend_fc
+                   FROM ap_transaction WHERE id = $1`, [advId]
             );
             if (advRes.rows.length === 0) continue;
             const advTotalFc = Number(advRes.rows[0].total_amount_fc) || 0;
             if (advTotalFc === 0) continue;
             const ratio = appliedFc / advTotalFc;
-            refundVatFc += Number(advRes.rows[0].vat_amount_fc) * ratio;
-            refundVatLc += Number(advRes.rows[0].vat_amount_lc) * ratio;
+            const pendLc = round2(Number(advRes.rows[0].pend_lc) * ratio);
+            const pendFc = round2(Number(advRes.rows[0].pend_fc) * ratio);
+            refundVatFc += (Number(advRes.rows[0].vat_amount_fc) - Number(advRes.rows[0].pend_fc)) * ratio;
+            refundVatLc += (Number(advRes.rows[0].vat_amount_lc) - Number(advRes.rows[0].pend_lc)) * ratio;
+            if (pendLc) {
+                const acc = depositPendingAccount((await depositParts(client, a)).dep);
+                const cur = refundPend.get(acc) || { lc: 0, fc: 0 };
+                refundPend.set(acc, { lc: cur.lc + pendLc, fc: cur.fc + pendFc });
+            }
         }
+        const refundPendLc = [...refundPend.values()].reduce((s, v) => s + v.lc, 0);
+        const refundPendFc = [...refundPend.values()].reduce((s, v) => s + v.fc, 0);
 
-        const advanceNetLc = totalAmount - refundVatLc;
-        const advanceNetFc = (Number(header.total_amount_fc) || 0) - refundVatFc;
+        const advanceNetLc = round2(totalAmount - refundVatLc - refundPendLc);
+        const advanceNetFc = round2((Number(header.total_amount_fc) || 0) - refundVatFc - refundPendFc);
 
         if (advanceAccountId) {
             glDetails.push({
@@ -666,6 +717,10 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
                 debit_fc: 0,
                 credit_fc: refundVatFc,
             });
+        }
+        for (const [acc, v] of refundPend) {
+            glDetails.push({ account_id: acc, description: `ล้าง VAT รอตัด (คืนมัดจำ) ${docNo}`,
+                debit_lc: 0, credit_lc: round2(v.lc), debit_fc: 0, credit_fc: round2(v.fc) });
         }
 
     } else if (isPayment) {
@@ -781,24 +836,37 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
         if (totalAdvanceDeducted > 0 && advanceAccountId) {
             header._depositParts = [];
             let vatLcSum = 0, vatFcSum = 0;
+            const pendByAcc = new Map(); // VAT รอตัดของมัดจำ → ล้างบัญชีภาษีซื้อรอตัดของใบมัดจำ
             for (const a of advanceDeductions) {
                 const part = await depositParts(client, a);
                 // ใช้ยอด LC ที่หน้าจอส่งมา (applied_amount_lc) เพื่อให้รวมเท่าเดิม แยก VAT ตามสัดส่วนของใบมัดจำ
-                const ratio = Number(part.dep.total_amount_lc) ? Number(part.dep.vat_amount_lc) / Number(part.dep.total_amount_lc) : 0;
-                const vatLc = round2((Number(a.applied_amount_lc) || 0) * ratio);
+                const appliedLc = Number(a.applied_amount_lc) || 0;
+                const vatLc = round2(appliedLc * part.ratio);
                 if (vatLc && vatAccountId) {
                     vatLcSum += vatLc; vatFcSum += part.vatFc;
-                    header._depositParts.push({ ...part, vatLc, netLc: round2((Number(a.applied_amount_lc) || 0) - vatLc) });
+                    header._depositParts.push({ ...part, vatLc, netLc: round2(appliedLc - vatLc), vtBaseLc: round2(appliedLc * part.baseRatio) });
+                }
+                const pendLc = round2(appliedLc * part.pendRatio);
+                if (pendLc) {
+                    const acc = depositPendingAccount(part.dep);
+                    const cur = pendByAcc.get(acc) || { lc: 0, fc: 0 };
+                    pendByAcc.set(acc, { lc: cur.lc + pendLc, fc: cur.fc + part.pendFc });
                 }
             }
+            const pendLcSum = [...pendByAcc.values()].reduce((s, v) => s + v.lc, 0);
+            const pendFcSum = [...pendByAcc.values()].reduce((s, v) => s + v.fc, 0);
             glDetails.push({
                 account_id: advanceAccountId,
                 description: `ตัดมัดจำ ${docNo}`,
                 debit_lc: 0,
-                credit_lc: round2(totalAdvanceDeducted - vatLcSum),
+                credit_lc: round2(totalAdvanceDeducted - vatLcSum - pendLcSum),
                 debit_fc: 0,
-                credit_fc: round2(totalAdvanceDeductedFc - vatFcSum),
+                credit_fc: round2(totalAdvanceDeductedFc - vatFcSum - pendFcSum),
             });
+            for (const [acc, v] of pendByAcc) {
+                glDetails.push({ account_id: acc, description: `ล้าง VAT รอตัดของมัดจำที่ตัด ${docNo}`,
+                    debit_lc: 0, credit_lc: round2(v.lc), debit_fc: 0, credit_fc: round2(v.fc) });
+            }
             if (vatLcSum) {
                 glDetails.push({
                     account_id: vatAccountId,
@@ -1211,6 +1279,8 @@ const fetchOpenAdvances = async (req, res) => {
             SELECT t.id, t.doc_no, t.doc_date, t.ref_po_id, t.ref_po_doc_no,
                    t.total_amount_lc, ROUND(t.balance_amount_lc + COALESCE(own.amt, 0), 2) AS balance_amount_lc,
                    t.total_amount_fc, t.vat_amount_fc, t.vat_amount_lc,
+                   ${depositDeferredVatSql('t')} AS deferred_vat_amount_lc,
+                   ${depositDeferredVatSql('t', 'vat_amount_fc')} AS deferred_vat_amount_fc,
                    t.currency_code, t.exchange_rate,
                    d.doc_code, d.sys_doc_type
             FROM ap_transaction t

@@ -263,28 +263,38 @@ const loadDeposits = async (db, sql, ids) => {
   return m;
 };
 const DEPOSIT_COLS = `dep.doc_no, ${ymdSql('dep.doc_date')} AS doc_date, dep.exchange_rate::float AS rate,
-       dep.vat_amount_lc::float AS vat_lc, dep.total_amount_lc::float AS total_lc`;
+       (dep.vat_amount_lc - (SELECT COALESCE(SUM(dt.vat_amount_lc), 0) FROM ar_transaction_detail dt
+          WHERE dt.header_id = dep.id AND dt.is_deferred_vat = TRUE AND dt.vat_type <> 'NOVAT'))::float AS vat_lc, -- VAT รอตัดยังไม่เคยเสีย = มัดจำไม่มี VAT
+       dep.total_amount_lc::float AS total_lc`;
+// มัดจำที่มี VAT: ภาษีนำส่งไปแล้วตอนรับมัดจำ → หักจากฐานภาษี (มูลค่าก่อนภาษีและ VAT ลดลง)
+// มัดจำที่ไม่มี VAT: ยังไม่เคยเสียภาษี → ใบกำกับคิด VAT เต็ม แล้วหักมัดจำจากยอดรวมหลัง VAT
+// (ตรงกับการลงบัญชี: depositParts ใช้สัดส่วน VAT ของใบมัดจำ — ไม่มี VAT = หักลูกหนี้ด้วยยอดเต็ม ไม่คืนภาษีขาย)
 const depositFields = (deps, t, lc, currency, base) => {
-  let fc = 0, vatFc = 0, legLc = 0, vatLc = 0;
+  let fc = 0, vatFc = 0, legLc = 0, vatLc = 0, vatDepFc = 0, vatDepLc = 0;
   for (const d of deps || []) {
     const amt = num(d.fc);
     const ratio = num(d.total_lc) ? num(d.vat_lc) / num(d.total_lc) : 0;
     const leg = round2(amt * (num(d.rate) || 1));
     fc += amt; vatFc += round2(amt * ratio); legLc += leg; vatLc += round2(leg * ratio);
+    if (ratio) { vatDepFc += amt; vatDepLc += leg; }
   }
-  const netFc = round2(fc - vatFc), netLc = round2(legLc - vatLc);
+  const netFc = round2(vatDepFc - vatFc), netLc = round2(vatDepLc - vatLc);          // มัดจำที่มี VAT ส่วนก่อนภาษี
+  const noVatFc = round2(fc - vatDepFc), noVatLc = round2(legLc - vatDepLc);         // มัดจำที่ไม่มี VAT (หักหลังภาษี)
   const beforeVat = round2(t.beforeVat - netFc), vat = round2(t.vat - vatFc);
   const beforeVatLc = round2(lc.beforeVat - netLc), vatLcAfter = round2(lc.vat - vatLc);
-  const total = round2(beforeVat + vat), totalLc = round2(beforeVatLc + vatLcAfter);
+  const subtotal = round2(beforeVat + vat), subtotalLc = round2(beforeVatLc + vatLcAfter);
+  const total = round2(subtotal - noVatFc), totalLc = round2(subtotalLc - noVatLc);
   const sorted = [...(deps || [])].sort((a, b) => s(a.doc_date).localeCompare(s(b.doc_date)));
   return {
     deposit_doc_nos: sorted.map(d => s(d.doc_no)).join(', '),
     deposit_doc_date: sorted.length ? sorted[sorted.length - 1].doc_date : '',
     deposit_amount: netFc, deposit_vat_amount: round2(vatFc), deposit_total: round2(fc),
+    deposit_no_vat_amount: noVatFc, total_before_no_vat_deposit: subtotal,
     before_vat_after_deposit: beforeVat, vat_after_deposit: vat, total_after_deposit: total,
     amount_text_after_deposit: amountWords(total, currency),
     amount_text_after_deposit_en: englishAmountText(total, currency),
     deposit_amount_lc: netLc, deposit_vat_amount_lc: round2(vatLc),
+    deposit_no_vat_amount_lc: noVatLc, total_before_no_vat_deposit_lc: subtotalLc,
     before_vat_after_deposit_lc: beforeVatLc, vat_after_deposit_lc: vatLcAfter, total_after_deposit_lc: totalLc,
     amount_text_after_deposit_lc: amountWords(totalLc, base),
   };
@@ -461,9 +471,11 @@ const SALES_INVOICE = {
     f('line_discount_total', 'ส่วนลดรายการรวม (ก่อนส่วนลดท้ายบิล)', 'Line discounts total (before bill discounts)', 'total', 'money'),
     f('deposit_doc_nos', 'เลขที่ใบรับเงินมัดจำที่หัก', 'Deducted deposit receipt no.', 'deposit'),
     f('deposit_doc_date', 'วันที่ใบรับเงินมัดจำที่หัก (ใบล่าสุด)', 'Deducted deposit receipt date (latest)', 'deposit', 'date'),
-    f('deposit_amount', 'หักเงินมัดจำ (ก่อนภาษี)', 'Less deposit (before VAT)', 'deposit', 'money'),
+    f('deposit_amount', 'หักเงินมัดจำที่มี VAT (ก่อนภาษี)', 'Less VAT-bearing deposit (before VAT)', 'deposit', 'money'),
     f('deposit_vat_amount', 'ภาษีของเงินมัดจำที่หัก', 'VAT of deducted deposit', 'deposit', 'money'),
-    f('deposit_total', 'หักเงินมัดจำ (รวมภาษี)', 'Less deposit (incl. VAT)', 'deposit', 'money'),
+    f('deposit_total', 'หักเงินมัดจำทั้งหมด (รวมภาษี)', 'Less all deposits (incl. VAT)', 'deposit', 'money'),
+    f('total_before_no_vat_deposit', 'รวมเงินก่อนหักมัดจำที่ไม่มี VAT', 'Total before non-VAT deposit', 'deposit', 'money'),
+    f('deposit_no_vat_amount', 'หักเงินมัดจำที่ไม่มี VAT (หักหลังภาษี)', 'Less non-VAT deposit (after VAT)', 'deposit', 'money'),
     f('before_vat_after_deposit', 'มูลค่าก่อนภาษีหลังหักมัดจำ', 'Amount before VAT after deposit', 'deposit', 'money'),
     f('vat_after_deposit', 'ภาษีมูลค่าเพิ่มหลังหักมัดจำ', 'VAT after deposit', 'deposit', 'money'),
     f('total_after_deposit', 'จำนวนเงินรวมทั้งสิ้นหลังหักมัดจำ', 'Grand total after deposit', 'deposit', 'money'),
@@ -471,6 +483,8 @@ const SALES_INVOICE = {
     f('amount_text_after_deposit_en', 'จำนวนเงินตัวอักษรหลังหักมัดจำ (อังกฤษ)', 'Amount in words after deposit (EN)', 'deposit'),
     f('deposit_amount_lc', 'หักเงินมัดจำก่อนภาษี (สกุลเงินหลัก)', 'Less deposit before VAT (base currency)', 'deposit', 'money'),
     f('deposit_vat_amount_lc', 'ภาษีของเงินมัดจำ (สกุลเงินหลัก)', 'VAT of deposit (base currency)', 'deposit', 'money'),
+    f('total_before_no_vat_deposit_lc', 'รวมเงินก่อนหักมัดจำที่ไม่มี VAT (สกุลเงินหลัก)', 'Total before non-VAT deposit (base currency)', 'deposit', 'money'),
+    f('deposit_no_vat_amount_lc', 'หักเงินมัดจำที่ไม่มี VAT (สกุลเงินหลัก)', 'Less non-VAT deposit (base currency)', 'deposit', 'money'),
     f('before_vat_after_deposit_lc', 'มูลค่าก่อนภาษีหลังหักมัดจำ (สกุลเงินหลัก)', 'Amount before VAT after deposit (base currency)', 'deposit', 'money'),
     f('vat_after_deposit_lc', 'ภาษีหลังหักมัดจำ (สกุลเงินหลัก)', 'VAT after deposit (base currency)', 'deposit', 'money'),
     f('total_after_deposit_lc', 'รวมทั้งสิ้นหลังหักมัดจำ (สกุลเงินหลัก)', 'Grand total after deposit (base currency)', 'deposit', 'money'),
