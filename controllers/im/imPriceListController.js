@@ -280,9 +280,52 @@ const resolveItemPrice = async (client, { itemId, listType, vendorId, customerId
     const listIncl = (await client.query(`SELECT price_includes_vat FROM im_price_list WHERE id = $1`, [priceListId])).rows[0]?.price_includes_vat === true;
     const listPrice = Number(detailRes.rows[0].unit_price_fc);
     return {
-        price_list_id: priceListId, uom_id: detailRes.rows[0].uom_id,
+        source: 'LIST', price_list_id: priceListId, uom_id: detailRes.rows[0].uom_id,
         unit_price_fc: convertListPrice(listPrice, listIncl, priceIncludesVat, vatRate),
         list_price_fc: listPrice, price_includes_vat: listIncl,
+    };
+};
+
+// ราคาซื้อล่าสุดจากผู้ขายรายนี้ (ใช้เมื่อไม่พบในตารางราคาซื้อ) — จาก IM รับของ '11'/'12' ที่ Post/Received แล้ว และ PO ที่
+// อนุมัติแล้ว สินค้า/หน่วยนับ/สกุลเงินเดียวกัน วันที่ไม่เกิน docDate (ไม่แปลงอัตราแลกเปลี่ยนข้ามสกุล) ราคาที่กรอกก่อนส่วนลด
+// (ส่วนลดครั้งก่อนไม่ติดมา) ทำเป็นราคาไม่รวม VAT ตามเอกสารต้นทาง แล้วแปลงให้ตรงกับเอกสารปัจจุบัน — คืน null ถ้าไม่พบ
+const lastPurchasePrice = async (client, { itemId, vendorId, uomId, currencyCode, docDate, priceIncludesVat, vatRate }) => {
+    if (!itemId || !vendorId) return null;
+    const base = await getBaseCurrencyCode(client);
+    const cur = currencyCode || base;
+    const exists = async (t) => (await client.query(`SELECT to_regclass($1) AS t`, [t])).rows[0].t != null;
+    const parts = [];
+    const exclSql = (price, dt, h) => `(${price} / CASE WHEN COALESCE(${h}.price_includes_vat, false) AND COALESCE(${dt}.vat_type, 'NOVAT') <> 'NOVAT'
+        THEN 1 + COALESCE(${dt}.vat_rate, 0) / 100 ELSE 1 END)`;
+    if (await exists('im_transaction_detail')) {
+        parts.push(`
+            SELECT h.doc_no, h.doc_date, to_char(h.doc_date, 'YYYY-MM-DD') AS doc_date_txt, h.id AS hid, dt.id AS did,
+                   ${exclSql('COALESCE(dt.billed_unit_cost_fc, dt.unit_cost_fc)', 'dt', 'h')} AS price_excl
+              FROM im_transaction_detail dt
+              JOIN im_transaction h ON h.id = dt.header_id
+              JOIN sa_module_document md ON md.id = h.doc_id
+             WHERE md.sys_doc_type IN ('11', '12') AND h.status IN ('Posted', 'Received')
+               AND h.vendor_id = $1 AND dt.item_id = $2 AND ($3::int IS NULL OR dt.uom_id IS NULL OR dt.uom_id = $3)
+               AND COALESCE(h.currency_code, $4) = $5 AND h.doc_date <= $6::date
+               AND NOT COALESCE(dt.is_free, false) AND COALESCE(dt.billed_unit_cost_fc, dt.unit_cost_fc) > 0`);
+    }
+    if (await exists('po_transaction_detail')) {
+        parts.push(`
+            SELECT h.doc_no, h.doc_date, to_char(h.doc_date, 'YYYY-MM-DD') AS doc_date_txt, h.id AS hid, dt.id AS did, ${exclSql('dt.unit_price_fc', 'dt', 'h')} AS price_excl
+              FROM po_transaction_detail dt
+              JOIN po_transaction h ON h.id = dt.header_id
+             WHERE h.status IN ('Approved', 'PartiallyReceived', 'FullyReceived', 'Received', 'Closed')
+               AND h.vendor_id = $1 AND dt.item_id = $2 AND ($3::int IS NULL OR dt.uom_id IS NULL OR dt.uom_id = $3)
+               AND COALESCE(h.currency_code, $4) = $5 AND h.doc_date <= $6::date AND dt.unit_price_fc > 0`);
+    }
+    if (!parts.length) return null;
+    const r = await client.query(`${parts.join(' UNION ALL ')} ORDER BY doc_date DESC, hid DESC, did DESC LIMIT 1`,
+        [vendorId, itemId, uomId || null, base, cur, docDate || today()]);
+    if (!r.rows.length) return null;
+    const excl = Math.round(Number(r.rows[0].price_excl) * 10000) / 10000;
+    return {
+        source: 'LAST', unit_price_fc: convertListPrice(excl, false, priceIncludesVat, vatRate),
+        ref_doc_no: r.rows[0].doc_no, ref_doc_date: r.rows[0].doc_date_txt, // date-only เป็นข้อความ (ไม่เลื่อนเป็น UTC)
     };
 };
 
@@ -299,7 +342,7 @@ const resolvePriceHandler = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await ensureImPriceListTable(client);
-        const { item_id, list_type, vendor_id, customer_id, uom_id, qty, doc_date, currency_code, price_includes_vat, vat_rate } = req.query;
+        const { item_id, list_type, vendor_id, customer_id, uom_id, qty, doc_date, currency_code, price_includes_vat, vat_rate, fallback_last_purchase } = req.query;
         if (!item_id || !list_type) return res.status(400).json({ message: 'กรุณาระบุ item_id และ list_type' });
         const result = await resolveItemPrice(client, {
             itemId: item_id, listType: list_type, vendorId: vendor_id || null, customerId: customer_id || null,
@@ -307,6 +350,15 @@ const resolvePriceHandler = async (req, res) => {
             priceIncludesVat: price_includes_vat == null || price_includes_vat === '' ? null : price_includes_vat === 'true',
             vatRate: vat_rate || 0,
         });
+        // ฝั่งซื้อ (PO/IM รับของ): ไม่พบในตารางราคา = ใช้ราคาซื้อล่าสุดจากผู้ขายรายนี้
+        if (!result && list_type === 'PURCHASE' && fallback_last_purchase === 'true') {
+            const last = await lastPurchasePrice(client, {
+                itemId: item_id, vendorId: vendor_id || null, uomId: uom_id || null, currencyCode: currency_code || null,
+                docDate: doc_date || null, priceIncludesVat: price_includes_vat == null || price_includes_vat === '' ? null : price_includes_vat === 'true',
+                vatRate: vat_rate || 0,
+            });
+            return res.status(200).json(last || {});
+        }
         res.status(200).json(result || {});
     } catch (error) {
         console.error('Error resolving item price:', error);
@@ -558,5 +610,5 @@ const deleteRow = async (req, res) => {
 
 module.exports = {
     ensureImPriceListTable, fetchRows, fetchRow, fetchByItem, addRow, updateRow, deleteRow, LIST_TYPES,
-    resolveItemPrice, convertListPrice, resolvePriceHandler, findOverlapAgainstExisting,
+    resolveItemPrice, convertListPrice, lastPurchasePrice, resolvePriceHandler, findOverlapAgainstExisting,
 };
