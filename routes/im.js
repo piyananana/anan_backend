@@ -121,6 +121,13 @@ router.put('/im_transaction/:id/credit_request', imCredit.request);
 router.put('/im_transaction/:id/credit_approve', imCredit.approve);
 router.put('/im_transaction/:id/credit_reject', imCredit.reject);
 router.put('/im_transaction/:id/credit_withdraw', imCredit.withdraw);
+// ซื้อเงินสด ('14') — ขออนุมัติจ่ายตามวงเงินอนุมัติจ่าย (controllers/im/imCashPurchase.js)
+const imCashPurchase = require('../controllers/im/imCashPurchase');
+router.get('/im_transaction/payment_my_pending', imCashPurchase.myPending);
+router.put('/im_transaction/:id/payment_request', imCashPurchase.requestPayment);
+router.put('/im_transaction/:id/payment_approve', imCashPurchase.approvePayment);
+router.put('/im_transaction/:id/payment_reject', imCashPurchase.rejectPayment);
+router.put('/im_transaction/:id/payment_withdraw', imCashPurchase.withdrawPayment);
 router.get('/im_transaction',            imTransactionController.fetchRows);
 router.get('/im_transaction/:id',        imTransactionController.fetchRow);
 router.get('/im_transaction/:id/returnable_lines', imTransactionController.fetchReturnableLines);

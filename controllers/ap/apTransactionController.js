@@ -984,7 +984,8 @@ const adjustInvoiceBalances = async (client, transactionId, sign) => {
 const AP_REVERSE_INFO_SQL = `
     SELECT t.id, t.doc_no, t.status, t.gl_entry_id, t.paid_amount_lc, t.total_amount_lc, d.sys_doc_type,
            p.ap_status, gp.gl_status AS gl_period_status,
-           EXISTS (SELECT 1 FROM im_transaction i WHERE i.linked_ap_transaction_id = t.id) AS from_im,
+           EXISTS (SELECT 1 FROM im_transaction i WHERE i.linked_ap_transaction_id = t.id
+                      OR (to_jsonb(i)->>'linked_ap_payment_id')::int = t.id) AS from_im, -- ใบจ่ายของซื้อเงินสด '14'
            COALESCE(t.description, '') LIKE 'ตั้งหนี้สินค้าฝากขาย%' AS from_consignment,
            (SELECT string_agg(DISTINCT p2.doc_no, ', ')
               FROM ap_transaction_apply a JOIN ap_transaction p2 ON p2.id = a.transaction_id
@@ -1059,9 +1060,20 @@ const apReverseBlockMessage = (b) => AP_REVERSE_BLOCK_MESSAGES[b.code] + (b.ref 
 
 // ใช้จาก IM: ใบตั้งหนี้ที่เอกสาร IM / การตั้งหนี้ฝากขายสร้างให้ — สถานะ, เหตุที่ถอย/ยกเลิกไม่ได้
 // (ไม่นับ IM_SOURCE / CONSIGNMENT เพราะผู้เรียกคือต้นทางเอง), งวดยังเปิดหรือไม่
-const getApLinkedState = async (db, id) => {
+// exceptId = ใบจ่ายชำระที่ซื้อเงินสด ('14') สร้างคู่กัน — ไม่นับเป็นเอกสารอ้างอิง/ยอดจ่ายของใบตั้งหนี้ (ถอย/ยกเลิกไปพร้อมกัน)
+const getApLinkedState = async (db, id, exceptId = null) => {
     const info = (await queryAPReverseInfo(db, id)).rows[0];
     if (!info) return null;
+    if (exceptId) {
+        const x = (await db.query(`
+            SELECT (SELECT string_agg(DISTINCT p.doc_no, ', ')
+                      FROM ap_transaction_apply a JOIN ap_transaction p ON p.id = a.transaction_id
+                     WHERE a.applied_to_id = $1 AND a.transaction_id NOT IN ($1, $2) AND p.status NOT IN ('Void', 'Deleted')) AS applied_by,
+                   (SELECT COALESCE(SUM(applied_amount_lc), 0) FROM ap_transaction_apply
+                     WHERE applied_to_id = $1 AND transaction_id = $2) AS own_paid`, [id, exceptId])).rows[0];
+        info.applied_by = x.applied_by;
+        info.paid_amount_lc = Number(info.paid_amount_lc) - Number(x.own_paid);
+    }
     const b = info.status === 'Posted' ? getApVoidBlock({ ...info, from_im: false, from_consignment: false }) : null;
     return {
         status: info.status, doc_no: info.doc_no, gl_entry_id: info.gl_entry_id,
@@ -1406,29 +1418,16 @@ const fetchRemittanceAdviceByDocNo = async (req, res) => {
 };
 
 // --- 1. Create Transaction (Draft/Post) ---
-const createTransaction = async (req, res) => {
-    const { header, details, applies, payments, whts, action } = req.body;
-    const client = await req.dbPool.connect();
-    try {
-        await client.query('BEGIN');
-        // idempotent schema migrations
-        await client.query(`ALTER TABLE ap_transaction_detail ADD COLUMN IF NOT EXISTS item_code VARCHAR(50)`).catch(() => {});
-        await client.query(`ALTER TABLE ap_transaction_detail ADD COLUMN IF NOT EXISTS item_name VARCHAR(200)`).catch(() => {});
-        await client.query(`ALTER TABLE ap_transaction ADD COLUMN IF NOT EXISTS price_includes_vat BOOLEAN NOT NULL DEFAULT false`);
-        await ensureTaxInvoiceColumns(client);
+// สร้างเอกสาร AP (ร่าง/โพสต์) ภายใน transaction ของผู้เรียก — ใช้ทั้ง API และซื้อเงินสดของ IM ('14' สร้างใบจ่ายชำระ)
+// คืน { id, doc_no } (มิเรอร์ insertArTransaction ของ AR)
+const insertApTransaction = async (client, { header, details, applies, payments, whts, action }, { preApproved = false } = {}) => {
+    // idempotent schema migrations
+    await client.query(`ALTER TABLE ap_transaction_detail ADD COLUMN IF NOT EXISTS item_code VARCHAR(50)`).catch(() => {});
+    await client.query(`ALTER TABLE ap_transaction_detail ADD COLUMN IF NOT EXISTS item_name VARCHAR(200)`).catch(() => {});
+    await client.query(`ALTER TABLE ap_transaction ADD COLUMN IF NOT EXISTS price_includes_vat BOOLEAN NOT NULL DEFAULT false`);
+    await ensureTaxInvoiceColumns(client);
 
-        if (action === 'Post') {
-            const periodRes = await client.query(
-                `SELECT id FROM gl_posting_period
-                 WHERE $1::date BETWEEN period_start_date AND period_end_date
-                 AND gl_status = 'OPEN' LIMIT 1`, [header.doc_date]
-            );
-            if (periodRes.rows.length === 0)
-                throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่เอกสาร ${header.doc_date}`);
-            const sdt = (await client.query(`SELECT sys_doc_type FROM sa_module_document WHERE id=$1`, [header.doc_id])).rows[0]?.sys_doc_type || '';
-            if (await requiresApproval(client, sdt, { refNo: header.ref_no, vendorId: header.vendor_id })) throw new Error(MUST_APPROVE_MSG);
-        }
-
+    if (action === 'Post') {
         const periodRes = await client.query(
             `SELECT id FROM gl_posting_period
              WHERE $1::date BETWEEN period_start_date AND period_end_date
@@ -1436,173 +1435,194 @@ const createTransaction = async (req, res) => {
         );
         if (periodRes.rows.length === 0)
             throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่เอกสาร ${header.doc_date}`);
-        const periodId = periodRes.rows[0].id;
+        const sdt = (await client.query(`SELECT sys_doc_type FROM sa_module_document WHERE id=$1`, [header.doc_id])).rows[0]?.sys_doc_type || '';
+        // preApproved: เอกสารต้นทางผ่านการอนุมัติจ่ายมาแล้ว (ซื้อเงินสด IM '14' อนุมัติตามวงเงินจ่ายที่เอกสาร IM)
+            if (!preApproved && await requiresApproval(client, sdt, { refNo: header.ref_no, vendorId: header.vendor_id })) throw new Error(MUST_APPROVE_MSG);
+    }
 
-        let finalDocNo = header.doc_no;
-        if (!finalDocNo || finalDocNo === 'AUTO') {
-            finalDocNo = await generateDocNo(client, header.doc_id, header.doc_date, header.branch_id);
-            if (!finalDocNo) throw new Error('Auto numbering failed or manual doc_no required');
-        }
+    const periodRes = await client.query(
+        `SELECT id FROM gl_posting_period
+         WHERE $1::date BETWEEN period_start_date AND period_end_date
+         AND gl_status = 'OPEN' LIMIT 1`, [header.doc_date]
+    );
+    if (periodRes.rows.length === 0)
+        throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่เอกสาร ${header.doc_date}`);
+    const periodId = periodRes.rows[0].id;
 
-        const status = action === 'Post' ? 'Posted' : 'Draft';
+    let finalDocNo = header.doc_no;
+    if (!finalDocNo || finalDocNo === 'AUTO') {
+        finalDocNo = await generateDocNo(client, header.doc_id, header.doc_date, header.branch_id);
+        if (!finalDocNo) throw new Error('Auto numbering failed or manual doc_no required');
+    }
 
-        const hRes = await client.query(`
-            INSERT INTO ap_transaction
-            (doc_id, doc_no, doc_date, due_date, period_id,
-             vendor_id, vendor_code, vendor_name_th,
-             ap_account_id, currency_id, currency_code, exchange_rate,
-             subtotal_fc, discount_amount_fc, before_vat_fc, vat_amount_fc, total_amount_fc,
-             subtotal_lc, discount_amount_lc, before_vat_lc, vat_amount_lc, total_amount_lc,
-             paid_amount_lc, balance_amount_lc,
-             ref_no, ref_doc_id, ref_doc_no, description, status,
-             dim1_id, dim2_id, dim3_id, dim4_id, dim5_id,
-             branch_id, created_by)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
-                    $13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
-                    $25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36)
-            RETURNING id
-        `, [
-            header.doc_id, finalDocNo, header.doc_date, header.due_date || null, periodId,
-            header.vendor_id, header.vendor_code || null, header.vendor_name_th || null,
-            header.ap_account_id || null, header.currency_id || null, header.currency_code || await getBaseCurrencyCode(client),
-            header.exchange_rate || 1,
-            header.subtotal_fc || 0, header.discount_amount_fc || 0,
-            header.before_vat_fc || 0, header.vat_amount_fc || 0, header.total_amount_fc || 0,
-            header.subtotal_lc || 0, header.discount_amount_lc || 0,
-            header.before_vat_lc || 0, header.vat_amount_lc || 0, header.total_amount_lc || 0,
-            0, header.total_amount_lc || 0,
-            header.ref_no || null, header.ref_doc_id || null, header.ref_doc_no || null,
-            header.description || null, status,
-            header.dim1_id || null, header.dim2_id || null,
-            header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
-            header.branch_id || null, header.created_by || null,
-        ]);
-        const newHeaderId = hRes.rows[0].id;
-        await client.query(`UPDATE ap_transaction SET price_includes_vat=$1, tax_invoice_no=$3, tax_invoice_date=$4 WHERE id=$2`,
-            [header.price_includes_vat === true, newHeaderId, ...taxInvoiceOf(header)]);
-        // ใบมัดจำอ้างอิงใบสั่งซื้อ (utils/depositRef.js)
-        await saveDepositRef(client, 'ap', newHeaderId, header);
+    const status = action === 'Post' ? 'Posted' : 'Draft';
 
-        // Insert details — expense_account_id = บัญชีที่ใช้ลงบัญชีของบรรทัด (เลือกได้ ค่าเริ่มต้นจากประเภทเอกสาร) + มิติของบรรทัด
-        await ensureDetailDimColumns(client, 'ap_transaction_detail');
-        let lineNo = 1;
-        for (const d of (details || [])) {
-            await client.query(`
-                INSERT INTO ap_transaction_detail
-                (header_id, line_no, item_code, item_name, description,
-                 quantity, unit_price_fc, discount_percent, discount_amount_fc,
-                 subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
-                 expense_account_id, subtotal_lc, vat_amount_lc, total_amount_lc, is_deferred_vat,
-                 dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
-            `, [
-                newHeaderId, lineNo++, d.item_code || null, d.item_name || null, d.description || null,
-                d.quantity ?? 1, d.unit_price_fc || 0, d.discount_percent || 0, d.discount_amount_fc || 0,
-                d.subtotal_fc || 0, d.vat_type || 'NOVAT', d.vat_rate ?? 0,
-                d.vat_amount_fc || 0, d.total_amount_fc || 0,
-                d.expense_account_id || null,
-                d.subtotal_lc || 0, d.vat_amount_lc || 0, d.total_amount_lc || 0,
-                d.is_deferred_vat || false,
-                ...detailDimParams(d)
-            ]);
-        }
+    const hRes = await client.query(`
+        INSERT INTO ap_transaction
+        (doc_id, doc_no, doc_date, due_date, period_id,
+         vendor_id, vendor_code, vendor_name_th,
+         ap_account_id, currency_id, currency_code, exchange_rate,
+         subtotal_fc, discount_amount_fc, before_vat_fc, vat_amount_fc, total_amount_fc,
+         subtotal_lc, discount_amount_lc, before_vat_lc, vat_amount_lc, total_amount_lc,
+         paid_amount_lc, balance_amount_lc,
+         ref_no, ref_doc_id, ref_doc_no, description, status,
+         dim1_id, dim2_id, dim3_id, dim4_id, dim5_id,
+         branch_id, created_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
+                $13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
+                $25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36)
+        RETURNING id
+    `, [
+        header.doc_id, finalDocNo, header.doc_date, header.due_date || null, periodId,
+        header.vendor_id, header.vendor_code || null, header.vendor_name_th || null,
+        header.ap_account_id || null, header.currency_id || null, header.currency_code || await getBaseCurrencyCode(client),
+        header.exchange_rate || 1,
+        header.subtotal_fc || 0, header.discount_amount_fc || 0,
+        header.before_vat_fc || 0, header.vat_amount_fc || 0, header.total_amount_fc || 0,
+        header.subtotal_lc || 0, header.discount_amount_lc || 0,
+        header.before_vat_lc || 0, header.vat_amount_lc || 0, header.total_amount_lc || 0,
+        0, header.total_amount_lc || 0,
+        header.ref_no || null, header.ref_doc_id || null, header.ref_doc_no || null,
+        header.description || null, status,
+        header.dim1_id || null, header.dim2_id || null,
+        header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
+        header.branch_id || null, header.created_by || null,
+    ]);
+    const newHeaderId = hRes.rows[0].id;
+    await client.query(`UPDATE ap_transaction SET price_includes_vat=$1, tax_invoice_no=$3, tax_invoice_date=$4 WHERE id=$2`,
+        [header.price_includes_vat === true, newHeaderId, ...taxInvoiceOf(header)]);
+    // ใบมัดจำอ้างอิงใบสั่งซื้อ (utils/depositRef.js)
+    await saveDepositRef(client, 'ap', newHeaderId, header);
 
-        // Insert apply records
-        for (const a of (applies || [])) {
-            await client.query(`
-                INSERT INTO ap_transaction_apply
-                (transaction_id, applied_to_id, applied_amount_lc, applied_amount_fc, applied_date, apply_type, created_by)
-                VALUES ($1,$2,$3,$4,$5,$6,$7)
-            `, [newHeaderId, a.applied_to_id, a.applied_amount_lc || 0, a.applied_amount_fc || 0,
-                header.doc_date, a.apply_type || 'invoice', header.created_by || null]);
-        }
-
-        // Update invoice balances
-        await adjustInvoiceBalances(client, newHeaderId, +1);
-
-        // Insert payment rows
-        await ensurePaymentTable(client);
-        let pmLineNo = 1;
-        for (const p of (payments || [])) {
-            await ensureCheckbookColumns(client);
-            await client.query(`
-                INSERT INTO ap_transaction_payment
-                (header_id, line_no, payment_method_id, payment_method_code, payment_method_name,
-                 payment_method_type, cm_bank_account_id, gl_account_id,
-                 amount_lc, amount_fc, ref_no, payment_date, remark,
-                 drawer_bank_name, drawer_bank_branch, drawer_account_no, created_by, checkbook_id)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-            `, [
-                newHeaderId, pmLineNo++,
-                p.payment_method_id || null, p.payment_method_code || null, p.payment_method_name || null,
-                p.payment_method_type || 'CASH', p.cm_bank_account_id || null, p.gl_account_id || null,
-                p.amount_lc || 0, p.amount_fc || 0,
-                p.ref_no || null, p.payment_date || header.doc_date, p.remark || null,
-                p.drawer_bank_name || null, p.drawer_bank_branch || null, p.drawer_account_no || null,
-                header.created_by || null,
-                p.payment_method_type === 'CHECK' ? (p.checkbook_id || null) : null,
-            ]);
-        }
-
-        // Insert WHT rows
+    // Insert details — expense_account_id = บัญชีที่ใช้ลงบัญชีของบรรทัด (เลือกได้ ค่าเริ่มต้นจากประเภทเอกสาร) + มิติของบรรทัด
+    await ensureDetailDimColumns(client, 'ap_transaction_detail');
+    let lineNo = 1;
+    for (const d of (details || [])) {
         await client.query(`
-            CREATE TABLE IF NOT EXISTS ap_transaction_wht (
-                id SERIAL PRIMARY KEY,
-                header_id INT NOT NULL REFERENCES ap_transaction(id) ON DELETE CASCADE,
-                wht_type VARCHAR(100),
-                wht_type_id INT REFERENCES cd_wht_type(id),
-                income_type VARCHAR(20),
-                wht_rate NUMERIC(5,2) DEFAULT 0,
-                base_amount_lc NUMERIC(15,2) DEFAULT 0,
-                wht_amount_lc NUMERIC(15,2) DEFAULT 0,
-                description TEXT
-            )
-        `);
-        await client.query(`ALTER TABLE ap_transaction_wht ADD COLUMN IF NOT EXISTS wht_type_id INT REFERENCES cd_wht_type(id)`).catch(() => {});
-        await client.query(`ALTER TABLE ap_transaction_wht ADD COLUMN IF NOT EXISTS income_type VARCHAR(20)`).catch(() => {});
-        for (const w of (whts || [])) {
-            await client.query(`
-                INSERT INTO ap_transaction_wht (header_id, wht_type, wht_type_id, income_type, wht_rate, base_amount_lc, wht_amount_lc, description)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-            `, [newHeaderId, w.wht_type || null, w.wht_type_id || null, w.income_type || null,
-                w.wht_rate || 0, w.base_amount_lc || 0, w.wht_amount_lc || 0, w.description || null]);
-        }
-        // Update header wht_amount_lc
-        const totalWhtLc = (whts || []).reduce((s, w) => s + (Number(w.wht_amount_lc) || 0), 0);
-        if (totalWhtLc > 0) {
-            await client.query(`UPDATE ap_transaction SET wht_amount_lc=$1 WHERE id=$2`, [totalWhtLc, newHeaderId]);
-        }
+            INSERT INTO ap_transaction_detail
+            (header_id, line_no, item_code, item_name, description,
+             quantity, unit_price_fc, discount_percent, discount_amount_fc,
+             subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
+             expense_account_id, subtotal_lc, vat_amount_lc, total_amount_lc, is_deferred_vat,
+             dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+        `, [
+            newHeaderId, lineNo++, d.item_code || null, d.item_name || null, d.description || null,
+            d.quantity ?? 1, d.unit_price_fc || 0, d.discount_percent || 0, d.discount_amount_fc || 0,
+            d.subtotal_fc || 0, d.vat_type || 'NOVAT', d.vat_rate ?? 0,
+            d.vat_amount_fc || 0, d.total_amount_fc || 0,
+            d.expense_account_id || null,
+            d.subtotal_lc || 0, d.vat_amount_lc || 0, d.total_amount_lc || 0,
+            d.is_deferred_vat || false,
+            ...detailDimParams(d)
+        ]);
+    }
 
-        // Post GL
-        let glEntryId = null;
-        if (action === 'Post') {
-            const sysDocTypeRes = await client.query(
-                `SELECT sys_doc_type FROM sa_module_document WHERE id = $1 LIMIT 1`, [header.doc_id]
-            );
-            const sysDocType1 = sysDocTypeRes.rows[0]?.sys_doc_type || '';
-            const isRaPost = sysDocType1 === '70';
+    // Insert apply records
+    for (const a of (applies || [])) {
+        await client.query(`
+            INSERT INTO ap_transaction_apply
+            (transaction_id, applied_to_id, applied_amount_lc, applied_amount_fc, applied_date, apply_type, created_by)
+            VALUES ($1,$2,$3,$4,$5,$6,$7)
+        `, [newHeaderId, a.applied_to_id, a.applied_amount_lc || 0, a.applied_amount_fc || 0,
+            header.doc_date, a.apply_type || 'invoice', header.created_by || null]);
+    }
 
-            if (!isRaPost) {
-                const headerWithDocNo = { ...header, doc_no: finalDocNo, _applies: applies || [], _payments: payments || [], _whts: whts || [] };
-                glEntryId = await postGlEntry(client, newHeaderId, headerWithDocNo, details || [], finalDocNo);
-                await insertVtRecords(client, newHeaderId, headerWithDocNo, details || [], sysDocType1);
-                for (const part of headerWithDocNo._depositParts || []) await insertDepositVtReversal(client, newHeaderId, headerWithDocNo, part);
-                if (sysDocType1 === '80') {
-                    await insertDeferredVtRecordsForPayment(client, newHeaderId, headerWithDocNo,
-                        await computePaymentDeferredVat(client, await paymentInvoiceRatios(client, applies)));
-                }
-                if (glEntryId) {
-                    await client.query(`UPDATE ap_transaction SET gl_entry_id=$1, gl_doc_no=(SELECT doc_no FROM gl_entry_header WHERE id=$1) WHERE id=$2`, [glEntryId, newHeaderId]);
-                }
-                if (['65'].includes(sysDocType1)) {
-                    await client.query(`UPDATE ap_transaction SET balance_amount_lc=0 WHERE id=$1`, [newHeaderId]);
-                }
-                // เลขเช็คจากสมุดเช็ค (จ่ายมัดจำ/จ่ายชำระ) ก่อนสร้างรายการจ่ายธนาคาร
-                if (['60', '80'].includes(sysDocType1)) await assignCheckNumbers(client, 'ap_transaction_payment', newHeaderId, 'ap_transaction_id');
-                if (['60', '65', '80'].includes(sysDocType1)) await postCmPaymentHelper(client, newHeaderId, glEntryId);
+    // Update invoice balances
+    await adjustInvoiceBalances(client, newHeaderId, +1);
+
+    // Insert payment rows
+    await ensurePaymentTable(client);
+    let pmLineNo = 1;
+    for (const p of (payments || [])) {
+        await ensureCheckbookColumns(client);
+        await client.query(`
+            INSERT INTO ap_transaction_payment
+            (header_id, line_no, payment_method_id, payment_method_code, payment_method_name,
+             payment_method_type, cm_bank_account_id, gl_account_id,
+             amount_lc, amount_fc, ref_no, payment_date, remark,
+             drawer_bank_name, drawer_bank_branch, drawer_account_no, created_by, checkbook_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+        `, [
+            newHeaderId, pmLineNo++,
+            p.payment_method_id || null, p.payment_method_code || null, p.payment_method_name || null,
+            p.payment_method_type || 'CASH', p.cm_bank_account_id || null, p.gl_account_id || null,
+            p.amount_lc || 0, p.amount_fc || 0,
+            p.ref_no || null, p.payment_date || header.doc_date, p.remark || null,
+            p.drawer_bank_name || null, p.drawer_bank_branch || null, p.drawer_account_no || null,
+            header.created_by || null,
+            p.payment_method_type === 'CHECK' ? (p.checkbook_id || null) : null,
+        ]);
+    }
+
+    // Insert WHT rows
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS ap_transaction_wht (
+            id SERIAL PRIMARY KEY,
+            header_id INT NOT NULL REFERENCES ap_transaction(id) ON DELETE CASCADE,
+            wht_type VARCHAR(100),
+            wht_type_id INT REFERENCES cd_wht_type(id),
+            income_type VARCHAR(20),
+            wht_rate NUMERIC(5,2) DEFAULT 0,
+            base_amount_lc NUMERIC(15,2) DEFAULT 0,
+            wht_amount_lc NUMERIC(15,2) DEFAULT 0,
+            description TEXT
+        )
+    `);
+    await client.query(`ALTER TABLE ap_transaction_wht ADD COLUMN IF NOT EXISTS wht_type_id INT REFERENCES cd_wht_type(id)`).catch(() => {});
+    await client.query(`ALTER TABLE ap_transaction_wht ADD COLUMN IF NOT EXISTS income_type VARCHAR(20)`).catch(() => {});
+    for (const w of (whts || [])) {
+        await client.query(`
+            INSERT INTO ap_transaction_wht (header_id, wht_type, wht_type_id, income_type, wht_rate, base_amount_lc, wht_amount_lc, description)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        `, [newHeaderId, w.wht_type || null, w.wht_type_id || null, w.income_type || null,
+            w.wht_rate || 0, w.base_amount_lc || 0, w.wht_amount_lc || 0, w.description || null]);
+    }
+    // Update header wht_amount_lc
+    const totalWhtLc = (whts || []).reduce((s, w) => s + (Number(w.wht_amount_lc) || 0), 0);
+    if (totalWhtLc > 0) {
+        await client.query(`UPDATE ap_transaction SET wht_amount_lc=$1 WHERE id=$2`, [totalWhtLc, newHeaderId]);
+    }
+
+    // Post GL
+    let glEntryId = null;
+    if (action === 'Post') {
+        const sysDocTypeRes = await client.query(
+            `SELECT sys_doc_type FROM sa_module_document WHERE id = $1 LIMIT 1`, [header.doc_id]
+        );
+        const sysDocType1 = sysDocTypeRes.rows[0]?.sys_doc_type || '';
+        const isRaPost = sysDocType1 === '70';
+
+        if (!isRaPost) {
+            const headerWithDocNo = { ...header, doc_no: finalDocNo, _applies: applies || [], _payments: payments || [], _whts: whts || [] };
+            glEntryId = await postGlEntry(client, newHeaderId, headerWithDocNo, details || [], finalDocNo);
+            await insertVtRecords(client, newHeaderId, headerWithDocNo, details || [], sysDocType1);
+            for (const part of headerWithDocNo._depositParts || []) await insertDepositVtReversal(client, newHeaderId, headerWithDocNo, part);
+            if (sysDocType1 === '80') {
+                await insertDeferredVtRecordsForPayment(client, newHeaderId, headerWithDocNo,
+                    await computePaymentDeferredVat(client, await paymentInvoiceRatios(client, applies)));
             }
+            if (glEntryId) {
+                await client.query(`UPDATE ap_transaction SET gl_entry_id=$1, gl_doc_no=(SELECT doc_no FROM gl_entry_header WHERE id=$1) WHERE id=$2`, [glEntryId, newHeaderId]);
+            }
+            if (['65'].includes(sysDocType1)) {
+                await client.query(`UPDATE ap_transaction SET balance_amount_lc=0 WHERE id=$1`, [newHeaderId]);
+            }
+            // เลขเช็คจากสมุดเช็ค (จ่ายมัดจำ/จ่ายชำระ) ก่อนสร้างรายการจ่ายธนาคาร
+            if (['60', '80'].includes(sysDocType1)) await assignCheckNumbers(client, 'ap_transaction_payment', newHeaderId, 'ap_transaction_id');
+            if (['60', '65', '80'].includes(sysDocType1)) await postCmPaymentHelper(client, newHeaderId, glEntryId);
         }
+    }
 
+    return { id: newHeaderId, doc_no: finalDocNo };
+};
+
+const createTransaction = async (req, res) => {
+    const { header, details, applies, payments, whts, action } = req.body;
+    const client = await req.dbPool.connect();
+    try {
+        await client.query('BEGIN');
+        const { id: newHeaderId } = await insertApTransaction(client, { header, details, applies, payments, whts, action });
         await client.query('COMMIT');
         const full = await fetchRowById(req.dbPool, newHeaderId);
         res.status(201).json(full);
@@ -2149,7 +2169,7 @@ module.exports = {
     fetchOpenRemittanceAdvices, fetchRaInvoices,
     fetchRemittanceAdviceByDocNo,
     createTransaction, updateTransaction, voidTransaction, deleteTransaction, reverseTransaction,
-    voidApDocument, getApLinkedState, generateDocNo,
+    voidApDocument, getApLinkedState, generateDocNo, insertApTransaction,
     buildInvAdvanceGl, insertDepositVtReversal, adjustInvoiceBalances,
     submitTransaction, approveTransaction, rejectTransaction, postTransaction,
 };

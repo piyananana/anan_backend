@@ -286,7 +286,7 @@ const resolveItemPrice = async (client, { itemId, listType, vendorId, customerId
     };
 };
 
-// ราคาซื้อล่าสุดจากผู้ขายรายนี้ (ใช้เมื่อไม่พบในตารางราคาซื้อ) — จาก IM รับของ '11'/'12' ที่ Post/Received แล้ว และ PO ที่
+// ราคาซื้อล่าสุดจากผู้ขายรายนี้ (ใช้เมื่อไม่พบในตารางราคาซื้อ) — จาก IM รับของ '11'/'12'/ซื้อเงินสด '14' ที่ Post/Received แล้ว และ PO ที่
 // อนุมัติแล้ว สินค้า/หน่วยนับ/สกุลเงินเดียวกัน วันที่ไม่เกิน docDate (ไม่แปลงอัตราแลกเปลี่ยนข้ามสกุล) ราคาที่กรอกก่อนส่วนลด
 // (ส่วนลดครั้งก่อนไม่ติดมา) ทำเป็นราคาไม่รวม VAT ตามเอกสารต้นทาง แล้วแปลงให้ตรงกับเอกสารปัจจุบัน — คืน null ถ้าไม่พบ
 const lastPurchasePrice = async (client, { itemId, vendorId, uomId, currencyCode, docDate, priceIncludesVat, vatRate }) => {
@@ -304,7 +304,7 @@ const lastPurchasePrice = async (client, { itemId, vendorId, uomId, currencyCode
               FROM im_transaction_detail dt
               JOIN im_transaction h ON h.id = dt.header_id
               JOIN sa_module_document md ON md.id = h.doc_id
-             WHERE md.sys_doc_type IN ('11', '12') AND h.status IN ('Posted', 'Received')
+             WHERE md.sys_doc_type IN ('11', '12', '14') AND h.status IN ('Posted', 'Received')
                AND h.vendor_id = $1 AND dt.item_id = $2 AND ($3::int IS NULL OR dt.uom_id IS NULL OR dt.uom_id = $3)
                AND COALESCE(h.currency_code, $4) = $5 AND h.doc_date <= $6::date
                AND NOT COALESCE(dt.is_free, false) AND COALESCE(dt.billed_unit_cost_fc, dt.unit_cost_fc) > 0`);
