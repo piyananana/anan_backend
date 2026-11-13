@@ -850,6 +850,241 @@ const SALES_INVOICE = {
   },
 };
 
-const SOURCES = { SALES_INVOICE };
+// ── ใบสำคัญจ่าย: ซื้อเงินสด IM '14' (โพสต์แล้ว) ─────────────────────────────────────────
+// ผู้ขาย = ผู้ขายจริงที่ระบุในเอกสาร (bill_to_*) ถ้ามี ไม่งั้นผู้ขายในระบบ; ยอดรวมจากใบตั้งหนี้ AP ที่สร้าง (ตรงกับบัญชี)
+// วิธีจ่าย/ภาษีหัก ณ ที่จ่าย จากเอกสาร IM; ผู้อนุมัติ = คิวอนุมัติจ่าย (doc_approval 'IM_CASHPUR')
+const TAX_KIND_TH = { FULL: 'ใบกำกับภาษีเต็มรูป', ABB: 'ใบกำกับภาษีอย่างย่อ', NONE: 'ไม่มีใบกำกับภาษี' };
+const TAX_KIND_EN = { FULL: 'Full tax invoice', ABB: 'Abbreviated tax invoice', NONE: 'No tax invoice' };
+const PAYMENT_VOUCHER = {
+  key: 'PAYMENT_VOUCHER',
+  name_th: 'ใบสำคัญจ่าย',
+  name_en: 'Payment Voucher',
+  docTypes: [{ module: 'IM', sys_module: '31', sys_doc_types: ['14'] }],
+  fields: [
+    ...COMPANY_FIELDS,
+    f('vendor_code', 'รหัสผู้ขาย', 'Vendor code', 'vendor'),
+    f('vendor_name', 'ชื่อผู้ขาย (ผู้รับเงิน)', 'Vendor name (payee)', 'vendor'),
+    f('vendor_name_en', 'ชื่อผู้ขาย (อังกฤษ)', 'Vendor name (EN)', 'vendor'),
+    f('vendor_address', 'ที่อยู่ผู้ขาย', 'Vendor address', 'vendor'),
+    f('vendor_address1', 'ที่อยู่ผู้ขาย บรรทัด 1', 'Vendor address line 1', 'vendor'),
+    f('vendor_address2', 'ที่อยู่ผู้ขาย บรรทัด 2', 'Vendor address line 2', 'vendor'),
+    f('vendor_tax_id', 'เลขประจำตัวผู้เสียภาษีผู้ขาย', 'Vendor tax ID', 'vendor'),
+    f('vendor_branch_label', 'สำนักงานใหญ่/สาขาที่ xxxxx (ผู้ขาย)', 'Head office/Branch xxxxx (vendor)', 'vendor'),
+    f('vendor_tax_id_branch', 'เลขผู้เสียภาษี + สาขา (ผู้ขาย)', 'Tax ID + branch (vendor)', 'vendor'),
+    f('doc_no', 'เลขที่เอกสาร', 'Document no.', 'document'),
+    f('doc_date', 'วันที่เอกสาร', 'Document date', 'document', 'date'),
+    f('doc_type_code', 'รหัสประเภทเอกสาร', 'Doc type code', 'document'),
+    f('doc_type_name', 'ชื่อประเภทเอกสาร', 'Doc type name', 'document'),
+    f('doc_type_name_en', 'ชื่อประเภทเอกสาร (อังกฤษ)', 'Doc type name (EN)', 'document'),
+    f('tax_invoice_no', 'เลขที่ใบกำกับภาษี/ใบเสร็จผู้ขาย', 'Vendor tax invoice / receipt no.', 'document'),
+    f('tax_invoice_date', 'วันที่ใบกำกับภาษีผู้ขาย', 'Vendor tax invoice date', 'document', 'date'),
+    f('tax_invoice_kind', 'ประเภทใบกำกับภาษี', 'Tax invoice type', 'document'),
+    f('tax_invoice_kind_en', 'ประเภทใบกำกับภาษี (อังกฤษ)', 'Tax invoice type (EN)', 'document'),
+    f('ap_invoice_no', 'เลขที่ใบตั้งหนี้ AP', 'AP invoice no.', 'document'),
+    f('payment_no', 'เลขที่ใบจ่ายชำระ AP', 'AP payment no.', 'document'),
+    f('payment_date', 'วันที่จ่าย', 'Payment date', 'document', 'date'),
+    f('gl_doc_no', 'เลขที่รายการบัญชี (ใบจ่าย)', 'GL voucher no. (payment)', 'document'),
+    f('description', 'หมายเหตุ', 'Remark', 'document'),
+    f('warehouse_name', 'คลังสินค้า', 'Warehouse', 'document'),
+    f('warehouse_name_en', 'คลังสินค้า (อังกฤษ)', 'Warehouse (EN)', 'document'),
+    f('prepared_by', 'ผู้จัดทำ', 'Prepared by', 'document'),
+    f('requested_by', 'ผู้ขออนุมัติจ่าย', 'Payment requested by', 'document'),
+    f('approver_code', 'รหัสผู้อนุมัติจ่าย', 'Payment approver code', 'document'),
+    f('approver_name', 'ชื่อผู้อนุมัติจ่าย', 'Payment approver name', 'document'),
+    f('approve_date', 'วันที่อนุมัติจ่าย', 'Payment approval date', 'document', 'date'),
+    f('currency_code', 'สกุลเงิน', 'Currency', 'document'),
+    f('currency_name', 'ชื่อสกุลเงิน', 'Currency name', 'document'),
+    f('currency_name_en', 'ชื่อสกุลเงิน (อังกฤษ)', 'Currency name (EN)', 'document'),
+    f('exchange_rate', 'อัตราแลกเปลี่ยน', 'Exchange rate', 'document', 'number'),
+    f('subtotal', 'รวมเงิน', 'Subtotal', 'total', 'money'),
+    f('discount_amount', 'ส่วนลด', 'Discount', 'total', 'money'),
+    f('before_vat', 'มูลค่าก่อนภาษี', 'Amount before VAT', 'total', 'money'),
+    f('vat_rate', 'อัตราภาษี (%)', 'VAT rate (%)', 'total', 'number'),
+    f('vat_amount', 'ภาษีซื้อ', 'Input VAT', 'total', 'money'),
+    f('total_amount', 'จำนวนเงินรวมทั้งสิ้น', 'Grand total', 'total', 'money'),
+    f('total_qty', 'จำนวนรวม', 'Total quantity', 'total', 'qty'),
+    f('amount_text', 'จำนวนเงินรวมตัวอักษร', 'Grand total in words', 'total'),
+    f('deposit_doc_nos', 'เลขที่ใบจ่ายมัดจำที่หัก', 'Deducted deposit no.', 'total'),
+    f('deposit_total', 'หักเงินมัดจำ', 'Less deposits', 'total', 'money'),
+    f('amount_due', 'ยอดที่ต้องจ่าย (หลังหักมัดจำ)', 'Amount due (after deposits)', 'total', 'money'),
+    f('net_paid', 'ยอดจ่ายสุทธิ (หลังหัก ณ ที่จ่าย)', 'Net paid (after WHT)', 'total', 'money'),
+    f('net_paid_text', 'ยอดจ่ายสุทธิตัวอักษร', 'Net paid in words', 'total'),
+    f('net_paid_text_en', 'ยอดจ่ายสุทธิตัวอักษร (อังกฤษ)', 'Net paid in words (EN)', 'total'),
+    f('base_currency_code', 'สกุลเงินหลัก', 'Base currency', 'total'),
+    f('total_amount_lc', 'จำนวนเงินรวม (สกุลเงินหลัก)', 'Grand total (base currency)', 'total', 'money'),
+    f('net_paid_lc', 'ยอดจ่ายสุทธิ (สกุลเงินหลัก)', 'Net paid (base currency)', 'total', 'money'),
+    f('line_count', 'จำนวนรายการ', 'Line count', 'total', 'number'),
+    f('payment_methods', 'วิธีจ่าย (ชื่อ + จำนวนเงิน)', 'Payment methods (name + amount)', 'payment'),
+    f('payment_methods_en', 'วิธีจ่าย (อังกฤษ)', 'Payment methods (EN)', 'payment'),
+    f('cash_amount', 'จ่ายเป็นเงินสด', 'Paid in cash', 'payment', 'money'),
+    f('check_amount', 'จ่ายเป็นเช็ค', 'Paid by cheque', 'payment', 'money'),
+    f('transfer_amount', 'จ่ายเป็นเงินโอน', 'Paid by transfer', 'payment', 'money'),
+    f('qr_amount', 'จ่ายผ่าน QR/พร้อมเพย์', 'Paid by QR/PromptPay', 'payment', 'money'),
+    f('card_amount', 'จ่ายด้วยบัตร', 'Paid by card', 'payment', 'money'),
+    f('other_amount', 'จ่ายวิธีอื่น', 'Paid by other methods', 'payment', 'money'),
+    f('cash_mark', 'เครื่องหมาย X เงินสด', 'X mark: cash', 'payment'),
+    f('check_mark', 'เครื่องหมาย X เช็ค', 'X mark: cheque', 'payment'),
+    f('transfer_mark', 'เครื่องหมาย X เงินโอน/QR', 'X mark: transfer/QR', 'payment'),
+    f('card_mark', 'เครื่องหมาย X บัตร', 'X mark: card', 'payment'),
+    f('check_details', 'รายละเอียดเช็ค (เลขที่ ธนาคาร สาขา)', 'Cheque details (no., bank, branch)', 'payment'),
+    f('check_details_en', 'รายละเอียดเช็ค (อังกฤษ)', 'Cheque details (EN)', 'payment'),
+    f('payment_refs', 'เลขที่อ้างอิงการจ่าย', 'Payment reference nos.', 'payment'),
+    f('wht_amount', 'ภาษีหัก ณ ที่จ่าย', 'Withholding tax', 'payment', 'money'),
+    f('wht_certificate_nos', 'เลขที่หนังสือรับรองการหักภาษี', 'WHT certificate nos.', 'payment'),
+    ...PRINT_FIELDS,
+    f('line_no', 'ลำดับ', 'No.', 'line', 'number', 'L'),
+    f('item_code', 'รหัสสินค้า', 'Item code', 'line', 'text', 'L'),
+    f('item_name', 'ชื่อสินค้า', 'Item name', 'line', 'text', 'L'),
+    f('item_name_en', 'ชื่อสินค้า (อังกฤษ)', 'Item name (EN)', 'line', 'text', 'L'),
+    f('description', 'รายละเอียด', 'Description', 'line', 'text', 'L'),
+    f('item_desc', 'ชื่อสินค้า + รายละเอียด', 'Item name + description', 'line', 'text', 'L'),
+    f('qty', 'จำนวน', 'Quantity', 'line', 'qty', 'L'),
+    f('unit', 'หน่วย', 'Unit', 'line', 'text', 'L'),
+    f('unit_en', 'หน่วย (อังกฤษ)', 'Unit (EN)', 'line', 'text', 'L'),
+    f('unit_price', 'ราคาต่อหน่วย', 'Unit price', 'line', 'money', 'L'),
+    f('discount_percent', 'ส่วนลด %', 'Discount %', 'line', 'number', 'L'),
+    f('discount_amount', 'ส่วนลด', 'Discount', 'line', 'money', 'L'),
+    f('amount', 'จำนวนเงิน', 'Amount', 'line', 'money', 'L'),
+    f('vat_rate', 'อัตราภาษี (%)', 'VAT rate (%)', 'line', 'number', 'L'),
+    f('vat_amount', 'ภาษี', 'VAT', 'line', 'money', 'L'),
+    f('line_total', 'จำนวนเงินรวมภาษี', 'Amount incl. VAT', 'line', 'money', 'L'),
+  ],
+
+  listDocs: async (db, { docIds, docNoFrom, docNoTo, dateFrom, dateTo, keys }) => {
+    const p = [docIds];
+    let c = '';
+    if (keys) { p.push(keys.filter(k => k.startsWith('IM:')).map(k => Number(k.split(':')[1])).filter(Boolean)); c += ` AND t.id = ANY($${p.length}::int[])`; }
+    if (docNoFrom) { p.push(docNoFrom); c += ` AND t.doc_no >= $${p.length}`; }
+    if (docNoTo) { p.push(docNoTo); c += ` AND t.doc_no <= $${p.length}`; }
+    if (dateFrom) { p.push(dateFrom); c += ` AND t.doc_date >= $${p.length}::date`; }
+    if (dateTo) { p.push(dateTo); c += ` AND t.doc_date <= $${p.length}::date`; }
+    const base = await loadBaseCurrency(db);
+    return (await db.query(`
+        SELECT 'IM:' || t.id AS key, 'IM' AS module, t.id, d.doc_code, t.doc_no, ${ymdSql('t.doc_date')} AS doc_date,
+               t.vendor_code AS customer_code, COALESCE(NULLIF(to_jsonb(t)->>'bill_to_name', ''), t.vendor_name_th) AS customer_name,
+               COALESCE(b.total_amount_fc, 0)::float AS total_amount, t.currency_code
+          FROM im_transaction t JOIN sa_module_document d ON d.id = t.doc_id
+          LEFT JOIN ap_transaction b ON b.id = t.linked_ap_transaction_id
+         WHERE t.doc_id = ANY($1::int[]) AND t.status = 'Posted' ${c}
+         ORDER BY t.doc_date, t.doc_no${keys ? '' : ' LIMIT 2000'}`, p)).rows.map(r => ({
+      ...r, currency_code: s(r.currency_code) || base, is_base_currency: (s(r.currency_code) || base) === base,
+    }));
+  },
+
+  loadDocs: async (db, keys) => {
+    await ensureImPriceColumns(db);
+    const ids = keys.filter(k => k.startsWith('IM:')).map(k => Number(k.split(':')[1])).filter(Boolean);
+    const out = new Map();
+    if (!ids.length) return out;
+    const heads = (await db.query(`
+        SELECT t.id, t.doc_no, ${ymdSql('t.doc_date')} AS doc_date, t.ref_no, t.description, t.currency_code,
+               t.exchange_rate::float AS exchange_rate, t.price_includes_vat, t.branch_id, t.created_by, t.vendor_id,
+               t.vendor_code, t.vendor_name_th, d.doc_code, d.doc_name_thai, d.doc_name_eng,
+               to_jsonb(t)->>'bill_to_name' AS bill_to_name, to_jsonb(t)->>'bill_to_address' AS bill_to_address,
+               to_jsonb(t)->>'bill_to_tax_id' AS bill_to_tax_id, to_jsonb(t)->>'bill_to_branch' AS bill_to_branch,
+               to_jsonb(t)->>'tax_invoice_kind' AS tax_invoice_kind, to_jsonb(t)->>'pay_requested_by' AS pay_requested_by,
+               ${ymdSql('t.vendor_invoice_date')} AS vendor_invoice_date,
+               w.warehouse_name_th, w.warehouse_name_en,
+               b.doc_no AS ap_invoice_no, ${ymdSql('b.doc_date')} AS ap_invoice_date,
+               b.subtotal_fc::float AS b_subtotal, COALESCE(b.discount_amount_fc, 0)::float AS b_discount, b.before_vat_fc::float AS b_before_vat,
+               b.vat_amount_fc::float AS b_vat, b.total_amount_fc::float AS b_total, b.total_amount_lc::float AS b_total_lc,
+               pay.doc_no AS payment_no, ${ymdSql('pay.doc_date')} AS payment_date, pay.gl_doc_no AS pay_gl_doc_no,
+               COALESCE(pay.total_amount_fc, 0)::float AS pay_total, COALESCE(pay.total_amount_lc, 0)::float AS pay_total_lc,
+               v.vendor_name_en, v.tax_id AS v_tax_id, to_jsonb(v)->>'tax_branch_code' AS v_branch, to_jsonb(a) AS v_addr
+          FROM im_transaction t
+          JOIN sa_module_document d ON d.id = t.doc_id
+          LEFT JOIN im_warehouse w ON w.id = t.warehouse_id
+          LEFT JOIN ap_transaction b ON b.id = t.linked_ap_transaction_id
+          LEFT JOIN ap_transaction pay ON pay.id = (to_jsonb(t)->>'linked_ap_payment_id')::int
+          LEFT JOIN ap_vendor v ON v.id = t.vendor_id
+          LEFT JOIN LATERAL (SELECT * FROM ap_vendor_address x WHERE x.vendor_id = t.vendor_id
+                              ORDER BY (x.address_type = 'billing') DESC, x.is_default DESC, x.id LIMIT 1) a ON TRUE
+         WHERE t.id = ANY($1::int[])`, [ids])).rows;
+    const lines = (await db.query(`
+        SELECT dt.header_id, dt.line_no, COALESCE(NULLIF(dt.item_code, ''), it.item_code) AS item_code,
+               COALESCE(NULLIF(dt.item_name, ''), it.item_name_th) AS item_name, it.item_name_en, dt.description,
+               ABS(dt.qty)::float AS qty, COALESCE(dt.unit_cost_fc, dt.unit_cost, 0)::float AS price,
+               COALESCE(dt.discount_percent, 0)::float AS discount_percent, COALESCE(dt.vat_type, 'NOVAT') AS vat_type,
+               COALESCE(dt.vat_rate, 0)::float AS vat_rate, u.uom_code, u.uom_name_th, u.uom_name_en
+          FROM im_transaction_detail dt LEFT JOIN im_uom u ON u.id = dt.uom_id LEFT JOIN im_item it ON it.id = dt.item_id
+         WHERE dt.header_id = ANY($1::int[]) ORDER BY dt.header_id, dt.line_no, dt.id`, [ids])).rows;
+    const deps = (await db.query(`
+        SELECT t.id AS hid, string_agg(dep.doc_no, ', ' ORDER BY dep.doc_date) AS nos, SUM(a.applied_amount_fc)::float AS fc
+          FROM im_transaction t JOIN ap_transaction_apply a ON a.transaction_id = t.linked_ap_transaction_id AND a.apply_type = 'inv_advance'
+          JOIN ap_transaction dep ON dep.id = a.applied_to_id
+         WHERE t.id = ANY($1::int[]) GROUP BY t.id`, [ids])).rows;
+    const branches = await loadBranches(db, heads.map(h => h.branch_id));
+    const companyTaxId = s((await db.query(`SELECT tax_id_number FROM sa_company ORDER BY is_active DESC NULLS LAST, id LIMIT 1`)).rows[0]?.tax_id_number);
+    const appr = await loadApprovers(db, 'IM_CASHPUR', ids);
+    const pays = await loadCashSalePayments(db, ids);
+    const base = await loadBaseCurrency(db);
+    const curOf = (h) => s(h.currency_code) || base;
+    const currencies = await loadCurrencies(db, heads.map(curOf));
+    const preparers = new Map((await db.query(`SELECT user_name, first_name, last_name FROM sa_user WHERE user_name = ANY($1::text[])`,
+      [[...new Set(heads.flatMap(h => [s(h.created_by), s(h.pay_requested_by)]).filter(Boolean))]])).rows.map(u => [u.user_name, userDisplayName(u)]));
+
+    for (const h of heads) {
+      const bt = s(h.bill_to_name);
+      const addr = bt ? null : thaiAddress(h.v_addr);
+      const [btLine1, ...btRest] = s(h.bill_to_address).split(/\r?\n/);
+      const code = bt ? s(h.bill_to_branch) : s(h.v_branch);
+      const taxId = bt ? s(h.bill_to_tax_id) : s(h.v_tax_id);
+      const ls = lines.filter(l => l.header_id === h.id).map((l, i) => {
+        const vr = l.vat_type === 'NOVAT' ? 0 : l.vat_rate;
+        const incl = h.price_includes_vat === true && vr > 0;
+        const a = calcLineAmounts({ qty: l.qty, price: l.price, discountPercent: l.discount_percent, vatRate: vr, priceIncludesVat: incl });
+        const name = s(l.item_name), desc = s(l.description);
+        return {
+          line_no: i + 1, item_code: s(l.item_code), item_name: name || desc, item_name_en: s(l.item_name_en) || name || desc, description: desc,
+          item_desc: name && desc && desc !== name ? `${name} ${desc}` : (name || desc),
+          qty: l.qty, unit: s(l.uom_name_th) || s(l.uom_code), unit_en: s(l.uom_name_en) || s(l.uom_code),
+          unit_price: incl ? round2(l.price * 100 / (100 + vr)) : l.price, discount_percent: l.discount_percent, discount_amount: a.discount,
+          amount: a.net, vat_rate: vr, vat_amount: a.vat, line_total: round2(a.net + a.vat),
+        };
+      });
+      const p = pays.get(h.id);
+      const pf = paymentFields(p ? { ...p, rate: h.exchange_rate } : null);
+      const dep = deps.find(x => x.hid === h.id);
+      const total = round2(num(h.b_total));
+      const due = round2(total - num(dep?.fc));
+      const netPaid = round2(num(h.pay_total));
+      const a = appr.get(h.id);
+      out.set(`IM:${h.id}`, {
+        header: {
+          ...(branches.get(h.branch_id) || branches.get(0)),
+          ...companyTaxFields(companyTaxId, branches.get(h.branch_id) || branches.get(0)),
+          vendor_code: s(h.vendor_code), vendor_name: bt || s(h.vendor_name_th), vendor_name_en: bt || s(h.vendor_name_en) || s(h.vendor_name_th),
+          vendor_address: bt ? s(h.bill_to_address).replace(/\s*\r?\n\s*/g, ' ') : addr.full,
+          vendor_address1: bt ? s(btLine1) : addr.line1, vendor_address2: bt ? btRest.map(s).filter(Boolean).join(' ') : addr.line2,
+          vendor_tax_id: taxId, vendor_branch_label: taxBranchTh(code),
+          vendor_tax_id_branch: [taxId, taxBranchTh(code)].filter(Boolean).join(' '),
+          doc_no: s(h.doc_no), doc_date: h.doc_date,
+          doc_type_code: s(h.doc_code), doc_type_name: s(h.doc_name_thai), doc_type_name_en: s(h.doc_name_eng) || s(h.doc_name_thai),
+          tax_invoice_no: s(h.ref_no), tax_invoice_date: h.vendor_invoice_date || h.ap_invoice_date || h.doc_date,
+          tax_invoice_kind: TAX_KIND_TH[s(h.tax_invoice_kind) || 'FULL'], tax_invoice_kind_en: TAX_KIND_EN[s(h.tax_invoice_kind) || 'FULL'],
+          ap_invoice_no: s(h.ap_invoice_no), payment_no: s(h.payment_no), payment_date: h.payment_date || h.doc_date,
+          gl_doc_no: s(h.pay_gl_doc_no), description: s(h.description),
+          warehouse_name: s(h.warehouse_name_th), warehouse_name_en: s(h.warehouse_name_en) || s(h.warehouse_name_th),
+          prepared_by: preparers.get(s(h.created_by)) || s(h.created_by),
+          requested_by: preparers.get(s(h.pay_requested_by)) || s(h.pay_requested_by),
+          ...approverFields(a, ''),
+          ...currencyFields(currencies, curOf(h)), currency_code: curOf(h), exchange_rate: num(h.exchange_rate) || 1,
+          subtotal: round2(num(h.b_subtotal)), discount_amount: round2(num(h.b_discount)), before_vat: round2(num(h.b_before_vat)),
+          vat_rate: headerVatRate(ls), vat_amount: round2(num(h.b_vat)), total_amount: total,
+          total_qty: ls.reduce((t, l) => t + l.qty, 0), amount_text: amountWords(total, curOf(h)),
+          deposit_doc_nos: s(dep?.nos), deposit_total: round2(num(dep?.fc)), amount_due: due,
+          net_paid: netPaid, net_paid_text: amountWords(netPaid, curOf(h)), net_paid_text_en: englishAmountText(netPaid, curOf(h)),
+          base_currency_code: base, total_amount_lc: round2(num(h.b_total_lc)), net_paid_lc: round2(num(h.pay_total_lc)),
+          line_count: ls.length,
+          ...pf,
+        },
+        lines: ls,
+      });
+    }
+    return out;
+  },
+};
+
+const SOURCES = { SALES_INVOICE, PAYMENT_VOUCHER };
 
 module.exports = { SOURCES, loadCompany };

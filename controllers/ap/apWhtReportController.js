@@ -31,9 +31,10 @@ const fetchWhtReport = async (req, res) => {
         t.doc_no        AS payment_doc_no,
         t.doc_date      AS payment_date,
         v.vendor_code,
-        v.vendor_name_th,
-        v.vendor_name_en,
-        v.tax_id,
+        -- ซื้อเงินสด (IM '14'): ผู้ขายจริงที่ระบุในเอกสาร (bill_to_*) ใช้แทนผู้ขายเงินสดทั้งชุด — ช่องที่ว่างพิมพ์ว่าง
+        CASE WHEN bt.name IS NOT NULL THEN bt.name ELSE v.vendor_name_th END AS vendor_name_th,
+        CASE WHEN bt.name IS NOT NULL THEN bt.name ELSE v.vendor_name_en END AS vendor_name_en,
+        CASE WHEN bt.name IS NOT NULL THEN bt.tax_id ELSE v.tax_id END AS tax_id,
         v.vendor_type,
         w.wht_type,
         wt.wht_name_en   AS wht_type_en,
@@ -42,17 +43,19 @@ const fetchWhtReport = async (req, res) => {
         w.base_amount_lc,
         w.wht_amount_lc,
         w.description,
-        addr.address_no,
-        addr.address_building_village,
-        addr.address_alley,
-        addr.address_road,
-        addr.address_sub_district,
-        addr.address_district,
-        addr.address_province,
-        addr.address_zip_code
+        CASE WHEN bt.name IS NOT NULL THEN bt.address ELSE addr.address_no END AS address_no,
+        CASE WHEN bt.name IS NOT NULL THEN NULL ELSE addr.address_building_village END AS address_building_village,
+        CASE WHEN bt.name IS NOT NULL THEN NULL ELSE addr.address_alley END AS address_alley,
+        CASE WHEN bt.name IS NOT NULL THEN NULL ELSE addr.address_road END AS address_road,
+        CASE WHEN bt.name IS NOT NULL THEN NULL ELSE addr.address_sub_district END AS address_sub_district,
+        CASE WHEN bt.name IS NOT NULL THEN NULL ELSE addr.address_district END AS address_district,
+        CASE WHEN bt.name IS NOT NULL THEN NULL ELSE addr.address_province END AS address_province,
+        CASE WHEN bt.name IS NOT NULL THEN NULL ELSE addr.address_zip_code END AS address_zip_code
       FROM ap_transaction_wht w
       JOIN ap_transaction t ON t.id = w.header_id
       JOIN ap_vendor      v ON v.id = t.vendor_id
+      CROSS JOIN LATERAL (SELECT NULLIF(to_jsonb(t)->>'bill_to_name', '') AS name, to_jsonb(t)->>'bill_to_tax_id' AS tax_id,
+                                 to_jsonb(t)->>'bill_to_address' AS address) bt
       LEFT JOIN cd_wht_type wt ON wt.id = w.wht_type_id
       LEFT JOIN ap_vendor_address addr
              ON addr.vendor_id = v.id
