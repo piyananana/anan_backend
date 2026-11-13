@@ -16,6 +16,8 @@ const DOC_TYPE_TARGET = {
     '11': { target_module: 'AP',   target_doc_code: '10', auto: true },  // รับสินค้า+ตั้งหนี้อัตโนมัติ -> AP ตั้งหนี้
     '12': { target_module: 'AP',   target_doc_code: '10', auto: true },  // รับสินค้า รอตั้งหนี้ -> AP ตั้งหนี้ตอน Post AP/GL
     '13': { target_module: 'NONE', target_doc_code: null, auto: false }, // รับฝากขาย -> ตั้งหนี้ผ่าน Consignment Settlement
+    // ซื้อเงินสด -> AP ตั้งหนี้ + AP จ่ายชำระ ('80') ตัดใบตั้งหนี้นั้นทันที (receipt_doc_code = sys_doc_type ของใบจ่าย)
+    '14': { target_module: 'AP',   target_doc_code: '10', auto: true, receipt_doc_code: '80' },
     '15': { target_module: 'AP',   target_doc_code: '30', auto: true },  // คืนสินค้า (RTS)      -> AP ลดหนี้
     '20': { target_module: 'AP',   target_doc_code: '30', auto: true },  // ลดหนี้เจ้าหนี้ (CNS)  -> AP ลดหนี้
     '25': { target_module: 'AP',   target_doc_code: '50', auto: true },  // เพิ่มหนี้เจ้าหนี้ (DNS) -> AP เพิ่มหนี้
@@ -63,6 +65,8 @@ const ensureImGlAccountSetupTable = async (client) => {
     // ขายเงินสด ('33'): ประเภทเอกสารรับชำระ AR ที่สร้างอัตโนมัติ + ลูกค้าเงินสดตั้งต้นของเอกสารใหม่
     await client.query(`ALTER TABLE im_gl_account_setup ADD COLUMN IF NOT EXISTS receipt_target_doc_id INTEGER REFERENCES sa_module_document(id)`).catch(() => {});
     await client.query(`ALTER TABLE im_gl_account_setup ADD COLUMN IF NOT EXISTS default_customer_id INTEGER REFERENCES ar_customer(id)`).catch(() => {});
+    // ซื้อเงินสด ('14'): ใบจ่ายชำระ AP ใช้ receipt_target_doc_id ช่องเดียวกัน + ผู้ขายเงินสดตั้งต้นของเอกสารใหม่
+    await client.query(`ALTER TABLE im_gl_account_setup ADD COLUMN IF NOT EXISTS default_vendor_id INTEGER REFERENCES ap_vendor(id)`).catch(() => {});
 };
 
 // Driven by sa_module_document (sys_module='31') so the left panel always reflects the
@@ -87,6 +91,7 @@ const SETUP_SELECT = `
         s.target_doc_id,         tg_d.doc_code AS target_doc_code_sel,       tg_d.doc_name_thai AS target_doc_name_th, tg_d.doc_name_eng AS target_doc_name_en,
         s.receipt_target_doc_id, rc_d.doc_code AS receipt_target_doc_code,   rc_d.doc_name_thai AS receipt_target_doc_name_th, rc_d.doc_name_eng AS receipt_target_doc_name_en,
         s.default_customer_id,   dc.customer_code AS default_customer_code,  dc.customer_name_th AS default_customer_name_th, dc.customer_name_en AS default_customer_name_en,
+        s.default_vendor_id,     dv.vendor_code AS default_vendor_code,      dv.vendor_name_th AS default_vendor_name_th, dv.vendor_name_en AS default_vendor_name_en,
         s.created_at, s.updated_at, s.created_by, s.updated_by
     FROM sa_module_document d
     LEFT JOIN im_gl_account_setup s ON s.doc_code = d.doc_code
@@ -102,6 +107,7 @@ const SETUP_SELECT = `
     LEFT JOIN sa_module_document tg_d ON tg_d.id = s.target_doc_id
     LEFT JOIN sa_module_document rc_d ON rc_d.id = s.receipt_target_doc_id
     LEFT JOIN ar_customer dc          ON dc.id = s.default_customer_id
+    LEFT JOIN ap_vendor dv            ON dv.id = s.default_vendor_id
     WHERE d.sys_module = '31'
       AND d.is_doc_type = true
 `;
@@ -149,7 +155,7 @@ const upsertRow = async (req, res) => {
     const {
         inventory_account_id, cogs_account_id, variance_account_id, wip_account_id, grir_account_id,
         vat_output_account_id, vat_input_account_id, consignment_payable_account_id, gl_doc_id, target_doc_id,
-        receipt_target_doc_id, default_customer_id,
+        receipt_target_doc_id, default_customer_id, default_vendor_id,
     } = req.body;
     const userName = req.headers.username || null;
     const client = await req.dbPool.connect();
@@ -172,17 +178,27 @@ const upsertRow = async (req, res) => {
             if (t.rows.length === 0) return res.status(400).json({ message: 'ประเภทเอกสาร AR/AP ที่เลือกไม่ตรงกับประเภทเอกสาร IM นี้' });
             targetDocId = t.rows[0].id;
         }
-        // ขายเงินสด: ใบเสร็จต้องเป็น AR sys_doc_type ตาม receipt_doc_code, ลูกค้าตั้งต้นต้องมีอยู่จริง (ประเภทอื่นไม่เก็บ)
-        let receiptDocId = null, defaultCustomerId = null;
+        // ขายเงินสด/ซื้อเงินสด: ใบเสร็จ/ใบจ่ายต้องเป็น AR/AP sys_doc_type ตาม receipt_doc_code, ลูกค้า/ผู้ขายตั้งต้นต้องมีอยู่จริง
+        // (ประเภทอื่นไม่เก็บ) — ขาย ('33') เก็บลูกค้า ซื้อ ('14') เก็บผู้ขาย
+        let receiptDocId = null, defaultCustomerId = null, defaultVendorId = null;
         if (target?.receipt_doc_code) {
             if (receipt_target_doc_id) {
                 const t = await client.query(
                     `SELECT id FROM sa_module_document WHERE id = $1 AND sys_module = $2 AND sys_doc_type = $3 AND is_doc_type = true`,
                     [receipt_target_doc_id, TARGET_SYS_MODULE[target.target_module], target.receipt_doc_code]);
-                if (t.rows.length === 0) return res.status(400).json({ message: 'ประเภทเอกสารรับชำระ AR ที่เลือกไม่ตรงกับประเภทเอกสาร IM นี้' });
+                if (t.rows.length === 0) {
+                    return res.status(400).json({ message: target.target_module === 'AP'
+                        ? 'ประเภทเอกสารจ่ายชำระ AP ที่เลือกไม่ตรงกับประเภทเอกสาร IM นี้'
+                        : 'ประเภทเอกสารรับชำระ AR ที่เลือกไม่ตรงกับประเภทเอกสาร IM นี้' });
+                }
                 receiptDocId = t.rows[0].id;
             }
-            if (default_customer_id) {
+            if (target.target_module === 'AP' && default_vendor_id) {
+                const v = await client.query(`SELECT id FROM ap_vendor WHERE id = $1`, [default_vendor_id]);
+                if (v.rows.length === 0) return res.status(400).json({ message: 'ไม่พบผู้ขายเงินสดที่เลือก' });
+                defaultVendorId = v.rows[0].id;
+            }
+            if (target.target_module === 'AR' && default_customer_id) {
                 const c = await client.query(`SELECT id FROM ar_customer WHERE id = $1`, [default_customer_id]);
                 if (c.rows.length === 0) return res.status(400).json({ message: 'ไม่พบลูกค้าเงินสดที่เลือก' });
                 defaultCustomerId = c.rows[0].id;
@@ -193,8 +209,8 @@ const upsertRow = async (req, res) => {
             `INSERT INTO im_gl_account_setup
                 (doc_code, inventory_account_id, cogs_account_id, variance_account_id, wip_account_id, grir_account_id,
                  vat_output_account_id, vat_input_account_id, consignment_payable_account_id, gl_doc_id, created_by, updated_by, target_doc_id,
-                 receipt_target_doc_id, default_customer_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11,$12,$13,$14)
+                 receipt_target_doc_id, default_customer_id, default_vendor_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11,$12,$13,$14,$15)
              ON CONFLICT (doc_code) DO UPDATE SET
                 inventory_account_id  = EXCLUDED.inventory_account_id,
                 cogs_account_id       = EXCLUDED.cogs_account_id,
@@ -208,11 +224,12 @@ const upsertRow = async (req, res) => {
                 target_doc_id         = EXCLUDED.target_doc_id,
                 receipt_target_doc_id = EXCLUDED.receipt_target_doc_id,
                 default_customer_id   = EXCLUDED.default_customer_id,
+                default_vendor_id     = EXCLUDED.default_vendor_id,
                 updated_by            = EXCLUDED.updated_by,
                 updated_at            = NOW()`,
             [doc_code, inventory_account_id || null, cogs_account_id || null, variance_account_id || null,
              wip_account_id || null, grir_account_id || null, vat_output_account_id || null, vat_input_account_id || null,
-             consignment_payable_account_id || null, gl_doc_id || null, userName, targetDocId, receiptDocId, defaultCustomerId]
+             consignment_payable_account_id || null, gl_doc_id || null, userName, targetDocId, receiptDocId, defaultCustomerId, defaultVendorId]
         );
 
         const updated = await client.query(`${SETUP_SELECT} AND d.doc_code = $1`, [doc_code]);
@@ -251,7 +268,8 @@ const resolveTargetDoc = async (client, imDocCode) => {
     return { id: row.t_id, doc_code: row.t_code };
 };
 
-// ประเภทเอกสารรับชำระ AR ที่ขายเงินสดสร้างอัตโนมัติ — ต้องตั้งก่อน Post ไม่ fallback (เหมือน resolveTargetDoc)
+// ประเภทเอกสารรับชำระ AR (ขายเงินสด '33') / จ่ายชำระ AP (ซื้อเงินสด '14') ที่สร้างอัตโนมัติ — ต้องตั้งก่อน Post ไม่ fallback
+// (เหมือน resolveTargetDoc)
 const resolveReceiptDoc = async (client, imDocCode) => {
     const r = await client.query(`
         SELECT d.sys_doc_type, t.id AS t_id, t.doc_code AS t_code, t.sys_module AS t_module,
@@ -262,12 +280,13 @@ const resolveReceiptDoc = async (client, imDocCode) => {
          WHERE d.doc_code = $1 AND d.sys_module = '31' LIMIT 1`, [imDocCode]);
     const row = r.rows[0];
     const target = row && DOC_TYPE_TARGET[row.sys_doc_type];
-    if (!target?.receipt_doc_code) throw new Error(`ประเภทเอกสาร ${imDocCode} ไม่ได้สร้างใบเสร็จรับชำระ AR อัตโนมัติ`);
-    if (!row.t_id) throw new Error(`ยังไม่ได้ตั้งค่าประเภทเอกสารรับชำระ AR ที่สร้างอัตโนมัติ สำหรับ ${imDocCode} — ตั้งค่าที่หน้าตั้งค่าบัญชี IM`);
+    if (!target?.receipt_doc_code) throw new Error(`ประเภทเอกสาร ${imDocCode} ไม่ได้สร้างใบรับ/จ่ายชำระอัตโนมัติ`);
+    const label = target.target_module === 'AP' ? 'ประเภทเอกสารจ่ายชำระ AP' : 'ประเภทเอกสารรับชำระ AR';
+    if (!row.t_id) throw new Error(`ยังไม่ได้ตั้งค่า${label} ที่สร้างอัตโนมัติ สำหรับ ${imDocCode} — ตั้งค่าที่หน้าตั้งค่าบัญชี IM`);
     if (row.t_module !== TARGET_SYS_MODULE[target.target_module] || row.t_type !== target.receipt_doc_code) {
-        throw new Error(`ประเภทเอกสารรับชำระ AR ${row.t_code} ที่ตั้งไว้สำหรับ ${imDocCode} ไม่ตรงประเภท — แก้ที่หน้าตั้งค่าบัญชี IM`);
+        throw new Error(`${label} ${row.t_code} ที่ตั้งไว้สำหรับ ${imDocCode} ไม่ตรงประเภท — แก้ที่หน้าตั้งค่าบัญชี IM`);
     }
-    if (!row.t_active) throw new Error(`ประเภทเอกสารรับชำระ AR ${row.t_code} ที่ตั้งไว้สำหรับ ${imDocCode} ถูกปิดใช้งาน — แก้ที่หน้าตั้งค่าบัญชี IM`);
+    if (!row.t_active) throw new Error(`${label} ${row.t_code} ที่ตั้งไว้สำหรับ ${imDocCode} ถูกปิดใช้งาน — แก้ที่หน้าตั้งค่าบัญชี IM`);
     return { id: row.t_id, doc_code: row.t_code };
 };
 
