@@ -2447,7 +2447,8 @@ const isPriceAdmin = async (client, userName) => {
     return ['administrator', 'developer'].includes(String(r.rows[0]?.user_type || '').toLowerCase());
 };
 // ราคาที่บรรทัดต้องใช้ (สกุลเงินเอกสาร) — ใบสั่งขาย: ราคาของบรรทัด SO แปลงตามราคารวม/ไม่รวม VAT ของเอกสารนี้ (เหมือน
-// หน้าจอตอนดึงรายการ) / อื่นๆ: ตารางราคา คืน null = ไม่มีราคากำหนด (กรอกเองได้)
+// หน้าจอตอนดึงรายการ) / อื่นๆ: ตารางราคา แปลงตามราคารวม/ไม่รวม VAT ของตารางกับเอกสาร ด้วยอัตรา VAT ของบรรทัด
+// คืน null = ไม่มีราคากำหนด (กรอกเองได้)
 const expectedSalesPrice = async (client, d, { customerId, docDate, currencyCode, priceIncludesVat }) => {
     if (d.ref_so_detail_id) {
         const so = (await client.query(`
@@ -2462,7 +2463,9 @@ const expectedSalesPrice = async (client, d, { customerId, docDate, currencyCode
     }
     const { resolveItemPrice } = require('./imPriceListController');
     const qty = Math.abs(imLineQty(d)) || 1;
-    const r = await resolveItemPrice(client, { itemId: d.item_id, listType: 'SALES', customerId, uomId: d.uom_id || null, qty, docDate, currencyCode });
+    const vatRate = d.vat_type && d.vat_type !== 'NOVAT' ? Number(d.vat_rate) || 0 : 0;
+    const r = await resolveItemPrice(client, { itemId: d.item_id, listType: 'SALES', customerId, uomId: d.uom_id || null, qty, docDate, currencyCode,
+        priceIncludesVat: priceIncludesVat === true, vatRate });
     return r && Number(r.unit_price_fc) > 0 ? { price: Number(r.unit_price_fc), source: 'LIST' } : null;
 };
 const assertSalesPrices = async (client, { sysDocType, userName, customerId, docDate, currencyCode, priceIncludesVat, lines }) => {
