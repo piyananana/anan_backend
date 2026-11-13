@@ -117,7 +117,7 @@ const fetchReport = async (req, res) => {
                 h.id AS header_id, h.change_no, h.status AS change_status, h.change_type,
                 h.effective_from, h.effective_to, h.approved_at, h.approved_by,
                 d.id AS detail_id, d.item_id, d.min_qty, d.old_unit_price_fc, d.new_unit_price_fc,
-                pl.id AS price_list_id, pl.price_list_code, pl.price_list_name,
+                pl.id AS price_list_id, pl.price_list_code, pl.price_list_name, pl.price_includes_vat,
                 pg.id AS price_group_id, pg.price_group_code, pg.price_group_name_th, pg.price_group_name_en,
                 i.item_code, i.item_name_th, i.item_name_en, i.category_id,
                 c.category_code, c.category_name_th, c.category_name_en,

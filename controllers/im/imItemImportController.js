@@ -98,7 +98,7 @@ const TEMPLATE_SHEETS = [
       { key: 'price_list_code', label: 'รหัสตารางราคา (ต้องมีอยู่แล้วในระบบ)',                     required: true,  example: 'WSL1' },
       { key: 'uom_code',        label: 'รหัสหน่วยนับ (ว่าง = ใช้ได้ทุกหน่วยของสินค้า, ไม่ว่างต้องเป็นหน่วยหลักหรือหน่วยทางเลือกของสินค้านี้)', required: false, example: '' },
       { key: 'min_qty',         label: 'จำนวนขั้นต่ำ',                                             required: false, example: '0' },
-      { key: 'unit_price_fc',   label: 'ราคาต่อหน่วย',                                            required: true,  example: '100' },
+      { key: 'unit_price_fc',   label: 'ราคาต่อหน่วย (รวม VAT หรือไม่ ตามที่ตั้งไว้ในตารางราคา)',                                          required: true,  example: '100' },
       { key: 'price_type',      label: `ชนิดราคา (${PRICE_TYPES.join('/')})`,                      required: false, example: 'STANDARD' },
       { key: 'effective_from',  label: 'มีผลตั้งแต่ (YYYY-MM-DD)',                                 required: false, example: '' },
       { key: 'effective_to',    label: 'มีผลถึง (YYYY-MM-DD)',                                     required: false, example: '' },

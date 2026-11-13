@@ -120,6 +120,9 @@ const ensureImPriceListTable = async (client) => {
     // ลูกค้าค้าส่งมาผูก) ก็ไม่ได้แปลว่าเป็นลิสต์กลาง/ค่าเริ่มต้นเสมอไป — เจอบั๊กจริงตอนทดสอบรอบก่อน (RTLG/WSLG
     // ทั้งคู่ไม่มีใครผูกพร้อมกัน แต่ไม่ใช่ทั้งคู่ที่ควรเป็น default)
     await client.query(`ALTER TABLE im_price_list ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT false`).catch(() => {});
+    // ราคาในตารางนี้รวม VAT แล้วหรือไม่ (ทั้งตาราง) — ค่าเริ่มต้น false = ไม่รวม VAT ตารางเดิมทำงานเหมือนเดิม
+    // resolveItemPrice แปลงราคาให้ตรงกับเอกสารเมื่อผู้เรียกส่งค่ารวม VAT ของเอกสาร + อัตรา VAT ของบรรทัดมา
+    await client.query(`ALTER TABLE im_price_list ADD COLUMN IF NOT EXISTS price_includes_vat BOOLEAN NOT NULL DEFAULT false`).catch(() => {});
     await client.query(`DROP INDEX IF EXISTS idx_price_list_central_uq`).catch(() => {});
 
     // unique index กันความกำกวมตอน resolveItemPrice — ลิสต์ default ได้ใบเดียวต่อ list_type (price_group_id ไม่
@@ -198,7 +201,7 @@ const fetchByItem = async (req, res) => {
         await ensureImPriceListTable(client);
         const result = await client.query(
             `SELECT d.*,
-                    h.price_list_code, h.price_list_name, h.list_type, h.is_default,
+                    h.price_list_code, h.price_list_name, h.list_type, h.is_default, h.price_includes_vat,
                     pg.price_group_code, pg.price_group_name_th, pg.price_group_name_en,
                     c.currency_code,
                     u.uom_code, u.uom_name_th, u.uom_name_en
@@ -230,7 +233,10 @@ const fetchByItem = async (req, res) => {
 // หนี้ AP/AR จากราคานี้เลย (ไม่มีช่องราคาให้กรอก หรือดึงราคามาจาก PO/SO/เอกสารต้นฉบับที่อ้างอิงอยู่แล้ว)
 // currencyCode (ถ้าระบุ) = ใช้เฉพาะตารางราคาที่สกุลเงินตรงกับเอกสาร (ตารางที่ไม่ระบุสกุลเงิน = สกุลเงินหลัก) — ลิสต์ของ
 // ลูกค้า/ผู้ขายที่คนละสกุลเงินจะข้ามไปใช้ลิสต์ default แทน (เอกสาร IM ฝั่งขายส่งมาเสมอ, PO/SO/Quote ยังไม่ส่ง)
-const resolveItemPrice = async (client, { itemId, listType, vendorId, customerId, uomId, qty, docDate, currencyCode }) => {
+// priceIncludesVat (ถ้าระบุ true/false) = เอกสารคิดราคารวม VAT หรือไม่ — ถ้าตารางราคาตั้งต่างจากเอกสาร แปลงราคาด้วย
+// vatRate ของบรรทัด (0/ไม่ระบุ = ไม่แปลง) ไม่ระบุ = คืนราคาตามตาราง (ผู้เรียกเดิม) คืน list_price_fc/
+// price_includes_vat ของตารางไว้ด้วยเสมอ
+const resolveItemPrice = async (client, { itemId, listType, vendorId, customerId, uomId, qty, docDate, currencyCode, priceIncludesVat, vatRate }) => {
     const partyTable = listType === 'PURCHASE' ? 'ap_vendor' : 'ar_customer';
     const partyId = listType === 'PURCHASE' ? vendorId : customerId;
     const date = docDate || today();
@@ -271,7 +277,21 @@ const resolveItemPrice = async (client, { itemId, listType, vendorId, customerId
         LIMIT 1
     `, [priceListId, itemId, q, uomId || null, date]);
     if (detailRes.rows.length === 0) return null;
-    return { price_list_id: priceListId, unit_price_fc: Number(detailRes.rows[0].unit_price_fc), uom_id: detailRes.rows[0].uom_id };
+    const listIncl = (await client.query(`SELECT price_includes_vat FROM im_price_list WHERE id = $1`, [priceListId])).rows[0]?.price_includes_vat === true;
+    const listPrice = Number(detailRes.rows[0].unit_price_fc);
+    return {
+        price_list_id: priceListId, uom_id: detailRes.rows[0].uom_id,
+        unit_price_fc: convertListPrice(listPrice, listIncl, priceIncludesVat, vatRate),
+        list_price_fc: listPrice, price_includes_vat: listIncl,
+    };
+};
+
+// ราคาตามตาราง -> ราคาตามเอกสาร (ปัด 4 ตำแหน่งเท่า unit_price_fc) — docIncl null/undefined หรือ rate 0 = ไม่แปลง
+const convertListPrice = (price, listIncl, docIncl, vatRate) => {
+    const rate = Number(vatRate) || 0;
+    if (docIncl == null || !rate || listIncl === (docIncl === true)) return price;
+    const v = listIncl ? price * 100 / (100 + rate) : price * (100 + rate) / 100;
+    return Math.round(v * 10000) / 10000;
 };
 
 // GET /im_price_list/resolve_price?item_id=&list_type=PURCHASE|SALES&vendor_id=&customer_id=&uom_id=&qty=&doc_date=
@@ -279,11 +299,13 @@ const resolvePriceHandler = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await ensureImPriceListTable(client);
-        const { item_id, list_type, vendor_id, customer_id, uom_id, qty, doc_date, currency_code } = req.query;
+        const { item_id, list_type, vendor_id, customer_id, uom_id, qty, doc_date, currency_code, price_includes_vat, vat_rate } = req.query;
         if (!item_id || !list_type) return res.status(400).json({ message: 'กรุณาระบุ item_id และ list_type' });
         const result = await resolveItemPrice(client, {
             itemId: item_id, listType: list_type, vendorId: vendor_id || null, customerId: customer_id || null,
             uomId: uom_id || null, qty: qty || 0, docDate: doc_date || null, currencyCode: currency_code || null,
+            priceIncludesVat: price_includes_vat == null || price_includes_vat === '' ? null : price_includes_vat === 'true',
+            vatRate: vat_rate || 0,
         });
         res.status(200).json(result || {});
     } catch (error) {
@@ -396,14 +418,14 @@ const addRow = async (req, res) => {
         const header = await client.query(
             `INSERT INTO im_price_list
                 (price_list_code, price_list_name, list_type, currency_id,
-                 price_group_id, is_default, is_active, created_by, updated_by)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)
+                 price_group_id, is_default, is_active, created_by, updated_by, price_includes_vat)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9)
              RETURNING id`,
             [
                 b.price_list_code.trim().toUpperCase(), b.price_list_name.trim(),
                 b.list_type || 'SALES', b.currency_id || null,
                 b.price_group_id || null, b.is_default ?? false,
-                b.is_active ?? true, userName,
+                b.is_active ?? true, userName, b.price_includes_vat === true,
             ]
         );
         const headerId = header.rows[0].id;
@@ -463,12 +485,13 @@ const updateRow = async (req, res) => {
                 is_default      = $5,
                 is_active       = $6,
                 updated_by      = $7,
-                updated_at      = NOW()
+                updated_at      = NOW(),
+                price_includes_vat = $9
              WHERE id = $8
              RETURNING id`,
             [b.price_list_name || '', b.list_type || 'SALES', b.currency_id || null,
              b.price_group_id || null, b.is_default ?? false,
-             b.is_active ?? true, userName, id]
+             b.is_active ?? true, userName, id, b.price_includes_vat === true]
         );
         if (result.rows.length === 0) {
             await client.query('ROLLBACK');
@@ -535,5 +558,5 @@ const deleteRow = async (req, res) => {
 
 module.exports = {
     ensureImPriceListTable, fetchRows, fetchRow, fetchByItem, addRow, updateRow, deleteRow, LIST_TYPES,
-    resolveItemPrice, resolvePriceHandler, findOverlapAgainstExisting,
+    resolveItemPrice, convertListPrice, resolvePriceHandler, findOverlapAgainstExisting,
 };

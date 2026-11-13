@@ -98,7 +98,7 @@ const ensureImPriceChangeTable = async (client) => {
 
 const HEADER_SELECT = `
     SELECT h.*,
-           pl.price_list_code, pl.price_list_name, pl.list_type,
+           pl.price_list_code, pl.price_list_name, pl.list_type, pl.price_includes_vat,
            md.doc_name_thai, md.doc_name_eng,
            (SELECT COUNT(*) FROM im_price_change_detail d WHERE d.header_id = h.id) AS line_count,
            (SELECT COUNT(*) FROM im_price_change_detail d WHERE d.header_id = h.id AND d.is_selected = true) AS selected_count
