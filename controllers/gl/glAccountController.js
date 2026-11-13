@@ -51,6 +51,68 @@ const DIM_RULES_SQL = `
     ) AS dim_rules
 `;
 
+// คอลัมน์ธุรกรรมที่อ้างบัญชี — บัญชีที่ปรากฏในตารางเหล่านี้ถือว่า "มีธุรกรรมแล้ว" หน้าจอผังบัญชีไม่แสดงปุ่มลบ
+// (ตารางที่ยังไม่ถูกสร้างใน DB นั้นจะถูกข้าม)
+const TRANSACTION_ACCOUNT_COLUMNS = [
+    ['gl_entry_detail', 'account_id'], ['gl_balance_accum', 'account_id'],
+    ['ap_transaction', 'ap_account_id'], ['ap_transaction_detail', 'expense_account_id'], ['ap_transaction_payment', 'gl_account_id'],
+    ['ar_transaction', 'ar_account_id'], ['ar_transaction_detail', 'revenue_account_id'], ['ar_transaction_payment', 'gl_account_id'],
+    ['cm_transaction', 'gl_account_id'], ['cm_transaction_detail', 'expense_account_id'], ['cm_transaction_payment', 'gl_account_id'],
+    ['cm_bank_charge', 'gl_account_id'], ['cm_petty_cash_voucher', 'expense_gl_account_id'],
+    ['cm_bank_fx_revaluation', 'fx_gain_account_id'], ['cm_bank_fx_revaluation', 'fx_loss_account_id'],
+    ['cm_bank_fx_revaluation_line', 'gl_account_id'], ['im_transaction_payment', 'gl_account_id'],
+];
+// คอลัมน์ที่อ้าง gl_account.id แต่ไม่มี foreign key (FK ตรวจหาจาก information_schema อัตโนมัติ)
+const NON_FK_ACCOUNT_COLUMNS = [
+    ['ap_year_end_setup', 'fx_gain_account_id'], ['ap_year_end_setup', 'fx_loss_account_id'],
+    ['ap_year_end_setup', 'unrealized_fx_gain_account_id'], ['ap_year_end_setup', 'unrealized_fx_loss_account_id'],
+    ['ar_customer', 'ar_account_id'], ['cm_gl_account_setup', 'gl_account_id'],
+];
+
+// ชื่อที่แสดงในข้อความ "ลบไม่ได้" (ตารางที่ไม่อยู่ในรายการแสดงชื่อตาราง)
+const REFERENCE_LABELS = {
+    gl_entry_detail: 'รายการบัญชี GL', gl_balance_accum: 'ยอดคงเหลือบัญชี', gl_adjusting_template: 'แม่แบบรายการปรับปรุง',
+    gl_closing_config: 'ตั้งค่าปิดบัญชี', gl_fin_report_row_acct: 'งบการเงิน (หัวบัญชี)',
+    ap_gl_account_setup: 'ตั้งค่าบัญชี AP', ap_transaction: 'เอกสาร AP', ap_transaction_detail: 'รายการเอกสาร AP',
+    ap_transaction_payment: 'การจ่ายเงิน AP', ap_vendor: 'ผู้ขาย', ap_vendor_group: 'กลุ่มผู้ขาย', ap_year_end_setup: 'ตั้งค่าสิ้นปี AP',
+    ar_gl_account_setup: 'ตั้งค่าบัญชี AR', ar_transaction: 'เอกสาร AR', ar_transaction_detail: 'รายการเอกสาร AR',
+    ar_transaction_payment: 'การรับเงิน AR', ar_customer: 'ลูกค้า', ar_customer_group: 'กลุ่มลูกค้า', ar_year_end_setup: 'ตั้งค่าสิ้นปี AR',
+    cd_vat_rate: 'อัตราภาษีมูลค่าเพิ่ม', cd_wht_type: 'ประเภทภาษีหัก ณ ที่จ่าย',
+    cm_bank_account: 'บัญชีธนาคาร', cm_payment_method: 'วิธีการชำระเงิน', cm_transaction: 'เอกสาร CM', cm_transaction_detail: 'รายการเอกสาร CM',
+    cm_transaction_payment: 'การชำระเงิน CM', cm_transaction_gl_setup: 'ตั้งค่าบัญชี CM', cm_gl_account_setup: 'ตั้งค่าบัญชี CM',
+    cm_bank_charge: 'ค่าธรรมเนียมธนาคาร', cm_petty_cash_voucher: 'ใบสำคัญเงินสดย่อย',
+    cm_bank_fx_revaluation: 'ปรับมูลค่าบัญชีธนาคาร', cm_bank_fx_revaluation_line: 'ปรับมูลค่าบัญชีธนาคาร',
+    im_accounting_setting: 'ตั้งค่าบัญชีสินค้า', im_gl_account_setup: 'ตั้งค่าบัญชี IM', im_item: 'สินค้า', im_item_category: 'หมวดสินค้า',
+    im_transaction_payment: 'การรับชำระ IM', im_warehouse: 'คลังสินค้า', mo_gl_account_setup: 'ตั้งค่าบัญชีการผลิต',
+};
+const referenceLabel = (t) => REFERENCE_LABELS[t] || t;
+
+const existingColumns = async (client, pairs) => {
+    const r = await client.query(`SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = current_schema()`);
+    const have = new Set(r.rows.map(x => `${x.table_name}.${x.column_name}`));
+    return pairs.filter(([t, c]) => have.has(`${t}.${c}`));
+};
+
+// ทุกที่ที่อ้างบัญชี: FK ทั้งหมด (ยกเว้น CASCADE และ parent_id ของ gl_account เอง) + คอลัมน์ที่ไม่มี FK + หัวบัญชีในงบการเงิน
+const accountReferences = async (client, accountId) => {
+    const fk = (await client.query(`
+        SELECT DISTINCT kcu.table_name, kcu.column_name
+          FROM information_schema.referential_constraints rc
+          JOIN information_schema.key_column_usage kcu ON kcu.constraint_name = rc.constraint_name AND kcu.constraint_schema = rc.constraint_schema
+          JOIN information_schema.constraint_column_usage ccu ON ccu.constraint_name = rc.unique_constraint_name AND ccu.constraint_schema = rc.unique_constraint_schema
+         WHERE ccu.table_name = 'gl_account' AND rc.delete_rule <> 'CASCADE' AND kcu.table_name <> 'gl_account'`)).rows.map(r => [r.table_name, r.column_name]);
+    const used = [];
+    for (const [t, c] of [...fk, ...await existingColumns(client, NON_FK_ACCOUNT_COLUMNS)]) {
+        const r = await client.query(`SELECT 1 FROM "${t}" WHERE "${c}" = $1 LIMIT 1`, [accountId]);
+        if (r.rows.length && !used.includes(referenceLabel(t))) used.push(referenceLabel(t));
+    }
+    if ((await existingColumns(client, [['gl_fin_report_row_acct', 'header_account_code']])).length) {
+        const r = await client.query(`SELECT 1 FROM gl_fin_report_row_acct WHERE header_account_code = (SELECT account_code FROM gl_account WHERE id = $1) LIMIT 1`, [accountId]);
+        if (r.rows.length) used.push(referenceLabel('gl_fin_report_row_acct'));
+    }
+    return used;
+};
+
 // GET all rows with lock info
 const fetchRows = async (req, res) => {
     try {
@@ -68,11 +130,16 @@ const fetchRows = async (req, res) => {
     }
 };
 
-// GET all rows including inactive (for admin tree view)
+// GET all rows including inactive (for admin tree view) — has_transactions = มีธุรกรรมอ้างบัญชีแล้ว (ลบไม่ได้)
 const fetchAllRows = async (req, res) => {
     try {
+        const cols = await existingColumns(req.dbPool, TRANSACTION_ACCOUNT_COLUMNS);
+        const used = cols.length
+            ? cols.map(([t, c]) => `SELECT x.id FROM gl_account x WHERE EXISTS (SELECT 1 FROM "${t}" u WHERE u."${c}" = x.id)`).join(' UNION ')
+            : 'SELECT NULL::int AS id WHERE false';
         const result = await req.dbPool.query(`
-            SELECT a.*, ${DIM_RULES_SQL}
+            WITH used AS (${used})
+            SELECT a.*, ${DIM_RULES_SQL}, EXISTS (SELECT 1 FROM used WHERE used.id = a.id) AS has_transactions
             FROM gl_account a
             LEFT JOIN gl_account_dim_rule dr ON dr.account_id = a.id
             GROUP BY a.id
@@ -208,11 +275,22 @@ const updateRow = async (req, res) => {
 };
 
 // DELETE row
+// ลบได้เฉพาะบัญชีที่ไม่มีบัญชีย่อยและไม่ถูกอ้างที่ใดเลย (ธุรกรรม/ตั้งค่า/ลูกค้า/ผู้ขาย/สินค้า/งบการเงิน) — dim rule ลบตาม (CASCADE)
 const deleteRow = async (req, res) => {
     const { id } = req.params;
     const client = await req.dbPool.connect(); // ใช้ transaction เพื่อความปลอดภัย
     try {
         await client.query('BEGIN');
+        const child = await client.query('SELECT 1 FROM gl_account WHERE parent_id = $1 LIMIT 1', [id]);
+        if (child.rows.length) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ message: 'ลบไม่ได้: บัญชีนี้มีบัญชีย่อย กรุณาลบบัญชีย่อยก่อน' });
+        }
+        const used = await accountReferences(client, id);
+        if (used.length) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ message: `ลบไม่ได้: บัญชีนี้ถูกใช้อยู่ใน ${used.join(', ')}` });
+        }
         const result = await client.query('DELETE FROM gl_account WHERE id = $1 RETURNING *', [id]);
 
         if (result.rows.length === 0) {
@@ -224,6 +302,7 @@ const deleteRow = async (req, res) => {
         res.status(204).send(); // No Content
     } catch (err) {
         await client.query('ROLLBACK');
+        if (err.code === '23503') return res.status(409).json({ message: `ลบไม่ได้: บัญชีนี้ถูกใช้อยู่ใน ${err.table ? referenceLabel(err.table) : 'ตารางอื่น'}` });
         console.error('Error deleting:', err);
         res.status(500).json({ error: 'Internal server error' });
     } finally {
