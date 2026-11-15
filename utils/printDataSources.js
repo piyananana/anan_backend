@@ -502,6 +502,7 @@ const SALES_INVOICE = {
     f('unit', 'หน่วย', 'Unit', 'line', 'text', 'L'),
     f('unit_en', 'หน่วย (อังกฤษ)', 'Unit (EN)', 'line', 'text', 'L'),
     f('unit_price', 'ราคาต่อหน่วย', 'Unit price', 'line', 'money', 'L'),
+    f('net_unit_price', 'ราคาต่อหน่วยสุทธิหลังส่วนลด (ก่อน VAT)', 'Net unit price after discounts (excl. VAT)', 'line', 'money', 'L'),
     f('discount_percent', 'ส่วนลด %', 'Discount %', 'line', 'number', 'L'),
     f('discount_amount', 'ส่วนลด', 'Discount', 'line', 'money', 'L'),
     f('discount_text', 'ส่วนลดขั้นบันได (เช่น 10+5)', 'Step discount (e.g. 10+5)', 'line', 'text', 'L'),
@@ -585,7 +586,9 @@ const SALES_INVOICE = {
                ri.doc_no AS ref_im_doc_no, ${ymdSql('ri.doc_date')} AS ref_im_doc_date, ${ymdSql('ar.doc_date')} AS ar_doc_date,
                w.warehouse_name_th, w.warehouse_name_en,
                ${ymdSql('ar.due_date')} AS ar_due_date, ${ymdSql('t.doc_date + COALESCE(c.credit_term_days, 0)')} AS calc_due_date,
-               c.credit_term_days
+               c.credit_term_days, c.credit_term_months,
+               to_jsonb(t)->>'due_date' AS im_due_date,
+               (to_jsonb(t)->>'credit_term_months')::int AS im_term_months, (to_jsonb(t)->>'credit_term_days')::int AS im_term_days
           FROM im_transaction t
           JOIN sa_module_document d ON d.id = t.doc_id
           LEFT JOIN so_transaction so ON so.id = t.ref_so_id
@@ -733,10 +736,12 @@ const SALES_INVOICE = {
         line_discount_total: round2(lines.reduce((t, l) => t + (l.line_own_discount || 0), 0)),
       };
     };
-    const creditFields = (days) => ({
+    const creditFields = (days, months = 0) => ({
       credit_days: days || 0,
-      credit_term: days ? `เครดิต ${days} วัน` : 'เงินสด',
-      credit_term_en: days ? `Credit ${days} day${days === 1 ? '' : 's'}` : 'Cash',
+      credit_term: months || days
+        ? `เครดิต${months ? ` ${months} เดือน` : ''}${days ? ` ${days} วัน` : ''}` : 'เงินสด',
+      credit_term_en: months || days
+        ? `Credit${months ? ` ${months} month${months === 1 ? '' : 's'}` : ''}${days ? ` ${days} day${days === 1 ? '' : 's'}` : ''}` : 'Cash',
     });
 
     for (const h of imHeads) {
@@ -755,6 +760,7 @@ const SALES_INVOICE = {
         const vatLc = incl ? round2(round2(a.total * rate) - amountLc) : round2(amountLc * vr / 100);
         return {
           ...lineCommon(l, i), qty: l.qty, unit_price: incl ? round2(l.unit_price * 100 / (100 + vr)) : l.unit_price,
+          net_unit_price: l.qty ? round2(amount / l.qty) : 0, // พิมพ์ 2 ตำแหน่ง (หน้าจอแสดง 4 ตำแหน่ง)
           discount_percent: l.discount_percent, discount_amount: a.discount, gross_amount: a.gross,
           discount_text: s(l.discount_text), line_discount_amount: exVat(l.line_discount_amount),
           line_own_discount: round2(a.discount - exVat(l.bill_discount_amount)), bill_discount_share: exVat(l.bill_discount_amount), bill_discount_entered: l.bill_discount_amount,
@@ -771,7 +777,10 @@ const SALES_INVOICE = {
       const sp = imSp.get(h.id) || {};
       // ขายเงินสด: รับเงินครบวันเดียวกัน — เงื่อนไข "เงินสด" ครบกำหนดวันที่เอกสาร
       const isCashSale = h.sys_doc_type === '33';
-      const days = isCashSale ? 0 : (h.credit_term_days || 0);
+      // เงื่อนไขเครดิตที่ระบุในเอกสาร IM ก่อน (ค่าเริ่มต้นจากลูกค้า แก้ได้) — เอกสารเก่าที่ไม่มีค่า ใช้ของลูกค้า
+      const hasImTerm = h.im_term_months != null || h.im_term_days != null;
+      const days = isCashSale ? 0 : (hasImTerm ? (h.im_term_days || 0) : (h.credit_term_days || 0));
+      const months = isCashSale ? 0 : (hasImTerm ? (h.im_term_months || 0) : (h.credit_term_months || 0));
       const imT = {
         subtotal: gross, discount: gross - sub, beforeVat: sub, vat, total: sub + vat, vatRate: headerVatRate(lines),
         qty: lines.reduce((a, l) => a + l.qty, 0),
@@ -782,8 +791,8 @@ const SALES_INVOICE = {
           ...(branches.get(h.branch_id) || branches.get(0)),
           ...companyTaxFields(companyTaxId, branches.get(h.branch_id) || branches.get(0)),
           ...customerFields(customers.get(h.customer_id), h),
-          doc_no: s(h.doc_no), doc_date: h.doc_date, due_date: isCashSale ? h.doc_date : (h.ar_due_date || h.calc_due_date),
-          ...creditFields(days),
+          doc_no: s(h.doc_no), doc_date: h.doc_date, due_date: isCashSale ? h.doc_date : (h.ar_due_date || h.im_due_date || h.calc_due_date),
+          ...creditFields(days, months),
           doc_type_code: s(h.doc_code), doc_type_name: s(h.doc_name_thai), doc_type_name_en: s(h.doc_name_eng) || s(h.doc_name_thai),
           ref_no: s(h.ref_no),
           ref_doc_no: s(h.so_doc_no) || s(h.ref_im_doc_no) || s(h.ref_doc_no),
@@ -809,6 +818,7 @@ const SALES_INVOICE = {
       const exVat = (l, v) => round2(h.price_includes_vat && l.vat_type !== 'NOVAT' ? v * 100 / (100 + l.vat_rate) : v);
       const lines = arLines.filter(l => l.header_id === h.id).map((l, i) => ({
         ...lineCommon(fillFromIm(l, srcLines[i]), i), qty: l.qty, unit_price: l.unit_price, discount_percent: l.discount_percent,
+        net_unit_price: l.qty ? round2(l.amount / l.qty) : 0,
         discount_text: s(l.discount_text), line_discount_amount: exVat(l, l.line_discount_amount),
         line_own_discount: round2(l.discount_amount - exVat(l, l.bill_discount_amount)), bill_discount_share: exVat(l, l.bill_discount_amount),
         bill_discount_entered: l.bill_discount_amount,

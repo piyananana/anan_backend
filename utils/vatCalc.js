@@ -200,6 +200,12 @@ const computeSalesDiscounts = (lines, { billDiscountPercent = 0, cashDiscountAmo
         const entered = round2(Math.abs(Number(qtyOf(l)) || 0) * (Number(priceOf(l)) || 0));
         if (l.is_free) return { entered: 0, own: 0, text: '', lineAmt: 0 };
         const { factor, text } = parseStepDiscount(l.discount_text);
+        // ส่วนลด (เงิน) ติดลบ = ขายแพงกว่าราคาที่กรอก ไม่อนุญาต (ต้องแก้ราคาขายแทน) — เดิมปัดเป็น 0 เงียบ ๆ
+        if ((Number(l.line_discount_amount) || 0) < -0.000001) {
+            const err = new Error(`${l.item_code || ''}: ส่วนลด (เงิน) ติดลบไม่ได้ (${Number(l.line_discount_amount)}) — ถ้าต้องการขายสูงกว่าราคา ให้แก้ราคาขาย/หน่วย`.trim());
+            err.status = 400;
+            throw err;
+        }
         const lineAmt = round2(Math.max(Number(l.line_discount_amount) || 0, 0));
         const own = round2(entered * (1 - factor) + lineAmt);
         if (own > entered + 0.005) {
