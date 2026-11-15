@@ -11,6 +11,16 @@ function parseNullableDate(dateString) {
     return dateString; // ถ้ามีค่า ให้ส่งเป็น String วันที่ไป
 }
 
+// ฟอนต์หลักของระบบ — ต้องตรงกับ family ที่ลงทะเบียนใน pubspec.yaml ของ Flutter
+const UI_FONTS = ['tahoma', 'IBMPlexSansThai'];
+function parseUiFont(v) {
+    if (v === undefined || v === null || v === '') return null; // ไม่ส่งมา = คงค่าเดิม/ใช้ค่าเริ่มต้น
+    if (!UI_FONTS.includes(v)) {
+        const err = new Error(`ฟอนต์ไม่รองรับ: ${v}`); err.status = 400; throw err;
+    }
+    return v;
+}
+
 // GET Company Info (ปกติจะมีแค่ 1 บริษัทที่ใช้แอปนี้)
 const getCompanyInfo = async (req, res) => {
     try {
@@ -37,13 +47,18 @@ const createCompanyInfo = async (req, res) => {
         address_alley, address_road, address_sub_district, address_district,
         address_province, address_country, address_zip_code, tax_id_number,
         start_date, maintenance_contract_date, serial_number,
-        phone_number, fax_number, email, website, primary_contact_person, is_active
+        phone_number, fax_number, email, website, primary_contact_person, is_active, ui_font
     } = req.body;
 
     const logo_url = req.file ? req.file.path : null; // Path ของไฟล์ที่อัปโหลด
 
     const parsed_start_date = parseNullableDate(start_date);
     const parsed_maintenance_contract_date = parseNullableDate(maintenance_contract_date);
+    let parsed_ui_font;
+    try { parsed_ui_font = parseUiFont(ui_font); } catch (e) {
+        if (req.file) fs.unlinkSync(req.file.path);
+        return res.status(400).json({ message: e.message });
+    }
 
     // Validation (ขั้นต้น)
     if (!thai_name || !tax_id_number) {
@@ -62,15 +77,16 @@ const createCompanyInfo = async (req, res) => {
                 'address_alley, address_road, address_sub_district, address_district, '+
                 'address_province, address_country, address_zip_code, tax_id_number, '+
                 'logo_url, start_date, maintenance_contract_date, serial_number, '+
-                'phone_number, fax_number, email, website, primary_contact_person, is_active )'+
-            'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22) '+
+                'phone_number, fax_number, email, website, primary_contact_person, is_active, ui_font )'+
+            'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, COALESCE($23, \'tahoma\')) '+
             'RETURNING *',
             [
                 thai_name, english_name, address_no, address_building_village,
                 address_alley, address_road, address_sub_district, address_district,
                 address_province, address_country, address_zip_code, tax_id_number,
                 logo_url, parsed_start_date, parsed_maintenance_contract_date, serial_number,
-                phone_number, fax_number, email, website, primary_contact_person, is_active === 'true'
+                phone_number, fax_number, email, website, primary_contact_person, is_active === 'true',
+                parsed_ui_font
             ]
         );
         await client.query('COMMIT');
@@ -95,7 +111,7 @@ const updateCompanyInfo = async (req, res) => {
         address_alley, address_road, address_sub_district, address_district,
         address_province, address_country, address_zip_code, tax_id_number,
         start_date, maintenance_contract_date, serial_number,
-        phone_number, fax_number, email, website, primary_contact_person, is_active
+        phone_number, fax_number, email, website, primary_contact_person, is_active, ui_font
     } = req.body;
 
     const new_logo_url = req.file ? req.file.path : null; // Path ของไฟล์ใหม่ที่อัปโหลด
@@ -103,6 +119,11 @@ const updateCompanyInfo = async (req, res) => {
     // VVVV ใช้ Helper function VVVV
     const parsed_start_date = parseNullableDate(start_date);
     const parsed_maintenance_contract_date = parseNullableDate(maintenance_contract_date);
+    let parsed_ui_font;
+    try { parsed_ui_font = parseUiFont(ui_font); } catch (e) {
+        if (req.file) fs.unlinkSync(req.file.path);
+        return res.status(400).json({ message: e.message });
+    }
 
     // Validation (ขั้นต้น)
     if (!thai_name || !tax_id_number || isNaN(companyId)) {
@@ -127,7 +148,7 @@ const updateCompanyInfo = async (req, res) => {
             'address_province=$9', 'address_country=$10', 'address_zip_code=$11', 'tax_id_number=$12',
             'start_date=$13', 'maintenance_contract_date=$14', 'serial_number=$15',
             'phone_number=$16', 'fax_number=$17', 'email=$18', 'website=$19',
-            'primary_contact_person=$20', 'is_active=$21', 'updated_at=NOW()'
+            'primary_contact_person=$20', 'is_active=$21', 'ui_font=COALESCE($22, ui_font)', 'updated_at=NOW()'
         ];
         const queryParams = [
             thai_name, english_name, address_no, address_building_village,
@@ -135,12 +156,12 @@ const updateCompanyInfo = async (req, res) => {
             address_province, address_country, address_zip_code, tax_id_number,
             parsed_start_date, parsed_maintenance_contract_date, serial_number,
             phone_number, fax_number, email, website,
-            primary_contact_person, is_active === 'true'
+            primary_contact_person, is_active === 'true', parsed_ui_font
         ];
 
         // let logoUpdate = '';
         if (new_logo_url) {
-            updateFields.push('logo_url=$22'); // เพิ่ม logo_url ใน update
+            updateFields.push('logo_url=$23'); // เพิ่ม logo_url ใน update
             queryParams.push(new_logo_url);
         }
 
