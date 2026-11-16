@@ -2272,7 +2272,7 @@ const fetchBillCollectionByDocNo = async (req, res) => {
 };
 
 module.exports = {
-    createTransaction, insertArTransaction, ensureArCreateSchema,
+    createTransaction, insertArTransaction, ensureArCreateSchema, resolvePaymentGlAccount,
     updateTransaction,
     voidTransaction,
     voidArDocument,

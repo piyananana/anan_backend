@@ -2616,6 +2616,7 @@ const saveImCashSale = async (client, headerId, { header = {}, payments, whts } 
         [headerId])).rows[0].v);
     const received = round2(Number(header.cash_received) || 0);
     if (received < 0) throw bad('เงินที่รับมาต้องไม่ติดลบ');
+    if (received && cashFc <= 0.005) throw bad('กรอกรับเงินมาแล้ว แต่ไม่มีวิธีรับชำระเป็นเงินสด — เพิ่มรายการเงินสด หรือล้างช่องรับเงินมา');
     if (received && received < cashFc - 0.005) throw bad(`เงินที่รับมา (${received}) น้อยกว่ายอดรับชำระด้วยเงินสด (${cashFc})`);
     const b = cleanBillTo(header);
     await client.query(`
@@ -4100,7 +4101,8 @@ const deleteTransaction = async (req, res) => {
 };
 
 // GET-like (POST เพราะส่งรายการสินค้า) — บัญชีที่ตอน Post จะใช้ต่อสินค้า สำหรับตัวอย่างรายการบัญชีบนหน้าจอ
-// body: { doc_code, warehouse_id, to_warehouse_id, item_ids: [] }
+// body: { doc_code, warehouse_id, to_warehouse_id, item_ids: [], customer_id?, payments?: [{ payment_method_type, gl_account_id, cm_bank_account_id }] }
+//   → เพิ่ม ar_account (ลูกค้า > กลุ่ม > ประเภทเอกสาร AR ที่สร้าง) และ receipt (ขายเงินสด: บัญชีของแต่ละวิธีรับเงิน + ภาษีถูกหัก ณ ที่จ่าย)
 //   → { mode (ค่าเริ่มต้นของบริษัท), items: { [item_id]: { mode, to_mode, inventory, to_inventory, purchases, to_purchases, cogs, revenue } } }
 // mode/to_mode = โหมดของสินค้าในคลังต้นทาง/ปลายทาง (สินค้า → หมวดสินค้า → คลัง → ค่าเริ่มต้น) แบบเดียวกับ applyLineModes
 // ใช้ resolver ชุดเดียวกับ postGlEntry/postApBillFromGrn/postArBillFromDln (ไม่ throw — บัญชีที่หาไม่เจอส่ง null)
@@ -4109,7 +4111,8 @@ const AP_DOC_FOR_IM = { '11': '10', '12': '10', '14': '10', '15': '30', '20': '3
 const fetchGlAccounts = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
-        const { doc_code, warehouse_id, to_warehouse_id } = req.body || {};
+        const { doc_code, warehouse_id, to_warehouse_id, customer_id } = req.body || {};
+        const payments = Array.isArray(req.body?.payments) ? req.body.payments : [];
         const itemIds = [...new Set((req.body?.item_ids || []).map(Number).filter(Boolean))];
         const sdRes = await client.query(
             `SELECT sys_doc_type FROM sa_module_document WHERE doc_code = $1 AND sys_module = '31' LIMIT 1`, [doc_code]);
@@ -4150,6 +4153,26 @@ const fetchGlAccounts = async (req, res) => {
             items[itemId] = a;
         }
 
+        // บัญชีลูกหนี้ — ลำดับเดียวกับ postArBillFromDln (resolveArAccountId)
+        let arAccountId = null;
+        if (AR_DOC_FOR_IM[sysDocType] && setup.target_doc_id) {
+            arAccountId = await resolveArAccountId(client, { customerId: Number(customer_id) || null, docId: setup.target_doc_id });
+            if (arAccountId) ids.add(arAccountId);
+        }
+        // ใบเสร็จรับชำระของขายเงินสด — บัญชีตาม resolvePaymentGlAccount ของ AR (วิธีรับเงิน → บัญชีธนาคาร → ตามประเภท → เงินสด)
+        let receipt = null;
+        if (sysDocType === CASH_SALE_TYPE && setup.receipt_target_doc_id) {
+            const rs = (await client.query(`
+                SELECT s.* FROM ar_gl_account_setup s JOIN sa_module_document d ON d.doc_code = s.doc_code WHERE d.id = $1`,
+                [setup.receipt_target_doc_id])).rows[0] || null;
+            const { resolvePaymentGlAccount } = require('../ar/arTransactionController');
+            const cash = Number(rs?.cash_account_id) || null;
+            const pays = [];
+            for (const p of payments) pays.push(await resolvePaymentGlAccount(client, p || {}, rs, cash));
+            receipt = { wht: Number(rs?.wht_account_id) || null, payments: pays };
+            [receipt.wht, ...pays].forEach(v => v && ids.add(v));
+        }
+
         const accRes = ids.size ? await client.query(
             `SELECT id, account_code, account_name_thai, account_name_eng FROM gl_account WHERE id = ANY($1::int[])`, [[...ids]]) : { rows: [] };
         const acc = Object.fromEntries(accRes.rows.map(r => [r.id, r]));
@@ -4159,7 +4182,11 @@ const fetchGlAccounts = async (req, res) => {
             a.mode = modes[Number(itemId)] || mode;
             a.to_mode = to_warehouse_id ? (toModes[Number(itemId)] || mode) : null;
         }
-        res.json({ sys_doc_type: sysDocType, mode, items });
+        res.json({
+            sys_doc_type: sysDocType, mode, items,
+            ar_account: describe(arAccountId),
+            receipt: receipt && { wht: describe(receipt.wht), payments: receipt.payments.map(describe) },
+        });
     } catch (err) {
         console.error('Error fetching IM GL accounts:', err);
         res.status(500).json({ error: err.message });
