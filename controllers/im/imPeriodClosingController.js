@@ -105,6 +105,9 @@ const POSTED_STATUSES = `('Posted','Received','Delivered')`; // เอกสา�
 const COGS_TYPES = ['30', '31', '32', '33', '35', '40', '45', '60'];
 const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 const unitKey = (itemId, whId) => `${itemId}|${whId}`;
+// คีย์ (บัญชี × สาขา) — สาขาว่าง = ''
+const abKey = (acc, br) => `${acc}|${br ?? ''}`;
+const abSplit = (k) => { const [a, b] = k.split('|'); return [Number(a), b === '' ? null : Number(b)]; };
 
 // การปิดงวดแบบปรับยอดให้ตรง (user-approved 2026-10-30, ดู project_im_mixed_accounting_mode):
 // 1. มูลค่าสต็อก ณ วันสิ้นงวด ต่อ (สินค้า × คลัง) = มูลค่าปัจจุบัน − การเคลื่อนไหวของเอกสารที่ลงวันที่หลังสิ้นงวด
@@ -115,6 +118,9 @@ const unitKey = (itemId, whId) => `${itemId}|${whId}`;
 // 5. ต้นทุนขาย = ซื้อสุทธิ − ส่วนที่ปรับเพิ่มบัญชีสต็อก — ลงตามบัญชีต้นทุนของสินค้าตามมูลค่าที่ขาย/เบิกจริงใน subledger
 //    (บรรทัด Periodic) ส่วนที่เหลือ (สูญหาย ปรับยอด ส่วนต่างราคา รายการ GL อื่น) ลงบัญชีต้นทุนเริ่มต้นของบริษัท
 // ปรับจากยอด GL จริงทุกครั้ง จึงไม่ต้องมียอดต้นงวด และไม่เพี้ยนเมื่อเปลี่ยนโหมดกลางงวดหรือ MOI/MOR ลงบัญชีไว้ก่อนแล้ว
+// สาขา (วิธี 1, user-approved 2026-11-18): ทุกยอดคิดแยกต่อ (บัญชี × สาขา) แล้วลงบรรทัดรายการบัญชีที่สาขานั้น
+//   มูลค่าสต็อก = สาขาของคลัง; ยอด GL/ซื้อ = สาขาของบรรทัด ถ้าว่างใช้ของหัวรายการ; ต้นทุนจาก subledger = สาขาของเอกสาร IM
+//   ต้นทุนส่วนที่เหลือคิดต่อสาขา → แต่ละสาขาสมดุลในตัวเอง
 const computeClosing = async (client, periodId) => {
     const periodRes = await client.query(
         `SELECT id, period_name, period_start_date::text AS s, period_end_date::text AS e, im_status FROM gl_posting_period WHERE id = $1`, [periodId]);
@@ -143,7 +149,8 @@ const computeClosing = async (client, periodId) => {
 
     // บรรทัดในงวด (โหมดที่ใช้ตอน Post + ต้นทุนขาย/เบิกของบรรทัด Periodic)
     const lines = (await client.query(`
-        SELECT d.item_id, d.gl_mode, d.to_gl_mode, d.total_value_lc, t.warehouse_id, t.to_warehouse_id, t.doc_code, t.status, md.sys_doc_type
+        SELECT d.item_id, d.gl_mode, d.to_gl_mode, d.total_value_lc, t.warehouse_id, t.to_warehouse_id, t.doc_code, t.status, md.sys_doc_type,
+               t.branch_id
           FROM im_transaction_detail d
           JOIN im_transaction t ON t.id = d.header_id
           JOIN sa_module_document md ON md.id = t.doc_id
@@ -182,11 +189,11 @@ const computeClosing = async (client, periodId) => {
           FROM im_item i LEFT JOIN im_item_category c ON c.id = i.category_id
          WHERE i.id = ANY($1::int[])`, [itemIds])).rows : [];
     const itemMap = Object.fromEntries(itemRows.map(r => [r.id, r]));
-    const whRows = (await client.query(`SELECT id, warehouse_code, inventory_account_id FROM im_warehouse`)).rows;
+    const whRows = (await client.query(`SELECT id, warehouse_code, inventory_account_id, branch_id FROM im_warehouse`)).rows;
     const whMap = Object.fromEntries(whRows.map(r => [r.id, r]));
     const pick = (...ids) => ids.map(Number).find(n => n > 0) || null;
 
-    const inv = {}; // account_id -> { target, periodic_value, perpetual_value, has_periodic }
+    const inv = {}; // account_id -> { target, periodic_value, perpetual_value, has_periodic, byBranch: { branch: target } }
     for (const k of units) {
         const [i, w] = k.split('|').map(Number);
         const it = itemMap[i] || {};
@@ -199,19 +206,26 @@ const computeClosing = async (client, periodId) => {
             }
             continue;
         }
-        const a = inv[acc] = inv[acc] || { target: 0, periodic_value: 0, perpetual_value: 0, has_periodic: false };
+        const a = inv[acc] = inv[acc] || { target: 0, periodic_value: 0, perpetual_value: 0, has_periodic: false, byBranch: {} };
         a.target += v;
+        const wb = whMap[w]?.branch_id ?? '';
+        a.byBranch[wb] = (a.byBranch[wb] || 0) + v;
         if (isPeriodic) { a.periodic_value += v; a.has_periodic = true; } else a.perpetual_value += v;
     }
 
     // 3. ยอด GL ณ วันสิ้นงวดของบัญชีสต็อก
     const invIds = Object.keys(inv).map(Number);
     const glBal = invIds.length ? (await client.query(`
-        SELECT d.account_id, SUM(d.debit_lc - d.credit_lc) AS bal
+        SELECT d.account_id, COALESCE(d.branch_id, h.branch_id) AS branch_id, SUM(d.debit_lc - d.credit_lc) AS bal
           FROM gl_entry_detail d JOIN gl_entry_header h ON h.id = d.header_id
          WHERE h.status = 'Posted' AND h.doc_date <= $1 AND d.account_id = ANY($2::int[])
-         GROUP BY 1`, [period.e, invIds])).rows : [];
-    const glMap = Object.fromEntries(glBal.map(r => [r.account_id, Number(r.bal) || 0]));
+         GROUP BY 1, 2`, [period.e, invIds])).rows : [];
+    const glMap = {};   // account_id -> ยอดรวมทุกสาขา
+    const glByAb = {};  // abKey -> ยอด
+    for (const r of glBal) {
+        glMap[r.account_id] = (glMap[r.account_id] || 0) + (Number(r.bal) || 0);
+        glByAb[abKey(r.account_id, r.branch_id)] = Number(r.bal) || 0;
+    }
 
     // 4. บัญชีซื้อสินค้าทุกบัญชีที่ตั้งไว้ — ยอดสุทธิในงวด
     const purIds = (await client.query(`
@@ -220,10 +234,10 @@ const computeClosing = async (client, periodId) => {
         UNION SELECT purchases_account_id FROM im_item_category WHERE purchases_account_id IS NOT NULL
         UNION SELECT purchases_account_id FROM im_accounting_setting WHERE purchases_account_id IS NOT NULL`)).rows.map(r => r.id);
     const purBal = purIds.length ? (await client.query(`
-        SELECT d.account_id, SUM(d.debit_lc - d.credit_lc) AS bal
+        SELECT d.account_id, COALESCE(d.branch_id, h.branch_id) AS branch_id, SUM(d.debit_lc - d.credit_lc) AS bal
           FROM gl_entry_detail d JOIN gl_entry_header h ON h.id = d.header_id
          WHERE h.status = 'Posted' AND h.doc_date BETWEEN $1 AND $2 AND d.account_id = ANY($3::int[])
-         GROUP BY 1`, [period.s, period.e, purIds])).rows : [];
+         GROUP BY 1, 2`, [period.s, period.e, purIds])).rows : [];
 
     // 5. ต้นทุนขาย/เบิกของบรรทัด Periodic ตาม subledger — บัญชี: สินค้า → หมวดสินค้า → ประเภทเอกสาร → ค่าเริ่มต้นของบริษัท
     const setupCogs = {};
@@ -231,18 +245,21 @@ const computeClosing = async (client, periodId) => {
         const r = await client.query(`SELECT cogs_account_id FROM im_gl_account_setup WHERE doc_code = $1`, [code]);
         setupCogs[code] = r.rows[0]?.cogs_account_id || null;
     }
-    const subCogs = {}; // account_id -> ต้นทุน (บวก = Dr)
+    const subCogs = {}; // abKey(บัญชี, สาขาของเอกสาร) -> ต้นทุน (บวก = Dr)
     for (const l of lines) {
         if (l.eff_mode !== 'PERIODIC' || !COGS_TYPES.includes(l.sys_doc_type)) continue;
         const it = itemMap[l.item_id] || {};
         const acc = pick(it.i_cogs, it.c_cogs, setupCogs[l.doc_code], setting.cogs_account_id);
         if (!acc) { errors.push(`ไม่พบบัญชีต้นทุนขายของ ${it.item_code || l.item_id}`); continue; }
-        subCogs[acc] = (subCogs[acc] || 0) - Number(l.total_value_lc || 0);
+        const k = abKey(acc, l.branch_id);
+        subCogs[k] = (subCogs[k] || 0) - Number(l.total_value_lc || 0);
     }
 
-    // สรุปรายการบัญชี (บวก = Dr, ลบ = Cr)
+    // สรุปรายการบัญชี (บวก = Dr, ลบ = Cr) ต่อ (บัญชี × สาขา); ส่วนต่างต่อสาขา (ซื้อ − ปรับสต็อก − ต้นทุน subledger) ลงต้นทุนเริ่มต้น
     const net = {};
-    const addNet = (acc, amt) => { if (acc && Math.abs(amt) >= 0.005) net[acc] = (net[acc] || 0) + amt; };
+    const addNet = (acc, br, amt) => { if (acc && Math.abs(amt) >= 0.005) { const k = abKey(acc, br); net[k] = (net[k] || 0) + amt; } };
+    const brResidual = {}; // สาขา -> ส่วนต่างที่เหลือ (บวก = Dr ต้นทุน)
+    const addRes = (br, amt) => { const k = br ?? ''; brResidual[k] = (brResidual[k] || 0) + amt; };
     let inventoryAdj = 0, glBefore = 0, ending = 0;
     const reconciliation = [];
     for (const [acc, a] of Object.entries(inv)) {
@@ -261,7 +278,15 @@ const computeClosing = async (client, periodId) => {
             warnings.push('บัญชีสต็อกที่ปรับยอดมีสินค้า Perpetual ผสมอยู่ — ถ้าเอกสาร Perpetual ลงบัญชีสต็อกอื่น (เช่น บัญชีของประเภทเอกสาร) ส่วนต่างจะถูกรวมเป็นต้นทุนขาย');
         }
         inventoryAdj += diff; glBefore += gl; ending += a.target;
-        addNet(Number(acc), diff);
+        // ต่อสาขา: เป้าหมายตามสาขาของคลัง เทียบยอด GL ของสาขานั้น (สาขาที่มีแต่ยอด GL ปรับเป็นศูนย์)
+        const brs = new Set([...Object.keys(a.byBranch),
+            ...Object.keys(glByAb).filter(k => k.startsWith(`${acc}|`)).map(k => k.split('|')[1])]);
+        for (const b of brs) {
+            const br = b === '' ? null : Number(b);
+            const d = r2((a.byBranch[b] || 0) - (glByAb[abKey(acc, br)] || 0));
+            addNet(Number(acc), br, d);
+            addRes(br, -d);
+        }
     }
     let purchasesNet = 0;
     const purchasesLines = [];
@@ -269,26 +294,32 @@ const computeClosing = async (client, periodId) => {
         const bal = r2(r.bal);
         if (Math.abs(bal) < 0.005) continue;
         purchasesNet += bal;
-        purchasesLines.push({ account_id: r.account_id, amount: bal });
-        addNet(r.account_id, -bal);
+        const pl = purchasesLines.find(p => p.account_id === r.account_id);
+        if (pl) pl.amount = r2(pl.amount + bal); else purchasesLines.push({ account_id: r.account_id, amount: bal });
+        addNet(r.account_id, r.branch_id ?? null, -bal);
+        addRes(r.branch_id ?? null, bal);
     }
     inventoryAdj = r2(inventoryAdj); purchasesNet = r2(purchasesNet);
     const cogsTotal = r2(purchasesNet - inventoryAdj);
     let subTotal = 0;
     const cogsLines = [];
-    for (const [acc, amt] of Object.entries(subCogs)) {
+    for (const [k, amt] of Object.entries(subCogs)) {
         const v = r2(amt);
         if (Math.abs(v) < 0.005) continue;
+        const [acc, br] = abSplit(k);
         subTotal += v;
-        cogsLines.push({ account_id: Number(acc), amount: v, source: 'SUBLEDGER' });
-        addNet(Number(acc), v);
+        const cl = cogsLines.find(c => c.account_id === acc);
+        if (cl) cl.amount = r2(cl.amount + v); else cogsLines.push({ account_id: acc, amount: v, source: 'SUBLEDGER' });
+        addNet(acc, br, v);
+        addRes(br, -v);
     }
     const residual = r2(cogsTotal - subTotal);
-    if (Math.abs(residual) >= 0.005) {
+    const resBranches = Object.entries(brResidual).map(([b, v]) => [b === '' ? null : Number(b), r2(v)]).filter(([, v]) => Math.abs(v) >= 0.005);
+    if (Math.abs(residual) >= 0.005 || resBranches.length) {
         if (!setting.cogs_account_id) errors.push('ยังไม่ได้ตั้งค่าบัญชีต้นทุนขายเริ่มต้นในหน้าโหมดบัญชีสินค้าคงคลัง (ใช้ลงส่วนต่างจากการปรับยอด)');
         else {
-            cogsLines.push({ account_id: Number(setting.cogs_account_id), amount: residual, source: 'RESIDUAL' });
-            addNet(Number(setting.cogs_account_id), residual);
+            if (Math.abs(residual) >= 0.005) cogsLines.push({ account_id: Number(setting.cogs_account_id), amount: residual, source: 'RESIDUAL' });
+            for (const [br, v] of resBranches) addNet(Number(setting.cogs_account_id), br, v);
         }
     }
 
@@ -308,8 +339,18 @@ const computeClosing = async (client, periodId) => {
     if (prevOpen.rows.length) warnings.push(`งวดก่อนหน้า (${prevOpen.rows[0].period_name}) ยังไม่ได้ปิดงวดสต็อก — ต้นทุนของงวดนั้นจะถูกรวมในงวดนี้`);
 
     const journal = Object.entries(net)
-        .map(([acc, amt]) => ({ account_id: Number(acc), debit: amt > 0 ? r2(amt) : 0, credit: amt < 0 ? r2(-amt) : 0 }))
+        .map(([k, amt]) => { const [acc, br] = abSplit(k); return { account_id: acc, branch_id: br, debit: amt > 0 ? r2(amt) : 0, credit: amt < 0 ? r2(-amt) : 0 }; })
         .filter(l => l.debit || l.credit);
+    // ตรวจบัญชีที่บังคับสาขา (บรรทัดที่ไม่มีสาขา)
+    const reqBr = journal.filter(l => !l.branch_id).map(l => l.account_id);
+    if (reqBr.length) {
+        const codes = (await client.query(`SELECT account_code FROM gl_account WHERE branch_required AND id = ANY($1::int[]) ORDER BY 1`, [reqBr])).rows;
+        if (codes.length) errors.push(`ต้องระบุสาขา: บัญชี ${codes.map(c => c.account_code).join(', ')} บังคับระบุสาขา — ตั้งสาขาให้คลังสินค้า/เอกสารที่เกี่ยวข้อง`);
+    }
+    const brCodes = Object.fromEntries((await client.query(
+        `SELECT id, branch_code FROM cd_branch WHERE id = ANY($1::int[])`, [[...new Set(journal.map(l => l.branch_id).filter(Boolean))]])).rows
+        .map(b => [b.id, b.branch_code]));
+    journal.forEach(l => { l.branch_code = brCodes[l.branch_id] || ''; });
 
     // ชื่อบัญชีสำหรับหน้าจอ
     const accIds = [...new Set([...journal.map(j => j.account_id), ...reconciliation.map(r => r.account_id),
@@ -325,7 +366,8 @@ const computeClosing = async (client, periodId) => {
         inventory_adjustment: inventoryAdj, subledger_cogs: r2(subTotal), residual_cogs: residual,
         reconciliation: reconciliation.map(named).sort((a, b) => a.account_code.localeCompare(b.account_code)),
         purchases: purchasesLines.map(named), cogs: cogsLines.map(named),
-        journal: journal.map(named).sort((a, b) => (b.debit - a.debit) || a.account_code.localeCompare(b.account_code)),
+        journal: journal.map(named).sort((a, b) => (b.debit - a.debit) || a.account_code.localeCompare(b.account_code)
+            || a.branch_code.localeCompare(b.branch_code)),
         errors: [...new Set(errors)], warnings: [...new Set(warnings)],
     };
 };
@@ -388,19 +430,20 @@ const confirmClose = async (req, res) => {
             const glHeaderRes = await client.query(`
                 INSERT INTO gl_entry_header
                 (doc_id, doc_no, doc_date, posting_date, period_id, description,
-                 currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc, created_by)
-                VALUES ($1,$2,$3,$4,$5,$6,$10,1,'Posted',$7,$8,0,0,$9)
+                 currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc, created_by, branch_id)
+                VALUES ($1,$2,$3,$4,$5,$6,$10,1,'Posted',$7,$8,0,0,$9,$11)
                 RETURNING id
             `, [setting.closing_gl_doc_id, docNo, docDate, docDate, periodId, description, totalDebit, totalCredit, createdByUserId,
-                (await getBaseCurrency(client)).id]); // สกุลเงินหลัก ไม่ใช่ id 1 ตายตัว
+                (await getBaseCurrency(client)).id, // สกุลเงินหลัก ไม่ใช่ id 1 ตายตัว
+                new Set(c.journal.map(l => l.branch_id ?? null)).size === 1 ? (c.journal[0].branch_id ?? null) : null]);
             glEntryId = glHeaderRes.rows[0].id;
 
             let lineNo = 1;
             for (const l of c.journal) {
                 await client.query(`
-                    INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
-                    VALUES ($1,$2,$3,$4,$5,$6,0,0)
-                `, [glEntryId, lineNo++, l.account_id, description, l.debit, l.credit]);
+                    INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc, branch_id)
+                    VALUES ($1,$2,$3,$4,$5,$6,0,0,$7)
+                `, [glEntryId, lineNo++, l.account_id, description, l.debit, l.credit, l.branch_id ?? null]);
             }
         }
 

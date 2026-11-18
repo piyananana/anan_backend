@@ -4,6 +4,7 @@ const { checkCmPeriodOpen } = require('../cm/cmPeriodCheckHelper');
 const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { computePaymentDeferredVat, insertDeferredVtRecordsForPayment } = require('./apTransactionController');
 const { describeJournalLines } = require('../../utils/glJournalPreview');
+const { assertRequiredBranch } = require('../../utils/glDims');
 const { postedApAccountId } = require('../../utils/apAccount');
 const DA = require('../../utils/docApproval');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
@@ -119,7 +120,8 @@ class BulkPayError extends Error {
 }
 
 // ตรวจข้อมูลและสร้างบรรทัดรายการบัญชีของการจ่ายแบบกลุ่ม — ใช้ทั้ง preview และ run (ไม่เขียนข้อมูล)
-// บรรทัด: Dr เจ้าหนี้ทีละใบ, Cr ธนาคารยอดรวม, แล้ว Dr ภาษีซื้อ / Cr ภาษีซื้อรอตัด ของใบที่มี VAT รอตัดบัญชี
+// บรรทัด: Dr เจ้าหนี้ทีละใบ, Cr ธนาคารยอดรวมต่อสาขา, แล้ว Dr ภาษีซื้อ / Cr ภาษีซื้อรอตัด ของใบที่มี VAT รอตัดบัญชี
+// สาขา (วิธี 1, user-approved 2026-11-18): ทุกบรรทัดใช้สาขาของใบตั้งหนี้ — ธนาคารแยกยอดตามสาขาให้แต่ละสาขาสมดุล
 const prepareBulkPayment = async (client, { bank_account_id, payment_date, items }) => {
     if (!bank_account_id || !payment_date || !items || !items.length)
         throw new BulkPayError(400, 'bank_account_id, payment_date and items are required');
@@ -164,8 +166,13 @@ const prepareBulkPayment = async (client, { bank_account_id, payment_date, items
     const totalAmount = docs.reduce((s, d) => s + d.amount, 0);
 
     const lines = docs.map(({ doc, amount, apAccountId }) =>
-        ({ account_id: apAccountId, description: `Payment ${doc.doc_no}`, debit: amount, credit: 0 }));
-    lines.push({ account_id: bankAcct.gl_account_id, description: 'Bulk payment', debit: 0, credit: totalAmount, isBank: true });
+        ({ account_id: apAccountId, branch_id: doc.branch_id ?? null, description: `Payment ${doc.doc_no}`, debit: amount, credit: 0 }));
+    const bankByBranch = new Map();
+    for (const { doc, amount } of docs) bankByBranch.set(doc.branch_id ?? null, (bankByBranch.get(doc.branch_id ?? null) || 0) + amount);
+    for (const br of [...bankByBranch.keys()].sort((a, b) => (a ?? 0) - (b ?? 0))) {
+        lines.push({ account_id: bankAcct.gl_account_id, branch_id: br, description: 'Bulk payment', debit: 0,
+                     credit: Math.round(bankByBranch.get(br) * 100) / 100, isBank: true });
+    }
 
     // รับรู้ VAT รอตัดบัญชี (บริการ) ของใบแจ้งหนี้ตามสัดส่วนที่จ่าย — Dr ภาษีซื้อ / Cr ภาษีซื้อรอตัด
     // (มิเรอร์การจ่ายชำระปกติใน apTransactionController — จ่ายแบบกลุ่มเป็นยอดบาท จึงใช้สัดส่วนยอดบาท)
@@ -180,8 +187,8 @@ const prepareBulkPayment = async (client, { bank_account_id, payment_date, items
             throw new BulkPayError(400, `ใบแจ้งหนี้ ${apDoc.doc_no} มี VAT รอตัดบัญชีที่ต้องรับรู้ — กรุณาตั้งค่าบัญชีภาษีซื้อและบัญชีภาษีซื้อรอตัดบัญชีในการตั้งค่าบัญชี AP ของเอกสารจ่ายชำระ`);
         }
         lines.push(
-            { account_id: setup.vat_input_account_id, description: `รับรู้ VAT รอตัดบัญชี ${apDoc.doc_no}`, debit: deferred.vatLc, credit: 0 },
-            { account_id: setup.vat_pending_input_account_id, description: `VAT รอตัดบัญชี ${apDoc.doc_no}`, debit: 0, credit: deferred.vatLc });
+            { account_id: setup.vat_input_account_id, branch_id: apDoc.branch_id ?? null, description: `รับรู้ VAT รอตัดบัญชี ${apDoc.doc_no}`, debit: deferred.vatLc, credit: 0 },
+            { account_id: setup.vat_pending_input_account_id, branch_id: apDoc.branch_id ?? null, description: `VAT รอตัดบัญชี ${apDoc.doc_no}`, debit: 0, credit: deferred.vatLc });
         deferredByDoc.push({ apDoc, deferred });
         deferredTotal += deferred.vatLc;
     }
@@ -209,6 +216,10 @@ const payItems = async (client, body, createdBy) => {
     if (!pc.allowed) throw new BulkPayError(400, pc.message);
 
     const { setup, docs, totalAmount, lines, deferredByDoc, deferredTotal } = await prepareBulkPayment(client, body);
+    await assertRequiredBranch(client, lines, null);
+    // ทุกบรรทัดสาขาเดียวกัน → หัวรายการใช้สาขานั้นด้วย
+    const branchSet = new Set(lines.map(l => l.branch_id ?? null));
+    const headerBranch = branchSet.size === 1 ? [...branchSet][0] : null;
 
     // Open GL period
     const periodRes = await client.query(`
@@ -232,19 +243,19 @@ const payItems = async (client, body, createdBy) => {
            ref_no, description,
            currency_id, exchange_rate, status,
            total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-           created_by)
-        VALUES ($1,$2,$3,$3,$4,$5,$6,1,1,'Posted',$7,$7,$7,$7,$8)
+           created_by, branch_id)
+        VALUES ($1,$2,$3,$3,$4,$5,$6,1,1,'Posted',$7,$7,$7,$7,$8,$9)
         RETURNING id`,
         [setup.gl_doc_id, glDocNo, payment_date, periodId, body.batch_no || glDocNo,
-         `Bulk Payment ${body.batch_no || glDocNo}`, totalGl, createdByUserId]);
+         `Bulk Payment ${body.batch_no || glDocNo}`, totalGl, createdByUserId, headerBranch]);
     const glEntryId = glHeaderRes.rows[0].id;
 
     let lineNo = 1;
     for (const l of lines) {
         await client.query(`
-            INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
-            VALUES ($1,$2,$3,$4,$5,$6,$5,$6)`,
-            [glEntryId, lineNo++, l.account_id, l.isBank ? `Bulk payment ${glDocNo}` : l.description, l.debit, l.credit]);
+            INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc, branch_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$5,$6,$7)`,
+            [glEntryId, lineNo++, l.account_id, l.isBank ? `Bulk payment ${glDocNo}` : l.description, l.debit, l.credit, l.branch_id ?? null]);
     }
 
     const created = [];

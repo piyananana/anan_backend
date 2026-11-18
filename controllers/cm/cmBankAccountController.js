@@ -30,14 +30,16 @@ const ensureColumns = async (pool) => {
     // เลขประจำตัวผู้เสียภาษี/สาขาของธนาคารเจ้าของบัญชี — ผู้ขายในรายงานภาษีซื้อของค่าธรรมเนียมธนาคาร (CM 70)
     await pool.query(`ALTER TABLE cm_bank_account ADD COLUMN IF NOT EXISTS tax_id VARCHAR(20)`);
     await pool.query(`ALTER TABLE cm_bank_account ADD COLUMN IF NOT EXISTS tax_branch_code VARCHAR(5)`);
+    // สาขาของบัญชีธนาคาร — ตีราคา FX ธนาคารลงรายการบัญชีที่สาขานี้ (user-approved 2026-11-18, sql/cm_bank_account_branch.sql)
+    await pool.query(`ALTER TABLE cm_bank_account ADD COLUMN IF NOT EXISTS branch_id INT REFERENCES cd_branch(id)`);
 };
 
-// บันทึกเลขผู้เสียภาษี/สาขา (สาขา 5 หลัก, 00000 = สำนักงานใหญ่)
+// บันทึกเลขผู้เสียภาษี/สาขา (สาขา 5 หลัก, 00000 = สำนักงานใหญ่) + สาขาของบัญชีธนาคาร (cd_branch)
 const saveTaxFields = async (db, id, body) => {
   const branch = normalizeTaxBranch(body.tax_branch_code);
   if (branch.error) throw Object.assign(new Error(branch.error), { status: 400 });
-  await db.query(`UPDATE cm_bank_account SET tax_id = $1, tax_branch_code = $2 WHERE id = $3`,
-    [(body.tax_id || '').trim() || null, branch.value, id]);
+  await db.query(`UPDATE cm_bank_account SET tax_id = $1, tax_branch_code = $2, branch_id = $3 WHERE id = $4`,
+    [(body.tax_id || '').trim() || null, branch.value, Number(body.branch_id) || null, id]);
 };
 
 const BASE_SELECT = `
@@ -51,10 +53,12 @@ const BASE_SELECT = `
     b.bank_name_eng AS bank_name_en,
     b.short_name    AS bank_short_name,
     ga.account_code      AS gl_account_code,
-    ga.account_name_thai AS gl_account_name
+    ga.account_name_thai AS gl_account_name,
+    br.branch_code, br.branch_name_thai, br.branch_name_eng
   FROM cm_bank_account ba
   LEFT JOIN cd_bank    b  ON b.id  = ba.bank_id
   LEFT JOIN gl_account ga ON ga.id = ba.gl_account_id
+  LEFT JOIN cd_branch  br ON br.id = ba.branch_id
 `;
 
 const fetchRows = async (req, res) => {

@@ -10,7 +10,7 @@
 
 const { today: todayYmd, ymd } = require('../../utils/dateUtil');
 const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
-const { headerDims, lineDims, ensureDetailDimColumns, detailDimParams, assertRequiredDims } = require('../../utils/glDims');
+const { headerDims, lineDims, ensureDetailDimColumns, detailDimParams, assertRequiredDims, assertRequiredBranch } = require('../../utils/glDims');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { checkCmPeriodOpen } = require('./cmPeriodCheckHelper');
 const { ensureCheckbookColumns, assignCheckNumbers } = require('../../utils/cmCheckbook');
@@ -497,13 +497,16 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
         createdByUserId = uRes.rows[0]?.id || null;
     }
 
+    // สาขาของเอกสาร (บันทึกแล้วก่อน Post) → หัวรายการบัญชี (user-approved 2026-11-18)
+    const branchId = (await client.query(`SELECT branch_id FROM cm_transaction WHERE id = $1`, [headerId])).rows[0]?.branch_id
+        ?? (Number(header.branch_id) || null);
     const glHeaderRes = await client.query(`
         INSERT INTO gl_entry_header
         (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
          currency_id, exchange_rate, status,
          total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc, created_by,
-         ref_doc_id, ref_doc_no, ref_doc_date)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'Posted',$10,$11,$12,$13,$14,$15,$16,$3)
+         ref_doc_id, ref_doc_no, ref_doc_date, branch_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'Posted',$10,$11,$12,$13,$14,$15,$16,$3,$17)
         RETURNING id
     `, [
         setup.gl_doc_id, glDocNo, header.doc_date, header.doc_date, periodId,
@@ -511,13 +514,14 @@ const postGlEntry = async (client, headerId, header, details, applies, payments,
         header.currency_id || null, exchangeRate,
         totalDebitLc, totalCreditLc, totalDebitFc, totalCreditFc,
         createdByUserId,
-        header.doc_id, docNo,
+        header.doc_id, docNo, branchId,
     ]);
     const glHeaderId = glHeaderRes.rows[0].id;
     await client.query(`UPDATE cm_transaction SET gl_doc_no=$1 WHERE id=$2`, [glDocNo, headerId]);
 
     // ตรวจมิติที่บัญชีบังคับ (gl_account_dim_rule) ต่อบรรทัดรายการบัญชี — เหมือน AR/AP/IM
     await assertRequiredDims(client, glDetails, hDims);
+    await assertRequiredBranch(client, glDetails, branchId);
 
     let lineNo = 1;
     for (const l of glDetails) {

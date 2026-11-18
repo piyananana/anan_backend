@@ -33,18 +33,26 @@ const generateDocNo = async (client, docId, date) => {
 
 // Insert a GL entry bypassing OPEN check (closing entries go into any period)
 // gl_balance_accum is maintained by DB triggers on gl_entry_header/gl_entry_detail
+// สาขา + มิติ (user-approved 2026-11-18): ขั้น 3/4/5 แยกยอดต่อชุด (สาขาของบรรทัด ว่าง = ของหัวรายการ + มิติ 1-5 ของบรรทัด)
+// และลงบรรทัดที่ชุดนั้น — ยอดสะสมรายสาขา/มิติของบัญชีรายได้/ค่าใช้จ่ายปิดเป็นศูนย์ กำไรสะสมและยอดยกมามีสาขา/มิติครบ
+// (ตัวอย่างในหน้าจอสรุปต่อบัญชี × สาขา) ถ้าทุกบรรทัดสาขาเดียวกัน หัวรายการได้สาขานั้นด้วย
+const COMBO_KEYS = ['branch_id', 'dim1_id', 'dim2_id', 'dim3_id', 'dim4_id', 'dim5_id'];
+const comboOf = (row) => Object.fromEntries(COMBO_KEYS.map(k => [k, row[k] ?? null]));
+const comboKey = (row) => COMBO_KEYS.map(k => row[k] ?? '').join('|');
 const createClosingEntry = async (client, { docId, docNo, docDate, periodId, description, details, createdBy }) => {
   const totalDebit  = details.reduce((s, d) => s + (Number(d.debit_lc)  || 0), 0);
   const totalCredit = details.reduce((s, d) => s + (Number(d.credit_lc) || 0), 0);
+  const branchSet = new Set(details.map(d => d.branch_id ?? null));
+  const headerBranch = branchSet.size === 1 ? [...branchSet][0] : null;
 
   const headerRes = await client.query(`
     INSERT INTO gl_entry_header
       (doc_id, doc_no, doc_date, posting_date, period_id, description,
        currency_id, exchange_rate, status,
-       total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc, created_by)
-    VALUES ($1,$2,$3,$3,$4,$5, 1,1,'Posted', $6,$7,$6,$7,$8)
+       total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc, created_by, branch_id)
+    VALUES ($1,$2,$3,$3,$4,$5, 1,1,'Posted', $6,$7,$6,$7,$8,$9)
     RETURNING id
-  `, [docId, docNo, docDate, periodId, description, totalDebit, totalCredit, createdBy || 1]);
+  `, [docId, docNo, docDate, periodId, description, totalDebit, totalCredit, createdBy || 1, headerBranch]);
   const headerId = headerRes.rows[0].id;
 
   let lineNo = 1;
@@ -53,8 +61,9 @@ const createClosingEntry = async (client, { docId, docNo, docDate, periodId, des
       INSERT INTO gl_entry_detail
         (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc,
          branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
-      VALUES ($1,$2,$3,$4,$5,$6,$5,$6, NULL,NULL,NULL,NULL,NULL,NULL)
-    `, [headerId, lineNo++, d.account_id, d.description || description, d.debit_lc || 0, d.credit_lc || 0]);
+      VALUES ($1,$2,$3,$4,$5,$6,$5,$6, $7,$8,$9,$10,$11,$12)
+    `, [headerId, lineNo++, d.account_id, d.description || description, d.debit_lc || 0, d.credit_lc || 0,
+        d.branch_id ?? null, d.dim1_id ?? null, d.dim2_id ?? null, d.dim3_id ?? null, d.dim4_id ?? null, d.dim5_id ?? null]);
   }
 
   return headerId;
@@ -142,15 +151,17 @@ const previewStep3 = async (req, res) => {
         a.account_code,
         a.account_name_thai,
         a.account_type,
+        COALESCE(d.branch_id, h.branch_id) AS branch_id, br.branch_code,
         COALESCE(SUM(d.debit_lc - d.credit_lc), 0) AS net_balance
       FROM gl_account a
       JOIN gl_entry_detail d ON d.account_id = a.id
       JOIN gl_entry_header h ON h.id = d.header_id AND h.status = 'Posted'
       JOIN gl_posting_period p ON p.id = h.period_id AND p.fiscal_year_id = $1
+      LEFT JOIN cd_branch br ON br.id = COALESCE(d.branch_id, h.branch_id)
       WHERE a.account_type = ANY($2::text[]) OR a.account_type = ANY($3::text[])
-      GROUP BY a.id, a.account_code, a.account_name_thai, a.account_type
+      GROUP BY a.id, a.account_code, a.account_name_thai, a.account_type, COALESCE(d.branch_id, h.branch_id), br.branch_code
       HAVING ABS(SUM(d.debit_lc - d.credit_lc)) > 0.001
-      ORDER BY a.account_code
+      ORDER BY a.account_code, br.branch_code NULLS FIRST
     `, [fyId, config.revenue_account_types, config.expense_account_types]);
 
     res.status(200).json(balRes.rows);
@@ -189,44 +200,48 @@ const confirmStep3 = async (req, res) => {
     // Calculate net balances for revenue and expense accounts
     const balRes = await client.query(`
       SELECT
-        a.id AS account_id, a.account_type,
+        a.id AS account_id, a.account_type, COALESCE(d.branch_id, h.branch_id) AS branch_id, d.dim1_id, d.dim2_id, d.dim3_id, d.dim4_id, d.dim5_id,
         COALESCE(SUM(d.debit_lc - d.credit_lc), 0) AS net_balance
       FROM gl_account a
       JOIN gl_entry_detail d ON d.account_id = a.id
       JOIN gl_entry_header h ON h.id = d.header_id AND h.status = 'Posted'
       JOIN gl_posting_period p ON p.id = h.period_id AND p.fiscal_year_id = $1
       WHERE a.account_type = ANY($2::text[]) OR a.account_type = ANY($3::text[])
-      GROUP BY a.id, a.account_type
+      GROUP BY a.id, a.account_type, COALESCE(d.branch_id, h.branch_id), d.dim1_id, d.dim2_id, d.dim3_id, d.dim4_id, d.dim5_id
       HAVING ABS(SUM(d.debit_lc - d.credit_lc)) > 0.001
     `, [fyId, config.revenue_account_types, config.expense_account_types]);
 
     if (balRes.rows.length === 0) throw new Error('No revenue/expense balances to close');
 
-    // Build entry details: reverse each account's balance to bring to zero
+    // Build entry details: reverse each (account × combo) balance to bring to zero
     const details = [];
-    let incomeSummaryNet = 0;
+    const summaryByCombo = new Map(); // comboKey → { combo, amt } (+ = credit to income summary)
+    const r2 = (n) => Math.round(n * 100) / 100;
 
     for (const row of balRes.rows) {
       const net = Number(row.net_balance);
+      const combo = comboOf(row);
+      const k = comboKey(row);
       // To close: entry opposite of current balance
       if (net > 0) {
         // Debit balance → credit to close
-        details.push({ account_id: row.account_id, debit_lc: 0, credit_lc: net });
-        incomeSummaryNet -= net; // income summary gets debit
+        details.push({ account_id: row.account_id, ...combo, debit_lc: 0, credit_lc: net });
       } else if (net < 0) {
         // Credit balance → debit to close
-        details.push({ account_id: row.account_id, debit_lc: -net, credit_lc: 0 });
-        incomeSummaryNet += (-net); // income summary gets credit
+        details.push({ account_id: row.account_id, ...combo, debit_lc: -net, credit_lc: 0 });
+      }
+      if (net !== 0) {
+        if (!summaryByCombo.has(k)) summaryByCombo.set(k, { combo, amt: 0 });
+        summaryByCombo.get(k).amt -= net; // debit balance → income summary gets debit, credit → credit
       }
     }
 
-    // Income summary account receives the net
-    // incomeSummaryNet > 0 = net credit (profit) → credit income summary
-    // incomeSummaryNet < 0 = net debit  (loss)   → debit  income summary
-    if (incomeSummaryNet > 0) {
-      details.push({ account_id: config.income_summary_account_id, debit_lc: 0, credit_lc: incomeSummaryNet });
-    } else if (incomeSummaryNet < 0) {
-      details.push({ account_id: config.income_summary_account_id, debit_lc: -incomeSummaryNet, credit_lc: 0 });
+    // Income summary account receives the net of each combo
+    // > 0 = net credit (profit) → credit income summary; < 0 = net debit (loss) → debit income summary
+    for (const { combo, amt } of summaryByCombo.values()) {
+      const v = r2(amt);
+      if (v > 0) details.push({ account_id: config.income_summary_account_id, ...combo, debit_lc: 0, credit_lc: v });
+      else if (v < 0) details.push({ account_id: config.income_summary_account_id, ...combo, debit_lc: -v, credit_lc: 0 });
     }
 
     // Generate doc no
@@ -280,6 +295,17 @@ const previewStep4 = async (req, res) => {
       JOIN gl_posting_period p ON p.id = h.period_id AND p.fiscal_year_id = $1
       WHERE d.account_id = $2
     `, [closing.fiscal_year_id, config.income_summary_account_id]);
+    // แยกต่อสาขา (โอนเข้ากำไรสะสมแยกตามสาขา)
+    const byBranch = (await pool.query(`
+      SELECT COALESCE(d.branch_id, h.branch_id) AS branch_id, br.branch_code, SUM(d.debit_lc - d.credit_lc) AS net_balance
+      FROM gl_entry_detail d
+      JOIN gl_entry_header h ON h.id = d.header_id AND h.status = 'Posted'
+      JOIN gl_posting_period p ON p.id = h.period_id AND p.fiscal_year_id = $1
+      LEFT JOIN cd_branch br ON br.id = COALESCE(d.branch_id, h.branch_id)
+      WHERE d.account_id = $2
+      GROUP BY 1, 2 HAVING ABS(SUM(d.debit_lc - d.credit_lc)) > 0.001 ORDER BY 2 NULLS FIRST
+    `, [closing.fiscal_year_id, config.income_summary_account_id])).rows
+      .map(r => ({ branch_id: r.branch_id, branch_code: r.branch_code || '', net_income: -Number(r.net_balance) }));
 
     // netIncome = debit - credit of income summary:
     //   < 0 = credit balance = PROFIT   → display as positive
@@ -290,6 +316,7 @@ const previewStep4 = async (req, res) => {
       income_summary_account_id: config.income_summary_account_id,
       retained_earnings_account_id: config.retained_earnings_account_id,
       net_income: -netIncome,  // positive = profit, negative = loss
+      by_branch: byBranch,
     });
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -320,32 +347,36 @@ const confirmStep4 = async (req, res) => {
     `, [closing.fiscal_year_id]);
     const closingPeriodId = periodRes.rows[0].id;
 
-    // Net balance of income summary account (after step 3)
+    // Net balance of income summary account (after step 3) per branch
     const balRes = await client.query(`
-      SELECT COALESCE(SUM(d.debit_lc - d.credit_lc), 0) AS net_balance
+      SELECT COALESCE(d.branch_id, h.branch_id) AS branch_id, d.dim1_id, d.dim2_id, d.dim3_id, d.dim4_id, d.dim5_id, COALESCE(SUM(d.debit_lc - d.credit_lc), 0) AS net_balance
       FROM gl_entry_detail d
       JOIN gl_entry_header h ON h.id = d.header_id AND h.status = 'Posted'
       JOIN gl_posting_period p ON p.id = h.period_id AND p.fiscal_year_id = $1
       WHERE d.account_id = $2
+      GROUP BY 1, 2, 3, 4, 5, 6 ORDER BY 1 NULLS FIRST, 2, 3, 4, 5, 6
     `, [closing.fiscal_year_id, config.income_summary_account_id]);
 
     // netIncome = SUM(debit_lc - credit_lc) of income summary account
     //   < 0 = credit balance = PROFIT  (revenue > expense)
     //   > 0 = debit  balance = LOSS    (expense > revenue)
-    const netIncome = Number(balRes.rows[0].net_balance);
-    if (Math.abs(netIncome) < 0.001) throw new Error('Net income is zero — nothing to transfer');
-
+    const netIncome = balRes.rows.reduce((s, r) => s + Number(r.net_balance), 0);
     const details = [];
-    if (netIncome < 0) {
-      // Profit: income summary has credit balance → debit it to close, credit retained earnings
-      const profit = -netIncome;
-      details.push({ account_id: config.income_summary_account_id,    debit_lc: profit, credit_lc: 0 });
-      details.push({ account_id: config.retained_earnings_account_id, debit_lc: 0,      credit_lc: profit });
-    } else {
-      // Loss: income summary has debit balance → credit it to close, debit retained earnings
-      details.push({ account_id: config.income_summary_account_id,    debit_lc: 0,        credit_lc: netIncome });
-      details.push({ account_id: config.retained_earnings_account_id, debit_lc: netIncome, credit_lc: 0 });
+    for (const r of balRes.rows) {
+      const net = Number(r.net_balance);
+      const combo = comboOf(r);
+      if (Math.abs(net) < 0.001) continue;
+      if (net < 0) {
+        // Profit: income summary has credit balance → debit it to close, credit retained earnings
+        details.push({ account_id: config.income_summary_account_id,    ...combo, debit_lc: -net, credit_lc: 0 });
+        details.push({ account_id: config.retained_earnings_account_id, ...combo, debit_lc: 0,    credit_lc: -net });
+      } else {
+        // Loss: income summary has debit balance → credit it to close, debit retained earnings
+        details.push({ account_id: config.income_summary_account_id,    ...combo, debit_lc: 0,   credit_lc: net });
+        details.push({ account_id: config.retained_earnings_account_id, ...combo, debit_lc: net, credit_lc: 0 });
+      }
     }
+    if (details.length === 0) throw new Error('Net income is zero — nothing to transfer');
 
     let docNo = 'TRANSFER-AUTO';
     if (config.closing_doc_id) {
@@ -398,15 +429,17 @@ const previewStep5 = async (req, res) => {
         a.account_code,
         a.account_name_thai,
         a.account_type,
+        COALESCE(d.branch_id, h.branch_id) AS branch_id, br.branch_code,
         COALESCE(SUM(d.debit_lc - d.credit_lc), 0) AS net_balance
       FROM gl_account a
       JOIN gl_entry_detail d ON d.account_id = a.id
       JOIN gl_entry_header h ON h.id = d.header_id AND h.status = 'Posted'
       JOIN gl_posting_period p ON p.id = h.period_id AND p.fiscal_year_id = $1
+      LEFT JOIN cd_branch br ON br.id = COALESCE(d.branch_id, h.branch_id)
       WHERE a.account_type != ALL($2::text[])
-      GROUP BY a.id, a.account_code, a.account_name_thai, a.account_type
+      GROUP BY a.id, a.account_code, a.account_name_thai, a.account_type, COALESCE(d.branch_id, h.branch_id), br.branch_code
       HAVING ABS(SUM(d.debit_lc - d.credit_lc)) > 0.001
-      ORDER BY a.account_code
+      ORDER BY a.account_code, br.branch_code NULLS FIRST
     `, [closing.fiscal_year_id, allTypes]);
 
     res.status(200).json(balRes.rows);
@@ -445,14 +478,14 @@ const confirmStep5 = async (req, res) => {
     // Balance sheet account ending balances
     const balRes = await client.query(`
       SELECT
-        a.id AS account_id,
+        a.id AS account_id, COALESCE(d.branch_id, h.branch_id) AS branch_id, d.dim1_id, d.dim2_id, d.dim3_id, d.dim4_id, d.dim5_id,
         COALESCE(SUM(d.debit_lc - d.credit_lc), 0) AS net_balance
       FROM gl_account a
       JOIN gl_entry_detail d ON d.account_id = a.id
       JOIN gl_entry_header h ON h.id = d.header_id AND h.status = 'Posted'
       JOIN gl_posting_period p ON p.id = h.period_id AND p.fiscal_year_id = $1
       WHERE a.account_type != ALL($2::text[])
-      GROUP BY a.id
+      GROUP BY a.id, COALESCE(d.branch_id, h.branch_id), d.dim1_id, d.dim2_id, d.dim3_id, d.dim4_id, d.dim5_id
       HAVING ABS(SUM(d.debit_lc - d.credit_lc)) > 0.001
     `, [closing.fiscal_year_id, allTypes]);
 
@@ -462,9 +495,9 @@ const confirmStep5 = async (req, res) => {
     for (const row of balRes.rows) {
       const net = Number(row.net_balance);
       if (net > 0) {
-        details.push({ account_id: row.account_id, debit_lc: net, credit_lc: 0 });
+        details.push({ account_id: row.account_id, ...comboOf(row), debit_lc: net, credit_lc: 0 });
       } else if (net < 0) {
-        details.push({ account_id: row.account_id, debit_lc: 0, credit_lc: -net });
+        details.push({ account_id: row.account_id, ...comboOf(row), debit_lc: 0, credit_lc: -net });
       }
     }
 

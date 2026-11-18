@@ -23,7 +23,7 @@ const getGeneralLedgerTransactions = async (req, res) => {
         let sql = `
             SELECT
                 d.account_id, a.account_code, a.account_name_thai, a.account_name_eng, a.normal_balance,
-                d.branch_id, d.dim1_id, d.dim2_id, d.dim3_id, d.dim4_id, d.dim5_id,
+                COALESCE(d.branch_id, h.branch_id) AS branch_id, d.dim1_id, d.dim2_id, d.dim3_id, d.dim4_id, d.dim5_id,
                 h.doc_date, doc.doc_code, h.doc_no, d.line_no,
                 ref_doc.doc_code AS ref_doc_code, h.ref_doc_no, h.ref_doc_date,
                 d.description, d.debit_lc, d.credit_lc
@@ -47,13 +47,14 @@ const getGeneralLedgerTransactions = async (req, res) => {
             params.push(account_to);
             sql += ` AND a.account_code <= $${params.length}`;
         }
+        // สาขาของบรรทัด ถ้าว่างใช้ของหัวรายการ — ตรงกับยอดสะสม (sql/gl_balance_accum_trigger.sql)
         if (branch_id) {
             params.push(parseInt(branch_id));
-            sql += ` AND h.branch_id = $${params.length}`;
+            sql += ` AND COALESCE(d.branch_id, h.branch_id) = $${params.length}`;
         }
 
         // เรียงลำดับตาม รหัสบัญชี -> สาขา -> dim1 -> dim2 -> วันที่ -> เลขที่เอกสาร -> ลำดับ
-        sql += ` ORDER BY a.account_code ASC, d.branch_id ASC, d.dim1_id ASC, d.dim2_id ASC, h.doc_date ASC, h.doc_no ASC, d.line_no ASC`;
+        sql += ` ORDER BY a.account_code ASC, COALESCE(d.branch_id, h.branch_id) ASC, d.dim1_id ASC, d.dim2_id ASC, h.doc_date ASC, h.doc_no ASC, d.line_no ASC`;
 
         const result = await client.query(sql, params);
         res.json(result.rows);
@@ -81,8 +82,9 @@ const getReportBeginningBalance = async (req, res) => {
 
     let periodIds;
     if (!period_id) {
-      // ไม่ระบุงวด → สะสมทุกงวดในปี
-      periodIds = periodsRes.rows.map(p => p.id);
+      // ไม่ระบุงวด (ทุกงวดตั้งแต่ต้นปี) → ยอดยกมา = งวดแรก (งวดยกยอด) เท่านั้น
+      // งวดปกติแสดงเป็นรายการเคลื่อนไหวอยู่แล้ว (getGeneralLedgerTransactions ข้ามงวดแรก) — เดิมรวมทุกงวด = นับซ้ำ
+      periodIds = [periodsRes.rows[0].id];
     } else {
       const selected = periodsRes.rows.find(p => p.id == period_id);
       if (!selected) return res.json([]);

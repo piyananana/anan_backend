@@ -12,6 +12,7 @@ const { getBaseCurrency } = require('../../utils/baseCurrency');
 const { resolveApAccountId } = require('../../utils/apAccount');
 const { today, ymd } = require('../../utils/dateUtil');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
+const { assertRequiredBranch } = require('../../utils/glDims');
 
 // หา consumption ที่มาจาก layer ของเอกสารรับฝากขาย (sys_doc_type='13') และยังไม่ถูก settle
 const PENDING_SELECT = `
@@ -19,7 +20,7 @@ const PENDING_SELECT = `
         c.id AS consumption_id, c.qty, c.layer_id,
         l.unit_cost, l.lot_no, l.serial_no, l.source_doc_id AS receipt_header_id, l.source_doc_no AS receipt_doc_no,
         rt.id AS receipt_txn_id, rt.doc_code AS receipt_doc_code, rt.vendor_id,
-        rt.currency_code AS receipt_currency_code, rt.exchange_rate AS receipt_exchange_rate,
+        rt.currency_code AS receipt_currency_code, rt.exchange_rate AS receipt_exchange_rate, rt.branch_id AS receipt_branch_id,
         v.vendor_code, v.vendor_name_th, v.tax_id AS vendor_tax_id,
         st.id AS sale_txn_id, st.doc_no AS sale_doc_no, st.doc_date AS sale_doc_date,
         it.id AS item_id, it.item_code, it.item_name_th, it.item_name_en,
@@ -85,48 +86,65 @@ const openPeriodId = async (client, date) => (await client.query(
     `SELECT id FROM gl_posting_period WHERE $1::date BETWEEN period_start_date AND period_end_date
        AND gl_status = 'OPEN' AND ap_status = 'OPEN' LIMIT 1`, [date])).rows[0]?.id || null;
 
-// ลงรายการบัญชีของใบตั้งหนี้ฝากขายจากบรรทัดใน ap_transaction_detail (Dr เจ้าหนี้ฝากขาย / Cr เจ้าหนี้การค้า)
+// ลงรายการบัญชีของใบตั้งหนี้ฝากขาย (Dr เจ้าหนี้ฝากขาย / Cr เจ้าหนี้การค้า)
 // ใช้ตอนตั้งหนี้ครั้งแรก และตอนโพสต์ใหม่หลังถอยเป็นร่าง (เลขที่รายการบัญชีเดิมเก็บไว้ที่ gl_doc_no)
+// สาขา (วิธี 1, user-approved 2026-11-18): Dr เจ้าหนี้ฝากขายลงสาขาของใบรับฝากขายต้นทาง (ที่ Cr ไว้ตอนรับ)
+// Cr เจ้าหนี้การค้าแยกยอดตามสาขาเดียวกันให้แต่ละสาขาสมดุล — คำนวณจากรายการขายที่ผูกกับใบนี้ (ต้อง mark ก่อนเรียก)
+// ใบเก่าที่ไม่มีรายการผูก ใช้บรรทัดใน ap_transaction_detail กับสาขาของใบตั้งหนี้
+const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 const postSettlementGl = async (client, apTransactionId, userId) => {
     const tx = (await client.query(`SELECT * FROM ap_transaction WHERE id = $1`, [apTransactionId])).rows[0];
-    const lines = (await client.query(
-        `SELECT expense_account_id, total_amount_lc FROM ap_transaction_detail WHERE header_id = $1 ORDER BY line_no`,
-        [apTransactionId])).rows;
-    const debitByAccount = {};
-    for (const l of lines) {
-        debitByAccount[l.expense_account_id] = (debitByAccount[l.expense_account_id] || 0) + Number(l.total_amount_lc);
+    let parts = (await client.query(`
+        SELECT gs.consignment_payable_account_id AS account_id, rt.branch_id, SUM(c.qty * l.unit_cost) AS amt
+          FROM im_stock_layer_consumption c
+          JOIN im_stock_layer l ON l.id = c.layer_id
+          JOIN im_transaction rt ON rt.id = l.source_doc_id
+          LEFT JOIN im_gl_account_setup gs ON gs.doc_code = rt.doc_code
+         WHERE c.settlement_ap_transaction_id = $1
+         GROUP BY 1, 2 ORDER BY 2 NULLS FIRST, 1`, [apTransactionId])).rows;
+    if (!parts.length || parts.some(p => !p.account_id)) {
+        parts = (await client.query(`
+            SELECT expense_account_id AS account_id, $2::int AS branch_id, SUM(total_amount_lc) AS amt
+              FROM ap_transaction_detail WHERE header_id = $1 GROUP BY 1 ORDER BY 1`, [apTransactionId, tx.branch_id || null])).rows;
     }
     const glDetails = [];
-    for (const [accId, amt] of Object.entries(debitByAccount)) {
+    const creditByBranch = new Map();
+    for (const p of parts) {
+        const amt = r2(p.amt);
         if (amt === 0) continue;
-        glDetails.push({ account_id: Number(accId), description: `Settle เจ้าหนี้ฝากขาย ${tx.doc_no}`, debit_lc: amt, credit_lc: 0 });
+        const br = p.branch_id ?? null;
+        glDetails.push({ account_id: Number(p.account_id), branch_id: br, description: `Settle เจ้าหนี้ฝากขาย ${tx.doc_no}`, debit_lc: amt, credit_lc: 0 });
+        creditByBranch.set(br, r2((creditByBranch.get(br) || 0) + amt));
     }
-    const total = glDetails.reduce((s, l) => s + l.debit_lc, 0);
-    if (total !== 0) {
-        glDetails.push({ account_id: Number(tx.ap_account_id), description: `ตั้งหนี้ผู้ฝากขาย ${tx.doc_no}`, debit_lc: 0, credit_lc: total });
+    for (const [br, amt] of creditByBranch) {
+        if (amt !== 0) glDetails.push({ account_id: Number(tx.ap_account_id), branch_id: br, description: `ตั้งหนี้ผู้ฝากขาย ${tx.doc_no}`, debit_lc: 0, credit_lc: amt });
     }
     if (glDetails.length === 0) return null;
+    await assertRequiredBranch(client, glDetails, null);
+    const total = r2(glDetails.reduce((s, l) => s + l.debit_lc, 0));
+    const headerBranch = creditByBranch.size === 1 ? [...creditByBranch.keys()][0] : null;
 
     const glDocNo = tx.gl_doc_no || `GL-${tx.doc_no}`;
     const glRes = await client.query(`
         INSERT INTO gl_entry_header
         (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
          currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-         created_by, ref_doc_id, ref_doc_no, external_source_id, ref_doc_date)
-        VALUES ($1,$2,$3,$3,$4,$5,$6,$12,1,'Posted',$7,$7,0,0,$8,$9,$10,$11,$3)
+         created_by, ref_doc_id, ref_doc_no, external_source_id, ref_doc_date, branch_id)
+        VALUES ($1,$2,$3,$3,$4,$5,$6,$12,1,'Posted',$7,$7,0,0,$8,$9,$10,$11,$3,$13)
         RETURNING id
     `, [
         tx.gl_doc_id, glDocNo, tx.doc_date, tx.period_id, tx.ref_no, tx.description,
         total, userId, tx.doc_id, tx.doc_no, apTransactionId,
         (await getBaseCurrency(client)).id, // ยอดเป็นบาทล้วน (fc 0) — สกุลเงินหลัก ไม่ใช่ id 1 ตายตัว
+        headerBranch,
     ]);
     const glEntryId = glRes.rows[0].id;
     let glLineNo = 1;
     for (const l of glDetails) {
         await client.query(`
-            INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc)
-            VALUES ($1,$2,$3,$4,$5,$6,0,0)
-        `, [glEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc]);
+            INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc, branch_id)
+            VALUES ($1,$2,$3,$4,$5,$6,0,0,$7)
+        `, [glEntryId, glLineNo++, l.account_id, l.description, l.debit_lc, l.credit_lc, l.branch_id ?? null]);
     }
     await client.query(`UPDATE ap_transaction SET gl_entry_id = $1, gl_doc_no = $2 WHERE id = $3`, [glEntryId, glDocNo, apTransactionId]);
     return glEntryId;
@@ -207,6 +225,8 @@ const postSettlement = async (req, res) => {
             };
         });
         const totalAmountLc = lineRows.reduce((s, l) => s + l.amountLc, 0);
+        const receiptBranches = new Set(rows.map(r => r.receipt_branch_id ?? null));
+        const docBranchId = receiptBranches.size === 1 ? [...receiptBranches][0] : null;
         const totalAmountFc = lineRows.reduce((s, l) => s + l.amountFc, 0);
 
         const apHeaderRes = await client.query(`
@@ -214,13 +234,14 @@ const postSettlement = async (req, res) => {
             (doc_id, doc_no, doc_date, period_id, vendor_id, vendor_code, vendor_name_th, ap_account_id, gl_doc_id,
              currency_code, exchange_rate, subtotal_fc, before_vat_fc, vat_amount_fc, total_amount_fc,
              subtotal_lc, before_vat_lc, vat_amount_lc, total_amount_lc,
-             balance_amount_lc, ref_no, description, status, created_by, updated_by)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12,0,$12,$13,$13,0,$13,$13,$14,$15,'Posted',$16,$16)
+             balance_amount_lc, ref_no, description, status, created_by, updated_by, branch_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12,0,$12,$13,$13,0,$13,$13,$14,$15,'Posted',$16,$16,$17)
             RETURNING id
         `, [
             apDocId, apDocNo, settleDate, periodId, vendor_id, vendorRow.vendor_code, vendorRow.vendor_name_th, apAccountId, apSetup.gl_doc_id,
             docCurrencyCode, docExchangeRate, totalAmountFc,
             totalAmountLc, ref_no || null, `${SETTLEMENT_DESCRIPTION_PREFIX} (Consignment Settlement) ${apDocNo}`, createdByUserId,
+            docBranchId,
         ]);
         const apTransactionId = apHeaderRes.rows[0].id;
 
@@ -234,12 +255,11 @@ const postSettlement = async (req, res) => {
             `, [apTransactionId, lineNo++, l.itemName || l.itemCode, l.quantity, l.unitPriceFc, l.amountFc, l.consignmentPayableAccountId, l.amountLc]);
         }
 
-        await postSettlementGl(client, apTransactionId, createdByUserId);
-
         await client.query(
             `UPDATE im_stock_layer_consumption SET settlement_ap_transaction_id = $1 WHERE id = ANY($2::int[])`,
             [apTransactionId, consumption_ids]
         );
+        await postSettlementGl(client, apTransactionId, createdByUserId);
 
         await client.query('COMMIT');
         res.status(201).json({ ap_transaction_id: apTransactionId, ap_doc_no: apDocNo, total_amount: totalAmountLc, line_count: lineRows.length });

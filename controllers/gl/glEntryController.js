@@ -1,5 +1,6 @@
 // File: controllers/gl/glEntriesController.js
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
+const { assertRequiredBranch } = require('../../utils/glDims');
 
 // --- Helper: Validate required dimensions per detail line before Post ---
 const validateDimRules = async (client, details) => {
@@ -177,8 +178,8 @@ const createTransaction = async (req, res) => {
             INSERT INTO gl_entry_detail
             (header_id, line_no, account_id, description,
              debit_lc, credit_lc, debit_fc, credit_fc,
-             dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+             dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
         `;
         let lineNo = 1;
         for (const row of details) {
@@ -187,12 +188,14 @@ const createTransaction = async (req, res) => {
                 row.debit_lc, row.credit_lc, row.debit_fc, row.credit_fc,
                 row.dim1_id || null, row.dim2_id || null,
                 row.dim3_id || null, row.dim4_id || null, row.dim5_id || null,
+                row.branch_id || null, // สาขาของบรรทัด (รายการจากงานประมวลผลที่แยกสาขา) — ปกติว่าง ใช้สาขาที่หัวรายการ
             ]);
         }
 
         // D. Validate dim rules if Post (gl_balance_accum is maintained by DB triggers)
         if (action === 'Post') {
             await validateDimRules(client, details);
+            await assertRequiredBranch(client, details, header.branch_id);
         }
 
         await client.query('COMMIT');
@@ -269,8 +272,8 @@ const updateTransaction = async (req, res) => {
             INSERT INTO gl_entry_detail
             (header_id, line_no, account_id, description,
              debit_lc, credit_lc, debit_fc, credit_fc,
-             dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+             dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
         `;
         let lineNo = 1;
         for (const row of details) {
@@ -279,12 +282,14 @@ const updateTransaction = async (req, res) => {
                 row.debit_lc, row.credit_lc, row.debit_fc, row.credit_fc,
                 row.dim1_id || null, row.dim2_id || null,
                 row.dim3_id || null, row.dim4_id || null, row.dim5_id || null,
+                row.branch_id || null, // สาขาของบรรทัด (รายการจากงานประมวลผลที่แยกสาขา) — ปกติว่าง ใช้สาขาที่หัวรายการ
             ]);
         }
 
         // Validate dim rules if Post (gl_balance_accum is maintained by DB triggers)
         if (action === 'Post') {
             await validateDimRules(client, details);
+            await assertRequiredBranch(client, details, header.branch_id);
         }
 
         await client.query('COMMIT');
@@ -505,9 +510,12 @@ const getTransactionById = async (req, res) => {
                    v2.value_code AS dim2_code, v2.value_name_thai AS dim2_name,
                    v3.value_code AS dim3_code, v3.value_name_thai AS dim3_name,
                    v4.value_code AS dim4_code, v4.value_name_thai AS dim4_name,
-                   v5.value_code AS dim5_code, v5.value_name_thai AS dim5_name
+                   v5.value_code AS dim5_code, v5.value_name_thai AS dim5_name,
+                   lb.branch_code AS line_branch_code, lb.branch_name_thai AS line_branch_name_thai,
+                   lb.branch_name_eng AS line_branch_name_eng
             FROM gl_entry_detail d
             LEFT JOIN gl_account a ON a.id = d.account_id
+            LEFT JOIN cd_branch lb ON lb.id = d.branch_id
             LEFT JOIN gl_dimension_value v1 ON v1.id = d.dim1_id
             LEFT JOIN gl_dimension_value v2 ON v2.id = d.dim2_id
             LEFT JOIN gl_dimension_value v3 ON v3.id = d.dim3_id

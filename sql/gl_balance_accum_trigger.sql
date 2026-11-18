@@ -8,7 +8,11 @@
 --   - เปลี่ยนสถานะเป็น/จาก Posted (ผ่านรายการ, Void, ถอยเป็น Draft) → บวก/ลบทั้งรายการ
 --   - แก้งวด/สาขา/สกุลเงินของรายการที่ Posted           → ย้ายยอดจากค่าเดิมไปค่าใหม่
 --   - ลบหัวรายการที่ Posted                              → ลบยอดทุกบรรทัด
--- คีย์ยอดสะสมเหมือนเดิม: งวด + บัญชี + ชุดมิติ (สาขาจากหัวรายการ + dim1-5 จากบรรทัด) + สกุลเงิน (ค่าว่าง = 1)
+-- คีย์ยอดสะสมเหมือนเดิม: งวด + บัญชี + ชุดมิติ (สาขา + dim1-5 จากบรรทัด) + สกุลเงิน (ค่าว่าง = 1)
+-- สาขา = สาขาของบรรทัด (gl_entry_detail.branch_id) ถ้าว่างใช้สาขาของหัวรายการ (2026-11-18 วิธี 1)
+--   เอกสารปกติ: บรรทัดว่าง → ใช้หัวรายการ; งานประมวลผลรวมหลายสาขา (ค่าเผื่อหนี้สูญ, ตีราคา FX, จ่ายชำระหลายใบ,
+--   ปิดงวด, ปิดบัญชีสิ้นปี ฯลฯ) ใส่สาขาของเอกสารต้นทางที่บรรทัด
+--   รายงานที่อ่านรายการบัญชีโดยตรงต้องใช้ COALESCE(d.branch_id, h.branch_id) เช่นเดียวกัน
 -- end_balance = ยอดเคลื่อนไหวสุทธิของงวด (เดบิต - เครดิต) ไม่ใช่ยอดยกไป
 --
 -- gl_rebuild_balance_accum() ล้างแล้วคำนวณยอดสะสมใหม่ทั้งหมดจากรายการที่ Posted — ไฟล์นี้เรียกให้ท้ายไฟล์
@@ -59,7 +63,7 @@ DECLARE
     d RECORD;
 BEGIN
     FOR d IN SELECT * FROM gl_entry_detail WHERE header_id = p_header_id LOOP
-        PERFORM gl_accum_apply(p_period_id, d.account_id, p_currency_id, p_branch_id,
+        PERFORM gl_accum_apply(p_period_id, d.account_id, p_currency_id, COALESCE(d.branch_id, p_branch_id),
             d.dim1_id, d.dim2_id, d.dim3_id, d.dim4_id, d.dim5_id, d.debit_lc, d.credit_lc, p_sign);
     END LOOP;
 END;
@@ -73,14 +77,14 @@ BEGIN
     IF TG_OP IN ('UPDATE', 'DELETE') THEN
         SELECT period_id, currency_id, branch_id, status INTO h FROM gl_entry_header WHERE id = OLD.header_id;
         IF FOUND AND h.status = 'Posted' THEN
-            PERFORM gl_accum_apply(h.period_id, OLD.account_id, h.currency_id, h.branch_id,
+            PERFORM gl_accum_apply(h.period_id, OLD.account_id, h.currency_id, COALESCE(OLD.branch_id, h.branch_id),
                 OLD.dim1_id, OLD.dim2_id, OLD.dim3_id, OLD.dim4_id, OLD.dim5_id, OLD.debit_lc, OLD.credit_lc, -1);
         END IF;
     END IF;
     IF TG_OP IN ('INSERT', 'UPDATE') THEN
         SELECT period_id, currency_id, branch_id, status INTO h FROM gl_entry_header WHERE id = NEW.header_id;
         IF FOUND AND h.status = 'Posted' THEN
-            PERFORM gl_accum_apply(h.period_id, NEW.account_id, h.currency_id, h.branch_id,
+            PERFORM gl_accum_apply(h.period_id, NEW.account_id, h.currency_id, COALESCE(NEW.branch_id, h.branch_id),
                 NEW.dim1_id, NEW.dim2_id, NEW.dim3_id, NEW.dim4_id, NEW.dim5_id, NEW.debit_lc, NEW.credit_lc, 1);
         END IF;
     END IF;
@@ -139,7 +143,7 @@ BEGIN
     DELETE FROM gl_balance_accum;
 
     INSERT INTO gl_dim_combination (branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
-    SELECT DISTINCT COALESCE(h.branch_id, 0), COALESCE(d.dim1_id, 0), COALESCE(d.dim2_id, 0),
+    SELECT DISTINCT COALESCE(d.branch_id, h.branch_id, 0), COALESCE(d.dim1_id, 0), COALESCE(d.dim2_id, 0),
            COALESCE(d.dim3_id, 0), COALESCE(d.dim4_id, 0), COALESCE(d.dim5_id, 0)
       FROM gl_entry_detail d JOIN gl_entry_header h ON h.id = d.header_id
      WHERE h.status = 'Posted'
@@ -153,7 +157,7 @@ BEGIN
       FROM gl_entry_detail d
       JOIN gl_entry_header h ON h.id = d.header_id
       JOIN gl_dim_combination c
-        ON c.branch_id = COALESCE(h.branch_id, 0) AND c.dim1_id = COALESCE(d.dim1_id, 0)
+        ON c.branch_id = COALESCE(d.branch_id, h.branch_id, 0) AND c.dim1_id = COALESCE(d.dim1_id, 0)
        AND c.dim2_id = COALESCE(d.dim2_id, 0) AND c.dim3_id = COALESCE(d.dim3_id, 0)
        AND c.dim4_id = COALESCE(d.dim4_id, 0) AND c.dim5_id = COALESCE(d.dim5_id, 0)
      WHERE h.status = 'Posted' AND h.period_id IS NOT NULL AND d.account_id IS NOT NULL

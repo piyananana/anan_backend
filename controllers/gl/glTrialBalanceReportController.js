@@ -76,12 +76,34 @@ const getTrialBalance = async (req, res) => {
       const masterJoins = isShowDim
         ? `LEFT JOIN cd_branch br ON t.branch_id = br.id
            LEFT JOIN gl_dimension_value v1 ON v1.id = t.dim1_id
-           LEFT JOIN gl_dimension_value v2 ON v2.id = t.dim2_id`
+           LEFT JOIN gl_dimension_value v2 ON v2.id = t.dim2_id
+           LEFT JOIN gl_dimension_value v3 ON v3.id = t.dim3_id
+           LEFT JOIN gl_dimension_value v4 ON v4.id = t.dim4_id
+           LEFT JOIN gl_dimension_value v5 ON v5.id = t.dim5_id`
         : '';
 
       const masterSelects = isShowDim
-        ? ', br.branch_code, v1.value_code AS dim1_code, v1.value_name_thai AS dim1_name, v2.value_code AS dim2_code, v2.value_name_thai AS dim2_name'
+        ? `, br.branch_code${[1, 2, 3, 4, 5].map(i => `, v${i}.value_code AS dim${i}_code, v${i}.value_name_thai AS dim${i}_name`).join('')}`
         : '';
+
+      // แยกแถวสาขา/มิติเฉพาะบัญชีที่ผังบัญชีบังคับ (user-approved 2026-11-17):
+      //   บังคับมิติ (gl_account_dim_rule.is_required, ประเภทมิติที่เปิดใช้) → แยกตามมิติที่บังคับเท่านั้น
+      //   บังคับสาขา (gl_account.branch_required) → แยกตามสาขา
+      //   บัญชีอื่น → ยอดรวมบรรทัดเดียว (ไม่มี dimension_rows)
+      const splitRules = {};
+      if (isShowDim) {
+        const rr = await client.query(`
+          SELECT a.id, a.branch_required,
+                 COALESCE(array_agg(t.slot_no) FILTER (WHERE t.slot_no IS NOT NULL), '{}') AS slots
+            FROM gl_account a
+            LEFT JOIN gl_account_dim_rule r ON r.account_id = a.id AND r.is_required = true
+            LEFT JOIN gl_dimension_type t ON t.type_code = r.type_code AND t.is_active = true
+           GROUP BY a.id, a.branch_required`);
+        for (const r of rr.rows) {
+          const slots = (r.slots || []).map(Number);
+          if (r.branch_required || slots.length) splitRules[r.id] = { branch: !!r.branch_required, slots: new Set(slots) };
+        }
+      }
 
       const sql = `
         WITH
@@ -173,17 +195,24 @@ const getTrialBalance = async (req, res) => {
           const mDr = Number(row.mvmt_dr);
           const mCr = Number(row.mvmt_cr);
 
-          // เก็บข้อมูล Dimension แยกไว้ใน Array ของ Account นั้นๆ
-          if (isShowDim) {
-             acc.dimension_rows.push({
-               branch_code: row.branch_code,
-               dim1_code: row.dim1_code,
-               dim1_name: row.dim1_name,
-               dim2_code: row.dim2_code,
-               dim2_name: row.dim2_name,
-               beg_dr: bDr, beg_cr: bCr,
-               mvmt_dr: mDr, mvmt_cr: mCr
-             });
+          // แถวสาขา/มิติ: เฉพาะบัญชีที่บังคับ — รวมตามสาขา (ถ้าบังคับ) + มิติที่บังคับ
+          const rule = isShowDim ? splitRules[row.account_id] : null;
+          if (rule) {
+            const key = [rule.branch ? (row.branch_id ?? 0) : '-',
+              ...[1, 2, 3, 4, 5].map(i => rule.slots.has(i) ? (row[`dim${i}_id`] ?? 0) : '-')].join('_');
+            acc.dimMap = acc.dimMap || {};
+            let d = acc.dimMap[key];
+            if (!d) {
+              d = acc.dimMap[key] = { branch_code: rule.branch ? (row.branch_code || null) : null,
+                beg_dr: 0, beg_cr: 0, mvmt_dr: 0, mvmt_cr: 0 };
+              for (const i of [1, 2, 3, 4, 5]) {
+                d[`dim${i}_code`] = rule.slots.has(i) ? (row[`dim${i}_code`] || null) : null;
+                d[`dim${i}_name`] = rule.slots.has(i) ? (row[`dim${i}_name`] || null) : null;
+              }
+              d.missing = (rule.branch && !row.branch_id) || [...rule.slots].some(i => !row[`dim${i}_id`]);
+              acc.dimension_rows.push(d);
+            }
+            d.beg_dr += bDr; d.beg_cr += bCr; d.mvmt_dr += mDr; d.mvmt_cr += mCr;
           }
 
           // รวมยอดเข้าตัว Account หลัก

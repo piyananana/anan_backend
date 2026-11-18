@@ -4,7 +4,7 @@ const { branchCodeSql } = require('../../utils/taxBranch');
 const { today: todayYmd } = require('../../utils/dateUtil');
 const { resolveApAccountId, postedApAccountId, postedApAccountSql } = require('../../utils/apAccount');
 const { ensureDepositRefColumns, saveDepositRef } = require('../../utils/depositRef');
-const { headerDims, lineDims, ensureDetailDimColumns, detailDimParams, assertRequiredDims } = require('../../utils/glDims');
+const { headerDims, lineDims, ensureDetailDimColumns, detailDimParams, assertRequiredDims, assertRequiredBranch } = require('../../utils/glDims');
 const { ensureCheckbookColumns, assignCheckNumbers } = require('../../utils/cmCheckbook');
 const { syncPartyBankItems, voidBankItems, deleteBankItems, bankItemsClearedSql, ensureBankItemColumns } = require('../../utils/cmBankItems');
 // controllers/ap/apTransactionController.js
@@ -438,6 +438,9 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
     }
 
     const totalAmount = Number(header.total_amount_lc) || 0;
+    // สาขาของเอกสาร (บันทึกแล้วก่อน Post) → หัวรายการบัญชี = ยอดสะสม/รายงาน GL ตามสาขา (user-approved 2026-11-18)
+    const branchId = (await client.query(`SELECT branch_id FROM ap_transaction WHERE id = $1`, [headerId])).rows[0]?.branch_id
+        ?? (Number(header.branch_id) || null);
 
     // Insert GL entry header (placeholder totals)
     const glHeaderRes = await client.query(`
@@ -445,8 +448,8 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
         (doc_id, doc_no, doc_date, posting_date, period_id, ref_no, description,
          currency_id, exchange_rate, status,
          total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-         created_by, ref_doc_id, ref_doc_no, external_source_id, ref_doc_date)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'Posted',$10,$11,$12,$13,$14,$15,$16,$17,$3)
+         created_by, ref_doc_id, ref_doc_no, external_source_id, ref_doc_date, branch_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'Posted',$10,$11,$12,$13,$14,$15,$16,$17,$3,$18)
         RETURNING id
     `, [
         glDocId, glDocNo, header.doc_date, header.doc_date, periodId,
@@ -454,7 +457,7 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
         header.currency_id || 1, header.exchange_rate || 1,
         totalAmount, totalAmount,
         Number(header.total_amount_fc) || 0, Number(header.total_amount_fc) || 0,
-        createdByUserId, header.doc_id, docNo, headerId
+        createdByUserId, header.doc_id, docNo, headerId, branchId,
     ]);
     const glEntryId = glHeaderRes.rows[0].id;
 
@@ -928,6 +931,7 @@ const postGlEntry = async (client, headerId, header, details, docNo, reservedGlD
 
     // ตรวจมิติที่บัญชีบังคับ (gl_account_dim_rule) ต่อบรรทัดรายการบัญชี ก่อน insert
     await assertRequiredDims(client, glDetails, hDims);
+    await assertRequiredBranch(client, glDetails, branchId);
 
     const detailSql = `
         INSERT INTO gl_entry_detail

@@ -50,4 +50,16 @@ const assertRequiredDims = async (client, rows, hDims) => {
     if (errors.size) throw new Error(`Dimension ไม่ครบ:\n${[...errors].join('\n')}`);
 };
 
-module.exports = { SLOTS, headerDims, lineDims, ensureDetailDimColumns, detailDimParams, assertRequiredDims };
+// ตรวจสาขาที่บัญชีบังคับ (gl_account.branch_required, user-approved 2026-11-18)
+// สาขาของบรรทัด = row.branch_id ถ้าว่างใช้ branchId ของหัวรายการ (วิธี 1: งานประมวลผลใส่สาขาที่บรรทัด)
+// บังคับเฉพาะเมื่อบัญชีที่ลงรายการเปิด "ต้องระบุสาขา" — rows = บรรทัดรายการบัญชี { account_id }
+const assertRequiredBranch = async (client, rows, branchId) => {
+    if (Number(branchId)) return;
+    const ids = [...new Set(rows.filter(r => !Number(r.branch_id)).map(r => Number(r.account_id)).filter(Boolean))];
+    if (!ids.length) return;
+    const codes = (await client.query(
+        `SELECT account_code FROM gl_account WHERE branch_required = true AND id = ANY($1::int[]) ORDER BY account_code`, [ids])).rows;
+    if (codes.length) throw new Error(`ต้องระบุสาขา: บัญชี ${codes.map(r => r.account_code).join(', ')} บังคับระบุสาขา`);
+};
+
+module.exports = { SLOTS, headerDims, lineDims, ensureDetailDimColumns, detailDimParams, assertRequiredDims, assertRequiredBranch };

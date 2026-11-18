@@ -53,7 +53,7 @@ const getDailyTransactions = async (req, res) => {
         det.description AS detail_desc,
         det.debit_lc,
         det.credit_lc,
-        det.branch_id,
+        COALESCE(det.branch_id, h.branch_id) AS branch_id,
         det.dim1_id,
         det.dim2_id,
         det.dim3_id,
@@ -89,7 +89,8 @@ const getDailyTransactions = async (req, res) => {
     if (ref_doc_no_to)     { params.push(ref_doc_no_to);     sql += ` AND h.ref_doc_no <= $${params.length}`; }
     if (ref_doc_date_from) { params.push(ref_doc_date_from); sql += ` AND h.ref_doc_date >= $${params.length}`; }
     if (ref_doc_date_to)   { params.push(ref_doc_date_to);   sql += ` AND h.ref_doc_date <= $${params.length}`; }
-    if (branch_id)         { params.push(parseInt(branch_id)); sql += ` AND h.branch_id = $${params.length}`; }
+    // สาขาของบรรทัด ถ้าว่างใช้ของหัวรายการ (รายการที่แยกหลายสาขาแสดงเฉพาะบรรทัดของสาขาที่เลือก)
+    if (branch_id)         { params.push(parseInt(branch_id)); sql += ` AND COALESCE(det.branch_id, h.branch_id) = $${params.length}`; }
 
     // Order: by header (date, doc_code, doc_no), then detail (debit rows first, then by account_code)
     sql += `

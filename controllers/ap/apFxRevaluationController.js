@@ -4,6 +4,7 @@ const { BASE_CURRENCY_CODE_SQL } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { generateDocNo } = require('./apTransactionController');
 const { describeJournalLines, fetchPostedJournalLines } = require('../../utils/glJournalPreview');
+const { assertRequiredBranch } = require('../../utils/glDims');
 const { postedApAccountId } = require('../../utils/apAccount');
 // FX Revaluation สำหรับเจ้าหนี้สกุลเงินต่างประเทศ ณ วันปิดปี
 //
@@ -144,28 +145,41 @@ const buildRevalJournalLines = async (client, setup, details, isUnrealized) => {
     if (!gainAccountId || !lossAccountId)
         throw new Error('ยังไม่ได้ตั้งค่าบัญชี FX สำหรับปิดสิ้นปี AP');
 
+    // แยกตามสาขาของใบตั้งหนี้ (วิธี 1, user-approved 2026-11-18): แต่ละสาขามีบรรทัดบัญชีคุมยอด + กำไร/ขาดทุนของตัวเอง
+    const invIds = [...new Set(details.map(d => Number(d.invoice_id)).filter(Boolean))];
+    const branchOf = new Map(invIds.length
+        ? (await client.query(`SELECT id, branch_id FROM ap_transaction WHERE id = ANY($1::int[])`, [invIds])).rows
+            .map(r => [Number(r.id), r.branch_id ?? null])
+        : []);
     let totalGain = 0, totalLoss = 0;
-    const apAdjMap = {}; // apAccountId → net fxGainLoss
+    const byBranch = new Map(); // branch → { ap: Map(apAccountId → net fxGainLoss), gain, loss }
 
     for (const d of details) {
         const apAccId = await getApControlAccount(client, d.invoice_id);
         if (!apAccId) continue;
+        const br = branchOf.get(Number(d.invoice_id)) ?? null;
+        if (!byBranch.has(br)) byBranch.set(br, { ap: new Map(), gain: 0, loss: 0 });
+        const g = byBranch.get(br);
         const fxGl = Number(d.fx_gain_loss); // อ่านจาก DB เป็นข้อความ (NUMERIC) — ต้องแปลงก่อนบวก
-        apAdjMap[apAccId] = (apAdjMap[apAccId] || 0) + fxGl;
+        g.ap.set(Number(apAccId), (g.ap.get(Number(apAccId)) || 0) + fxGl);
         // positive → AP grew → FX Loss; negative → AP shrank → FX Gain
-        if (fxGl > 0) totalLoss += fxGl;
-        else totalGain += Math.abs(fxGl);
+        if (fxGl > 0) { totalLoss += fxGl; g.loss += fxGl; }
+        else { totalGain += Math.abs(fxGl); g.gain += Math.abs(fxGl); }
     }
 
     // AP Control: netAdj > 0 → AP grew → CR AP; netAdj < 0 → AP shrank → DR AP
-    const lines = [];
-    for (const [apAccId, netAdj] of Object.entries(apAdjMap)) {
-        if (Math.abs(netAdj) < 0.005) continue;
-        lines.push({ account_id: parseInt(apAccId), debit: netAdj < 0 ? -netAdj : 0, credit: netAdj > 0 ? netAdj : 0 });
-    }
     // FX Gain (AP shrank → CR) / FX Loss (AP grew → DR)
-    if (totalGain > 0.005) lines.push({ account_id: gainAccountId, debit: 0, credit: totalGain });
-    if (totalLoss > 0.005) lines.push({ account_id: lossAccountId, debit: totalLoss, credit: 0 });
+    const r2 = (n) => Math.round(n * 100) / 100;
+    const lines = [];
+    for (const br of [...byBranch.keys()].sort((a, b) => (a ?? 0) - (b ?? 0))) {
+        const g = byBranch.get(br);
+        for (const [apAccId, netAdj] of g.ap) {
+            if (Math.abs(netAdj) < 0.005) continue;
+            lines.push({ account_id: apAccId, branch_id: br, debit: netAdj < 0 ? r2(-netAdj) : 0, credit: netAdj > 0 ? r2(netAdj) : 0 });
+        }
+        if (g.gain > 0.005) lines.push({ account_id: gainAccountId, branch_id: br, debit: 0, credit: r2(g.gain) });
+        if (g.loss > 0.005) lines.push({ account_id: lossAccountId, branch_id: br, debit: r2(g.loss), credit: 0 });
+    }
     return { lines, totalGain, totalLoss };
 };
 
@@ -183,7 +197,8 @@ const revalJournal = async (db, { glEntryId, details, isUnrealized }) => {
 };
 
 const postRevalGlEntry = async (client, setup, details, revalDate, isUnrealized, docNo, createdBy) => {
-    const { lines, totalGain, totalLoss } = await buildRevalJournalLines(client, setup, details, isUnrealized);
+    const { lines } = await buildRevalJournalLines(client, setup, details, isUnrealized);
+    await assertRequiredBranch(client, lines, null);
 
     const periodRes = await client.query(
         `SELECT id FROM gl_posting_period
@@ -194,25 +209,28 @@ const postRevalGlEntry = async (client, setup, details, revalDate, isUnrealized,
         throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน สำหรับวันที่ ${revalDate}`);
     const periodId = periodRes.rows[0].id;
 
-    const totalDebitLc  = Math.round((totalGain + totalLoss) * 100) / 100;
-    const totalCreditLc = totalDebitLc;
+    const totalDebitLc  = Math.round(lines.reduce((t, l) => t + l.debit, 0) * 100) / 100;
+    const totalCreditLc = Math.round(lines.reduce((t, l) => t + l.credit, 0) * 100) / 100;
+    // ทุกบรรทัดสาขาเดียวกัน → หัวรายการใช้สาขานั้นด้วย
+    const branchSet = new Set(lines.map(l => l.branch_id ?? null));
+    const headerBranch = branchSet.size === 1 ? [...branchSet][0] : null;
 
     const hdrRes = await client.query(`
         INSERT INTO gl_entry_header
         (doc_id, doc_no, doc_date, posting_date, period_id, description,
          currency_id, exchange_rate, status,
          total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-         created_by)
+         created_by, branch_id)
         SELECT $1, $2, $3::date, $3::date, $4,
                $5,
                (SELECT id FROM cd_currency WHERE base_currency_flag=true LIMIT 1),
                1, 'Posted',
                $6, $7, $6, $7,
-               $8
+               $8, $9
         RETURNING id
     `, [setup.fx_reval_gl_doc_id, docNo, revalDate, periodId,
         isUnrealized ? 'ปรับมูลค่าเจ้าหนี้ต่างประเทศ (Unrealized)' : 'ปรับมูลค่าเจ้าหนี้ต่างประเทศ',
-        totalDebitLc, totalCreditLc, createdBy]);
+        totalDebitLc, totalCreditLc, createdBy, headerBranch]);
     const glEntryId = hdrRes.rows[0].id;
 
     // AP Control (ต่อบัญชี) แล้ว FX Gain / FX Loss
@@ -220,9 +238,9 @@ const postRevalGlEntry = async (client, setup, details, revalDate, isUnrealized,
     for (const l of lines) {
         await client.query(`
             INSERT INTO gl_entry_detail
-            (header_id, line_no, account_id, debit_lc, credit_lc, debit_fc, credit_fc)
-            VALUES ($1,$2,$3,$4,$5,$4,$5)
-        `, [glEntryId, lineNo++, l.account_id, l.debit, l.credit]);
+            (header_id, line_no, account_id, debit_lc, credit_lc, debit_fc, credit_fc, branch_id)
+            VALUES ($1,$2,$3,$4,$5,$4,$5,$6)
+        `, [glEntryId, lineNo++, l.account_id, l.debit, l.credit, l.branch_id ?? null]);
     }
 
     return glEntryId;
@@ -574,17 +592,17 @@ const insertReversingEntry = async (client, glEntryId, { docNo, date, periodId, 
         (doc_id, doc_no, doc_date, posting_date, period_id, description,
          currency_id, exchange_rate, status,
          total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-         created_by, ref_doc_id, ref_doc_no, ref_doc_date)
-        VALUES ($1,$2,$3::date,$3::date,$4,$5,$6,1,'Posted',$7,$8,$7,$8,$9,$10,$11,$12)
+         created_by, ref_doc_id, ref_doc_no, ref_doc_date, branch_id)
+        VALUES ($1,$2,$3::date,$3::date,$4,$5,$6,1,'Posted',$7,$8,$7,$8,$9,$10,$11,$12,$13)
         RETURNING id
     `, [origHdr.doc_id, docNo, date, periodId, description,
         origHdr.currency_id, origHdr.total_credit_lc, origHdr.total_debit_lc,
-        createdBy, origHdr.doc_id, origHdr.doc_no, origHdr.doc_date]);
+        createdBy, origHdr.doc_id, origHdr.doc_no, origHdr.doc_date, origHdr.branch_id]);
     const revId = revHdrRes.rows[0].id;
     await client.query(`
         INSERT INTO gl_entry_detail
-        (header_id, line_no, account_id, debit_lc, credit_lc, debit_fc, credit_fc)
-        SELECT $1, line_no, account_id, credit_lc, debit_lc, credit_lc, debit_lc
+        (header_id, line_no, account_id, debit_lc, credit_lc, debit_fc, credit_fc, branch_id)
+        SELECT $1, line_no, account_id, credit_lc, debit_lc, credit_lc, debit_lc, branch_id
           FROM gl_entry_detail WHERE header_id = $2 ORDER BY line_no
     `, [revId, glEntryId]);
     return revId;

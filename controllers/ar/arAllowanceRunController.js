@@ -2,6 +2,7 @@
 const { today: todayYmd, ymd } = require('../../utils/dateUtil');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { generateDocNo } = require('./arTransactionController');
+const { assertRequiredBranch } = require('../../utils/glDims');
 
 // คอลัมน์สำหรับถอยเป็นร่าง / ยกเลิก / ลบ (sql/ar_allowance_run_reverse_to_draft.sql)
 const ensureRunColumns = async (db) => {
@@ -85,6 +86,29 @@ const getPriorAllowance = async (client, setup) => {
         WHERE ged.account_id = $1 AND geh.status = 'Posted'
     `, [setup.allowance_contra_account_id]);
     return Math.abs(Number(r.rows[0].balance || 0));
+};
+
+// ── Helper: ยอดปรับแยกตามสาขา (วิธี 1, user-approved 2026-11-18) ───────────────
+// ยอดที่ควรเป็นของแต่ละสาขา = ค่าเผื่อของใบแจ้งหนี้ในสาขานั้น (สาขาของใบแจ้งหนี้)
+// ยอดสะสมเดิมของแต่ละสาขา = ยอดบัญชีค่าเผื่อ (เครดิต − เดบิต) ตามสาขาของบรรทัด ถ้าว่างใช้ของหัวรายการ
+// ยอดปรับของสาขา = ยอดที่ควรเป็น − ยอดสะสมเดิม → รวมทุกสาขาเท่ากับยอดปรับของทั้งรายการ
+const allowanceByBranch = async (client, runId, setup) => {
+    const target = (await client.query(`
+        SELECT t.branch_id, SUM(d.allowance_amount) AS amt
+          FROM ar_allowance_run_detail d JOIN ar_transaction t ON t.id = d.invoice_id
+         WHERE d.run_id = $1 GROUP BY t.branch_id`, [runId])).rows;
+    const prior = (await client.query(`
+        SELECT COALESCE(ged.branch_id, geh.branch_id) AS branch_id, SUM(ged.credit_lc - ged.debit_lc) AS amt
+          FROM gl_entry_detail ged JOIN gl_entry_header geh ON geh.id = ged.header_id
+         WHERE ged.account_id = $1 AND geh.status = 'Posted'
+         GROUP BY 1`, [setup.allowance_contra_account_id])).rows;
+    const m = new Map();
+    for (const r of target) m.set(r.branch_id ?? null, (m.get(r.branch_id ?? null) || 0) + Number(r.amt || 0));
+    for (const r of prior) m.set(r.branch_id ?? null, (m.get(r.branch_id ?? null) || 0) - Number(r.amt || 0));
+    return [...m.entries()]
+        .map(([branchId, adj]) => ({ branch_id: branchId, adj: Math.round(adj * 100) / 100 }))
+        .filter(x => Math.abs(x.adj) >= 0.005)
+        .sort((a, b) => (a.branch_id ?? 0) - (b.branch_id ?? 0));
 };
 
 // ── GET /api/ar/ar_allowance_run ─────────────────────────────────────────────
@@ -301,9 +325,20 @@ const postRun = async (req, res) => {
         }
         const periodId = periodRes.rows[0].id;
 
-        const adj    = Number(run.adjustment_amount);
-        const isInc  = adj > 0;   // เพิ่มค่าเผื่อ: DR expense, CR contra
-        const absAdj = Math.abs(adj);
+        // บรรทัดรายการบัญชีแยกตามสาขาของใบแจ้งหนี้ — เพิ่มค่าเผื่อ: DR expense, CR contra / ลด: กลับด้าน
+        const glLines = [];
+        for (const b of await allowanceByBranch(client, run.id, setup)) {
+            const isInc = b.adj > 0, absAdj = Math.abs(b.adj);
+            glLines.push({ account_id: setup.allowance_expense_account_id, branch_id: b.branch_id,
+                           debit: isInc ? absAdj : 0, credit: isInc ? 0 : absAdj });
+            glLines.push({ account_id: setup.allowance_contra_account_id, branch_id: b.branch_id,
+                           debit: isInc ? 0 : absAdj, credit: isInc ? absAdj : 0 });
+        }
+        await assertRequiredBranch(client, glLines, null);
+        const totalDr = Math.round(glLines.reduce((t, l) => t + l.debit, 0) * 100) / 100;
+        const branchSet = new Set(glLines.map(l => l.branch_id ?? null));
+        // ทุกบรรทัดสาขาเดียวกัน → หัวรายการใช้สาขานั้นด้วย
+        const headerBranch = branchSet.size === 1 ? [...branchSet][0] : null;
 
         // ถอยแล้วโพสต์ใหม่ใช้เลขเดิม
         const docNo = run.kept_gl_doc_no || await nextGlDocNo(client, setup.allowance_gl_doc_id, run.run_date,
@@ -313,29 +348,23 @@ const postRun = async (req, res) => {
             INSERT INTO gl_entry_header
             (doc_id, doc_no, doc_date, posting_date, period_id, description,
              currency_id, exchange_rate, status,
-             total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc, created_by)
+             total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc, created_by, branch_id)
             SELECT $1,$2,$3::date,$3::date,$4,$5,
                    (SELECT id FROM cd_currency WHERE base_currency_flag=true LIMIT 1),
-                   1,'Posted',$6,$6,$6,$6,$7
+                   1,'Posted',$6,$6,$6,$6,$7,$8
             RETURNING id
         `, [setup.allowance_gl_doc_id, docNo, run.run_date, periodId,
             `ค่าเผื่อหนี้สงสัยจะสูญ ปี ${run.period_year}`,
-            absAdj, glUserOf(req)]);
+            totalDr, glUserOf(req), headerBranch]);
         const glEntryId = glRes.rows[0].id;
 
-        // DR Expense (เพิ่ม) หรือ CR Expense (ลด)
-        await client.query(`
-            INSERT INTO gl_entry_detail (header_id, line_no, account_id, debit_lc, credit_lc, debit_fc, credit_fc)
-            VALUES ($1,1,$2,$3,$4,$3,$4)
-        `, [glEntryId, setup.allowance_expense_account_id,
-            isInc ? absAdj : 0, isInc ? 0 : absAdj]);
-
-        // CR Contra (เพิ่ม) หรือ DR Contra (ลด)
-        await client.query(`
-            INSERT INTO gl_entry_detail (header_id, line_no, account_id, debit_lc, credit_lc, debit_fc, credit_fc)
-            VALUES ($1,2,$2,$3,$4,$3,$4)
-        `, [glEntryId, setup.allowance_contra_account_id,
-            isInc ? 0 : absAdj, isInc ? absAdj : 0]);
+        let lineNo = 1;
+        for (const l of glLines) {
+            await client.query(`
+                INSERT INTO gl_entry_detail (header_id, line_no, account_id, debit_lc, credit_lc, debit_fc, credit_fc, branch_id)
+                VALUES ($1,$2,$3,$4,$5,$4,$5,$6)
+            `, [glEntryId, lineNo++, l.account_id, l.debit, l.credit, l.branch_id]);
+        }
 
         await client.query(`
             UPDATE ar_allowance_run SET status='Posted', gl_entry_id=$1, kept_gl_doc_no=$2, updated_by=$3, updated_at=NOW()
@@ -429,18 +458,18 @@ const voidRun = async (req, res) => {
                 (doc_id, doc_no, doc_date, posting_date, period_id, description,
                  currency_id, exchange_rate, status,
                  total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-                 created_by, ref_doc_id, ref_doc_no, ref_doc_date)
-                VALUES ($1,$2,$3::date,$3::date,$4,$5,$6,1,'Posted',$7,$8,$7,$8,$9,$10,$11,$12)
+                 created_by, ref_doc_id, ref_doc_no, ref_doc_date, branch_id)
+                VALUES ($1,$2,$3::date,$3::date,$4,$5,$6,1,'Posted',$7,$8,$7,$8,$9,$10,$11,$12,$13)
                 RETURNING id
             `, [origHdr.doc_id, revDocNo, today, todayPeriodId,
                 `[ยกเลิก ${origHdr.doc_no}] ${reason}`, origHdr.currency_id,
                 origHdr.total_credit_lc, origHdr.total_debit_lc,
-                glUserOf(req), origHdr.doc_id, origHdr.doc_no, origHdr.doc_date]);
+                glUserOf(req), origHdr.doc_id, origHdr.doc_no, origHdr.doc_date, origHdr.branch_id]);
             voidGlId = revRes.rows[0].id;
             await client.query(`
                 INSERT INTO gl_entry_detail
-                (header_id, line_no, account_id, debit_lc, credit_lc, debit_fc, credit_fc)
-                SELECT $1, line_no, account_id, credit_lc, debit_lc, credit_lc, debit_lc
+                (header_id, line_no, account_id, debit_lc, credit_lc, debit_fc, credit_fc, branch_id)
+                SELECT $1, line_no, account_id, credit_lc, debit_lc, credit_lc, debit_lc, branch_id
                   FROM gl_entry_detail WHERE header_id = $2 ORDER BY line_no
             `, [voidGlId, run.gl_entry_id]);
         }

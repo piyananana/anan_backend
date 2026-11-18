@@ -125,10 +125,12 @@ const accountLines = async (client, { drill, target, src, glData, glMatches, isE
     let lines = [];
     if (!conflict && account && src.periodIds.length > 0) {
         const params = [src.periodIds, account.id];
-        // สาขาของยอดสะสมมาจากหัวรายการ (มิติ 1-5 มาจากบรรทัด) — กรองให้ตรงกับ gl_balance_accum
+        // สาขาของยอดสะสม = สาขาของบรรทัด ถ้าว่างใช้ของหัวรายการ (มิติ 1-5 มาจากบรรทัด) — กรองให้ตรงกับ gl_balance_accum
         const where = Object.entries(filters).map(([k, v]) => {
             params.push(v);
-            return `COALESCE(${k === 'branch_id' ? 'h' : 'd'}.${k}, 0) = $${params.length}`;
+            return k === 'branch_id'
+                ? `COALESCE(d.branch_id, h.branch_id, 0) = $${params.length}`
+                : `COALESCE(d.${k}, 0) = $${params.length}`;
         });
         // รายการปิดบัญชีสิ้นปี (Step 3/4) ไม่นับ ถ้าคอลัมน์ตัดออก — ให้ตรงกับยอดในงบ
         if (src.excludeClosing) {

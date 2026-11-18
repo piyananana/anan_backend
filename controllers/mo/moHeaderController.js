@@ -28,7 +28,7 @@ const { today } = require('../../utils/dateUtil');
 const { getBaseCurrency } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const DA = require('../../utils/docApproval');
-const { headerDims, assertRequiredDims } = require('../../utils/glDims');
+const { headerDims, assertRequiredDims, assertRequiredBranch } = require('../../utils/glDims');
 const KIND = 'MO';
 
 const ensureMoHeaderTable = async (client) => {
@@ -625,13 +625,14 @@ const updateTransaction = async (req, res) => {
                 description      = $10,
                 updated_by       = $11,
                 updated_at       = NOW(),
-                dim1_id = $13, dim2_id = $14, dim3_id = $15, dim4_id = $16, dim5_id = $17
+                dim1_id = $13, dim2_id = $14, dim3_id = $15, dim4_id = $16, dim5_id = $17,
+                branch_id = $18
             WHERE id = $12
         `, [
             header.bom_header_id || null, header.warehouse_id, header.order_qty, header.uom_id || null,
             header.issue_method || 'EXPLICIT', header.costing_method || 'ACTUAL', header.costing_mode || 'OVERHEAD_PERCENT',
             header.overhead_percent ?? 0, header.due_date || null, header.description || null,
-            header.updated_by || null, id, ...headerDims(header),
+            header.updated_by || null, id, ...headerDims(header), Number(header.branch_id) || null,
         ]);
 
         await client.query(`DELETE FROM mo_component_detail WHERE header_id = $1`, [id]);
@@ -765,6 +766,7 @@ const openPeriodId = async (client, date) => (await client.query(
 // รายการปรับ WIP ตอนปิด — MO ที่ปิดก่อนมีคอลัมน์ close_gl_entry_id หาจากเลขที่อ้างอิง
 // ลงรายการบัญชีของใบสั่งผลิตเอง (บันทึกเวลา / ปิดใบสั่งผลิต) — lines: [{ account_id, debit, credit }]
 // ทุกบรรทัดใช้มิติของใบสั่งผลิต อ้างอิงเลขที่ใบสั่งผลิต และใช้สกุลเงินหลัก
+// สาขา = สาขาของใบสั่งผลิต (หัวรายการบัญชี) — บัญชีที่บังคับสาขาโพสต์ไม่ได้ถ้าใบสั่งผลิตไม่มีสาขา (user-approved 2026-11-18)
 const postMoGlEntry = async (client, { mo, glDocId, date, description, lines, docNo, createdByUserId }) => {
     const periodId = await openPeriodId(client, date);
     if (!periodId) throw new Error(`ไม่พบงวดบัญชีที่เปิดใช้งาน (GL และ IM) สำหรับวันที่ ${date}`);
@@ -778,15 +780,16 @@ const postMoGlEntry = async (client, { mo, glDocId, date, description, lines, do
     // ตรวจมิติที่บัญชีบังคับ (gl_account_dim_rule) — มิติของใบสั่งผลิตลงทุกบรรทัด เหมือนโมดูลอื่น
     const moDims = headerDims(mo);
     await assertRequiredDims(client, rows, moDims);
+    await assertRequiredBranch(client, rows, mo.branch_id);
     const glEntryId = (await client.query(`
         INSERT INTO gl_entry_header
         (doc_id, doc_no, doc_date, posting_date, period_id, description,
          currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-         created_by, ref_doc_id, ref_doc_no, ref_doc_date)
-        VALUES ($1,$2,$3,$3,$4,$5,$6,1,'Posted',$7,$8,0,0,$9,$10,$11,$12)
+         created_by, ref_doc_id, ref_doc_no, ref_doc_date, branch_id)
+        VALUES ($1,$2,$3,$3,$4,$5,$6,1,'Posted',$7,$8,0,0,$9,$10,$11,$12,$13)
         RETURNING id
     `, [glDocId, glDocNo, date, periodId, description, (await getBaseCurrency(client)).id,
-        totalDebit, totalCredit, createdByUserId || null, mo.doc_id, mo.doc_no, mo.doc_date])).rows[0].id;
+        totalDebit, totalCredit, createdByUserId || null, mo.doc_id, mo.doc_no, mo.doc_date, mo.branch_id || null])).rows[0].id;
     let lineNo = 1;
     for (const l of rows) {
         await client.query(`
@@ -945,14 +948,14 @@ const reverseTransaction = async (req, res) => {
                         INSERT INTO gl_entry_header
                         (doc_id, doc_no, doc_date, posting_date, period_id, description,
                          currency_id, exchange_rate, status, total_debit_lc, total_credit_lc, total_debit_fc, total_credit_fc,
-                         created_by, ref_doc_id, ref_doc_no, ref_doc_date)
-                        VALUES ($1,$2,$3,$3,$4,$5,$6,1,'Posted',$7,$8,0,0,$9,$10,$11,$12)
+                         created_by, ref_doc_id, ref_doc_no, ref_doc_date, branch_id)
+                        VALUES ($1,$2,$3,$3,$4,$5,$6,1,'Posted',$7,$8,0,0,$9,$10,$11,$12,$13)
                         RETURNING id`, [gl.doc_id, revNo, date, periodId, description, gl.currency_id,
-                        gl.total_credit_lc, gl.total_debit_lc, userIdOf(req), mo.doc_id, mo.doc_no, mo.doc_date])).rows[0].id;
+                        gl.total_credit_lc, gl.total_debit_lc, userIdOf(req), mo.doc_id, mo.doc_no, mo.doc_date, gl.branch_id])).rows[0].id;
                     await client.query(`
                         INSERT INTO gl_entry_detail (header_id, line_no, account_id, description, debit_lc, credit_lc, debit_fc, credit_fc,
-                                                     dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
-                        SELECT $1, line_no, account_id, $2, credit_lc, debit_lc, 0, 0, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id
+                                                     dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id)
+                        SELECT $1, line_no, account_id, $2, credit_lc, debit_lc, 0, 0, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id
                           FROM gl_entry_detail WHERE header_id = $3 ORDER BY line_no`, [revId, description, glId]);
                 }
             }
