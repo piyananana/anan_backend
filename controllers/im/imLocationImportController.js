@@ -1,6 +1,7 @@
 // controllers/im/imLocationImportController.js
 const XLSX = require('xlsx');
 const multer = require('multer');
+const { ensureImLocationTable } = require('./imLocationController');
 
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -19,7 +20,9 @@ const TEMPLATE_SHEETS = [
       { key: 'location_code',  label: 'รหัสตำแหน่ง (ไม่ซ้ำในคลังเดียวกัน)',                       required: true,  example: 'A-01-01' },
       { key: 'parent_code',    label: 'รหัสตำแหน่งแม่ (ว่าง = ระดับบนสุด, ต้องเป็นชนิด GROUP)',    required: false, example: 'A' },
       { key: 'location_type',  label: `ชนิดตำแหน่ง (${LOCATION_TYPES.join('/')})`,                required: true,  example: 'BIN' },
-      { key: 'location_name',  label: 'ชื่อตำแหน่ง',                                              required: false, example: 'ชั้น 1 แถว A ช่อง 01' },
+      { key: 'location_name',  label: 'ชื่อตำแหน่ง (ภาษาไทย)',                                    required: false, example: 'ชั้น 1 แถว A ช่อง 01' },
+      // allowMissing: เทมเพลตเก่าที่ยังไม่มีคอลัมน์นี้ยังนำเข้าได้
+      { key: 'location_name_en', label: 'ชื่อตำแหน่ง (ภาษาอังกฤษ)',                              required: false, example: 'Floor 1 Aisle A Bin 01', allowMissing: true },
       { key: 'category_code',  label: 'รหัสหมวดหมู่สินค้าที่ควรเก็บ (เฉพาะชนิด BIN)',             required: false, example: 'CAT01' },
       { key: 'is_active',      label: 'ใช้งาน (Y/N)',                                             required: false, example: 'Y' },
     ],
@@ -63,7 +66,7 @@ const readSheet = (workbook, sheetDef, { required = false } = {}) => {
   if (aoa.length === 0) return { present: false, colIdx: {}, rows: [] };
 
   const headers = aoa[0].map(h => String(h || '').trim());
-  const expectedKeys = sheetDef.columns.map(c => c.key);
+  const expectedKeys = sheetDef.columns.filter(c => !c.allowMissing).map(c => c.key);
   const missing = expectedKeys.filter(k => !headers.includes(k));
   if (missing.length > 0) {
     throw new ImportTemplateError(`Sheet "${sheetDef.name}" ไม่ตรงตามเทมเพลต ขาดคอลัมน์: ${missing.join(', ')}`);
@@ -145,6 +148,7 @@ const validateFile = [
         const parentCode      = get('parent_code').toUpperCase();
         const locationTypeRaw = get('location_type').toUpperCase();
         const locationName    = get('location_name');
+        const locationNameEn  = get('location_name_en');
         const categoryCode    = get('category_code').toUpperCase();
         const isActiveStr     = get('is_active');
 
@@ -200,6 +204,7 @@ const validateFile = [
           parent_code: parentCode || null,
           location_type: locationType,
           location_name: locationName || null,
+          location_name_en: locationNameEn || null,
           category_code: locationType === 'BIN' ? (categoryCode || null) : null,
           category_id: locationType === 'BIN' ? (resolvedCategory?.id || null) : null,
           is_active: isActiveStr ? parseBool(isActiveStr) : true,
@@ -299,6 +304,7 @@ const confirmImport = async (req, res) => {
   let imported = 0, skipped = 0;
   const importErrors = [];
   try {
+    await ensureImLocationTable(client); // คอลัมน์ใหม่ (location_name_en) ต้องมีก่อน INSERT
     await client.query('BEGIN');
 
     // seed id map with existing locations in the referenced warehouses
@@ -344,14 +350,15 @@ const confirmImport = async (req, res) => {
         const result = await client.query(
           `INSERT INTO im_location
              (warehouse_id, location_code, location_name, parent_id, level, location_type, category_id, is_active,
-              created_by, updated_by)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)
+              created_by, updated_by, location_name_en)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$10)
            RETURNING id`,
           [
             r.warehouse_id, trunc(locationCode, 20), trunc(r.location_name, 200),
             parentId, r.level || 1, r.location_type || 'BIN', r.category_id || null,
             r.is_active !== undefined ? r.is_active : true,
             userName,
+            trunc(r.location_name_en, 200),
           ]
         );
 

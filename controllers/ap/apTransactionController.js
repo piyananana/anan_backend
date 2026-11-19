@@ -2173,6 +2173,7 @@ module.exports = {
     fetchOpenRemittanceAdvices, fetchRaInvoices,
     fetchRemittanceAdviceByDocNo,
     createTransaction, updateTransaction, voidTransaction, deleteTransaction, reverseTransaction,
+    resolvePaymentGlAccount, // ใช้ทำตัวอย่างรายการบัญชีใบจ่ายชำระของซื้อเงินสด (IM)
     voidApDocument, getApLinkedState, generateDocNo, insertApTransaction,
     buildInvAdvanceGl, insertDepositVtReversal, adjustInvoiceBalances,
     submitTransaction, approveTransaction, rejectTransaction, postTransaction,

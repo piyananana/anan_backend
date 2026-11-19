@@ -36,7 +36,7 @@ const getGrBillingReport = async (req, res) => {
             SELECT
                 t.id, t.doc_no, t.doc_date, t.status,
                 t.vendor_id, t.vendor_code, t.vendor_name_th,
-                t.warehouse_id, w.warehouse_code, w.warehouse_name_th,
+                t.warehouse_id, w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
                 t.ref_no, t.linked_ap_transaction_id,
                 ($1::date - t.doc_date::date) AS days_outstanding,
                 COALESCE(SUM(dt.qty * dt.unit_cost), 0) AS stock_value,
@@ -49,7 +49,7 @@ const getGrBillingReport = async (req, res) => {
             WHERE d.sys_module = '31' AND d.sys_doc_type = '12'
               ${extraFilters}
             GROUP BY t.id, t.doc_no, t.doc_date, t.status, t.vendor_id, t.vendor_code, t.vendor_name_th,
-                     t.warehouse_id, w.warehouse_code, w.warehouse_name_th, t.ref_no, t.linked_ap_transaction_id
+                     t.warehouse_id, w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en, t.ref_no, t.linked_ap_transaction_id
             ORDER BY t.vendor_code ASC, t.doc_date ASC
         `, params);
 
@@ -72,6 +72,7 @@ const getGrBillingReport = async (req, res) => {
                 status: row.status,
                 warehouse_code: row.warehouse_code,
                 warehouse_name_th: row.warehouse_name_th,
+                warehouse_name_en: row.warehouse_name_en,
                 ref_no: row.ref_no,
                 linked_ap_transaction_id: row.linked_ap_transaction_id,
                 days_outstanding: row.status === 'Received' ? Number(row.days_outstanding) : null,

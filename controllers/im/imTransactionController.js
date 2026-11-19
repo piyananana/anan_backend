@@ -2710,7 +2710,7 @@ const fetchRowById = async (pool, id) => {
         SELECT t.*, to_jsonb(t)->>'due_date' AS due_date,
                d.doc_code AS d_doc_code, d.doc_name_thai, d.doc_name_eng, d.sys_doc_type, d.is_auto_numbering,
                w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
-               tw.warehouse_code AS to_warehouse_code, tw.warehouse_name_th AS to_warehouse_name_th,
+               tw.warehouse_code AS to_warehouse_code, tw.warehouse_name_th AS to_warehouse_name_th, tw.warehouse_name_en AS to_warehouse_name_en,
                b.branch_code, b.branch_name_thai,
                reft.doc_no AS ref_im_transaction_doc_no,
                reft.status AS ref_im_transaction_status,
@@ -4118,7 +4118,8 @@ const deleteTransaction = async (req, res) => {
 };
 
 // GET-like (POST เพราะส่งรายการสินค้า) — บัญชีที่ตอน Post จะใช้ต่อสินค้า สำหรับตัวอย่างรายการบัญชีบนหน้าจอ
-// body: { doc_code, warehouse_id, to_warehouse_id, item_ids: [], customer_id?, payments?: [{ payment_method_type, gl_account_id, cm_bank_account_id }] }
+// body: { doc_code, warehouse_id, to_warehouse_id, item_ids: [], customer_id?, vendor_id?, payments?: [{ payment_method_type, gl_account_id, cm_bank_account_id }] }
+//   → ฝั่งซื้อ: ap_account (ผู้ขาย > กลุ่ม > ประเภทเอกสาร AP ที่สร้าง), ap_vat, ap_discount และ payment (ซื้อเงินสด: บัญชีของแต่ละวิธีจ่าย + ภาษีหัก ณ ที่จ่าย)
 //   → เพิ่ม ar_account (ลูกค้า > กลุ่ม > ประเภทเอกสาร AR ที่สร้าง) และ receipt (ขายเงินสด: บัญชีของแต่ละวิธีรับเงิน + ภาษีถูกหัก ณ ที่จ่าย)
 //   → { mode (ค่าเริ่มต้นของบริษัท), items: { [item_id]: { mode, to_mode, inventory, to_inventory, purchases, to_purchases, cogs, revenue } } }
 // mode/to_mode = โหมดของสินค้าในคลังต้นทาง/ปลายทาง (สินค้า → หมวดสินค้า → คลัง → ค่าเริ่มต้น) แบบเดียวกับ applyLineModes
@@ -4128,7 +4129,7 @@ const AP_DOC_FOR_IM = { '11': '10', '12': '10', '14': '10', '15': '30', '20': '3
 const fetchGlAccounts = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
-        const { doc_code, warehouse_id, to_warehouse_id, customer_id } = req.body || {};
+        const { doc_code, warehouse_id, to_warehouse_id, customer_id, vendor_id } = req.body || {};
         const payments = Array.isArray(req.body?.payments) ? req.body.payments : [];
         const itemIds = [...new Set((req.body?.item_ids || []).map(Number).filter(Boolean))];
         const sdRes = await client.query(
@@ -4190,6 +4191,28 @@ const fetchGlAccounts = async (req, res) => {
             [receipt.wht, ...pays].forEach(v => v && ids.add(v));
         }
 
+        // ฝั่งซื้อ (เอกสาร AP อัตโนมัติ) — ลำดับเดียวกับ postApBillFromGrn / postApCreditDebitNoteFromIm
+        let apAccountId = null, apVatId = null, apDiscountId = null;
+        if (AP_DOC_FOR_IM[sysDocType] && setup.target_doc_id) {
+            apAccountId = await resolveApAccountId(client, { vendorId: Number(vendor_id) || null, docId: setup.target_doc_id });
+            apVatId = Number(setup.vat_input_account_id) || Number(apSetup?.vat_input_account_id) || null;
+            apDiscountId = Number(apSetup?.discount_account_id) || null;
+            [apAccountId, apVatId, apDiscountId].forEach(v => v && ids.add(v));
+        }
+        // ใบจ่ายชำระของซื้อเงินสด — บัญชีตาม resolvePaymentGlAccount ของ AP (วิธีจ่าย → บัญชีธนาคาร → ตามประเภท → เงินสด)
+        let payment = null;
+        if (CP.isCashPurchase(sysDocType) && setup.receipt_target_doc_id) {
+            const ps = (await client.query(`
+                SELECT s.* FROM ap_gl_account_setup s JOIN sa_module_document d ON d.doc_code = s.doc_code WHERE d.id = $1`,
+                [setup.receipt_target_doc_id])).rows[0] || null;
+            const { resolvePaymentGlAccount } = require('../ap/apTransactionController');
+            const cash = Number(ps?.cash_account_id) || null;
+            const pays = [];
+            for (const p of payments) pays.push(await resolvePaymentGlAccount(client, p || {}, ps, cash));
+            payment = { wht: Number(ps?.wht_payable_account_id) || null, payments: pays };
+            [payment.wht, ...pays].forEach(v => v && ids.add(v));
+        }
+
         const accRes = ids.size ? await client.query(
             `SELECT id, account_code, account_name_thai, account_name_eng FROM gl_account WHERE id = ANY($1::int[])`, [[...ids]]) : { rows: [] };
         const acc = Object.fromEntries(accRes.rows.map(r => [r.id, r]));
@@ -4203,6 +4226,8 @@ const fetchGlAccounts = async (req, res) => {
             sys_doc_type: sysDocType, mode, items,
             ar_account: describe(arAccountId),
             receipt: receipt && { wht: describe(receipt.wht), payments: receipt.payments.map(describe) },
+            ap_account: describe(apAccountId), ap_vat: describe(apVatId), ap_discount: describe(apDiscountId),
+            payment: payment && { wht: describe(payment.wht), payments: payment.payments.map(describe) },
         });
     } catch (err) {
         console.error('Error fetching IM GL accounts:', err);
