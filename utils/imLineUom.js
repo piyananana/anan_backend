@@ -158,4 +158,35 @@ const toDocUnitLines = async (client, details, fields) => {
     });
 };
 
-module.exports = { purposeOf, normalizeImLines, lineEffFactor, toBasePrice, ensureImLineUomColumns, toDocUnitLines, PRICE_FIELDS };
+/**
+ * หน่วยของบรรทัดเอกสารสั่ง (ใบเสนอราคา/ใบสั่งขาย/ใบสั่งซื้อ ...) — จำนวน/ราคาเก็บตามหน่วยของบรรทัดเลย (ไม่แปลงเป็นหน่วยหลัก
+ * เพราะเอกสารเหล่านี้ไม่ตัดสต็อก) + อัตราแปลง snapshot ไว้ใช้คิดจำนวนหน่วยหลักตอนส่ง/รับสินค้า
+ * ไม่ระบุหน่วย = หน่วยหลัก, หน่วยหลักไม่ตรวจทศนิยม (เหมือนบรรทัด IM — ฐานข้อมูลที่ยังไม่ได้ตั้งประเภทหน่วยใช้ต่อได้)
+ * หน่วยอื่น: ต้องอนุญาตในงาน (purpose) และจำนวนต้องตรงทศนิยมของหน่วย (นับจำนวน = ลงตัว, อื่น ๆ ปัด)
+ * @returns {{ uom_id, factor, qty, base_qty }}
+ */
+const resolveOrderLineUom = async (client, itemId, uomId, qty, purpose) => {
+    const n = Number(qty) || 0;
+    const item = (await client.query(`SELECT item_code, base_uom_id FROM im_item WHERE id = $1`, [itemId])).rows[0];
+    const baseId = item?.base_uom_id ? Number(item.base_uom_id) : null;
+    const id = uomId ? Number(uomId) : baseId;
+    if (!id || id === baseId) return { uom_id: id, factor: 1, qty: n, base_qty: n };
+    const r = await resolveFactor(client, itemId, id, { purpose });
+    const b = toBaseQty(Math.abs(n), r);
+    const sign = n < 0 ? -1 : 1;
+    return { uom_id: id, factor: b.factor, qty: sign * b.qty, base_qty: sign * b.baseQty };
+};
+
+/**
+ * จำนวนที่ส่งแล้วของบรรทัดใบสั่งขาย (alias sod) เป็นหน่วยของใบสั่งขาย — บรรทัด IM ที่ใช้หน่วยเดียวกับ SO นับ uom_qty
+ * ตรงตัว (ไม่เพี้ยนจากการปัดหน่วยหลัก เช่น ปอนด์ → กก.) หน่วยอื่น/ข้อมูลเก่า = จำนวนหน่วยหลัก ÷ อัตราแปลงของบรรทัด SO
+ * นับเฉพาะเอกสาร IM ที่ Posted/Delivered
+ */
+const soDeliveredSql = (sod = 'sod') => `COALESCE((
+    SELECT SUM(CASE WHEN imd.uom_qty IS NOT NULL AND imd.uom_id IS NOT DISTINCT FROM ${sod}.uom_id THEN ABS(imd.uom_qty)
+                    ELSE ABS(imd.qty) / NULLIF(${sod}.conversion_factor, 0) END)
+    FROM im_transaction_detail imd JOIN im_transaction imt ON imt.id = imd.header_id
+    WHERE imd.ref_so_detail_id = ${sod}.id AND imt.status IN ('Posted', 'Delivered')
+), 0)`;
+
+module.exports = { purposeOf, normalizeImLines, lineEffFactor, toBasePrice, ensureImLineUomColumns, toDocUnitLines, resolveOrderLineUom, soDeliveredSql, PRICE_FIELDS };

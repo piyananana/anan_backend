@@ -6,6 +6,7 @@
 'use strict';
 
 const { netUnitPriceSql, ensureSoPriceColumns } = require('../../utils/vatCalc');
+const { soDeliveredSql } = require('../../utils/imLineUom');
 
 const fetchReport = async (req, res) => {
     const { so_date_from, so_date_to, due_date_from, due_date_to, customer_ids, item_ids, sort_due_date } = req.query;
@@ -23,15 +24,15 @@ const fetchReport = async (req, res) => {
                 sod.id AS so_detail_id, sod.item_id, sod.item_code, sod.item_name,
                 -- ราคาหลังส่วนลด ก่อน VAT — มูลค่าค้างส่งไม่รวม VAT ไม่ว่าใบสั่งขายจะกรอกราคารวม VAT หรือไม่
                 sod.qty_ordered, ${netUnitPriceSql('sod.unit_price_fc', 'sod', 'so')} AS unit_price_fc,
-                COALESCE((
-                    SELECT SUM(ABS(imd.qty)) FROM im_transaction_detail imd
-                    JOIN im_transaction imt ON imt.id = imd.header_id
-                    WHERE imd.ref_so_detail_id = sod.id AND imt.status IN ('Posted','Delivered')
-                ), 0) AS qty_delivered,
+                -- จำนวนตามหน่วยของบรรทัดใบสั่งขาย (สั่ง/ส่งแล้ว/ค้างส่ง) + ชื่อหน่วย
+                ${soDeliveredSql('sod')} AS qty_delivered,
+                uu.uom_code, uu.uom_name_th, uu.uom_name_en,
                 c.customer_code, c.customer_name_th, c.customer_name_en,
                 w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en
             FROM so_transaction_detail sod
             JOIN so_transaction so ON so.id = sod.header_id
+            LEFT JOIN im_item ii ON ii.id = sod.item_id
+            LEFT JOIN im_uom uu ON uu.id = COALESCE(sod.uom_id, ii.base_uom_id)
             LEFT JOIN ar_customer c ON c.id = so.customer_id
             LEFT JOIN im_warehouse w ON w.id = so.warehouse_id
             WHERE so.status IN ('Approved','PartiallyDelivered','FullyDelivered')

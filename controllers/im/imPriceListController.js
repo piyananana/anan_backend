@@ -10,6 +10,18 @@ const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 
 const LIST_TYPES = ['SALES', 'PURCHASE'];
 
+// หน่วยของบรรทัดราคาต้องเป็นหน่วยที่สินค้าอนุญาตสำหรับงานของตารางราคา (ขาย/ซื้อ) — ตรวจเฉพาะบรรทัดใหม่หรือที่เปลี่ยน
+// สินค้า/หน่วย (prev = ค่าเดิมของบรรทัดที่มีอยู่แล้ว) บรรทัดเดิมที่สิทธิ์หน่วยถูกปิดภายหลังยังบันทึกตารางได้
+const assertPriceLineUoms = async (client, listType, lines, prev = new Map()) => {
+    const purpose = listType === 'PURCHASE' ? 'PURCHASE' : 'SALES';
+    for (const line of lines || []) {
+        if (!line.item_id || !line.uom_id) continue;
+        const old = line.id ? prev.get(Number(line.id)) : null;
+        if (old && Number(old.item_id) === Number(line.item_id) && Number(old.uom_id) === Number(line.uom_id)) continue;
+        await resolveFactor(client, line.item_id, line.uom_id, { purpose });
+    }
+};
+
 const ensureImPriceListTable = async (client) => {
     // im_price_list_detail references im_item/im_uom, so they must exist first
     await ensureImItemTable(client);
@@ -419,7 +431,9 @@ const findOverlappingPair = (details) => {
             const a = details[i], b = details[j];
             const aType = a.price_type || 'STANDARD';
             const bType = b.price_type || 'STANDARD';
-            if (a.item_id === b.item_id && aType === bType && Number(a.min_qty ?? 0) === Number(b.min_qty ?? 0)) {
+            // หน่วยต่างกันคนละราคา (ขวด/แพ็ค) ไม่ถือว่าทับซ้อน — เหมือน findPriceLineOverlap ของการนำเข้าสินค้า
+            if (a.item_id === b.item_id && aType === bType && Number(a.min_qty ?? 0) === Number(b.min_qty ?? 0)
+                && Number(a.uom_id || 0) === Number(b.uom_id || 0)) {
                 if (rangesOverlap(a.effective_from, a.effective_to, b.effective_from, b.effective_to)) {
                     return [a, b];
                 }
@@ -506,6 +520,7 @@ const addRow = async (req, res) => {
         );
         const headerId = header.rows[0].id;
 
+        await assertPriceLineUoms(client, b.list_type || 'SALES', b.details);
         for (const line of (b.details || [])) {
             await client.query(
                 `INSERT INTO im_price_list_detail
@@ -523,6 +538,7 @@ const addRow = async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         if (error.code === '23505') return res.status(409).json({ message: uniqueViolationMessage(error, b) });
+        if (error.code === 'UOM') return res.status(400).json({ message: error.message });
         console.error('Error adding im_price_list:', error);
         res.status(500).json({ message: 'Internal server error' });
     } finally { client.release(); }
@@ -577,8 +593,9 @@ const updateRow = async (req, res) => {
         // แก้ไขบรรทัดแบบ diff (UPDATE ของเดิม / INSERT ใหม่ / DELETE ที่ถูกลบ) แทน delete-all-then-reinsert เดิม —
         // เพื่อรักษา updated_by/updated_at ต่อบรรทัดไว้เป็น audit trail จริง (บรรทัดที่ id ไม่เปลี่ยนแต่ค่าเปลี่ยน
         // จะเห็นว่าใครแก้ล่าสุดเมื่อไหร่ ไม่ใช่ทุกบรรทัดโดนเขียนทับเป็น "ตอนนี้" หมดทุกครั้งที่กดบันทึก)
-        const existingIdsRes = await client.query(`SELECT id FROM im_price_list_detail WHERE price_list_id = $1`, [id]);
+        const existingIdsRes = await client.query(`SELECT id, item_id, uom_id FROM im_price_list_detail WHERE price_list_id = $1`, [id]);
         const existingIds = new Set(existingIdsRes.rows.map(r => r.id));
+        await assertPriceLineUoms(client, b.list_type || 'SALES', b.details, new Map(existingIdsRes.rows.map(r => [Number(r.id), r])));
         const incomingIds = new Set((b.details || []).filter(d => d.id).map(d => d.id));
         const removedIds = [...existingIds].filter(x => !incomingIds.has(x));
 
@@ -613,6 +630,7 @@ const updateRow = async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         if (error.code === '23505') return res.status(409).json({ message: uniqueViolationMessage(error, b) });
+        if (error.code === 'UOM') return res.status(400).json({ message: error.message });
         console.error('Error updating im_price_list:', error);
         res.status(500).json({ message: 'Internal server error' });
     } finally { client.release(); }

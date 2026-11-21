@@ -2281,7 +2281,7 @@ const postDetailLines = async (client, headerId, header, docNo) => {
         // DLN ('30'/'31'/'32') ที่อ้างอิงบรรทัด SO — มิเรอร์ GRN/PO block ข้างบนทุกประการ ฝั่งขาย
         if (['30', '31', '32', '33'].includes(sysDocType) && d.ref_so_detail_id) {
             const { soTransactionId } = await validateSoDeliverableQty(client, {
-                refSoDetailId: d.ref_so_detail_id, requestedQty: Math.abs(varianceQty), customerId: header.customer_id,
+                refSoDetailId: d.ref_so_detail_id, requestedQty: Math.abs(varianceQty), uomId: d.uom_id, uomQty: d.uom_qty, customerId: header.customer_id,
                 currencyCode: header.currency_code || await getBaseCurrencyCode(client),
             });
             touchedSoIds.add(soTransactionId);
@@ -2555,11 +2555,14 @@ const isPriceAdmin = async (client, userName) => {
 const expectedSalesPrice = async (client, d, { customerId, docDate, currencyCode, priceIncludesVat }) => {
     if (d.ref_so_detail_id) {
         const so = (await client.query(`
-            SELECT sod.unit_price_fc, sod.vat_type, soh.price_includes_vat FROM so_transaction_detail sod
+            SELECT sod.unit_price_fc, sod.vat_type, sod.conversion_factor, soh.price_includes_vat FROM so_transaction_detail sod
               JOIN so_transaction soh ON soh.id = sod.header_id WHERE sod.id = $1`, [d.ref_so_detail_id])).rows[0];
         if (!so) return null;
-        // บรรทัดใบสั่งขายยังเป็นหน่วยหลัก (ขั้นที่ 3) — ราคาต่อหน่วยในเอกสาร = ราคาหน่วยหลัก × อัตราแปลง
-        let price = (Number(so.unit_price_fc) || 0) * await docUomFactor(client, d);
+        // ราคาใบสั่งขายเป็นราคาต่อหน่วยของบรรทัด SO — ราคาต่อหน่วยในเอกสารนี้ = ราคา SO ÷ อัตรา SO × อัตราของบรรทัดนี้
+        // (หน่วยเดียวกัน = ราคา SO ตรงตัว)
+        const soFactor = Number(so.conversion_factor) || 1;
+        const imFactor = await docUomFactor(client, d);
+        let price = Math.abs(soFactor - imFactor) < 1e-9 ? (Number(so.unit_price_fc) || 0) : (Number(so.unit_price_fc) || 0) / soFactor * imFactor;
         const rate = d.vat_type && d.vat_type !== 'NOVAT' ? Number(d.vat_rate) || 0 : 0;
         const soIncl = so.price_includes_vat === true && so.vat_type != null;
         if (rate && soIncl !== (priceIncludesVat === true)) price = soIncl ? price * 100 / (100 + rate) : price * (100 + rate) / 100;

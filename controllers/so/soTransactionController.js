@@ -19,6 +19,19 @@ const DA = require('../../utils/docApproval');
 const { ensureCreditSchema, assertCreditForPost, soDocAmount, loadCreditApprovals } = require('../../utils/creditCheck');
 const { ensureSoPriceColumns, netUnitPriceSql, orderLineValues, saveOrderTotals, applyOrderSalesDiscounts, orderDiscountParams,
     saveOrderBillDiscount } = require('../../utils/vatCalc');
+const { resolveOrderLineUom, soDeliveredSql } = require('../../utils/imLineUom');
+
+// บรรทัดใบสั่งขาย: หน่วยต้องอนุญาตให้ขาย จำนวนตามทศนิยมของหน่วย — จำนวน/ราคาเก็บตามหน่วยของบรรทัด + อัตราแปลง snapshot
+// บรรทัดที่ดึงจากใบเสนอราคาต้องใช้หน่วยเดียวกับใบเสนอราคา (จำนวนคงเหลือที่แปลงได้นับในหน่วยของใบเสนอราคา)
+const normalizeSoLines = async (client, details) => {
+    for (const d of details || []) {
+        if (!d || !d.item_id) continue;
+        const u = await resolveOrderLineUom(client, d.item_id, d.uom_id, d.qty_ordered, 'SALES');
+        d.uom_id = u.uom_id;
+        d.qty_ordered = u.qty;
+        d.conversion_factor = u.factor;
+    }
+};
 const { fetchOrderDeposits } = require('../../utils/depositRef');
 const KIND = 'SO';
 
@@ -127,12 +140,8 @@ const fetchRowById = async (pool, id) => {
         WHERE t.id = $1`, [id]);
     if (hRes.rows.length === 0) return null;
     const dRes = await pool.query(`
-        SELECT dt.*, u.uom_code,
-               COALESCE((
-                   SELECT SUM(ABS(imd.qty)) FROM im_transaction_detail imd
-                   JOIN im_transaction imt ON imt.id = imd.header_id
-                   WHERE imd.ref_so_detail_id = dt.id AND imt.status IN ('Posted', 'Delivered')
-               ), 0) AS qty_delivered
+        SELECT dt.*, u.uom_code, u.uom_name_th, u.uom_name_en,
+               ${soDeliveredSql('dt')} AS qty_delivered
         FROM so_transaction_detail dt
         LEFT JOIN im_uom u ON u.id = dt.uom_id
         WHERE dt.header_id = $1 ORDER BY dt.line_no`, [id]);
@@ -244,6 +253,7 @@ const createTransaction = async (req, res) => {
             (header.customer_po_no || '').trim() || null, header.customer_po_date || null, header.price_includes_vat === true,
         ]);
         const headerId = hRes.rows[0].id;
+        await normalizeSoLines(client, details);
         // ส่วนลดขั้นบันได + เงินของรายการ + ท้ายบิล (% และเงินสด) ปันเข้ารายการ — ยอดบรรทัดคิดจาก discount_amount
         applyOrderSalesDiscounts(header, details, d => d.qty_ordered);
         await saveOrderBillDiscount(client, 'so_transaction', headerId, header);
@@ -263,18 +273,18 @@ const createTransaction = async (req, res) => {
             totalQty += qty;
             amts.push(amt);
             if (d.ref_quote_detail_id) {
-                const { quoteTransactionId } = await validateQuoteConvertibleQty(client, { refQuoteDetailId: d.ref_quote_detail_id, requestedQty: qty });
+                const { quoteTransactionId } = await validateQuoteConvertibleQty(client, { refQuoteDetailId: d.ref_quote_detail_id, requestedQty: qty, uomId: d.uom_id });
                 affectedQuoteIds.add(quoteTransactionId);
             }
             const newDetailRes = await client.query(`
                 INSERT INTO so_transaction_detail
                 (header_id, line_no, item_id, item_code, item_name, uom_id, qty_ordered, unit_price_fc, total_value_lc, description, ref_quote_detail_id,
-                 discount_percent, vat_type, vat_rate, discount_text, line_discount_amount, bill_discount_amount, discount_amount)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+                 discount_percent, vat_type, vat_rate, discount_text, line_discount_amount, bill_discount_amount, discount_amount, conversion_factor)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
                 RETURNING id
             `, [headerId, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
                 qty, price, amt.netLc, d.description || null, d.ref_quote_detail_id || null, discountPercent, vatType, vatRate,
-                ...orderDiscountParams(d)]);
+                ...orderDiscountParams(d), d.conversion_factor ?? 1]);
             if (d.ref_quote_detail_id) {
                 await copyAttachmentsToEntity(client, {
                     dbName, sourceModule: 'quote_transaction_detail', sourceEntityId: d.ref_quote_detail_id,
@@ -336,6 +346,7 @@ const updateTransaction = async (req, res) => {
             (header.customer_po_no || '').trim() || null, header.customer_po_date || null, header.price_includes_vat === true,
         ]);
 
+        await normalizeSoLines(client, details);
         applyOrderSalesDiscounts(header, details, d => d.qty_ordered);
         await saveOrderBillDiscount(client, 'so_transaction', id, header);
 
@@ -370,7 +381,7 @@ const updateTransaction = async (req, res) => {
             totalQty += qty;
             amts.push(amt);
             if (d.ref_quote_detail_id) {
-                const { quoteTransactionId } = await validateQuoteConvertibleQty(client, { refQuoteDetailId: d.ref_quote_detail_id, requestedQty: qty });
+                const { quoteTransactionId } = await validateQuoteConvertibleQty(client, { refQuoteDetailId: d.ref_quote_detail_id, requestedQty: qty, uomId: d.uom_id });
                 affectedQuoteIds.add(quoteTransactionId);
             }
             if (d.id && existingIds.has(d.id)) {
@@ -379,21 +390,21 @@ const updateTransaction = async (req, res) => {
                         line_no=$1, item_id=$2, item_code=$3, item_name=$4, uom_id=$5, qty_ordered=$6,
                         unit_price_fc=$7, total_value_lc=$8, description=$9, ref_quote_detail_id=$10,
                         discount_percent=$12, vat_type=$13, vat_rate=$14,
-                        discount_text=$15, line_discount_amount=$16, bill_discount_amount=$17, discount_amount=$18
+                        discount_text=$15, line_discount_amount=$16, bill_discount_amount=$17, discount_amount=$18, conversion_factor=$19
                     WHERE id=$11
                 `, [lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
                     qty, price, value, d.description || null, d.ref_quote_detail_id || null, d.id, discountPercent, vatType, vatRate,
-                    ...orderDiscountParams(d)]);
+                    ...orderDiscountParams(d), d.conversion_factor ?? 1]);
             } else {
                 const newDetailRes = await client.query(`
                     INSERT INTO so_transaction_detail
                     (header_id, line_no, item_id, item_code, item_name, uom_id, qty_ordered, unit_price_fc, total_value_lc, description, ref_quote_detail_id,
-                     discount_percent, vat_type, vat_rate, discount_text, line_discount_amount, bill_discount_amount, discount_amount)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+                     discount_percent, vat_type, vat_rate, discount_text, line_discount_amount, bill_discount_amount, discount_amount, conversion_factor)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
                     RETURNING id
                 `, [id, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
                     qty, price, value, d.description || null, d.ref_quote_detail_id || null, discountPercent, vatType, vatRate,
-                    ...orderDiscountParams(d)]);
+                    ...orderDiscountParams(d), d.conversion_factor ?? 1]);
                 if (d.ref_quote_detail_id) {
                     await copyAttachmentsToEntity(client, {
                         dbName, sourceModule: 'quote_transaction_detail', sourceEntityId: d.ref_quote_detail_id,
@@ -649,12 +660,8 @@ const fetchDeliverableLines = async (req, res) => {
                    dt.discount_percent, dt.vat_type, dt.vat_rate, t.price_includes_vat,
                    -- ราคาหลังส่วนลด ก่อน VAT — ใบส่งสินค้าใช้เตือนเมื่อราคาขายต่างจากใบสั่งขาย
                    ${netUnitPriceSql('dt.unit_price_fc', 'dt', 't')} AS net_unit_price_fc,
-                   u.uom_code,
-                   COALESCE((
-                       SELECT SUM(ABS(imd.qty)) FROM im_transaction_detail imd
-                       JOIN im_transaction imt ON imt.id = imd.header_id
-                       WHERE imd.ref_so_detail_id = dt.id AND imt.status IN ('Posted', 'Delivered')
-                   ), 0) AS qty_delivered
+                   u.uom_code, u.uom_name_th, u.uom_name_en, dt.conversion_factor,
+                   ${soDeliveredSql('dt')} AS qty_delivered
             FROM so_transaction_detail dt
             JOIN so_transaction t ON t.id = dt.header_id
             LEFT JOIN im_uom u ON u.id = dt.uom_id
@@ -680,9 +687,12 @@ const fetchDeliverableLines = async (req, res) => {
 // ตรวจสอบว่าจำนวนที่จะส่ง (ต่อบรรทัด DLN ที่อ้างอิง ref_so_detail_id) ไม่เกินจำนวนคงเหลือที่ส่งได้ของบรรทัด SO ต้นฉบับ
 // เอกสาร SO หนึ่งบรรทัดอาจถูกส่งหลายครั้ง (คนละใบ DLN) คงเหลือคำนวณจากผลรวมการส่งที่ Posted/Delivered แล้วเท่านั้น —
 // มิเรอร์ validatePoReceivableQty ใน poTransactionController.js ทุกประการ
-const validateSoDeliverableQty = async (client, { refSoDetailId, requestedQty, customerId, currencyCode }) => {
+// requestedQty = จำนวนหน่วยหลักที่ส่ง, uomId/uomQty = หน่วย/จำนวนตามหน่วยของบรรทัด IM — เทียบเป็นหน่วยของบรรทัด SO
+// (หน่วยเดียวกันใช้ uomQty ตรงตัว ไม่งั้นแปลงจากหน่วยหลักด้วยอัตราของบรรทัด SO)
+const validateSoDeliverableQty = async (client, { refSoDetailId, requestedQty, uomId, uomQty, customerId, currencyCode }) => {
     const origRes = await client.query(`
         SELECT sod.qty_ordered, sod.item_code, sod.header_id, so.customer_id, so.status AS so_status, so.doc_no,
+               sod.uom_id, sod.conversion_factor, ${soDeliveredSql('sod')} AS delivered,
                COALESCE(so.currency_code, ${BASE_CURRENCY_CODE_SQL}) AS currency_code
         FROM so_transaction_detail sod JOIN so_transaction so ON so.id = sod.header_id
         WHERE sod.id = $1
@@ -699,13 +709,12 @@ const validateSoDeliverableQty = async (client, { refSoDetailId, requestedQty, c
     if (currencyCode && orig.currency_code !== currencyCode) {
         throw new Error(`สกุลเงินของใบส่งสินค้า (${currencyCode}) ต้องตรงกับใบสั่งขาย ${orig.doc_no} (${orig.currency_code})`);
     }
-    const deliveredRes = await client.query(`
-        SELECT COALESCE(SUM(ABS(imd.qty)), 0) AS delivered
-        FROM im_transaction_detail imd JOIN im_transaction imt ON imt.id = imd.header_id
-        WHERE imd.ref_so_detail_id = $1 AND imt.status IN ('Posted', 'Delivered')
-    `, [refSoDetailId]);
-    const remaining = Number(orig.qty_ordered) - Number(deliveredRes.rows[0].delivered);
-    if (requestedQty > remaining + 0.0001) {
+    // จำนวนที่ส่งแล้วนับรวมบรรทัดนี้เอง (โพสต์อยู่ในทรานแซกชันเดียวกัน — สถานะยังไม่ Posted จึงยังไม่ถูกนับ)
+    const sameUnit = uomQty != null && Number(uomId || 0) === Number(orig.uom_id || 0);
+    const factor = Number(orig.conversion_factor) || 1;
+    const requested = sameUnit ? Math.abs(Number(uomQty)) : Math.abs(Number(requestedQty) || 0) / factor;
+    const remaining = Number(orig.qty_ordered) - Number(orig.delivered);
+    if (requested > remaining + 1e-6) {
         throw new Error(`จำนวนที่ส่งเกินกว่าคงเหลือที่สั่งขายของ ${orig.item_code} (คงเหลือส่งได้ ${remaining})`);
     }
     return { soTransactionId: orig.header_id };
@@ -721,12 +730,9 @@ const refreshSoStatus = async (client, soTransactionId) => {
 
     const sumRes = await client.query(`
         SELECT
-            COALESCE(SUM(sod.qty_ordered), 0) AS ordered,
-            COALESCE(SUM((
-                SELECT SUM(ABS(imd.qty)) FROM im_transaction_detail imd
-                JOIN im_transaction imt ON imt.id = imd.header_id
-                WHERE imd.ref_so_detail_id = sod.id AND imt.status IN ('Posted', 'Delivered')
-            )), 0) AS delivered
+            -- เทียบเป็นหน่วยหลัก (จำนวนของแต่ละบรรทัด × อัตราแปลง) เพราะบรรทัดต่างหน่วยกันรวมกันตรงๆ ไม่ได้
+            COALESCE(SUM(sod.qty_ordered * sod.conversion_factor), 0) AS ordered,
+            COALESCE(SUM(${soDeliveredSql('sod')} * sod.conversion_factor), 0) AS delivered
         FROM so_transaction_detail sod WHERE sod.header_id = $1
     `, [soTransactionId]);
     const { ordered, delivered } = sumRes.rows[0];

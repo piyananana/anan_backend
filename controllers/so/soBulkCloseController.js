@@ -4,6 +4,8 @@
 // qty_delivered คำนวณด้วยสูตรเดียวกับ soPendingDeliveryReportController.js/refreshSoStatus ทุกประการ — มิเรอร์
 // poBulkCloseController.js ทุกประการ (vendor->customer)
 'use strict';
+const { soDeliveredSql } = require('../../utils/imLineUom');
+const { ensureSoPriceColumns } = require('../../utils/vatCalc');
 
 const CLOSABLE_STATUSES = ['Approved', 'PartiallyDelivered', 'FullyDelivered'];
 
@@ -14,6 +16,7 @@ const fetchClosableList = async (req, res) => {
 
     const client = await req.dbPool.connect();
     try {
+        await ensureSoPriceColumns(client);
         const result = await client.query(`
             SELECT
                 so.id AS so_id, so.doc_no AS so_doc_no, so.doc_date AS so_doc_date, so.due_date, so.status,
@@ -21,12 +24,9 @@ const fetchClosableList = async (req, res) => {
                 c.customer_name_en,
                 so.warehouse_id, w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
                 so.total_value_lc,
-                COALESCE(SUM(sod.qty_ordered), 0) AS qty_ordered,
-                COALESCE(SUM((
-                    SELECT SUM(ABS(imd.qty)) FROM im_transaction_detail imd
-                    JOIN im_transaction imt ON imt.id = imd.header_id
-                    WHERE imd.ref_so_detail_id = sod.id AND imt.status IN ('Posted','Delivered')
-                )), 0) AS qty_delivered
+                -- รวมเป็นหน่วยหลัก (จำนวน × อัตราแปลงของบรรทัด) — บรรทัดต่างหน่วยกันรวมกันตรงๆ ไม่ได้
+                COALESCE(SUM(sod.qty_ordered * sod.conversion_factor), 0) AS qty_ordered,
+                COALESCE(SUM(${soDeliveredSql('sod')} * sod.conversion_factor), 0) AS qty_delivered
             FROM so_transaction so
             JOIN so_transaction_detail sod ON sod.header_id = so.id
             LEFT JOIN ar_customer c ON c.id = so.customer_id

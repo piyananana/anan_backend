@@ -110,6 +110,10 @@ const ensureSoPriceColumns = async (db) => {
     await addSalesPriceColumns(db, 'quote_transaction');
     await addSalesDiscountColumns(db, 'so_transaction');
     await addSalesDiscountColumns(db, 'quote_transaction');
+    // อัตราแปลงหน่วยของบรรทัด ณ ตอนบันทึก (หน่วยหลักต่อ 1 หน่วยของบรรทัด) — 1 = หน่วยหลัก/เอกสารเก่า
+    for (const t of ['so_transaction_detail', 'quote_transaction_detail']) {
+        await db.query(`ALTER TABLE IF EXISTS ${t} ADD COLUMN IF NOT EXISTS conversion_factor NUMERIC(18,6) NOT NULL DEFAULT 1`);
+    }
     if (dbName) ensuredSo.add(dbName);
 };
 

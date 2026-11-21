@@ -21,6 +21,18 @@ const { ensureSalespersonTable, saveDocSalespersons, loadSalespersons } = requir
 const ensureDocSalesperson = (db) => ensureSalespersonTable(db, 'quote_transaction_salesperson', 'quote_transaction', 'header_id');
 const { ensureSoTransactionTable } = require('./soTransactionController');
 const { addSalesPriceColumns, applyOrderSalesDiscounts, orderDiscountParams, saveOrderBillDiscount } = require('../../utils/vatCalc');
+const { resolveOrderLineUom } = require('../../utils/imLineUom');
+
+// บรรทัดใบเสนอราคา: หน่วยต้องอนุญาตให้ขาย จำนวนตามทศนิยมของหน่วย — จำนวน/ราคาเก็บตามหน่วยของบรรทัด + อัตราแปลง snapshot
+const normalizeQuoteLines = async (client, details) => {
+    for (const d of details || []) {
+        if (!d || !d.item_id) continue;
+        const u = await resolveOrderLineUom(client, d.item_id, d.uom_id, d.qty_quoted, 'SALES');
+        d.uom_id = u.uom_id;
+        d.qty_quoted = u.qty;
+        d.conversion_factor = u.factor;
+    }
+};
 // lazy — soTransactionController export ครบหลังโหลดเสร็จ (require วนกัน)
 const soLineValues = (...a) => require('./soTransactionController').soLineValues(...a);
 const saveSoTotals = (...a) => require('./soTransactionController').saveSoTotals(...a);
@@ -82,6 +94,8 @@ const ensureQuoteTransactionTable = async (client) => {
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_quote_transaction_detail_header ON quote_transaction_detail(header_id)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_quote_transaction_detail_item   ON quote_transaction_detail(item_id)`);
+    // อัตราแปลงหน่วยของบรรทัด ณ ตอนบันทึก (จำนวนหน่วยหลักต่อ 1 หน่วยของบรรทัด) — 1 = หน่วยหลัก/ใบเก่า
+    await client.query(`ALTER TABLE quote_transaction_detail ADD COLUMN IF NOT EXISTS conversion_factor NUMERIC(18,6) NOT NULL DEFAULT 1`);
 
     // คิวผู้อนุมัติอยู่ที่ตารางกลาง doc_approval (utils/docApproval.js, doc_kind 'QUOTE') — ตาราง quote_transaction_approval เดิมเลิกใช้แล้ว
 
@@ -117,7 +131,7 @@ const fetchRowById = async (pool, id) => {
         WHERE t.id = $1`, [id]);
     if (hRes.rows.length === 0) return null;
     const dRes = await pool.query(`
-        SELECT dt.*, u.uom_code,
+        SELECT dt.*, u.uom_code, u.uom_name_th, u.uom_name_en,
                COALESCE((
                    SELECT SUM(sod.qty_ordered) FROM so_transaction_detail sod
                    JOIN so_transaction so ON so.id = sod.header_id
@@ -235,6 +249,7 @@ const createTransaction = async (req, res) => {
             header.branch_id || null, userName, header.price_includes_vat === true,
         ]);
         const headerId = hRes.rows[0].id;
+        await normalizeQuoteLines(client, details);
         // ส่วนลดขั้นบันได + เงินของรายการ + ท้ายบิล (% และเงินสด) ปันเข้ารายการ — เหมือนใบสั่งขาย
         applyOrderSalesDiscounts(header, details, d => d.qty_quoted);
         await saveOrderBillDiscount(client, 'quote_transaction', headerId, header);
@@ -250,10 +265,10 @@ const createTransaction = async (req, res) => {
             await client.query(`
                 INSERT INTO quote_transaction_detail
                 (header_id, line_no, item_id, item_code, item_name, uom_id, qty_quoted, unit_price_fc, total_value_lc, description,
-                 discount_percent, vat_type, vat_rate, discount_text, line_discount_amount, bill_discount_amount, discount_amount)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+                 discount_percent, vat_type, vat_rate, discount_text, line_discount_amount, bill_discount_amount, discount_amount, conversion_factor)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
             `, [headerId, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                qty, price, amt.netLc, d.description || null, discountPercent, vatType, vatRate, ...orderDiscountParams(d)]);
+                qty, price, amt.netLc, d.description || null, discountPercent, vatType, vatRate, ...orderDiscountParams(d), d.conversion_factor ?? 1]);
         }
         await saveSoTotals(client, headerId, totalQty, amts, 'quote_transaction');
         await saveDocSalespersons(client, 'quote_transaction_salesperson', 'header_id', headerId, req.body.salespersons);
@@ -322,6 +337,7 @@ const updateTransaction = async (req, res) => {
             await client.query(`DELETE FROM quote_transaction_detail WHERE id = ANY($1::int[])`, [removedIds]);
         }
 
+        await normalizeQuoteLines(client, details);
         applyOrderSalesDiscounts(header, details, d => d.qty_quoted);
         await saveOrderBillDiscount(client, 'quote_transaction', id, header);
 
@@ -339,18 +355,18 @@ const updateTransaction = async (req, res) => {
                     UPDATE quote_transaction_detail SET
                         line_no=$1, item_id=$2, item_code=$3, item_name=$4, uom_id=$5, qty_quoted=$6,
                         unit_price_fc=$7, total_value_lc=$8, description=$9, discount_percent=$11, vat_type=$12, vat_rate=$13,
-                        discount_text=$14, line_discount_amount=$15, bill_discount_amount=$16, discount_amount=$17
+                        discount_text=$14, line_discount_amount=$15, bill_discount_amount=$16, discount_amount=$17, conversion_factor=$18
                     WHERE id=$10
                 `, [lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                    qty, price, value, d.description || null, d.id, discountPercent, vatType, vatRate, ...orderDiscountParams(d)]);
+                    qty, price, value, d.description || null, d.id, discountPercent, vatType, vatRate, ...orderDiscountParams(d), d.conversion_factor ?? 1]);
             } else {
                 await client.query(`
                     INSERT INTO quote_transaction_detail
                     (header_id, line_no, item_id, item_code, item_name, uom_id, qty_quoted, unit_price_fc, total_value_lc, description,
-                     discount_percent, vat_type, vat_rate, discount_text, line_discount_amount, bill_discount_amount, discount_amount)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+                     discount_percent, vat_type, vat_rate, discount_text, line_discount_amount, bill_discount_amount, discount_amount, conversion_factor)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
                 `, [id, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                    qty, price, value, d.description || null, discountPercent, vatType, vatRate, ...orderDiscountParams(d)]);
+                    qty, price, value, d.description || null, discountPercent, vatType, vatRate, ...orderDiscountParams(d), d.conversion_factor ?? 1]);
             }
         }
         await saveSoTotals(client, id, totalQty, amts, 'quote_transaction');
@@ -568,7 +584,7 @@ const fetchConvertibleLines = async (req, res) => {
             SELECT t.id AS header_id, t.doc_no, t.doc_date, t.status, t.currency_code, t.exchange_rate,
                    t.dim1_id, t.dim2_id, t.dim3_id, t.dim4_id, t.dim5_id, t.branch_id,
                    dt.id AS detail_id, dt.line_no, dt.item_id, dt.item_code, dt.item_name, dt.uom_id,
-                   dt.qty_quoted, dt.unit_price_fc, u.uom_code,
+                   dt.qty_quoted, dt.unit_price_fc, u.uom_code, u.uom_name_th, u.uom_name_en, dt.conversion_factor,
                    dt.discount_percent, dt.vat_type, dt.vat_rate, t.price_includes_vat,
                    COALESCE((
                        SELECT SUM(sod.qty_ordered) FROM so_transaction_detail sod
@@ -597,14 +613,21 @@ const fetchConvertibleLines = async (req, res) => {
 // --- Cross-module helpers, called from soTransactionController.js's line-save path ---
 
 // มิเรอร์ validatePrConvertibleQty ใน poPrTransactionController.js ทุกประการ
-const validateQuoteConvertibleQty = async (client, { refQuoteDetailId, requestedQty }) => {
+// uomId = หน่วยของบรรทัด SO (หลัง normalize, ไม่ระบุ = หน่วยหลัก) — ต้องตรงกับหน่วยของบรรทัดใบเสนอราคา
+const validateQuoteConvertibleQty = async (client, { refQuoteDetailId, requestedQty, uomId }) => {
     const origRes = await client.query(`
-        SELECT qtd.qty_quoted, qtd.item_code, qtd.header_id, qt.status AS quote_status
+        SELECT qtd.qty_quoted, qtd.item_code, qtd.header_id, qt.status AS quote_status,
+               COALESCE(qtd.uom_id, i.base_uom_id) AS uom_id, u.uom_code
         FROM quote_transaction_detail qtd JOIN quote_transaction qt ON qt.id = qtd.header_id
+        JOIN im_item i ON i.id = qtd.item_id
+        LEFT JOIN im_uom u ON u.id = COALESCE(qtd.uom_id, i.base_uom_id)
         WHERE qtd.id = $1
     `, [refQuoteDetailId]);
     if (origRes.rows.length === 0) throw new Error('ไม่พบรายการใบเสนอราคาต้นฉบับที่อ้างอิง');
     const orig = origRes.rows[0];
+    if (uomId !== undefined && Number(uomId || 0) !== Number(orig.uom_id || 0)) {
+        throw new Error(`รายการ ${orig.item_code} ที่ดึงจากใบเสนอราคาต้องใช้หน่วยเดียวกับใบเสนอราคา (${orig.uom_code || '-'})`);
+    }
     if (!['Approved', 'PartiallyConverted'].includes(orig.quote_status)) {
         throw new Error(`ใบเสนอราคา ${orig.item_code} ต้องอยู่สถานะ Approved หรือ PartiallyConverted เท่านั้นจึงจะแปลงเป็น SO เพิ่มได้`);
     }
