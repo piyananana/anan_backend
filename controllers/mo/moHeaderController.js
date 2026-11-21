@@ -30,6 +30,31 @@ const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const DA = require('../../utils/docApproval');
 const { headerDims, assertRequiredDims, assertRequiredBranch } = require('../../utils/glDims');
 const KIND = 'MO';
+const { resolvePlanLineUom, moIssuedSql, moReceivedSql, qtyInLineUnit, resolveOrderLineUom } = require('../../utils/imLineUom');
+
+// หน่วยของใบสั่งผลิต — จำนวนตามแผน/เบิกแล้ว/รับแล้วเก็บตามหน่วยของบรรทัด + อัตราแปลง snapshot (หน่วยหลักต่อ 1 หน่วย)
+// หน่วยต้องอนุญาตให้ใช้ผลิต ไม่ระบุ = หน่วยหลัก, หน่วยของหัวเอกสาร (จำนวนสั่งผลิต) = หน่วยของสินค้าผลผลิตหลัก
+// สถานะ/ต้นทุนเทียบเป็นจำนวนหน่วยหลัก (จำนวน × อัตราแปลง)
+const normalizeMoUoms = async (client, header, components, outputs) => {
+    for (const c of components || []) {
+        if (!c.component_item_id) continue;
+        const u = await resolvePlanLineUom(client, c.component_item_id, c.uom_id, 'PRODUCTION');
+        c.uom_id = u.uom_id; c.conversion_factor = u.factor;
+    }
+    for (const o of outputs || []) {
+        if (!o.output_item_id) continue;
+        const u = await resolvePlanLineUom(client, o.output_item_id, o.uom_id, 'PRODUCTION');
+        o.uom_id = u.uom_id; o.conversion_factor = u.factor;
+    }
+    const primary = (outputs || []).find(o => o.output_item_id && o.is_primary_output) || (outputs || []).find(o => o.output_item_id);
+    if (primary) {
+        const u = await resolvePlanLineUom(client, primary.output_item_id, header.uom_id || primary.uom_id, 'PRODUCTION');
+        header.uom_id = u.uom_id; header.conversion_factor = u.factor;
+    } else {
+        header.conversion_factor = 1;
+    }
+};
+const uomStatus = (error) => (error.code === 'UOM' ? 400 : null);
 
 const ensureMoHeaderTable = async (client) => {
     await ensureImItemTable(client);
@@ -169,6 +194,10 @@ const ensureMoHeaderTable = async (client) => {
     // ผลิตย่อย") ต้องเพิ่มทีหลังสุด เพราะ mo_component_detail เพิ่งถูกสร้างขึ้นด้านบนนี้เอง (วน FK ไป-กลับกับ
     // mo_header ไม่ได้ถ้าสร้างสองตารางนี้พร้อมกันในคราวเดียว)
     await client.query(`ALTER TABLE mo_header ADD COLUMN IF NOT EXISTS parent_mo_detail_id INTEGER REFERENCES mo_component_detail(id)`).catch(() => {});
+    // อัตราแปลงหน่วย ณ ตอนบันทึก (หน่วยหลักต่อ 1 หน่วยของบรรทัด) — 1 = หน่วยหลัก/ใบเก่า
+    await client.query(`ALTER TABLE mo_header ADD COLUMN IF NOT EXISTS conversion_factor NUMERIC(18,6) NOT NULL DEFAULT 1`);
+    await client.query(`ALTER TABLE mo_component_detail ADD COLUMN IF NOT EXISTS conversion_factor NUMERIC(18,6) NOT NULL DEFAULT 1`);
+    await client.query(`ALTER TABLE mo_output_detail ADD COLUMN IF NOT EXISTS conversion_factor NUMERIC(18,6) NOT NULL DEFAULT 1`);
 };
 
 const HEADER_SELECT = `
@@ -293,10 +322,11 @@ const fetchStatusReport = async (req, res) => {
                    u.uom_code, u.uom_name_th, u.uom_name_en,
                    bh.parent_item_id AS bom_parent_item_id, pi.item_code AS bom_parent_item_code,
                    pi.item_name_th AS bom_parent_item_name_th, pi.item_name_en AS bom_parent_item_name_en,
-                   COALESCE((SELECT SUM(c.planned_qty) FROM mo_component_detail c WHERE c.header_id = h.id), 0) AS component_planned_qty,
-                   COALESCE((SELECT SUM(c.issued_qty)  FROM mo_component_detail c WHERE c.header_id = h.id), 0) AS component_issued_qty,
-                   COALESCE((SELECT SUM(o.planned_qty)  FROM mo_output_detail o    WHERE o.header_id = h.id), 0) AS output_planned_qty,
-                   COALESCE((SELECT SUM(o.received_qty) FROM mo_output_detail o    WHERE o.header_id = h.id), 0) AS output_received_qty
+                   -- ยอดรวมเป็นจำนวนหน่วยหลัก (บรรทัดใช้หน่วยต่างกันได้) — % สำเร็จเทียบสัดส่วนเท่านั้น
+                   COALESCE((SELECT SUM(c.planned_qty * c.conversion_factor) FROM mo_component_detail c WHERE c.header_id = h.id), 0) AS component_planned_qty,
+                   COALESCE((SELECT SUM(c.issued_qty * c.conversion_factor)  FROM mo_component_detail c WHERE c.header_id = h.id), 0) AS component_issued_qty,
+                   COALESCE((SELECT SUM(o.planned_qty * o.conversion_factor)  FROM mo_output_detail o    WHERE o.header_id = h.id), 0) AS output_planned_qty,
+                   COALESCE((SELECT SUM(o.received_qty * o.conversion_factor) FROM mo_output_detail o    WHERE o.header_id = h.id), 0) AS output_received_qty
             FROM mo_header h
             JOIN sa_module_document d ON d.id = h.doc_id
             LEFT JOIN im_warehouse w  ON w.id = h.warehouse_id
@@ -367,11 +397,12 @@ const fetchCostVarianceReport = async (req, res) => {
                        FROM mo_operation_detail op JOIN mo_work_center wc ON wc.id = op.work_center_id
                        WHERE op.header_id = h.id
                    ), 0) AS routing_overhead_cost,
+                   -- จำนวนรับ (หน่วยหลัก) แปลงเป็นหน่วยของใบสั่งผลิต — ต้นทุนเฉลี่ยจึงเป็นต่อหน่วยที่สั่งผลิต
                    COALESCE((
                        SELECT SUM(ABS(imd.qty)) FROM im_transaction_detail imd
                        JOIN im_transaction imt ON imt.id = imd.header_id
                        WHERE imt.ref_mo_id = h.id AND imd.ref_mo_output_detail_id IS NOT NULL AND imt.status = 'Posted'
-                   ), 0) AS output_received_qty,
+                   ), 0) / COALESCE(NULLIF(h.conversion_factor, 0), 1) AS output_received_qty,
                    COALESCE((
                        SELECT SUM(ABS(imd.qty) * imd.unit_cost) FROM im_transaction_detail imd
                        JOIN im_transaction imt ON imt.id = imd.header_id
@@ -528,6 +559,7 @@ const createTransaction = async (req, res) => {
         if (!header.order_qty || Number(header.order_qty) <= 0) throw new Error('กรุณาระบุจำนวนที่สั่งผลิตให้มากกว่า 0');
         if (!Array.isArray(components) || components.length === 0) throw new Error('ต้องมีส่วนประกอบอย่างน้อย 1 รายการ');
         if (!Array.isArray(outputs) || outputs.length === 0) throw new Error('ต้องมีผลผลิตอย่างน้อย 1 รายการ');
+        await normalizeMoUoms(client, header, components, outputs);
 
         const docTypeRes = await client.query(`SELECT doc_code FROM sa_module_document WHERE id=$1`, [header.doc_id]);
         if (docTypeRes.rows.length === 0) throw new Error('ไม่พบประเภทเอกสาร');
@@ -544,8 +576,8 @@ const createTransaction = async (req, res) => {
                 (doc_id, doc_no, doc_code, doc_date, bom_header_id, warehouse_id, order_qty, uom_id,
                  issue_method, costing_method, costing_mode, overhead_percent, due_date, description,
                  parent_mo_id, parent_mo_detail_id,
-                 dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id, created_by, updated_by)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$23)
+                 dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id, created_by, updated_by, conversion_factor)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$23,$24)
             RETURNING id
         `, [
             header.doc_id, docNo, docCode, header.doc_date, header.bom_header_id || null, header.warehouse_id,
@@ -554,7 +586,7 @@ const createTransaction = async (req, res) => {
             header.overhead_percent ?? 0, header.due_date || null, header.description || null,
             header.parent_mo_id || null, header.parent_mo_detail_id || null,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
-            header.branch_id || null, header.created_by || null,
+            header.branch_id || null, header.created_by || null, header.conversion_factor ?? 1,
         ]);
         const headerId = hRes.rows[0].id;
 
@@ -562,18 +594,18 @@ const createTransaction = async (req, res) => {
         for (const c of components) {
             if (!c.component_item_id) continue;
             await client.query(`
-                INSERT INTO mo_component_detail (header_id, line_no, component_item_id, item_code, item_name, planned_qty, uom_id, location_id)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-            `, [headerId, lineNo++, c.component_item_id, c.item_code || null, c.item_name || null, c.planned_qty ?? 0, c.uom_id || null, c.location_id || null]);
+                INSERT INTO mo_component_detail (header_id, line_no, component_item_id, item_code, item_name, planned_qty, uom_id, location_id, conversion_factor)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            `, [headerId, lineNo++, c.component_item_id, c.item_code || null, c.item_name || null, c.planned_qty ?? 0, c.uom_id || null, c.location_id || null, c.conversion_factor ?? 1]);
         }
 
         let outLineNo = 1;
         for (const o of outputs) {
             if (!o.output_item_id) continue;
             await client.query(`
-                INSERT INTO mo_output_detail (header_id, line_no, output_item_id, item_code, item_name, planned_qty, uom_id, is_primary_output)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-            `, [headerId, outLineNo++, o.output_item_id, o.item_code || null, o.item_name || null, o.planned_qty ?? 0, o.uom_id || null, o.is_primary_output ?? false]);
+                INSERT INTO mo_output_detail (header_id, line_no, output_item_id, item_code, item_name, planned_qty, uom_id, is_primary_output, conversion_factor)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            `, [headerId, outLineNo++, o.output_item_id, o.item_code || null, o.item_name || null, o.planned_qty ?? 0, o.uom_id || null, o.is_primary_output ?? false, o.conversion_factor ?? 1]);
         }
 
         let opLineNo = 1;
@@ -591,7 +623,7 @@ const createTransaction = async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error creating mo_header:', error);
-        res.status(500).json({ message: error.message || 'Internal server error' });
+        res.status(uomStatus(error) || 500).json({ message: error.message || 'Internal server error' });
     } finally { client.release(); }
 };
 
@@ -610,6 +642,7 @@ const updateTransaction = async (req, res) => {
         if (!header.order_qty || Number(header.order_qty) <= 0) throw new Error('กรุณาระบุจำนวนที่สั่งผลิตให้มากกว่า 0');
         if (!Array.isArray(components) || components.length === 0) throw new Error('ต้องมีส่วนประกอบอย่างน้อย 1 รายการ');
         if (!Array.isArray(outputs) || outputs.length === 0) throw new Error('ต้องมีผลผลิตอย่างน้อย 1 รายการ');
+        await normalizeMoUoms(client, header, components, outputs);
 
         await client.query(`
             UPDATE mo_header SET
@@ -626,13 +659,14 @@ const updateTransaction = async (req, res) => {
                 updated_by       = $11,
                 updated_at       = NOW(),
                 dim1_id = $13, dim2_id = $14, dim3_id = $15, dim4_id = $16, dim5_id = $17,
-                branch_id = $18
+                branch_id = $18,
+                conversion_factor = $19
             WHERE id = $12
         `, [
             header.bom_header_id || null, header.warehouse_id, header.order_qty, header.uom_id || null,
             header.issue_method || 'EXPLICIT', header.costing_method || 'ACTUAL', header.costing_mode || 'OVERHEAD_PERCENT',
             header.overhead_percent ?? 0, header.due_date || null, header.description || null,
-            header.updated_by || null, id, ...headerDims(header), Number(header.branch_id) || null,
+            header.updated_by || null, id, ...headerDims(header), Number(header.branch_id) || null, header.conversion_factor ?? 1,
         ]);
 
         await client.query(`DELETE FROM mo_component_detail WHERE header_id = $1`, [id]);
@@ -640,9 +674,9 @@ const updateTransaction = async (req, res) => {
         for (const c of components) {
             if (!c.component_item_id) continue;
             await client.query(`
-                INSERT INTO mo_component_detail (header_id, line_no, component_item_id, item_code, item_name, planned_qty, uom_id, location_id)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-            `, [id, lineNo++, c.component_item_id, c.item_code || null, c.item_name || null, c.planned_qty ?? 0, c.uom_id || null, c.location_id || null]);
+                INSERT INTO mo_component_detail (header_id, line_no, component_item_id, item_code, item_name, planned_qty, uom_id, location_id, conversion_factor)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            `, [id, lineNo++, c.component_item_id, c.item_code || null, c.item_name || null, c.planned_qty ?? 0, c.uom_id || null, c.location_id || null, c.conversion_factor ?? 1]);
         }
 
         await client.query(`DELETE FROM mo_output_detail WHERE header_id = $1`, [id]);
@@ -650,9 +684,9 @@ const updateTransaction = async (req, res) => {
         for (const o of outputs) {
             if (!o.output_item_id) continue;
             await client.query(`
-                INSERT INTO mo_output_detail (header_id, line_no, output_item_id, item_code, item_name, planned_qty, uom_id, is_primary_output)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-            `, [id, outLineNo++, o.output_item_id, o.item_code || null, o.item_name || null, o.planned_qty ?? 0, o.uom_id || null, o.is_primary_output ?? false]);
+                INSERT INTO mo_output_detail (header_id, line_no, output_item_id, item_code, item_name, planned_qty, uom_id, is_primary_output, conversion_factor)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            `, [id, outLineNo++, o.output_item_id, o.item_code || null, o.item_name || null, o.planned_qty ?? 0, o.uom_id || null, o.is_primary_output ?? false, o.conversion_factor ?? 1]);
         }
 
         await client.query(`DELETE FROM mo_operation_detail WHERE header_id = $1`, [id]);
@@ -671,7 +705,7 @@ const updateTransaction = async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error updating mo_header:', error);
-        res.status(error.message === 'Not found' ? 404 : 500).json({ message: error.message || 'Internal server error' });
+        res.status(error.message === 'Not found' ? 404 : (uomStatus(error) || 500)).json({ message: error.message || 'Internal server error' });
     } finally { client.release(); }
 };
 
@@ -1082,7 +1116,7 @@ const checkMaterialAvailability = async (req, res) => {
                    COALESCE((
                        SELECT SUM(b.qty_on_hand) FROM im_stock_balance b
                        WHERE b.item_id = c.component_item_id AND b.warehouse_id = $2
-                   ), 0) AS available_qty
+                   ), 0) / NULLIF(c.conversion_factor, 0) AS available_qty
             FROM mo_component_detail c
             LEFT JOIN im_uom u ON u.id = c.uom_id
             WHERE c.header_id = $1
@@ -1176,7 +1210,10 @@ const explodeSubAssembly = async (req, res) => {
         if (bomRes.rows.length === 0) throw new Error('สินค้านี้ไม่มีสูตรการผลิต (BOM) ที่ใช้งานอยู่ ไม่สามารถสร้างใบสั่งผลิตย่อยได้');
         const bom = bomRes.rows[0];
         const bomQty = Number(bom.bom_qty) || 1;
-        const scale = remainingQty / bomQty;
+        // คงเหลือของส่วนประกอบ (หน่วยของบรรทัด) → จำนวนสั่งผลิตของใบย่อยในหน่วยผลผลิตของสูตร
+        const outFactor = Number(bom.output_conversion_factor) || 1;
+        const childQty = Math.round(remainingQty * (Number(comp.conversion_factor) || 1) / outFactor * 1e6) / 1e6;
+        const scale = childQty / bomQty;
 
         const docDate = due_date || today();
         let docNo = await generateDocNo(client, parentMo.doc_id, docDate, parentMo.branch_id || null);
@@ -1187,14 +1224,15 @@ const explodeSubAssembly = async (req, res) => {
                 (doc_id, doc_no, doc_code, doc_date, bom_header_id, warehouse_id, order_qty, uom_id,
                  issue_method, costing_method, costing_mode, overhead_percent, due_date,
                  parent_mo_id, parent_mo_detail_id, branch_id, created_by, updated_by,
-                 dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17,$18,$19,$20,$21,$22)
+                 dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, conversion_factor)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17,$18,$19,$20,$21,$22,$23)
             RETURNING id
         `, [
-            parentMo.doc_id, docNo, parentMo.doc_code, docDate, bom.id, parentMo.warehouse_id, remainingQty, bom.output_uom_id,
+            parentMo.doc_id, docNo, parentMo.doc_code, docDate, bom.id, parentMo.warehouse_id, childQty, bom.output_uom_id,
             bom.issue_method, bom.costing_method, bom.costing_mode, bom.overhead_percent, due_date || null,
             parentMo.id, comp.id, parentMo.branch_id || null, userName,
             ...headerDims(parentMo), // ใบสั่งผลิตย่อยใช้มิติของใบแม่เป็นค่าเริ่มต้น (แก้ได้ตอนร่าง)
+            outFactor,
         ]);
         const childId = hRes.rows[0].id;
 
@@ -1207,16 +1245,16 @@ const explodeSubAssembly = async (req, res) => {
         for (const d of bomDetailsRes.rows) {
             const plannedQty = Number(d.quantity_per) * scale * (1 + Number(d.scrap_percent) / 100);
             await client.query(`
-                INSERT INTO mo_component_detail (header_id, line_no, component_item_id, item_code, item_name, planned_qty, uom_id)
-                VALUES ($1,$2,$3,$4,$5,$6,$7)
-            `, [childId, lineNo++, d.component_item_id, d.item_code, d.item_name_th, plannedQty, d.uom_id]);
+                INSERT INTO mo_component_detail (header_id, line_no, component_item_id, item_code, item_name, planned_qty, uom_id, conversion_factor)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            `, [childId, lineNo++, d.component_item_id, d.item_code, d.item_name_th, plannedQty, d.uom_id, Number(d.conversion_factor) || 1]);
         }
 
         const parentItemRes = await client.query(`SELECT item_code, item_name_th FROM im_item WHERE id = $1`, [bom.parent_item_id]);
         await client.query(`
-            INSERT INTO mo_output_detail (header_id, line_no, output_item_id, item_code, item_name, planned_qty, uom_id, is_primary_output)
-            VALUES ($1,1,$2,$3,$4,$5,$6,true)
-        `, [childId, bom.parent_item_id, parentItemRes.rows[0]?.item_code, parentItemRes.rows[0]?.item_name_th, remainingQty, bom.output_uom_id]);
+            INSERT INTO mo_output_detail (header_id, line_no, output_item_id, item_code, item_name, planned_qty, uom_id, is_primary_output, conversion_factor)
+            VALUES ($1,1,$2,$3,$4,$5,$6,true,$7)
+        `, [childId, bom.parent_item_id, parentItemRes.rows[0]?.item_code, parentItemRes.rows[0]?.item_name_th, childQty, bom.output_uom_id, outFactor]);
 
         const bomOutputsRes = await client.query(`
             SELECT o.*, oi.item_code, oi.item_name_th
@@ -1227,9 +1265,9 @@ const explodeSubAssembly = async (req, res) => {
         for (const o of bomOutputsRes.rows) {
             const plannedQty = Number(o.output_qty_per) * scale;
             await client.query(`
-                INSERT INTO mo_output_detail (header_id, line_no, output_item_id, item_code, item_name, planned_qty, uom_id, is_primary_output)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,false)
-            `, [childId, outLineNo++, o.output_item_id, o.item_code, o.item_name_th, plannedQty, o.uom_id]);
+                INSERT INTO mo_output_detail (header_id, line_no, output_item_id, item_code, item_name, planned_qty, uom_id, is_primary_output, conversion_factor)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,false,$8)
+            `, [childId, outLineNo++, o.output_item_id, o.item_code, o.item_name_th, plannedQty, o.uom_id, Number(o.conversion_factor) || 1]);
         }
 
         const bomOperationsRes = await client.query(`SELECT * FROM mo_bom_operation_detail WHERE bom_header_id = $1 ORDER BY line_no`, [bom.id]);
@@ -1284,9 +1322,11 @@ const deleteTransaction = async (req, res) => {
 // ตรวจคงเหลือที่เบิกได้ของบรรทัดส่วนประกอบ MO นี้ ก่อน Post ธุรกรรม '90' (เบิกวัตถุดิบเข้าผลิต) ที่อ้างอิงเข้ามา —
 // มิเรอร์ validatePoReceivableQty ใน poTransactionController.js ทุกประการ (ไม่ต้องเทียบผู้ขาย/ลูกค้าเหมือน PO/SO
 // เพราะธุรกรรม IM ที่อ้างอิง MO ไม่มีแนวคิดคู่ค้า)
-const validateMoComponentIssueQty = async (client, { refMoComponentDetailId, requestedQty }) => {
+// requestedQty = จำนวนหน่วยหลักที่เคลื่อนไหว, uomId/uomQty = หน่วย/จำนวนในเอกสาร IM — เทียบเป็นหน่วยของบรรทัด MO
+const validateMoComponentIssueQty = async (client, { refMoComponentDetailId, requestedQty, uomId, uomQty }) => {
     const origRes = await client.query(`
-        SELECT c.planned_qty, c.item_code, c.header_id, h.status AS mo_status
+        SELECT c.planned_qty, c.item_code, c.header_id, c.uom_id, c.conversion_factor, h.status AS mo_status,
+               ${moIssuedSql('c')} AS issued
         FROM mo_component_detail c JOIN mo_header h ON h.id = c.header_id
         WHERE c.id = $1
     `, [refMoComponentDetailId]);
@@ -1295,13 +1335,9 @@ const validateMoComponentIssueQty = async (client, { refMoComponentDetailId, req
     if (!['Released', 'InProgress'].includes(orig.mo_status)) {
         throw new Error(`ใบสั่งผลิตของ ${orig.item_code} ต้องอยู่สถานะ Released หรือ InProgress เท่านั้นจึงจะเบิกวัตถุดิบเพิ่มได้`);
     }
-    const issuedRes = await client.query(`
-        SELECT COALESCE(SUM(ABS(imd.qty)), 0) AS issued
-        FROM im_transaction_detail imd JOIN im_transaction imt ON imt.id = imd.header_id
-        WHERE imd.ref_mo_component_detail_id = $1 AND imt.status = 'Posted'
-    `, [refMoComponentDetailId]);
-    const remaining = Number(orig.planned_qty) - Number(issuedRes.rows[0].issued);
-    if (requestedQty > remaining + 0.0001) {
+    // เอกสารนี้ยังไม่ Posted ระหว่างตรวจ จึงยังไม่ถูกนับในยอดเบิกแล้ว
+    const remaining = Number(orig.planned_qty) - Number(orig.issued);
+    if (qtyInLineUnit({ requestedQty, uomId, uomQty }, orig) > remaining + 0.0001) {
         throw new Error(`จำนวนที่เบิกเกินกว่าที่วางแผนไว้ของ ${orig.item_code} (คงเหลือเบิกได้ ${remaining})`);
     }
     return { moHeaderId: orig.header_id };
@@ -1309,9 +1345,10 @@ const validateMoComponentIssueQty = async (client, { refMoComponentDetailId, req
 
 // ตรวจคงเหลือที่รับได้ของบรรทัดผลผลิต MO นี้ ก่อน Post ธุรกรรม '95' (รับสินค้าเข้าคลังจากการผลิต) ที่อ้างอิงเข้ามา —
 // มิเรอร์ validateMoComponentIssueQty ข้างบนทุกประการ ฝั่งผลผลิต
-const validateMoOutputReceiptQty = async (client, { refMoOutputDetailId, requestedQty }) => {
+const validateMoOutputReceiptQty = async (client, { refMoOutputDetailId, requestedQty, uomId, uomQty }) => {
     const origRes = await client.query(`
-        SELECT o.planned_qty, o.item_code, o.header_id, h.status AS mo_status
+        SELECT o.planned_qty, o.item_code, o.header_id, o.uom_id, o.conversion_factor, h.status AS mo_status,
+               ${moReceivedSql('o')} AS received
         FROM mo_output_detail o JOIN mo_header h ON h.id = o.header_id
         WHERE o.id = $1
     `, [refMoOutputDetailId]);
@@ -1320,13 +1357,8 @@ const validateMoOutputReceiptQty = async (client, { refMoOutputDetailId, request
     if (!['Released', 'InProgress'].includes(orig.mo_status)) {
         throw new Error(`ใบสั่งผลิตของ ${orig.item_code} ต้องอยู่สถานะ Released หรือ InProgress เท่านั้นจึงจะรับสินค้าเพิ่มได้`);
     }
-    const receivedRes = await client.query(`
-        SELECT COALESCE(SUM(ABS(imd.qty)), 0) AS received
-        FROM im_transaction_detail imd JOIN im_transaction imt ON imt.id = imd.header_id
-        WHERE imd.ref_mo_output_detail_id = $1 AND imt.status = 'Posted'
-    `, [refMoOutputDetailId]);
-    const remaining = Number(orig.planned_qty) - Number(receivedRes.rows[0].received);
-    if (requestedQty > remaining + 0.0001) {
+    const remaining = Number(orig.planned_qty) - Number(orig.received);
+    if (qtyInLineUnit({ requestedQty, uomId, uomQty }, orig) > remaining + 0.0001) {
         throw new Error(`จำนวนที่รับเกินกว่าที่วางแผนไว้ของ ${orig.item_code} (คงเหลือรับได้ ${remaining})`);
     }
     return { moHeaderId: orig.header_id };
@@ -1343,18 +1375,10 @@ const refreshMoStatus = async (client, moHeaderId) => {
     if (!['Released', 'InProgress', 'Completed'].includes(statusRes.rows[0].status)) return;
 
     await client.query(`
-        UPDATE mo_component_detail c SET issued_qty = COALESCE((
-            SELECT SUM(ABS(imd.qty)) FROM im_transaction_detail imd
-            JOIN im_transaction imt ON imt.id = imd.header_id
-            WHERE imd.ref_mo_component_detail_id = c.id AND imt.status = 'Posted'
-        ), 0) WHERE c.header_id = $1
+        UPDATE mo_component_detail c SET issued_qty = ${moIssuedSql('c')} WHERE c.header_id = $1
     `, [moHeaderId]);
     await client.query(`
-        UPDATE mo_output_detail o SET received_qty = COALESCE((
-            SELECT SUM(ABS(imd.qty)) FROM im_transaction_detail imd
-            JOIN im_transaction imt ON imt.id = imd.header_id
-            WHERE imd.ref_mo_output_detail_id = o.id AND imt.status = 'Posted'
-        ), 0) WHERE o.header_id = $1
+        UPDATE mo_output_detail o SET received_qty = ${moReceivedSql('o')} WHERE o.header_id = $1
     `, [moHeaderId]);
 
     // wip_balance_lc = มูลค่าเบิกเข้า WIP สะสม (ธุรกรรม '90') หักมูลค่ารับออกจาก WIP สะสม (ธุรกรรม '95') — ควรจะ
@@ -1393,13 +1417,14 @@ const refreshMoStatus = async (client, moHeaderId) => {
 
     const sumRes = await client.query(`
         SELECT
-            COALESCE((SELECT SUM(c.issued_qty) FROM mo_component_detail c WHERE c.header_id = $1), 0) AS issued,
-            COALESCE((SELECT SUM(o.planned_qty) FROM mo_output_detail o WHERE o.header_id = $1), 0) AS output_planned,
-            COALESCE((SELECT SUM(o.received_qty) FROM mo_output_detail o WHERE o.header_id = $1), 0) AS output_received
+            -- เทียบเป็นจำนวนหน่วยหลัก (บรรทัดใช้หน่วยต่างกันได้)
+            COALESCE((SELECT SUM(c.issued_qty * c.conversion_factor) FROM mo_component_detail c WHERE c.header_id = $1), 0) AS issued,
+            COALESCE((SELECT SUM(o.planned_qty * o.conversion_factor) FROM mo_output_detail o WHERE o.header_id = $1), 0) AS output_planned,
+            COALESCE((SELECT SUM(o.received_qty * o.conversion_factor) FROM mo_output_detail o WHERE o.header_id = $1), 0) AS output_received
     `, [moHeaderId]);
     const { issued, output_planned, output_received } = sumRes.rows[0];
     let newStatus = 'Released';
-    if (Number(output_received) > 0 && Number(output_received) >= Number(output_planned)) {
+    if (Number(output_received) > 0 && Number(output_received) >= Number(output_planned) - 0.0001) {
         newStatus = 'Completed';
     } else if (Number(issued) > 0 || Number(output_received) > 0) {
         newStatus = 'InProgress';
@@ -1444,14 +1469,15 @@ const computeMoReceiptUnitCost = async (client, { moHeader, outputDetail }) => {
     const totalCost = materialCost + conversionCost;
 
     const totalPlannedRes = await client.query(
-        `SELECT COALESCE(SUM(planned_qty), 0) AS total FROM mo_output_detail WHERE header_id = $1`,
+        `SELECT COALESCE(SUM(planned_qty * conversion_factor), 0) AS total FROM mo_output_detail WHERE header_id = $1`,
         [moHeader.id]
     );
+    // ปันตามจำนวนหน่วยหลักที่วางแผน — ต้นทุนที่คืนเป็นต่อหน่วยหลัก (บรรทัด IM เก็บจำนวนหน่วยหลัก)
     const totalPlannedQty = Number(totalPlannedRes.rows[0].total) || 1;
-    const outputShare = Number(outputDetail.planned_qty) / totalPlannedQty;
+    const plannedQty = Number(outputDetail.planned_qty) * (Number(outputDetail.conversion_factor) || 1);
+    const outputShare = plannedQty / totalPlannedQty;
     const allocatedCost = totalCost * outputShare;
 
-    const plannedQty = Number(outputDetail.planned_qty);
     const actualUnitCost = plannedQty > 0 ? allocatedCost / plannedQty : 0;
     // โสหุ้ยแบบ % ปันเข้างานตอนรับ (Dr WIP / Cr โสหุ้ยที่ปันเข้างาน ใน postGlEntry '95') — แบบชั่วโมงปันไปแล้วตอนบันทึกเวลา
     const appliedOverheadUnitCost = moHeader.costing_mode === 'ROUTING' || plannedQty <= 0

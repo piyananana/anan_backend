@@ -197,4 +197,41 @@ const poReceivedSql = (pod = 'pod') => `COALESCE((
     WHERE imd.ref_po_detail_id = ${pod}.id AND imt.status IN ('Posted', 'Received')
 ), 0)`;
 
-module.exports = { purposeOf, normalizeImLines, lineEffFactor, toBasePrice, ensureImLineUomColumns, toDocUnitLines, resolveOrderLineUom, soDeliveredSql, poReceivedSql, PRICE_FIELDS };
+/**
+ * หน่วยของบรรทัดแผน (สูตรการผลิต/ใบสั่งผลิต) — ตรวจแค่ว่าหน่วยอนุญาตในงาน (purpose) แล้วคืนอัตราแปลง ไม่ตรวจทศนิยม
+ * เพราะจำนวนที่วางแผน/สเกลจากสูตรเป็นเศษได้ (การเบิก/รับจริงในเอกสาร IM ตรวจทศนิยมของหน่วยอีกครั้ง)
+ * ไม่ระบุหน่วย = หน่วยหลัก (factor 1)
+ */
+const resolvePlanLineUom = async (client, itemId, uomId, purpose) => {
+    const item = (await client.query(`SELECT base_uom_id FROM im_item WHERE id = $1`, [itemId])).rows[0];
+    const baseId = item?.base_uom_id ? Number(item.base_uom_id) : null;
+    const id = uomId ? Number(uomId) : baseId;
+    if (!id || id === baseId) return { uom_id: id, factor: 1 };
+    const r = await resolveFactor(client, itemId, id, { purpose });
+    return { uom_id: id, factor: r.factor };
+};
+
+/**
+ * จำนวนที่เบิก/รับแล้วของบรรทัดใบสั่งผลิต (alias) เป็นหน่วยของบรรทัดนั้น — สูตรเดียวกับ soDeliveredSql
+ * refCol = ref_mo_component_detail_id (เบิก '90') หรือ ref_mo_output_detail_id (รับ '95'), นับเฉพาะ Posted
+ */
+const moLineDoneSql = (alias, refCol) => `COALESCE((
+    SELECT SUM(CASE WHEN imd.uom_qty IS NOT NULL AND imd.uom_id IS NOT DISTINCT FROM ${alias}.uom_id THEN ABS(imd.uom_qty)
+                    ELSE ABS(imd.qty) / NULLIF(${alias}.conversion_factor, 0) END)
+    FROM im_transaction_detail imd JOIN im_transaction imt ON imt.id = imd.header_id
+    WHERE imd.${refCol} = ${alias}.id AND imt.status = 'Posted'
+), 0)`;
+const moIssuedSql = (c = 'c') => moLineDoneSql(c, 'ref_mo_component_detail_id');
+const moReceivedSql = (o = 'o') => moLineDoneSql(o, 'ref_mo_output_detail_id');
+
+/**
+ * จำนวนที่ขอเบิก/รับในเอกสาร IM เป็นหน่วยของบรรทัดเอกสารต้นทาง — หน่วยเดียวกัน = uom_qty ตรงตัว
+ * ไม่งั้น = จำนวนหน่วยหลัก ÷ อัตราแปลงของบรรทัดต้นทาง
+ */
+const qtyInLineUnit = ({ requestedQty, uomId, uomQty }, line) => {
+    const same = uomQty != null && Number(uomId || 0) === Number(line.uom_id || 0);
+    return same ? Math.abs(Number(uomQty)) : Math.abs(Number(requestedQty)) / (Number(line.conversion_factor) || 1);
+};
+
+module.exports = { purposeOf, normalizeImLines, lineEffFactor, toBasePrice, ensureImLineUomColumns, toDocUnitLines, resolveOrderLineUom, soDeliveredSql, poReceivedSql, PRICE_FIELDS,
+    resolvePlanLineUom, moIssuedSql, moReceivedSql, qtyInLineUnit };

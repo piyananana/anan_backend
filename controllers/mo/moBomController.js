@@ -6,6 +6,36 @@
 const { ensureImItemTable } = require('../im/imItemController');
 const { ensureImUomTable } = require('../im/imUomController');
 const { ensureMoWorkCenterTable } = require('./moWorkCenterController');
+const { resolveFactor } = require('../../utils/uom');
+
+// หน่วยของสูตรการผลิต (ผลผลิตหลัก/ส่วนประกอบ/ผลพลอยได้) — ต้องเป็นหน่วยที่สินค้าอนุญาตให้ใช้ผลิต ไม่ระบุ = หน่วยหลัก
+// จำนวนในสูตรเป็นอัตราส่วน (เช่น 0.5 ขวดต่อชิ้น) จึงไม่ตรวจทศนิยมของหน่วย — เก็บอัตราแปลง snapshot ไว้ต่อบรรทัด
+// (หน่วยหลักต่อ 1 หน่วยของบรรทัด) ใช้คิดต้นทุนและจำนวนหน่วยหลักตอนเบิก/รับเข้า
+const bomUom = async (client, itemId, uomId) => {
+    const item = (await client.query(`SELECT base_uom_id FROM im_item WHERE id = $1`, [itemId])).rows[0];
+    const baseId = item?.base_uom_id ? Number(item.base_uom_id) : null;
+    const id = uomId ? Number(uomId) : baseId;
+    if (!id || id === baseId) return { uom_id: id, factor: 1 };
+    const r = await resolveFactor(client, itemId, id, { purpose: 'PRODUCTION' });
+    return { uom_id: id, factor: r.factor };
+};
+const normalizeBomUoms = async (client, b) => {
+    const h = await bomUom(client, b.parent_item_id, b.output_uom_id);
+    b.output_uom_id = h.uom_id;
+    b.output_conversion_factor = h.factor;
+    for (const line of b.details || []) {
+        if (!line.component_item_id) continue;
+        const u = await bomUom(client, line.component_item_id, line.uom_id);
+        line.uom_id = u.uom_id;
+        line.conversion_factor = u.factor;
+    }
+    for (const out of b.outputs || []) {
+        if (!out.output_item_id) continue;
+        const u = await bomUom(client, out.output_item_id, out.uom_id);
+        out.uom_id = u.uom_id;
+        out.conversion_factor = u.factor;
+    }
+};
 
 const ISSUE_METHODS = ['BACKFLUSH', 'EXPLICIT'];
 const COSTING_METHODS = ['ACTUAL', 'STANDARD'];
@@ -85,6 +115,10 @@ const ensureMoBomTable = async (client) => {
         )
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_mo_bom_output_detail_header ON mo_bom_output_detail(bom_header_id)`);
+    // อัตราแปลงหน่วย ณ ตอนบันทึก (หน่วยหลักต่อ 1 หน่วย) — 1 = หน่วยหลัก/สูตรเก่า
+    await client.query(`ALTER TABLE mo_bom_header ADD COLUMN IF NOT EXISTS output_conversion_factor NUMERIC(18,6) NOT NULL DEFAULT 1`);
+    await client.query(`ALTER TABLE mo_bom_detail ADD COLUMN IF NOT EXISTS conversion_factor NUMERIC(18,6) NOT NULL DEFAULT 1`);
+    await client.query(`ALTER TABLE mo_bom_output_detail ADD COLUMN IF NOT EXISTS conversion_factor NUMERIC(18,6) NOT NULL DEFAULT 1`);
 
     // ขั้นตอนการผลิต (Routing) — ใช้จริงเมื่อ costing_mode='ROUTING' เท่านั้น (เก็บไว้ได้แม้ไม่ใช้โหมดนี้ ไม่บังคับ
     // ลบ ถ้าผู้ใช้สลับโหมดไปมา) ต้องมี mo_work_center อยู่ก่อนเสมอ
@@ -224,6 +258,7 @@ const addRow = async (req, res) => {
             await client.query('ROLLBACK');
             return res.status(400).json({ message: costingErr });
         }
+        await normalizeBomUoms(client, b);
 
         const isActive = b.is_active ?? true;
         if (isActive) {
@@ -236,13 +271,13 @@ const addRow = async (req, res) => {
         const header = await client.query(
             `INSERT INTO mo_bom_header
                 (parent_item_id, bom_version, bom_qty, output_uom_id, is_active, effective_date,
-                 issue_method, costing_method, costing_mode, overhead_percent, created_by, updated_by)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11)
+                 issue_method, costing_method, costing_mode, overhead_percent, created_by, updated_by, output_conversion_factor)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11,$12)
              RETURNING id`,
             [
                 b.parent_item_id, b.bom_version || '1', b.bom_qty ?? 1, b.output_uom_id || null, isActive, b.effective_date || null,
                 b.issue_method || 'EXPLICIT', b.costing_method || 'ACTUAL', b.costing_mode || 'OVERHEAD_PERCENT', b.overhead_percent ?? 0,
-                userName,
+                userName, b.output_conversion_factor ?? 1,
             ]
         );
         const headerId = header.rows[0].id;
@@ -251,9 +286,9 @@ const addRow = async (req, res) => {
         for (const line of b.details) {
             if (!line.component_item_id) continue;
             await client.query(
-                `INSERT INTO mo_bom_detail (bom_header_id, line_no, component_item_id, quantity_per, uom_id, scrap_percent, component_bom_header_id)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-                [headerId, lineNo++, line.component_item_id, line.quantity_per ?? 0, line.uom_id || null, line.scrap_percent ?? 0, line.component_bom_header_id || null]
+                `INSERT INTO mo_bom_detail (bom_header_id, line_no, component_item_id, quantity_per, uom_id, scrap_percent, component_bom_header_id, conversion_factor)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+                [headerId, lineNo++, line.component_item_id, line.quantity_per ?? 0, line.uom_id || null, line.scrap_percent ?? 0, line.component_bom_header_id || null, line.conversion_factor ?? 1]
             );
         }
 
@@ -261,9 +296,9 @@ const addRow = async (req, res) => {
         for (const out of (b.outputs || [])) {
             if (!out.output_item_id) continue;
             await client.query(
-                `INSERT INTO mo_bom_output_detail (bom_header_id, line_no, output_item_id, output_qty_per, uom_id)
-                 VALUES ($1,$2,$3,$4,$5)`,
-                [headerId, outLineNo++, out.output_item_id, out.output_qty_per ?? 0, out.uom_id || null]
+                `INSERT INTO mo_bom_output_detail (bom_header_id, line_no, output_item_id, output_qty_per, uom_id, conversion_factor)
+                 VALUES ($1,$2,$3,$4,$5,$6)`,
+                [headerId, outLineNo++, out.output_item_id, out.output_qty_per ?? 0, out.uom_id || null, out.conversion_factor ?? 1]
             );
         }
 
@@ -287,6 +322,7 @@ const addRow = async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error adding mo_bom_header:', error);
+        if (error.code === 'UOM') return res.status(400).json({ message: error.message });
         res.status(500).json({ message: 'Internal server error' });
     } finally { client.release(); }
 };
@@ -309,6 +345,7 @@ const updateRow = async (req, res) => {
             await client.query('ROLLBACK');
             return res.status(400).json({ message: costingErr });
         }
+        await normalizeBomUoms(client, b);
 
         const isActive = b.is_active ?? true;
         if (isActive) {
@@ -330,13 +367,14 @@ const updateRow = async (req, res) => {
                 costing_mode      = $8,
                 overhead_percent  = $9,
                 updated_by        = $10,
+                output_conversion_factor = $12,
                 updated_at        = NOW()
              WHERE id = $11
              RETURNING id`,
             [
                 b.bom_version || '1', b.bom_qty ?? 1, b.output_uom_id || null, isActive, b.effective_date || null,
                 b.issue_method || 'EXPLICIT', b.costing_method || 'ACTUAL', b.costing_mode || 'OVERHEAD_PERCENT', b.overhead_percent ?? 0,
-                userName, id,
+                userName, id, b.output_conversion_factor ?? 1,
             ]
         );
         if (result.rows.length === 0) {
@@ -349,9 +387,9 @@ const updateRow = async (req, res) => {
         for (const line of b.details) {
             if (!line.component_item_id) continue;
             await client.query(
-                `INSERT INTO mo_bom_detail (bom_header_id, line_no, component_item_id, quantity_per, uom_id, scrap_percent, component_bom_header_id)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-                [id, lineNo++, line.component_item_id, line.quantity_per ?? 0, line.uom_id || null, line.scrap_percent ?? 0, line.component_bom_header_id || null]
+                `INSERT INTO mo_bom_detail (bom_header_id, line_no, component_item_id, quantity_per, uom_id, scrap_percent, component_bom_header_id, conversion_factor)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+                [id, lineNo++, line.component_item_id, line.quantity_per ?? 0, line.uom_id || null, line.scrap_percent ?? 0, line.component_bom_header_id || null, line.conversion_factor ?? 1]
             );
         }
 
@@ -360,9 +398,9 @@ const updateRow = async (req, res) => {
         for (const out of (b.outputs || [])) {
             if (!out.output_item_id) continue;
             await client.query(
-                `INSERT INTO mo_bom_output_detail (bom_header_id, line_no, output_item_id, output_qty_per, uom_id)
-                 VALUES ($1,$2,$3,$4,$5)`,
-                [id, outLineNo++, out.output_item_id, out.output_qty_per ?? 0, out.uom_id || null]
+                `INSERT INTO mo_bom_output_detail (bom_header_id, line_no, output_item_id, output_qty_per, uom_id, conversion_factor)
+                 VALUES ($1,$2,$3,$4,$5,$6)`,
+                [id, outLineNo++, out.output_item_id, out.output_qty_per ?? 0, out.uom_id || null, out.conversion_factor ?? 1]
             );
         }
 
@@ -387,6 +425,7 @@ const updateRow = async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error updating mo_bom_header:', error);
+        if (error.code === 'UOM') return res.status(400).json({ message: error.message });
         res.status(500).json({ message: 'Internal server error' });
     } finally { client.release(); }
 };
@@ -445,11 +484,13 @@ const computeBomRolledUpCost = async (client, bomHeaderId, visiting = new Set())
         let isSubAssembly = false;
         if (subBomHeaderId) {
             const sub = await computeBomRolledUpCost(client, subBomHeaderId, visiting);
-            unitCost = sub.unitCost;
+            unitCost = sub.baseUnitCost; // ต้นทุนต่อหน่วยหลักของสินค้าย่อย
             isSubAssembly = true;
         } else {
             unitCost = Number(d.component_standard_cost) || 0;
         }
+        // ต้นทุนมาตรฐาน/ต้นทุนสินค้าย่อยเป็นต่อหน่วยหลัก — ต้นทุนต่อหน่วยของบรรทัด = × อัตราแปลงของบรรทัด
+        unitCost *= Number(d.conversion_factor) || 1;
         const qtyNeeded = Number(d.quantity_per) * (1 + Number(d.scrap_percent) / 100);
         const lineTotal = qtyNeeded * unitCost;
         materialCost += lineTotal;
@@ -485,7 +526,9 @@ const computeBomRolledUpCost = async (client, bomHeaderId, visiting = new Set())
         parentItemNameTh: bom.parent_item_name_th, parentItemNameEn: bom.parent_item_name_en,
         costingMode: bom.costing_mode, overheadPercent: Number(bom.overhead_percent) || 0,
         outputUomId: bom.output_uom_id,
+        // unitCost = ต่อหน่วยผลผลิตของสูตร (output_uom), baseUnitCost = ต่อหน่วยหลักของสินค้าที่ผลิต (ใช้กับสูตรแม่)
         materialCost, conversionCost, totalCost, unitCost: totalCost / bomQty,
+        baseUnitCost: totalCost / (bomQty * (Number(bom.output_conversion_factor) || 1)),
         breakdown,
     };
 };

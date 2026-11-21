@@ -5,7 +5,7 @@
 
 const { ensureImItemTable } = require('./imItemController');
 const { resolveFactor } = require('../../utils/uom');
-const { normalizeImLines, ensureImLineUomColumns, toBasePrice, lineEffFactor, toDocUnitLines } = require('../../utils/imLineUom');
+const { normalizeImLines, ensureImLineUomColumns, toBasePrice, lineEffFactor, toDocUnitLines, resolveOrderLineUom } = require('../../utils/imLineUom');
 const { getBaseCurrencyCode, getBaseCurrency } = require('../../utils/baseCurrency');
 const { ensureImWarehouseTable } = require('./imWarehouseController');
 const { ensureImLocationTable } = require('./imLocationController');
@@ -2289,14 +2289,14 @@ const postDetailLines = async (client, headerId, header, docNo) => {
         // '90' (เบิกวัตถุดิบเข้าผลิต) ที่อ้างอิงบรรทัดส่วนประกอบ MO — มิเรอร์ GRN/PO block ข้างบนทุกประการ
         if (sysDocType === '90' && d.ref_mo_component_detail_id) {
             const { moHeaderId } = await validateMoComponentIssueQty(client, {
-                refMoComponentDetailId: d.ref_mo_component_detail_id, requestedQty: Math.abs(varianceQty),
+                refMoComponentDetailId: d.ref_mo_component_detail_id, requestedQty: Math.abs(varianceQty), uomId: d.uom_id, uomQty: d.uom_qty,
             });
             touchedMoIds.add(moHeaderId);
         }
         // '95' (รับสินค้าเข้าคลังจากการผลิต) ที่อ้างอิงบรรทัดผลผลิต MO — มิเรอร์ DLN/SO block ข้างบนทุกประการ
         if (sysDocType === '95' && d.ref_mo_output_detail_id) {
             const { moHeaderId } = await validateMoOutputReceiptQty(client, {
-                refMoOutputDetailId: d.ref_mo_output_detail_id, requestedQty: Math.abs(varianceQty),
+                refMoOutputDetailId: d.ref_mo_output_detail_id, requestedQty: Math.abs(varianceQty), uomId: d.uom_id, uomQty: d.uom_qty,
             });
             touchedMoIds.add(moHeaderId);
         }
@@ -3314,9 +3314,13 @@ const createMoReceipt = async (req, res) => {
             );
             const systemQty = balRes.rows.length ? Number(balRes.rows[0].qty_on_hand) : 0;
 
+            // จำนวนที่รับเป็นหน่วยของบรรทัดผลผลิต MO — ต้นทุนที่คำนวณเป็นต่อหน่วยหลัก ส่ง unit_cost เป็นต่อหน่วยในเอกสาร
+            // (normalizeImLines หารกลับด้วยอัตราจริง) ส่วน mo_actual/applied_overhead เก็บต่อหน่วยหลักตรง ๆ
+            const u = await resolveOrderLineUom(client, outputDetail.output_item_id, outputDetail.uom_id, qty, 'PRODUCTION');
+            const eff = u.qty > 0 ? u.base_qty / u.qty : 1;
             builtLines.push({
                 item_id: outputDetail.output_item_id, item_code: outputDetail.item_code, item_name: outputDetail.item_name,
-                uom_id: outputDetail.uom_id, system_qty: systemQty, counted_qty: systemQty + qty, unit_cost: unitCost,
+                uom_id: outputDetail.uom_id, uom_qty: u.qty, system_qty: systemQty, counted_qty: systemQty + u.base_qty, unit_cost: unitCost * eff,
                 ref_mo_output_detail_id: outputDetail.id,
                 mo_actual_unit_cost: mo.costing_method === 'STANDARD' ? actualUnitCost : null,
                 mo_applied_overhead_unit_cost: appliedOverheadUnitCost || null,
