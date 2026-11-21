@@ -1,13 +1,27 @@
 // controllers/im/imItemTransactionReportController.js
 const { today } = require('../../utils/dateUtil');
 const { IM_EFFECTIVE_DOC_NO, parseStatuses, IM_LINE_QTY, IM_LINE_VALUE } = require('./imEffectiveTxSql');
+const { reportUom } = require('../../utils/reportUom');
 // รายงานสินค้าในธุรกรรม — flat list ระดับ "บรรทัดสินค้า" (ไม่ใช่ระดับเอกสารเหมือน imTransactionReportController)
 // ทุก sys_doc_type ของ IM รวมกันในรายงานเดียว จัดกลุ่ม+ยอดรวมย่อยตามฟีลด์ที่เลือกเรียง (Flutter ฝั่ง frontend
 // เป็นคนจัดกลุ่ม/แสดงยอดรวมย่อยตอน render — backend แค่ query แถวดิบมาเรียงลำดับให้ถูกต้องพอ)
 'use strict';
 
 const getItemTransactionReport = async (req, res) => {
-    const { date_from, date_to, sys_doc_types, category_ids, item_code_from, item_code_to, statuses, sort } = req.query;
+    const { date_from, date_to, sys_doc_types, category_ids, item_code_from, item_code_to, statuses, sort, uom_mode } = req.query;
+    // หน่วยแสดงผล: base (ค่าเริ่มต้น) = หน่วยหลัก, report = หน่วยรายงานของสินค้า, doc = หน่วยที่กรอกในเอกสาร
+    // (dt.qty เป็นหน่วยหลักเสมอหลังขั้นที่ 2 — เดิม join หน่วยจาก dt.uom_id ทำให้บรรทัดที่กรอกเป็นแพ็ค แสดงจำนวนขวดแต่ป้ายว่าแพ็ค)
+    const ru = reportUom(uom_mode);
+    const isDoc = uom_mode === 'doc';
+    const baseQty = `(${IM_LINE_QTY}) * t.sign`;
+    const qtySql = isDoc
+        ? `CASE WHEN dt.uom_qty IS NOT NULL AND dt.uom_id IS NOT NULL THEN SIGN(${baseQty}) * dt.uom_qty ELSE ${baseQty} END`
+        : ru.qty(baseQty);
+    const uomSql = isDoc
+        ? `COALESCE(du.uom_code, u.uom_code) AS uom_code,
+           CASE WHEN du.id IS NULL THEN u.uom_name_th ELSE du.uom_name_th END AS uom_name_th,
+           CASE WHEN du.id IS NULL THEN u.uom_name_en ELSE du.uom_name_en END AS uom_name_en`
+        : ru.uomCols;
 
     const dateFrom = date_from || today();
     const dateTo   = date_to   || today();
@@ -70,7 +84,7 @@ const getItemTransactionReport = async (req, res) => {
                 COALESCE(t.vendor_name_th, t.customer_name_th) AS party_name,
                 COALESCE(dt.item_code, it.item_code) AS item_code,
                 it.item_name_th, it.item_name_en,
-                (${IM_LINE_QTY}) * t.sign AS qty, u.uom_code, u.uom_name_th, u.uom_name_en,
+                ${qtySql} AS qty, ${uomSql},
                 (${IM_LINE_VALUE}) * t.sign AS total_value_lc, dt.is_free,
                 t.status, t.is_reversal
             FROM im_transaction_detail dt
@@ -83,7 +97,9 @@ const getItemTransactionReport = async (req, res) => {
             ) t ON t.id = dt.header_id
             JOIN sa_module_document d  ON d.id = t.doc_id
             LEFT JOIN im_item it       ON it.id = dt.item_id
-            LEFT JOIN im_uom u         ON u.id  = dt.uom_id
+            LEFT JOIN im_uom u         ON u.id  = COALESCE(it.base_uom_id, dt.uom_id)
+            LEFT JOIN im_uom du        ON du.id = CASE WHEN dt.uom_qty IS NOT NULL THEN dt.uom_id END
+            ${ru.join}
             WHERE t.eff_date >= $1::date
               AND t.eff_date <= $2::date
               ${filters}

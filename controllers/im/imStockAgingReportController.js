@@ -1,6 +1,7 @@
 // controllers/im/imStockAgingReportController.js
 const { today } = require('../../utils/dateUtil');
 const { ensureImPriceColumns } = require('../../utils/vatCalc');
+const { reportUom } = require('../../utils/reportUom');
 // รายงานอายุสินค้าคงคลัง (Stock Aging Report) — แยกวิธีคำนวณอายุตาม costing_method ของสินค้า เพราะข้อมูลที่มีอยู่
 // จริงต่างกันโดยพื้นฐาน:
 //   - FIFO/SPECIFIC: มี im_stock_layer เก็บเป็นล็อตแยกทุก batch (layer_date, remaining_qty) จึงรู้ "อายุจริง"
@@ -34,9 +35,10 @@ const getStockAgingReport = async (req, res) => {
     const {
         as_of_date, category_ids, item_code_from, item_code_to, costing_method,
         warehouse_ids, location_code_from, location_code_to,
-        sort, sort_dir,
+        sort, sort_dir, uom_mode,
     } = req.query;
     const asOf = as_of_date || today();
+    const ru = reportUom(uom_mode); // หน่วยแสดงผล: หน่วยหลัก (ค่าเริ่มต้น) / หน่วยรายงานของสินค้า
 
     await ensureImPriceColumns(req.dbPool); // is_non_stock — บรรทัดบริการไม่ใช่สต็อก
     const client = await req.dbPool.connect();
@@ -133,20 +135,21 @@ const getStockAgingReport = async (req, res) => {
                 WHERE b.qty_on_hand <> 0 AND it2.costing_method IN ('AVG', 'STANDARD')
             )
             SELECT
-                r.qty, r.unit_cost, r.value, r.lot_no, r.serial_no, r.age_days, r.no_movement_days,
+                ${ru.qty('r.qty')} AS qty, ${ru.cost('r.unit_cost')} AS unit_cost, r.value, r.lot_no, r.serial_no, r.age_days, r.no_movement_days,
                 it.id AS item_id, it.item_code, it.item_name_th, it.item_name_en, it.costing_method,
                 it.is_lot_tracked, it.is_serial_tracked,
                 cat.id AS category_id, cat.category_code, cat.category_name_th, cat.category_name_en,
                 w.id AS warehouse_id, w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
                 loc.id AS location_id, loc.location_code, loc.location_name,
                 loc.parent_id AS location_parent_id, loc.level AS location_level,
-                u.uom_code, u.uom_name_th, u.uom_name_en
+                ${ru.uomCols}
             FROM rows r
             JOIN im_item it                ON it.id = r.item_id
             LEFT JOIN im_item_category cat ON cat.id = it.category_id
             JOIN im_warehouse w             ON w.id = r.warehouse_id
             LEFT JOIN im_location loc       ON loc.id = r.location_id
             LEFT JOIN im_uom u              ON u.id = it.base_uom_id
+            ${ru.join}
             WHERE 1=1
               ${itemFilter}
               ${warehouseFilter}

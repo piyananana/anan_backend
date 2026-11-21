@@ -2,6 +2,7 @@
 const { today } = require('../../utils/dateUtil');
 const { ensureImPriceColumns } = require('../../utils/vatCalc');
 const { IM_EFFECTIVE_TX } = require('./imEffectiveTxSql');
+const { reportUom } = require('../../utils/reportUom');
 // รายงานสินค้าคงเหลือตามตำแหน่งที่เก็บ — ยอดคงเหลือ ณ วันที่สิ้นสุดที่เลือก แยกตาม item/warehouse/location/lot/serial
 //
 // จุดสำคัญ: ไม่ได้อ่านจาก im_stock_balance/im_stock_layer ตรงๆ (ตารางนั้นมีแค่ยอด "ปัจจุบัน" เท่านั้น ไม่รองรับ
@@ -28,9 +29,10 @@ const getStockBalanceByItemReport = async (req, res) => {
     const {
         date_to, category_ids, item_code_from, item_code_to, costing_method,
         warehouse_ids, location_code_from, location_code_to, balance_filter,
-        sort, sort_dir,
+        sort, sort_dir, uom_mode,
     } = req.query;
     const dateTo = date_to || today();
+    const ru = reportUom(uom_mode); // หน่วยแสดงผล: หน่วยหลัก (ค่าเริ่มต้น) / หน่วยรายงานของสินค้า
 
     await ensureImPriceColumns(req.dbPool); // is_non_stock — บรรทัดบริการไม่ใช่สต็อก
     const client = await req.dbPool.connect();
@@ -120,20 +122,21 @@ const getStockBalanceByItemReport = async (req, res) => {
                 GROUP BY effective_warehouse_id, effective_location_id, item_id, lot_no, serial_no
             )
             SELECT
-                b.qty, b.value, b.lot_no, b.serial_no,
+                ${ru.qty('b.qty')} AS qty, b.value, b.lot_no, b.serial_no,
                 it.id AS item_id, it.item_code, it.item_name_th, it.item_name_en, it.costing_method,
                 it.is_lot_tracked, it.is_serial_tracked,
                 cat.id AS category_id, cat.category_code, cat.category_name_th, cat.category_name_en,
                 w.id AS warehouse_id, w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
                 loc.id AS location_id, loc.location_code, loc.location_name,
                 loc.parent_id AS location_parent_id, loc.level AS location_level,
-                u.uom_code, u.uom_name_th, u.uom_name_en
+                ${ru.uomCols}
             FROM balance b
             JOIN im_item it                ON it.id = b.item_id
             LEFT JOIN im_item_category cat ON cat.id = it.category_id
             JOIN im_warehouse w             ON w.id = b.effective_warehouse_id
             LEFT JOIN im_location loc       ON loc.id = b.effective_location_id
             LEFT JOIN im_uom u              ON u.id = it.base_uom_id
+            ${ru.join}
             WHERE 1=1
               ${itemFilter}
               ${warehouseFilter}

@@ -23,6 +23,7 @@ const {
 } = require('./imTransactionController');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const DA = require('../../utils/docApproval');
+const { resolveFactor, toBaseQty, uomError } = require('../../utils/uom');
 const KIND = 'IM_COUNT';
 const {
     ensureImStockCountRunningTable,
@@ -99,7 +100,51 @@ const ensureImStockCountTable = async (client) => {
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_im_stock_count_detail_header   ON im_stock_count_detail(header_id)`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_im_stock_count_detail_location ON im_stock_count_detail(location_id)`);
+    // นับหลายหน่วยต่อบรรทัด (เช่น 2 ลัง + 5 ชิ้น) — counted_qty ของบรรทัด = ผลรวมจำนวนหน่วยหลัก (qty × อัตราแปลง)
+    // ไม่มีแถว = กรอกยอดเป็นหน่วยหลักตรง ๆ (หรือ import จาก Excel)
+    await client.query(`
+        CREATE TABLE IF NOT EXISTS im_stock_count_detail_uom (
+            id                SERIAL PRIMARY KEY,
+            detail_id         INTEGER NOT NULL REFERENCES im_stock_count_detail(id) ON DELETE CASCADE,
+            uom_id            INTEGER NOT NULL REFERENCES im_uom(id),
+            qty               NUMERIC(20,6) NOT NULL,
+            conversion_factor NUMERIC(18,6) NOT NULL DEFAULT 1
+        )
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_im_stock_count_detail_uom_detail ON im_stock_count_detail_uom(detail_id)`);
 };
+
+// ยอดนับแยกหน่วยของบรรทัด (alias d) — หน่วยใหญ่ก่อน
+const UOM_COUNTS_SQL = `COALESCE((
+    SELECT json_agg(json_build_object('uom_id', x.uom_id, 'uom_code', xu.uom_code, 'uom_name_th', xu.uom_name_th,
+                                      'uom_name_en', xu.uom_name_en, 'qty', x.qty, 'conversion_factor', x.conversion_factor)
+                    ORDER BY x.conversion_factor DESC, x.id)
+    FROM im_stock_count_detail_uom x JOIN im_uom xu ON xu.id = x.uom_id WHERE x.detail_id = d.id
+), '[]'::json) AS uom_counts`;
+
+// ยอดนับหลายหน่วย → จำนวนหน่วยหลัก: หน่วยต้องเป็นหน่วยของสินค้าที่ยังเปิดใช้งาน (งานตรวจนับ) จำนวนตรงทศนิยมของหน่วย
+// ผลรวมปัดตามทศนิยมของหน่วยหลัก — คืน { counted, rows } (rows = แถวที่จะเก็บ ไม่รวมจำนวน 0)
+const resolveUomCounts = async (client, itemId, uomCounts) => {
+    let total = 0, baseDp = 6;
+    const rows = [];
+    const seen = new Set();
+    for (const u of uomCounts) {
+        const q = Number(u.qty);
+        if (u.qty === null || u.qty === undefined || u.qty === '') continue;
+        if (!Number.isFinite(q) || q < 0) throw uomError(`จำนวนนับต้องเป็นตัวเลขไม่ติดลบ (${u.qty})`);
+        const r = await resolveFactor(client, itemId, u.uom_id, { purpose: 'COUNT' });
+        if (seen.has(r.uomId)) throw uomError(`หน่วย ${r.uomCode} ซ้ำในบรรทัดเดียวกัน`);
+        seen.add(r.uomId);
+        baseDp = r.baseDecimals;
+        if (q === 0) continue;
+        const b = toBaseQty(q, r);
+        total += b.baseQty;
+        rows.push({ uom_id: r.uomId, qty: b.qty, factor: b.factor });
+    }
+    const p = 10 ** Math.min(baseDp, 6);
+    return { counted: Math.round((total + Number.EPSILON) * p) / p, rows };
+};
+
 
 // ยอดคงเหลือระบบ ณ ตอนนี้ — สำหรับ item ปกติใช้ im_stock_balance, สำหรับ SPECIFIC (serial) ใช้การมี/ไม่มี layer เปิดอยู่
 // (สูตรเดียวกับ imTransactionController.fetchSystemQty — reuse STOCK_BALANCE_KEY เพื่อไม่ให้ formula เพี้ยนกัน)
@@ -164,7 +209,8 @@ const fetchRowById = async (pool, id) => {
     `, [id]);
     if (hRes.rows.length === 0) return null;
     const dRes = await pool.query(`
-        SELECT d.*, u.uom_code, u.uom_name_th, u.uom_name_en, l.location_code, l.sort_order AS location_sort_order
+        SELECT d.*, u.uom_code, u.uom_name_th, u.uom_name_en, l.location_code, l.sort_order AS location_sort_order,
+               ${UOM_COUNTS_SQL}
         FROM im_stock_count_detail d
         LEFT JOIN im_uom u      ON u.id = d.uom_id
         LEFT JOIN im_location l ON l.id = d.location_id
@@ -377,6 +423,7 @@ const fetchLinesForRecording = async (req, res) => {
     if (!location_id) return res.status(400).json({ message: 'กรุณาระบุตำแหน่งจัดเก็บ' });
     const client = await req.dbPool.connect();
     try {
+        await ensureImStockCountTable(client);
         const hRes = await client.query(`SELECT status, warehouse_id FROM im_stock_count WHERE id=$1`, [id]);
         if (hRes.rows.length === 0) return res.status(404).json({ message: 'Not found' });
         if (['Closed', 'Void', 'Deleted'].includes(hRes.rows[0].status)) {
@@ -385,7 +432,7 @@ const fetchLinesForRecording = async (req, res) => {
         const result = await client.query(`
             ${LOCATION_SUBTREE_CTE.replace('$LOC_PARAM', '$2')}
             SELECT d.*, u.uom_code, u.uom_name_th, u.uom_name_en, l.location_code,
-                   w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en
+                   w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en, ${UOM_COUNTS_SQL}
             FROM im_stock_count_detail d
             LEFT JOIN im_uom u      ON u.id = d.uom_id
             LEFT JOIN im_location l ON l.id = d.location_id
@@ -411,12 +458,32 @@ const updateCounts = async (req, res) => {
         const hRes = await client.query(`SELECT status FROM im_stock_count WHERE id=$1`, [id]);
         if (hRes.rows.length === 0) throw new Error('Not found');
         if (hRes.rows[0].status !== 'Posted') throw new Error('บันทึกยอดตรวจนับได้เฉพาะสถานะ Posted เท่านั้น');
+        await ensureImStockCountTable(client);
         for (const l of (lines || [])) {
+            const det = (await client.query(`SELECT id, item_id, item_code FROM im_stock_count_detail WHERE id=$1 AND header_id=$2`, [l.id, id])).rows[0];
+            if (!det) continue;
+            // uom_counts = นับหลายหน่วย (counted_qty คำนวณเอง) ไม่ส่ง/ว่าง = กรอกยอดหน่วยหลักตรง ๆ
+            let counted = l.counted_qty ?? null;
+            let uomRows = [];
+            if (Array.isArray(l.uom_counts) && l.uom_counts.length) {
+                try {
+                    const r = await resolveUomCounts(client, det.item_id, l.uom_counts);
+                    counted = r.counted; uomRows = r.rows;
+                } catch (e) {
+                    if (e.code === 'UOM') e.message = `${det.item_code}: ${e.message}`;
+                    throw e;
+                }
+            }
+            await client.query(`DELETE FROM im_stock_count_detail_uom WHERE detail_id=$1`, [det.id]);
+            for (const u of uomRows) {
+                await client.query(`INSERT INTO im_stock_count_detail_uom (detail_id, uom_id, qty, conversion_factor) VALUES ($1,$2,$3,$4)`,
+                    [det.id, u.uom_id, u.qty, u.factor]);
+            }
             await client.query(`
                 UPDATE im_stock_count_detail
                 SET counted_qty=$1, unit_cost=$2, remark=$3, counted_by=$4, counted_at=NOW()
                 WHERE id=$5 AND header_id=$6
-            `, [l.counted_qty ?? null, l.unit_cost ?? null, l.remark || null, userName, l.id, id]);
+            `, [counted, l.unit_cost ?? null, l.remark || null, userName, l.id, id]);
         }
         await client.query(`UPDATE im_stock_count SET updated_by=$1, updated_at=NOW() WHERE id=$2`, [userName, id]);
         await client.query('COMMIT');
@@ -425,7 +492,7 @@ const updateCounts = async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error updating im_stock_count counts:', error);
-        res.status(500).json({ message: error.message || 'Internal server error' });
+        res.status(error.status || 500).json({ message: error.message || 'Internal server error' });
     } finally { client.release(); }
 };
 
@@ -958,7 +1025,11 @@ const importConfirm = async (req, res) => {
         const hRes = await client.query(`SELECT status FROM im_stock_count WHERE id=$1`, [id]);
         if (hRes.rows.length === 0) throw new Error('Not found');
         if (hRes.rows[0].status !== 'Posted') throw new Error('Import ได้เฉพาะเอกสารสถานะ Posted เท่านั้น');
+        await ensureImStockCountTable(client);
         for (const r of (rows || [])) {
+            // ยอดจาก Excel เป็นหน่วยหลัก — แทนยอดนับแยกหน่วยเดิมของบรรทัดนั้น
+            await client.query(`DELETE FROM im_stock_count_detail_uom WHERE detail_id=$1
+                                  AND detail_id IN (SELECT id FROM im_stock_count_detail WHERE header_id=$2)`, [r.id, id]);
             await client.query(`
                 UPDATE im_stock_count_detail
                 SET counted_qty=$1, unit_cost=$2, remark=$3, counted_by=$4, counted_at=NOW()

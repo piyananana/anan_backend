@@ -2,6 +2,7 @@
 const { today } = require('../../utils/dateUtil');
 const { ensureImPriceColumns } = require('../../utils/vatCalc');
 const { IM_EFFECTIVE_TX, IM_EFFECTIVE_DOC_NO } = require('./imEffectiveTxSql');
+const { reportUom } = require('../../utils/reportUom');
 // รายงานสินค้าคงเหลือและการเคลื่อนไหว — จัดกลุ่ม คลัง > หมวดหมู่ > สินค้า (1 "การ์ด" ต่อ สินค้า+คลัง) พร้อมยอดสะสม
 // (running balance) ต่อบรรทัด
 //
@@ -31,7 +32,8 @@ const bucketOf = (sysDocType) => {
 };
 
 const getStockMovementReport = async (req, res) => {
-    const { warehouse_ids, category_ids, item_code_from, item_code_to, date_from, date_to } = req.query;
+    const { warehouse_ids, category_ids, item_code_from, item_code_to, date_from, date_to, uom_mode } = req.query;
+    const ru = reportUom(uom_mode); // หน่วยแสดงผล: หน่วยหลัก (ค่าเริ่มต้น) / หน่วยรายงานของสินค้า
     const dateFrom = date_from || today();
     const dateTo   = date_to   || today();
 
@@ -128,16 +130,16 @@ const getStockMovementReport = async (req, res) => {
             )
             SELECT
                 ir.txn_id, ir.doc_no, ir.doc_date, ir.doc_code, ir.doc_name_thai, ir.doc_name_eng, ir.sys_doc_type,
-                ir.qty, ir.total_value_lc, ir.lot_no, ir.serial_no, ir.is_free,
-                COALESCE(o.opening_qty, 0) + COALESCE(ir.cum_qty, 0)     AS running_qty,
+                ${ru.qty('ir.qty')} AS qty, ir.total_value_lc, ir.lot_no, ir.serial_no, ir.is_free,
+                ${ru.qty('COALESCE(o.opening_qty, 0) + COALESCE(ir.cum_qty, 0)')} AS running_qty,
                 COALESCE(o.opening_value, 0) + COALESCE(ir.cum_value, 0) AS running_value,
-                COALESCE(o.opening_qty, 0)   AS opening_qty,
+                ${ru.qty('COALESCE(o.opening_qty, 0)')} AS opening_qty,
                 COALESCE(o.opening_value, 0) AS opening_value,
                 w.id AS warehouse_id, w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
                 it.id AS item_id, it.item_code, it.item_name_th, it.item_name_en, it.costing_method,
                 it.is_lot_tracked, it.is_serial_tracked,
                 cat.id AS category_id, cat.category_code, cat.category_name_th, cat.category_name_en,
-                u.uom_code, u.uom_name_th, u.uom_name_en
+                ${ru.uomCols}
             FROM scope s
             LEFT JOIN opening  o  ON o.effective_warehouse_id  = s.effective_warehouse_id AND o.item_id  = s.item_id
             LEFT JOIN in_range ir ON ir.effective_warehouse_id = s.effective_warehouse_id AND ir.item_id = s.item_id
@@ -145,6 +147,7 @@ const getStockMovementReport = async (req, res) => {
             LEFT JOIN im_item_category cat ON cat.id = it.category_id
             LEFT JOIN im_warehouse w    ON w.id = s.effective_warehouse_id
             LEFT JOIN im_uom u          ON u.id = it.base_uom_id
+            ${ru.join}
             WHERE 1=1
               ${warehouseFilter}
               ${itemFilter}
