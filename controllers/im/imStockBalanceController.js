@@ -19,7 +19,7 @@ const ensureImStockBalanceTable = async (client) => {
             warehouse_id   INTEGER NOT NULL REFERENCES im_warehouse(id),
             location_id    INTEGER REFERENCES im_location(id),
             lot_no         VARCHAR(50),
-            qty_on_hand    NUMERIC(18,4) NOT NULL DEFAULT 0,
+            qty_on_hand    NUMERIC(20,6) NOT NULL DEFAULT 0,
             avg_unit_cost  NUMERIC(18,4) NOT NULL DEFAULT 0,
             total_value    NUMERIC(18,4) GENERATED ALWAYS AS (qty_on_hand * avg_unit_cost) STORED,
             created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),

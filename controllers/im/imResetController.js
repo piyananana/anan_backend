@@ -194,6 +194,9 @@ const resetMasterData = async (req, res) => {
         // หน่วยนับ — สินค้าบังคับมีหน่วยนับหลัก ต้องลบสินค้าก่อน (เลือก "สินค้า" ด้วย)
         if (resetUom) {
             await runStep('im_uom', async () => {
+                if ((await client.query(`SELECT to_regclass('public.im_uom_standard_conversion') AS reg`)).rows[0].reg) {
+                    deleted.im_uom_standard_conversion = (await client.query(`DELETE FROM im_uom_standard_conversion`)).rowCount;
+                }
                 deleted.im_uom = (await client.query(`DELETE FROM im_uom`)).rowCount;
             });
         }

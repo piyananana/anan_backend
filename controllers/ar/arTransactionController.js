@@ -2021,7 +2021,11 @@ const fetchRow = async (req, res) => {
         if (hRes.rows.length === 0) return res.status(404).json({ error: 'Not found' });
 
         const [detailsRes, appliesRes] = await Promise.all([
-            req.dbPool.query(`SELECT * FROM ar_transaction_detail WHERE header_id=$1 ORDER BY line_no`, [id]),
+            // ชื่อหน่วย (ไทย/อังกฤษ) ของ unit_code — บรรทัดที่สร้างจากเอกสาร IM เก็บรหัสหน่วยในเอกสาร
+            req.dbPool.query(`SELECT dt.*, u.uom_name_th AS unit_name_th, u.uom_name_en AS unit_name_en
+                FROM ar_transaction_detail dt
+                LEFT JOIN LATERAL (SELECT x.uom_name_th, x.uom_name_en FROM im_uom x WHERE x.uom_code = dt.unit_code LIMIT 1) u ON TRUE
+                WHERE dt.header_id=$1 ORDER BY dt.line_no`, [id]),
             req.dbPool.query(`
                 SELECT a.*, inv.doc_no AS applied_to_doc_no, inv.doc_date AS applied_to_doc_date,
                        inv.total_amount_lc AS applied_to_total,

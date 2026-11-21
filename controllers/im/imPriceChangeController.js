@@ -59,7 +59,7 @@ const ensureImPriceChangeTable = async (client) => {
             header_id             INTEGER NOT NULL REFERENCES im_price_change_header(id) ON DELETE CASCADE,
             item_id               INTEGER NOT NULL REFERENCES im_item(id),
             uom_id                INTEGER REFERENCES im_uom(id),
-            min_qty               NUMERIC(18,4) NOT NULL DEFAULT 0,
+            min_qty               NUMERIC(20,6) NOT NULL DEFAULT 0,
             source_detail_id      INTEGER REFERENCES im_price_list_detail(id),
             old_unit_price_fc     NUMERIC(18,4),
             new_unit_price_fc     NUMERIC(18,4) NOT NULL DEFAULT 0,

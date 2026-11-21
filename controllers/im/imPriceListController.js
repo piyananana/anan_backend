@@ -2,6 +2,7 @@
 'use strict';
 
 const { ensureImItemTable } = require('./imItemController');
+const { resolveFactor } = require('../../utils/uom');
 const { ensureImUomTable } = require('./imUomController');
 const { ensureImPriceGroupTable } = require('./imPriceGroupController');
 const { today } = require('../../utils/dateUtil');
@@ -33,7 +34,7 @@ const ensureImPriceListTable = async (client) => {
             price_list_id     INTEGER NOT NULL REFERENCES im_price_list(id) ON DELETE CASCADE,
             item_id           INTEGER NOT NULL REFERENCES im_item(id),
             uom_id            INTEGER REFERENCES im_uom(id),
-            min_qty           NUMERIC(18,4) NOT NULL DEFAULT 0,
+            min_qty           NUMERIC(20,6) NOT NULL DEFAULT 0,
             unit_price_fc     NUMERIC(18,4) NOT NULL DEFAULT 0,
             effective_from    DATE,
             effective_to      DATE
@@ -266,23 +267,38 @@ const resolveItemPrice = async (client, { itemId, listType, vendorId, customerId
     // ORDER BY price_type='PROMOTION' DESC มาก่อน min_qty/uom เสมอ — ถ้าบรรทัดโปรโมชั่นกับราคาปกติตรงกันทั้งคู่
     // (วันที่/min_qty/uom ตรงกันหมด ซึ่งเกิดได้ตั้งใจจากธุรกรรมเปลี่ยนแปลงราคาที่แทรกโปรโมชั่นคาบราคาปกติ) ให้
     // โปรโมชั่นชนะเสมอ ไม่งั้นราคาปกติจะบังโปรโมชั่นที่กำลังจะมีผลอยู่
+    // หน่วยนับหลายหน่วย (2026-11-21): ขอราคาของหน่วยที่ไม่ใช่หน่วยหลัก — ใช้บรรทัดของหน่วยนั้นก่อน ถ้าไม่มีใช้บรรทัด
+    // หน่วยหลัก/ไม่ระบุหน่วย × อัตราแปลง (qty ที่ขอเป็นหน่วยที่ขอ, min_qty ของบรรทัดหน่วยหลักเทียบกับ qty × อัตราแปลง)
+    const baseUomId = (await client.query(`SELECT base_uom_id FROM im_item WHERE id = $1`, [itemId])).rows[0]?.base_uom_id || null;
+    let factor = 1;
+    if (uomId && baseUomId && Number(uomId) !== Number(baseUomId)) {
+        try { factor = (await resolveFactor(client, itemId, uomId)).factor; } catch (e) { factor = null; } // แปลงไม่ได้ = ใช้ได้แค่บรรทัดหน่วยนั้น
+    }
     const detailRes = await client.query(`
         SELECT unit_price_fc, uom_id, min_qty
         FROM im_price_list_detail
-        WHERE price_list_id = $1 AND item_id = $2 AND min_qty <= $3
-          AND (uom_id = $4 OR uom_id IS NULL OR $4::int IS NULL)
+        WHERE price_list_id = $1 AND item_id = $2
+          AND (
+                ($4::int IS NULL AND min_qty <= $3)
+             OR (uom_id = $4 AND min_qty <= $3)
+             OR (uom_id IS NULL AND min_qty <= $3 * COALESCE($6::numeric, 1))
+             OR ($6::numeric IS NOT NULL AND uom_id = $7 AND uom_id <> $4 AND min_qty <= $3 * $6::numeric)
+          )
           AND (effective_from IS NULL OR effective_from <= $5::date)
           AND (effective_to   IS NULL OR effective_to   >= $5::date)
-        ORDER BY (price_type = 'PROMOTION') DESC, (uom_id IS NULL) ASC, min_qty DESC
+        ORDER BY (price_type = 'PROMOTION') DESC, (uom_id = $4) DESC NULLS LAST, (uom_id IS NULL) ASC, min_qty DESC
         LIMIT 1
-    `, [priceListId, itemId, q, uomId || null, date]);
+    `, [priceListId, itemId, q, uomId || null, date, factor, baseUomId]);
     if (detailRes.rows.length === 0) return null;
     const listIncl = (await client.query(`SELECT price_includes_vat FROM im_price_list WHERE id = $1`, [priceListId])).rows[0]?.price_includes_vat === true;
-    const listPrice = Number(detailRes.rows[0].unit_price_fc);
+    const row = detailRes.rows[0];
+    const converted = !!uomId && row.uom_id !== null && Number(row.uom_id) !== Number(uomId)
+        || (!!uomId && row.uom_id === null && factor != null && factor !== 1);
+    const listPrice = converted ? Math.round(Number(row.unit_price_fc) * factor * 1e6) / 1e6 : Number(row.unit_price_fc);
     return {
-        source: 'LIST', price_list_id: priceListId, uom_id: detailRes.rows[0].uom_id,
+        source: 'LIST', price_list_id: priceListId, uom_id: converted ? Number(uomId) : row.uom_id,
         unit_price_fc: convertListPrice(listPrice, listIncl, priceIncludesVat, vatRate),
-        list_price_fc: listPrice, price_includes_vat: listIncl,
+        list_price_fc: listPrice, price_includes_vat: listIncl, converted_from_base: converted,
     };
 };
 
@@ -300,7 +316,7 @@ const lastPurchasePrice = async (client, { itemId, vendorId, uomId, currencyCode
     if (await exists('im_transaction_detail')) {
         parts.push(`
             SELECT h.doc_no, h.doc_date, to_char(h.doc_date, 'YYYY-MM-DD') AS doc_date_txt, h.id AS hid, dt.id AS did,
-                   ${exclSql('COALESCE(dt.billed_unit_cost_fc, dt.unit_cost_fc)', 'dt', 'h')} AS price_excl
+                   ${exclSql('COALESCE(dt.uom_billed_unit_cost_fc, dt.uom_unit_cost_fc, dt.billed_unit_cost_fc, dt.unit_cost_fc)', 'dt', 'h')} AS price_excl
               FROM im_transaction_detail dt
               JOIN im_transaction h ON h.id = dt.header_id
               JOIN sa_module_document md ON md.id = h.doc_id
@@ -321,7 +337,15 @@ const lastPurchasePrice = async (client, { itemId, vendorId, uomId, currencyCode
     if (!parts.length) return null;
     const r = await client.query(`${parts.join(' UNION ALL ')} ORDER BY doc_date DESC, hid DESC, did DESC LIMIT 1`,
         [vendorId, itemId, uomId || null, base, cur, docDate || today()]);
-    if (!r.rows.length) return null;
+    if (!r.rows.length) {
+        // หน่วยนับหลายหน่วย: ไม่เคยซื้อเป็นหน่วยนี้ — ใช้ราคาซื้อล่าสุดของหน่วยหลัก × อัตราแปลง
+        const baseUomId = (await client.query(`SELECT base_uom_id FROM im_item WHERE id = $1`, [itemId])).rows[0]?.base_uom_id;
+        if (!uomId || !baseUomId || Number(uomId) === Number(baseUomId)) return null;
+        let factor;
+        try { factor = (await resolveFactor(client, itemId, uomId)).factor; } catch (e) { return null; }
+        const last = await lastPurchasePrice(client, { itemId, vendorId, uomId: baseUomId, currencyCode, docDate, priceIncludesVat, vatRate });
+        return last && { ...last, unit_price_fc: Math.round(Number(last.unit_price_fc) * factor * 1e6) / 1e6, converted_from_base: true };
+    }
     const excl = Math.round(Number(r.rows[0].price_excl) * 10000) / 10000;
     return {
         source: 'LAST', unit_price_fc: convertListPrice(excl, false, priceIncludesVat, vatRate),

@@ -54,7 +54,7 @@ const TEMPLATE_SHEETS = [
   },
   {
     key: 'uom_conversions',
-    name: 'หน่วยนับทางเลือก',
+    name: 'หน่วยนับทางเลือก', // ชื่อ sheet คงเดิม — ไฟล์ที่ลูกค้าเตรียมไว้แล้วยังใช้ได้
     columns: [
       { key: 'old_item_code',        label: 'รหัสสินค้าเก่า — เชื่อมกับ sheet ข้อมูลพื้นฐาน', required: true,  example: 'IA0001' },
       { key: 'uom_code',              label: 'รหัสหน่วยนับ',                                   required: true,  example: 'BOX' },
@@ -62,6 +62,13 @@ const TEMPLATE_SHEETS = [
       { key: 'barcode',               label: 'บาร์โค้ดของหน่วยนี้',                            required: false, example: '' },
       { key: 'is_purchase_default',   label: 'หน่วยซื้อตั้งต้น (Y/N)',                        required: false, example: 'N' },
       { key: 'is_sales_default',      label: 'หน่วยขายตั้งต้น (Y/N)',                         required: false, example: 'N' },
+      // เพิ่มทีหลัง (หน่วยนับหลายหน่วย) — optional ให้ไฟล์เทมเพลตรุ่นเก่ายังนำเข้าได้
+      { key: 'is_production_default', label: 'หน่วยผลิตตั้งต้น (Y/N)',                        required: false, optional: true, example: 'N' },
+      { key: 'is_count_default',      label: 'หน่วยตรวจนับตั้งต้น (Y/N)',                     required: false, optional: true, example: 'N' },
+      { key: 'is_report_default',     label: 'หน่วยรายงานตั้งต้น (Y/N)',                      required: false, optional: true, example: 'N' },
+      { key: 'allow_purchase',        label: 'ใช้ซื้อได้ (Y/N, ว่าง = Y)',                     required: false, optional: true, example: 'Y' },
+      { key: 'allow_sales',           label: 'ใช้ขายได้ (Y/N, ว่าง = Y)',                      required: false, optional: true, example: 'Y' },
+      { key: 'allow_production',      label: 'ใช้ผลิตได้ (Y/N, ว่าง = Y)',                     required: false, optional: true, example: 'Y' },
     ],
   },
   {
@@ -516,6 +523,12 @@ const validateFile = [
           barcode:               get('barcode') || null,
           is_purchase_default:   parseBool(get('is_purchase_default')),
           is_sales_default:      parseBool(get('is_sales_default')),
+          is_production_default: parseBool(get('is_production_default')),
+          is_count_default:      parseBool(get('is_count_default')),
+          is_report_default:     parseBool(get('is_report_default')),
+          allow_purchase:        get('allow_purchase') === '' ? true : parseBool(get('allow_purchase')),
+          allow_sales:           get('allow_sales') === '' ? true : parseBool(get('allow_sales')),
+          allow_production:      get('allow_production') === '' ? true : parseBool(get('allow_production')),
         });
       }
 

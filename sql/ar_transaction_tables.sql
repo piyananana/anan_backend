@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS ar_transaction_detail (
     item_code                VARCHAR(30),
     item_name                VARCHAR(200),
     description              TEXT,
-    quantity                 NUMERIC(18,4) NOT NULL DEFAULT 1,
+    quantity                 NUMERIC(20,6) NOT NULL DEFAULT 1,
     unit_code                VARCHAR(10),
     unit_price_fc            NUMERIC(18,4) NOT NULL DEFAULT 0,
     discount_percent         NUMERIC(5,2) NOT NULL DEFAULT 0,

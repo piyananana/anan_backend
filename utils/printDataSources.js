@@ -668,7 +668,9 @@ const SALES_INVOICE = {
     const imLines = imIds.length ? (await db.query(`
         SELECT dt.header_id, dt.line_no, COALESCE(NULLIF(dt.item_code, ''), it.item_code) AS item_code,
                COALESCE(NULLIF(dt.item_name, ''), it.item_name_th) AS item_name, dt.description,
-               ABS(dt.qty)::float AS qty, COALESCE(dt.unit_price, 0)::float AS unit_price, COALESCE(dt.discount_percent, 0)::float AS discount_percent,
+               -- หน่วยนับหลายหน่วย: บรรทัดที่บันทึกเป็นหน่วยอื่น พิมพ์จำนวน/ราคาตามหน่วยในเอกสาร (uom_*)
+               (CASE WHEN (dt.conversion_factor <> 1 AND dt.uom_qty IS NOT NULL) THEN dt.uom_qty ELSE ABS(dt.qty) END)::float AS qty,
+               COALESCE(CASE WHEN (dt.conversion_factor <> 1 AND dt.uom_qty IS NOT NULL) THEN dt.uom_unit_price END, dt.unit_price, 0)::float AS unit_price, COALESCE(dt.discount_percent, 0)::float AS discount_percent,
                dt.discount_amount::float AS disc_amount_entered, dt.discount_text, COALESCE(dt.line_discount_amount, 0)::float AS line_discount_amount,
                COALESCE(dt.bill_discount_amount, 0)::float AS bill_discount_amount,
                COALESCE(dt.vat_type, 'NOVAT') AS vat_type, COALESCE(dt.vat_rate, 0)::float AS vat_rate, dt.is_free,
@@ -1013,7 +1015,8 @@ const PAYMENT_VOUCHER = {
     const lines = (await db.query(`
         SELECT dt.header_id, dt.line_no, COALESCE(NULLIF(dt.item_code, ''), it.item_code) AS item_code,
                COALESCE(NULLIF(dt.item_name, ''), it.item_name_th) AS item_name, it.item_name_en, dt.description,
-               ABS(dt.qty)::float AS qty, COALESCE(dt.unit_cost_fc, dt.unit_cost, 0)::float AS price,
+               (CASE WHEN (dt.conversion_factor <> 1 AND dt.uom_qty IS NOT NULL) THEN dt.uom_qty ELSE ABS(dt.qty) END)::float AS qty,
+               COALESCE(CASE WHEN (dt.conversion_factor <> 1 AND dt.uom_qty IS NOT NULL) THEN COALESCE(dt.uom_unit_cost_fc, dt.uom_unit_cost) END, dt.unit_cost_fc, dt.unit_cost, 0)::float AS price,
                COALESCE(dt.discount_percent, 0)::float AS discount_percent, COALESCE(dt.vat_type, 'NOVAT') AS vat_type,
                COALESCE(dt.vat_rate, 0)::float AS vat_rate, u.uom_code, u.uom_name_th, u.uom_name_en
           FROM im_transaction_detail dt LEFT JOIN im_uom u ON u.id = dt.uom_id LEFT JOIN im_item it ON it.id = dt.item_id

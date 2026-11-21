@@ -47,7 +47,7 @@ const ensureMoHeaderTable = async (client) => {
             doc_date          DATE NOT NULL,
             bom_header_id     INTEGER REFERENCES mo_bom_header(id),
             warehouse_id      INTEGER NOT NULL REFERENCES im_warehouse(id),
-            order_qty         NUMERIC(18,4) NOT NULL DEFAULT 0,
+            order_qty         NUMERIC(20,6) NOT NULL DEFAULT 0,
             uom_id            INTEGER REFERENCES im_uom(id),
             issue_method      VARCHAR(10) NOT NULL DEFAULT 'EXPLICIT',
             costing_method    VARCHAR(10) NOT NULL DEFAULT 'ACTUAL',
@@ -101,8 +101,8 @@ const ensureMoHeaderTable = async (client) => {
             component_item_id INTEGER NOT NULL REFERENCES im_item(id),
             item_code         VARCHAR(30),
             item_name         VARCHAR(200),
-            planned_qty       NUMERIC(18,4) NOT NULL DEFAULT 0,
-            issued_qty        NUMERIC(18,4) NOT NULL DEFAULT 0,
+            planned_qty       NUMERIC(20,6) NOT NULL DEFAULT 0,
+            issued_qty        NUMERIC(20,6) NOT NULL DEFAULT 0,
             uom_id            INTEGER REFERENCES im_uom(id),
             location_id       INTEGER REFERENCES im_location(id)
         )
@@ -117,8 +117,8 @@ const ensureMoHeaderTable = async (client) => {
             output_item_id    INTEGER NOT NULL REFERENCES im_item(id),
             item_code         VARCHAR(30),
             item_name         VARCHAR(200),
-            planned_qty       NUMERIC(18,4) NOT NULL DEFAULT 0,
-            received_qty      NUMERIC(18,4) NOT NULL DEFAULT 0,
+            planned_qty       NUMERIC(20,6) NOT NULL DEFAULT 0,
+            received_qty      NUMERIC(20,6) NOT NULL DEFAULT 0,
             uom_id            INTEGER REFERENCES im_uom(id),
             is_primary_output BOOLEAN NOT NULL DEFAULT false
         )

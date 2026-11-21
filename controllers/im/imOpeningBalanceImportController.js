@@ -41,12 +41,12 @@ const ensureImOpeningBalanceBatchTable = async (client) => {
             lot_no        VARCHAR(50),
             serial_no     VARCHAR(50),
             costing_method VARCHAR(20) NOT NULL,
-            qty           NUMERIC(18,4) NOT NULL,
+            qty           NUMERIC(20,6) NOT NULL,
             unit_cost     NUMERIC(18,4) NOT NULL,
             stock_layer_id INTEGER,
-            balance_qty_before      NUMERIC(18,4),
+            balance_qty_before      NUMERIC(20,6),
             balance_avg_cost_before NUMERIC(18,4),
-            balance_qty_after       NUMERIC(18,4),
+            balance_qty_after       NUMERIC(20,6),
             balance_avg_cost_after  NUMERIC(18,4),
             created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )

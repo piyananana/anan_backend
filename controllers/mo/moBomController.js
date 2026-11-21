@@ -35,7 +35,7 @@ const ensureMoBomTable = async (client) => {
             id                SERIAL PRIMARY KEY,
             parent_item_id    INTEGER NOT NULL REFERENCES im_item(id),
             bom_version       VARCHAR(20)   NOT NULL DEFAULT '1',
-            bom_qty           NUMERIC(18,4) NOT NULL DEFAULT 1,
+            bom_qty           NUMERIC(20,6) NOT NULL DEFAULT 1,
             output_uom_id     INTEGER REFERENCES im_uom(id),
             is_active         BOOLEAN       NOT NULL DEFAULT true,
             effective_date    DATE,

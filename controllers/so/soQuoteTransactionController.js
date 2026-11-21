@@ -49,7 +49,7 @@ const ensureQuoteTransactionTable = async (client) => {
             valid_until_date DATE,
             status          VARCHAR(20) NOT NULL DEFAULT 'Draft',
             approval_mode   VARCHAR(10) NOT NULL DEFAULT 'ALL',
-            total_qty       NUMERIC(18,4) NOT NULL DEFAULT 0,
+            total_qty       NUMERIC(20,6) NOT NULL DEFAULT 0,
             total_value_lc  NUMERIC(18,4) NOT NULL DEFAULT 0,
             description     TEXT,
             dim1_id INTEGER, dim2_id INTEGER, dim3_id INTEGER, dim4_id INTEGER, dim5_id INTEGER,
@@ -74,7 +74,7 @@ const ensureQuoteTransactionTable = async (client) => {
             item_code      VARCHAR(30),
             item_name      VARCHAR(200),
             uom_id         INTEGER REFERENCES im_uom(id),
-            qty_quoted     NUMERIC(18,4) NOT NULL,
+            qty_quoted     NUMERIC(20,6) NOT NULL,
             unit_price_fc  NUMERIC(18,4) NOT NULL DEFAULT 0,
             total_value_lc NUMERIC(18,4) NOT NULL DEFAULT 0,
             description    TEXT

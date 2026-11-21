@@ -1128,7 +1128,15 @@ const ensurePaymentTable = async (client) => {
 const postCmPaymentHelper = (client, apTransactionId, glEntryId) => syncPartyBankItems(client, 'AP', apTransactionId, glEntryId);
 
 // --- Fetch helper ---
+// unit_code ของบรรทัด (หน่วยในเอกสาร IM) — เพิ่มคอลัมน์ครั้งแรกต่อฐานข้อมูล ก่อน query ดึงบรรทัดที่อ้างถึงคอลัมน์นี้
+const apUnitCodeReady = new WeakSet();
+const ensureApUnitCode = async (pool) => {
+    if (apUnitCodeReady.has(pool)) return;
+    await pool.query(`ALTER TABLE ap_transaction_detail ADD COLUMN IF NOT EXISTS unit_code VARCHAR(10)`).catch(() => {});
+    apUnitCodeReady.add(pool);
+};
 const fetchRowById = async (pool, id) => {
+    await ensureApUnitCode(pool);
     const [hRes, dRes, aRes, pRes, whtRes, apprRes] = await Promise.all([
         pool.query(`
             SELECT t.*,
@@ -1148,7 +1156,11 @@ const fetchRowById = async (pool, id) => {
             LEFT JOIN gl_dimension_value dim4 ON dim4.id = t.dim4_id
             LEFT JOIN gl_dimension_value dim5 ON dim5.id = t.dim5_id
             WHERE t.id = $1`, [id]),
-        pool.query(`SELECT * FROM ap_transaction_detail WHERE header_id=$1 ORDER BY line_no`, [id]),
+        // ชื่อหน่วย (ไทย/อังกฤษ) ของ unit_code — บรรทัดที่สร้างจากเอกสาร IM เก็บรหัสหน่วยในเอกสาร
+        pool.query(`SELECT dt.*, u.uom_name_th AS unit_name_th, u.uom_name_en AS unit_name_en
+            FROM ap_transaction_detail dt
+            LEFT JOIN LATERAL (SELECT x.uom_name_th, x.uom_name_en FROM im_uom x WHERE x.uom_code = dt.unit_code LIMIT 1) u ON TRUE
+            WHERE dt.header_id=$1 ORDER BY dt.line_no`, [id]),
         pool.query(`SELECT a.*, t.doc_no AS applied_to_doc_no, t.doc_date AS applied_to_doc_date
                     FROM ap_transaction_apply a
                     LEFT JOIN ap_transaction t ON t.id = a.applied_to_id
@@ -1428,6 +1440,7 @@ const insertApTransaction = async (client, { header, details, applies, payments,
     // idempotent schema migrations
     await client.query(`ALTER TABLE ap_transaction_detail ADD COLUMN IF NOT EXISTS item_code VARCHAR(50)`).catch(() => {});
     await client.query(`ALTER TABLE ap_transaction_detail ADD COLUMN IF NOT EXISTS item_name VARCHAR(200)`).catch(() => {});
+    await client.query(`ALTER TABLE ap_transaction_detail ADD COLUMN IF NOT EXISTS unit_code VARCHAR(10)`).catch(() => {});
     await client.query(`ALTER TABLE ap_transaction ADD COLUMN IF NOT EXISTS price_includes_vat BOOLEAN NOT NULL DEFAULT false`);
     await ensureTaxInvoiceColumns(client);
 
@@ -1508,8 +1521,8 @@ const insertApTransaction = async (client, { header, details, applies, payments,
              quantity, unit_price_fc, discount_percent, discount_amount_fc,
              subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
              expense_account_id, subtotal_lc, vat_amount_lc, total_amount_lc, is_deferred_vat,
-             dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+             dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, unit_code)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
         `, [
             newHeaderId, lineNo++, d.item_code || null, d.item_name || null, d.description || null,
             d.quantity ?? 1, d.unit_price_fc || 0, d.discount_percent || 0, d.discount_amount_fc || 0,
@@ -1518,7 +1531,8 @@ const insertApTransaction = async (client, { header, details, applies, payments,
             d.expense_account_id || null,
             d.subtotal_lc || 0, d.vat_amount_lc || 0, d.total_amount_lc || 0,
             d.is_deferred_vat || false,
-            ...detailDimParams(d)
+            ...detailDimParams(d),
+                d.unit_code || null
         ]);
     }
 
@@ -1649,6 +1663,7 @@ const updateTransaction = async (req, res) => {
         // idempotent schema migrations
         await client.query(`ALTER TABLE ap_transaction_detail ADD COLUMN IF NOT EXISTS item_code VARCHAR(50)`).catch(() => {});
         await client.query(`ALTER TABLE ap_transaction_detail ADD COLUMN IF NOT EXISTS item_name VARCHAR(200)`).catch(() => {});
+        await client.query(`ALTER TABLE ap_transaction_detail ADD COLUMN IF NOT EXISTS unit_code VARCHAR(10)`).catch(() => {});
 
         await client.query(`ALTER TABLE ap_transaction ADD COLUMN IF NOT EXISTS price_includes_vat BOOLEAN NOT NULL DEFAULT false`);
         await ensureTaxInvoiceColumns(client);
@@ -1716,8 +1731,8 @@ const updateTransaction = async (req, res) => {
                  quantity, unit_price_fc, discount_percent, discount_amount_fc,
                  subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
                  expense_account_id, subtotal_lc, vat_amount_lc, total_amount_lc, is_deferred_vat,
-                 dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+                 dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, unit_code)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
             `, [
                 id, lineNo++, d.item_code || null, d.item_name || null, d.description || null,
                 d.quantity ?? 1, d.unit_price_fc || 0, d.discount_percent || 0, d.discount_amount_fc || 0,
@@ -1726,7 +1741,8 @@ const updateTransaction = async (req, res) => {
                 d.expense_account_id || null,
                 d.subtotal_lc || 0, d.vat_amount_lc || 0, d.total_amount_lc || 0,
                 d.is_deferred_vat || false,
-                ...detailDimParams(d)
+                ...detailDimParams(d),
+                d.unit_code || null
             ]);
         }
         for (const a of (applies || [])) {

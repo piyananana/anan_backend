@@ -15,8 +15,8 @@ const ensureImItemWarehouseTable = async (client) => {
             id                  SERIAL PRIMARY KEY,
             item_id             INTEGER NOT NULL,
             warehouse_id        INTEGER NOT NULL REFERENCES im_warehouse(id),
-            min_stock_qty       NUMERIC(18,4) NOT NULL DEFAULT 0,
-            max_stock_qty       NUMERIC(18,4) NOT NULL DEFAULT 0,
+            min_stock_qty       NUMERIC(20,6) NOT NULL DEFAULT 0,
+            max_stock_qty       NUMERIC(20,6) NOT NULL DEFAULT 0,
             reorder_point       NUMERIC(18,4) NOT NULL DEFAULT 0,
             default_location_id INTEGER,
             UNIQUE (item_id, warehouse_id)

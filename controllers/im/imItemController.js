@@ -2,6 +2,7 @@
 'use strict';
 
 const { ensureImItemCategoryTable, generateNextCodeForCategory } = require('./imItemCategoryController');
+const { listItemUoms } = require('../../utils/uom');
 const { ensureImUomTable } = require('./imUomController');
 const { ensureImWarehouseTable } = require('./imWarehouseController');
 const { generateNextCode } = require('./imItemRunningController');
@@ -38,8 +39,8 @@ const ensureImItemTable = async (client) => {
             is_serial_tracked     BOOLEAN      NOT NULL DEFAULT false,
             shelf_life_days       INTEGER,
             default_warehouse_id  INTEGER REFERENCES im_warehouse(id),
-            min_stock_qty         NUMERIC(18,4) NOT NULL DEFAULT 0,
-            max_stock_qty         NUMERIC(18,4) NOT NULL DEFAULT 0,
+            min_stock_qty         NUMERIC(20,6) NOT NULL DEFAULT 0,
+            max_stock_qty         NUMERIC(20,6) NOT NULL DEFAULT 0,
             reorder_point         NUMERIC(18,4) NOT NULL DEFAULT 0,
             default_vat_type      VARCHAR(10)  NOT NULL DEFAULT 'VAT7',
             inventory_account_id  INTEGER REFERENCES gl_account(id),
@@ -142,6 +143,51 @@ const fetchRows = async (req, res) => {
     } finally { client.release(); }
 };
 
+// ที่ที่สินค้าถูกใช้แล้ว — มีที่ใดที่หนึ่ง = เปลี่ยนหน่วยหลักไม่ได้ (สต็อก/ต้นทุน/เอกสารเก่าคิดเป็นหน่วยหลักเดิม)
+const BASE_UOM_USAGE = [
+    ['im_transaction_detail',           'item_id',           'ธุรกรรมสินค้า'],
+    ['im_stock_balance',                'item_id',           'ยอดคงเหลือ'],
+    ['im_stock_layer',                  'item_id',           'ชั้นต้นทุน'],
+    ['im_opening_balance_batch_detail', 'item_id',           'ยอดยกมา'],
+    ['im_stock_count_detail',           'item_id',           'ใบตรวจนับ'],
+    ['im_price_list_detail',            'item_id',           'รายการราคา'],
+    ['im_price_change_detail',          'item_id',           'ใบเปลี่ยนราคา'],
+    ['pr_transaction_detail',           'item_id',           'ใบขอซื้อ'],
+    ['po_transaction_detail',           'item_id',           'ใบสั่งซื้อ'],
+    ['quote_transaction_detail',        'item_id',           'ใบเสนอราคา'],
+    ['so_transaction_detail',           'item_id',           'ใบสั่งขาย'],
+    ['mo_bom_header',                   'parent_item_id',    'BOM (สินค้าผลิต)'],
+    ['mo_bom_detail',                   'component_item_id', 'BOM (ส่วนประกอบ)'],
+    ['mo_bom_output_detail',            'output_item_id',    'BOM (ผลพลอยได้)'],
+    ['mo_component_detail',             'component_item_id', 'ใบสั่งผลิต (ส่วนประกอบ)'],
+    ['mo_output_detail',                'output_item_id',    'ใบสั่งผลิต (ผลผลิต)'],
+];
+
+const findBaseUomUsage = async (client, itemId) => {
+    const used = [];
+    for (const [table, col, label] of BASE_UOM_USAGE) {
+        const reg = await client.query(`SELECT to_regclass($1) AS reg`, [`public.${table}`]);
+        if (!reg.rows[0].reg) continue;
+        const r = await client.query(`SELECT 1 FROM ${table} WHERE ${col} = $1 LIMIT 1`, [itemId]);
+        if (r.rows.length) used.push(label);
+    }
+    return used;
+};
+
+// GET /im_item/:id/uoms?purpose=PURCHASE|SALES|PRODUCTION|COUNT|REPORT — หน่วยที่เลือกได้ในบรรทัดเอกสาร
+const fetchItemUoms = async (req, res) => {
+    const client = await req.dbPool.connect();
+    try {
+        await ensureImItemTable(client);
+        const purpose = req.query.purpose ? String(req.query.purpose).toUpperCase() : undefined;
+        res.status(200).json(await listItemUoms(client, Number(req.params.id), { purpose }));
+    } catch (error) {
+        if (error.status === 400) return res.status(400).json({ message: error.message });
+        console.error('Error fetching item uoms:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    } finally { client.release(); }
+};
+
 const fetchRow = async (req, res) => {
     const { id } = req.params;
     const client = await req.dbPool.connect();
@@ -151,7 +197,9 @@ const fetchRow = async (req, res) => {
         if (result.rows.length === 0) return res.status(404).json({ message: 'ไม่พบสินค้า' });
         const uomConversions = await imUomConversion.fetchByItem(client, id);
         const itemWarehouses = await imItemWarehouse.fetchByItem(client, id);
-        res.status(200).json({ ...result.rows[0], uom_conversions: uomConversions, item_warehouses: itemWarehouses });
+        const usedIn = await findBaseUomUsage(client, id);
+        res.status(200).json({ ...result.rows[0], uom_conversions: uomConversions, item_warehouses: itemWarehouses,
+            base_uom_locked: usedIn.length > 0, base_uom_used_in: usedIn });
     } catch (error) {
         console.error('Error fetching im_item row:', error);
         res.status(500).json({ message: 'Internal server error' });
@@ -222,6 +270,7 @@ const addRow = async (req, res) => {
         res.status(201).json({ ...newRow.rows[0], uom_conversions: uomConversions, item_warehouses: itemWarehouses });
     } catch (error) {
         await client.query('ROLLBACK');
+        if (error.status === 400) return res.status(400).json({ message: error.message });
         if (error.code === '23505') return res.status(409).json({ message: `รหัสสินค้า '${b.item_code}' มีอยู่แล้ว` });
         console.error('Error adding im_item:', error);
         res.status(500).json({ message: 'Internal server error' });
@@ -240,13 +289,21 @@ const updateRow = async (req, res) => {
         if (enumErr) { await client.query('ROLLBACK'); return res.status(400).json({ message: enumErr }); }
 
         const currentResult = await client.query(
-            `SELECT category_id, is_code_auto_generated, accounting_mode FROM im_item WHERE id = $1`, [id]
+            `SELECT category_id, is_code_auto_generated, accounting_mode, base_uom_id FROM im_item WHERE id = $1`, [id]
         );
         if (currentResult.rows.length === 0) {
             await client.query('ROLLBACK');
             return res.status(404).json({ message: 'ไม่พบสินค้า' });
         }
         const current = currentResult.rows[0];
+        // หน่วยหลักล็อกเมื่อสินค้าถูกใช้แล้ว (ข้อตัดสินใจ 2026-11-20)
+        if (Number(b.base_uom_id || 0) !== Number(current.base_uom_id || 0)) {
+            const usedIn = await findBaseUomUsage(client, id);
+            if (usedIn.length > 0) {
+                await client.query('ROLLBACK');
+                return res.status(409).json({ message: `เปลี่ยนหน่วยหลักไม่ได้ เนื่องจากสินค้านี้ใช้งานแล้วใน: ${usedIn.join(', ')}` });
+            }
+        }
         const newCategoryId = b.category_id || null;
         const currentCategoryId = current.category_id || null;
         if (current.is_code_auto_generated) {
@@ -320,9 +377,12 @@ const updateRow = async (req, res) => {
         const updated = await client.query(`${ITEM_SELECT} WHERE i.id = $1`, [id]);
         const uomConversions = await imUomConversion.fetchByItem(client, id);
         const itemWarehouses = await imItemWarehouse.fetchByItem(client, id);
-        res.status(200).json({ ...updated.rows[0], uom_conversions: uomConversions, item_warehouses: itemWarehouses });
+        const usedIn = await findBaseUomUsage(client, id);
+        res.status(200).json({ ...updated.rows[0], uom_conversions: uomConversions, item_warehouses: itemWarehouses,
+            base_uom_locked: usedIn.length > 0, base_uom_used_in: usedIn });
     } catch (error) {
         await client.query('ROLLBACK');
+        if (error.status === 400) return res.status(400).json({ message: error.message });
         console.error('Error updating im_item:', error);
         res.status(500).json({ message: 'Internal server error' });
     } finally { client.release(); }
@@ -347,4 +407,5 @@ module.exports = {
     ensureImItemTable,
     ITEM_TYPES, COSTING_METHODS,
     fetchRows, fetchRow, addRow, updateRow, deleteRow,
+    findBaseUomUsage, fetchItemUoms,
 };
