@@ -137,6 +137,8 @@ const ensurePoPriceColumns = async (db) => {
     const dbName = db.options?.database || db.database;
     if (dbName && ensuredPo.has(dbName)) return;
     await addSalesPriceColumns(db, 'po_transaction');
+    // อัตราแปลงหน่วยของบรรทัด ณ ตอนบันทึก (หน่วยหลักต่อ 1 หน่วยของบรรทัด) — 1 = หน่วยหลัก/เอกสารเก่า
+    await db.query(`ALTER TABLE IF EXISTS po_transaction_detail ADD COLUMN IF NOT EXISTS conversion_factor NUMERIC(18,6) NOT NULL DEFAULT 1`);
     if (dbName) ensuredPo.add(dbName);
 };
 

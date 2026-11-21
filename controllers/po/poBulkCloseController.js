@@ -3,6 +3,8 @@
 // (closeTransaction ใน poTransactionController.js) เรียกทีละใบจากฝั่ง frontend ไม่มี endpoint เขียนใหม่ที่นี่
 // qty_received คำนวณด้วยสูตรเดียวกับ poPendingReceiptReportController.js/refreshPoStatus ทุกประการ
 'use strict';
+const { poReceivedSql } = require('../../utils/imLineUom');
+const { ensurePoPriceColumns } = require('../../utils/vatCalc');
 
 const CLOSABLE_STATUSES = ['Approved', 'PartiallyReceived', 'FullyReceived'];
 
@@ -13,6 +15,7 @@ const fetchClosableList = async (req, res) => {
 
     const client = await req.dbPool.connect();
     try {
+        await ensurePoPriceColumns(client);
         const result = await client.query(`
             SELECT
                 po.id AS po_id, po.doc_no AS po_doc_no, po.doc_date AS po_doc_date, po.due_date, po.status,
@@ -20,12 +23,9 @@ const fetchClosableList = async (req, res) => {
                 v.vendor_name_en,
                 po.warehouse_id, w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
                 po.total_value_lc,
-                COALESCE(SUM(pod.qty_ordered), 0) AS qty_ordered,
-                COALESCE(SUM((
-                    SELECT SUM(ABS(imd.qty)) FROM im_transaction_detail imd
-                    JOIN im_transaction imt ON imt.id = imd.header_id
-                    WHERE imd.ref_po_detail_id = pod.id AND imt.status IN ('Posted','Received')
-                )), 0) AS qty_received
+                -- รวมเป็นหน่วยหลัก (จำนวน × อัตราแปลงของบรรทัด) — บรรทัดต่างหน่วยกันรวมกันตรงๆ ไม่ได้
+                COALESCE(SUM(pod.qty_ordered * pod.conversion_factor), 0) AS qty_ordered,
+                COALESCE(SUM(${poReceivedSql('pod')} * pod.conversion_factor), 0) AS qty_received
             FROM po_transaction po
             JOIN po_transaction_detail pod ON pod.header_id = po.id
             LEFT JOIN ap_vendor v ON v.id = po.vendor_id

@@ -16,6 +16,19 @@ const { reasonOf, userIdOf, sendErr, blk } = require('../../utils/docAction');
 const DA = require('../../utils/docApproval');
 const { ensurePoPriceColumns, netUnitPriceSql, orderLineValues, saveOrderTotals } = require('../../utils/vatCalc');
 const { fetchOrderDeposits } = require('../../utils/depositRef');
+const { resolveOrderLineUom, poReceivedSql } = require('../../utils/imLineUom');
+
+// บรรทัดใบสั่งซื้อ: หน่วยต้องอนุญาตให้ซื้อ จำนวนตามทศนิยมของหน่วย — จำนวน/ราคาเก็บตามหน่วยของบรรทัด + อัตราแปลง snapshot
+// บรรทัดที่ดึงจากใบขอซื้อต้องใช้หน่วยเดียวกับใบขอซื้อ (ตรวจใน validatePrConvertibleQty)
+const normalizePoLines = async (client, details) => {
+    for (const d of details || []) {
+        if (!d || !d.item_id) continue;
+        const u = await resolveOrderLineUom(client, d.item_id, d.uom_id, d.qty_ordered, 'PURCHASE');
+        d.uom_id = u.uom_id;
+        d.qty_ordered = u.qty;
+        d.conversion_factor = u.factor;
+    }
+};
 const KIND = 'PO';
 
 const ensurePoTransactionTable = async (client) => {
@@ -109,12 +122,8 @@ const fetchRowById = async (pool, id) => {
         WHERE t.id = $1`, [id]);
     if (hRes.rows.length === 0) return null;
     const dRes = await pool.query(`
-        SELECT dt.*, u.uom_code,
-               COALESCE((
-                   SELECT SUM(ABS(imd.qty)) FROM im_transaction_detail imd
-                   JOIN im_transaction imt ON imt.id = imd.header_id
-                   WHERE imd.ref_po_detail_id = dt.id AND imt.status IN ('Posted', 'Received')
-               ), 0) AS qty_received
+        SELECT dt.*, u.uom_code, u.uom_name_th, u.uom_name_en,
+               ${poReceivedSql('dt')} AS qty_received
         FROM po_transaction_detail dt
         LEFT JOIN im_uom u ON u.id = dt.uom_id
         WHERE dt.header_id = $1 ORDER BY dt.line_no`, [id]);
@@ -226,6 +235,7 @@ const createTransaction = async (req, res) => {
         const { copyAttachmentsToEntity } = require('../sa/saAttachmentController');
         const dbName = req.header('X-Database-Name');
         const affectedPrIds = new Set();
+        await normalizePoLines(client, details);
         let lineNo = 1, totalQty = 0;
         const amts = [];
         for (const d of details) {
@@ -235,17 +245,17 @@ const createTransaction = async (req, res) => {
             totalQty += qty;
             amts.push(amt);
             if (d.ref_pr_detail_id) {
-                const { prTransactionId } = await validatePrConvertibleQty(client, { refPrDetailId: d.ref_pr_detail_id, requestedQty: qty });
+                const { prTransactionId } = await validatePrConvertibleQty(client, { refPrDetailId: d.ref_pr_detail_id, requestedQty: qty, uomId: d.uom_id });
                 affectedPrIds.add(prTransactionId);
             }
             const newDetailRes = await client.query(`
                 INSERT INTO po_transaction_detail
                 (header_id, line_no, item_id, item_code, item_name, uom_id, qty_ordered, unit_price_fc, total_value_lc, description, ref_pr_detail_id,
-                 discount_percent, vat_type, vat_rate)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                 discount_percent, vat_type, vat_rate, conversion_factor)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
                 RETURNING id
             `, [headerId, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                qty, price, amt.netLc, d.description || null, d.ref_pr_detail_id || null, discountPercent, vatType, vatRate]);
+                qty, price, amt.netLc, d.description || null, d.ref_pr_detail_id || null, discountPercent, vatType, vatRate, d.conversion_factor ?? 1]);
             // คัดลอกไฟล์แนบจากบรรทัด PR ต้นทาง (ถ้ามี) มาไว้ที่บรรทัด PO ใหม่นี้ทันที เพื่อให้ผู้อนุมัติ PO เห็น
             // หลักฐานชุดเดียวกับที่ผู้อนุมัติ PR เคยเห็น — ดู copyAttachmentsToEntity สำหรับเหตุผลที่คัดลอกไฟล์จริง
             // แทนการ share file_path เดียวกัน
@@ -266,7 +276,7 @@ const createTransaction = async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error creating po_transaction:', error);
-        res.status(500).json({ message: error.message || 'Internal server error' });
+        res.status(error.status || 500).json({ message: error.message || 'Internal server error' });
     } finally { client.release(); }
 };
 
@@ -326,6 +336,7 @@ const updateTransaction = async (req, res) => {
             await client.query(`DELETE FROM po_transaction_detail WHERE id = ANY($1::int[])`, [removedIds]);
         }
 
+        await normalizePoLines(client, details);
         let lineNo = 1, totalQty = 0;
         const amts = [];
         for (const d of details) {
@@ -335,7 +346,7 @@ const updateTransaction = async (req, res) => {
             totalQty += qty;
             amts.push(amt);
             if (d.ref_pr_detail_id) {
-                const { prTransactionId } = await validatePrConvertibleQty(client, { refPrDetailId: d.ref_pr_detail_id, requestedQty: qty });
+                const { prTransactionId } = await validatePrConvertibleQty(client, { refPrDetailId: d.ref_pr_detail_id, requestedQty: qty, uomId: d.uom_id });
                 affectedPrIds.add(prTransactionId);
             }
             if (d.id && existingIds.has(d.id)) {
@@ -343,19 +354,19 @@ const updateTransaction = async (req, res) => {
                     UPDATE po_transaction_detail SET
                         line_no=$1, item_id=$2, item_code=$3, item_name=$4, uom_id=$5, qty_ordered=$6,
                         unit_price_fc=$7, total_value_lc=$8, description=$9, ref_pr_detail_id=$10,
-                        discount_percent=$12, vat_type=$13, vat_rate=$14
+                        discount_percent=$12, vat_type=$13, vat_rate=$14, conversion_factor=$15
                     WHERE id=$11
                 `, [lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                    qty, price, amt.netLc, d.description || null, d.ref_pr_detail_id || null, d.id, discountPercent, vatType, vatRate]);
+                    qty, price, amt.netLc, d.description || null, d.ref_pr_detail_id || null, d.id, discountPercent, vatType, vatRate, d.conversion_factor ?? 1]);
             } else {
                 const newDetailRes = await client.query(`
                     INSERT INTO po_transaction_detail
                     (header_id, line_no, item_id, item_code, item_name, uom_id, qty_ordered, unit_price_fc, total_value_lc, description, ref_pr_detail_id,
-                     discount_percent, vat_type, vat_rate)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                     discount_percent, vat_type, vat_rate, conversion_factor)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
                     RETURNING id
                 `, [id, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                    qty, price, amt.netLc, d.description || null, d.ref_pr_detail_id || null, discountPercent, vatType, vatRate]);
+                    qty, price, amt.netLc, d.description || null, d.ref_pr_detail_id || null, discountPercent, vatType, vatRate, d.conversion_factor ?? 1]);
                 if (d.ref_pr_detail_id) {
                     await copyAttachmentsToEntity(client, {
                         dbName, sourceModule: 'pr_transaction_detail', sourceEntityId: d.ref_pr_detail_id,
@@ -374,7 +385,7 @@ const updateTransaction = async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error updating po_transaction:', error);
-        res.status(500).json({ message: error.message || 'Internal server error' });
+        res.status(error.status || 500).json({ message: error.message || 'Internal server error' });
     } finally { client.release(); }
 };
 
@@ -602,12 +613,8 @@ const fetchReceivableLines = async (req, res) => {
                    dt.discount_percent, dt.vat_type, dt.vat_rate, t.price_includes_vat,
                    -- ราคาหลังส่วนลด ก่อน VAT (เทียบกับราคาสุทธิของใบรับสินค้า/ตั้งหนี้)
                    ${netUnitPriceSql('dt.unit_price_fc', 'dt', 't')} AS net_unit_price_fc,
-                   u.uom_code,
-                   COALESCE((
-                       SELECT SUM(ABS(imd.qty)) FROM im_transaction_detail imd
-                       JOIN im_transaction imt ON imt.id = imd.header_id
-                       WHERE imd.ref_po_detail_id = dt.id AND imt.status IN ('Posted', 'Received')
-                   ), 0) AS qty_received
+                   u.uom_code, u.uom_name_th, u.uom_name_en, dt.conversion_factor,
+                   ${poReceivedSql('dt')} AS qty_received
             FROM po_transaction_detail dt
             JOIN po_transaction t ON t.id = dt.header_id
             LEFT JOIN im_uom u ON u.id = dt.uom_id
@@ -633,9 +640,12 @@ const fetchReceivableLines = async (req, res) => {
 // ตรวจสอบว่าจำนวนที่จะรับ (ต่อบรรทัด GRN ที่อ้างอิง ref_po_detail_id) ไม่เกินจำนวนคงเหลือที่รับได้ของบรรทัด PO ต้นฉบับ
 // เอกสาร PO หนึ่งบรรทัดอาจถูกรับหลายครั้ง (คนละใบ GRN) คงเหลือคำนวณจากผลรวมการรับที่ Posted/Received แล้วเท่านั้น —
 // มิเรอร์ validateReturnableQty ใน imTransactionController.js ทุกประการ (ดูเหตุผลเรื่อง computed-on-read ที่นั่น)
-const validatePoReceivableQty = async (client, { refPoDetailId, requestedQty, vendorId, currencyCode }) => {
+// requestedQty = จำนวนหน่วยหลักที่รับ, uomId/uomQty = หน่วย/จำนวนตามหน่วยของบรรทัด IM — เทียบเป็นหน่วยของบรรทัด PO
+// (หน่วยเดียวกันใช้ uomQty ตรงตัว ไม่งั้นแปลงจากหน่วยหลักด้วยอัตราของบรรทัด PO)
+const validatePoReceivableQty = async (client, { refPoDetailId, requestedQty, uomId, uomQty, vendorId, currencyCode }) => {
     const origRes = await client.query(`
         SELECT pod.qty_ordered, pod.item_code, pod.header_id, po.vendor_id, po.status AS po_status, po.doc_no,
+               pod.uom_id, pod.conversion_factor, ${poReceivedSql('pod')} AS received,
                COALESCE(po.currency_code, ${BASE_CURRENCY_CODE_SQL}) AS currency_code
         FROM po_transaction_detail pod JOIN po_transaction po ON po.id = pod.header_id
         WHERE pod.id = $1
@@ -652,13 +662,11 @@ const validatePoReceivableQty = async (client, { refPoDetailId, requestedQty, ve
     if (currencyCode && orig.currency_code !== currencyCode) {
         throw new Error(`สกุลเงินของใบรับสินค้า (${currencyCode}) ต้องตรงกับใบสั่งซื้อ ${orig.doc_no} (${orig.currency_code})`);
     }
-    const receivedRes = await client.query(`
-        SELECT COALESCE(SUM(ABS(imd.qty)), 0) AS received
-        FROM im_transaction_detail imd JOIN im_transaction imt ON imt.id = imd.header_id
-        WHERE imd.ref_po_detail_id = $1 AND imt.status IN ('Posted', 'Received')
-    `, [refPoDetailId]);
-    const remaining = Number(orig.qty_ordered) - Number(receivedRes.rows[0].received);
-    if (requestedQty > remaining + 0.0001) {
+    const sameUnit = uomQty != null && Number(uomId || 0) === Number(orig.uom_id || 0);
+    const factor = Number(orig.conversion_factor) || 1;
+    const requested = sameUnit ? Math.abs(Number(uomQty)) : Math.abs(Number(requestedQty) || 0) / factor;
+    const remaining = Number(orig.qty_ordered) - Number(orig.received);
+    if (requested > remaining + 1e-6) {
         throw new Error(`จำนวนที่รับเกินกว่าคงเหลือที่สั่งซื้อของ ${orig.item_code} (คงเหลือรับได้ ${remaining})`);
     }
     return { poTransactionId: orig.header_id };
@@ -673,12 +681,9 @@ const refreshPoStatus = async (client, poTransactionId) => {
 
     const sumRes = await client.query(`
         SELECT
-            COALESCE(SUM(pod.qty_ordered), 0) AS ordered,
-            COALESCE(SUM((
-                SELECT SUM(ABS(imd.qty)) FROM im_transaction_detail imd
-                JOIN im_transaction imt ON imt.id = imd.header_id
-                WHERE imd.ref_po_detail_id = pod.id AND imt.status IN ('Posted', 'Received')
-            )), 0) AS received
+            -- เทียบเป็นหน่วยหลัก (จำนวนของแต่ละบรรทัด × อัตราแปลง) เพราะบรรทัดต่างหน่วยกันรวมกันตรงๆ ไม่ได้
+            COALESCE(SUM(pod.qty_ordered * pod.conversion_factor), 0) AS ordered,
+            COALESCE(SUM(${poReceivedSql('pod')} * pod.conversion_factor), 0) AS received
         FROM po_transaction_detail pod WHERE pod.header_id = $1
     `, [poTransactionId]);
     const { ordered, received } = sumRes.rows[0];

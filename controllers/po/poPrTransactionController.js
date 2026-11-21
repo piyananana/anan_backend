@@ -14,6 +14,18 @@ const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { reasonOf, userIdOf, sendErr, blk } = require('../../utils/docAction');
 const DA = require('../../utils/docApproval');
+const { resolveOrderLineUom } = require('../../utils/imLineUom');
+
+// บรรทัดใบขอซื้อ: หน่วยต้องอนุญาตให้ซื้อ จำนวนตามทศนิยมของหน่วย — จำนวน/ราคาประมาณเก็บตามหน่วยของบรรทัด + อัตราแปลง snapshot
+const normalizePrLines = async (client, details) => {
+    for (const d of details || []) {
+        if (!d || !d.item_id) continue;
+        const u = await resolveOrderLineUom(client, d.item_id, d.uom_id, d.qty_requested, 'PURCHASE');
+        d.uom_id = u.uom_id;
+        d.qty_requested = u.qty;
+        d.conversion_factor = u.factor;
+    }
+};
 const KIND = 'PR';
 
 const ensurePrTransactionTable = async (client) => {
@@ -76,6 +88,8 @@ const ensurePrTransactionTable = async (client) => {
     // มาก่อนแล้วเท่านั้น (ทั้งสองไฟล์ ALTER คอลัมน์เดียวกันแบบ idempotent ซ้ำกันได้อย่างปลอดภัย)
     await client.query(`ALTER TABLE po_transaction ADD COLUMN IF NOT EXISTS ref_pr_id INTEGER`);
     await client.query(`ALTER TABLE po_transaction_detail ADD COLUMN IF NOT EXISTS ref_pr_detail_id INTEGER`);
+    // อัตราแปลงหน่วยของบรรทัด ณ ตอนบันทึก (หน่วยหลักต่อ 1 หน่วยของบรรทัด) — 1 = หน่วยหลัก/เอกสารเก่า
+    await client.query(`ALTER TABLE pr_transaction_detail ADD COLUMN IF NOT EXISTS conversion_factor NUMERIC(18,6) NOT NULL DEFAULT 1`);
 
     // เผื่อตาราง pr_transaction ถูกสร้างไว้แล้วก่อนเพิ่มฟีลด์สกุลเงิน (CREATE TABLE IF NOT EXISTS ด้านบนจะไม่เพิ่ม
     // คอลัมน์ให้ตารางที่มีอยู่แล้ว) — รองรับการสั่งซื้อ/ขอซื้อสินค้าจากต่างประเทศเป็นสกุลเงินต่างประเทศได้
@@ -108,7 +122,7 @@ const fetchRowById = async (pool, id) => {
         WHERE t.id = $1`, [id]);
     if (hRes.rows.length === 0) return null;
     const dRes = await pool.query(`
-        SELECT dt.*, u.uom_code,
+        SELECT dt.*, u.uom_code, u.uom_name_th, u.uom_name_en,
                COALESCE((
                    SELECT SUM(pod.qty_ordered) FROM po_transaction_detail pod
                    JOIN po_transaction po ON po.id = pod.header_id
@@ -223,6 +237,7 @@ const createTransaction = async (req, res) => {
         ]);
         const headerId = hRes.rows[0].id;
 
+        await normalizePrLines(client, details);
         let lineNo = 1, totalQty = 0, totalValue = 0;
         for (const d of details) {
             const qty = Number(d.qty_requested) || 0;
@@ -232,10 +247,10 @@ const createTransaction = async (req, res) => {
             totalValue += value;
             await client.query(`
                 INSERT INTO pr_transaction_detail
-                (header_id, line_no, item_id, item_code, item_name, uom_id, qty_requested, needed_by_date, estimated_unit_cost, total_value_lc, description)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                (header_id, line_no, item_id, item_code, item_name, uom_id, qty_requested, needed_by_date, estimated_unit_cost, total_value_lc, description, conversion_factor)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
             `, [headerId, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                qty, d.needed_by_date || null, cost, value, d.description || null]);
+                qty, d.needed_by_date || null, cost, value, d.description || null, d.conversion_factor ?? 1]);
         }
         await client.query(`UPDATE pr_transaction SET total_qty=$1, total_value_lc=$2 WHERE id=$3`, [totalQty, totalValue, headerId]);
 
@@ -245,7 +260,7 @@ const createTransaction = async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error creating pr_transaction:', error);
-        res.status(500).json({ message: error.message || 'Internal server error' });
+        res.status(error.status || 500).json({ message: error.message || 'Internal server error' });
     } finally { client.release(); }
 };
 
@@ -304,6 +319,7 @@ const updateTransaction = async (req, res) => {
             await client.query(`DELETE FROM pr_transaction_detail WHERE id = ANY($1::int[])`, [removedIds]);
         }
 
+        await normalizePrLines(client, details);
         let lineNo = 1, totalQty = 0, totalValue = 0;
         for (const d of details) {
             const qty = Number(d.qty_requested) || 0;
@@ -315,17 +331,17 @@ const updateTransaction = async (req, res) => {
                 await client.query(`
                     UPDATE pr_transaction_detail SET
                         line_no=$1, item_id=$2, item_code=$3, item_name=$4, uom_id=$5, qty_requested=$6,
-                        needed_by_date=$7, estimated_unit_cost=$8, total_value_lc=$9, description=$10
+                        needed_by_date=$7, estimated_unit_cost=$8, total_value_lc=$9, description=$10, conversion_factor=$12
                     WHERE id=$11
                 `, [lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                    qty, d.needed_by_date || null, cost, value, d.description || null, d.id]);
+                    qty, d.needed_by_date || null, cost, value, d.description || null, d.id, d.conversion_factor ?? 1]);
             } else {
                 await client.query(`
                     INSERT INTO pr_transaction_detail
-                    (header_id, line_no, item_id, item_code, item_name, uom_id, qty_requested, needed_by_date, estimated_unit_cost, total_value_lc, description)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                    (header_id, line_no, item_id, item_code, item_name, uom_id, qty_requested, needed_by_date, estimated_unit_cost, total_value_lc, description, conversion_factor)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
                 `, [id, lineNo++, d.item_id, d.item_code || null, d.item_name || null, d.uom_id || null,
-                    qty, d.needed_by_date || null, cost, value, d.description || null]);
+                    qty, d.needed_by_date || null, cost, value, d.description || null, d.conversion_factor ?? 1]);
             }
         }
         await client.query(`UPDATE pr_transaction SET total_qty=$1, total_value_lc=$2 WHERE id=$3`, [totalQty, totalValue, id]);
@@ -336,7 +352,7 @@ const updateTransaction = async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error updating pr_transaction:', error);
-        res.status(500).json({ message: error.message || 'Internal server error' });
+        res.status(error.status || 500).json({ message: error.message || 'Internal server error' });
     } finally { client.release(); }
 };
 
@@ -542,7 +558,7 @@ const fetchConvertibleLines = async (req, res) => {
             SELECT t.id AS header_id, t.doc_no, t.doc_date, t.status, t.currency_code, t.exchange_rate,
                    t.dim1_id, t.dim2_id, t.dim3_id, t.dim4_id, t.dim5_id, t.branch_id,
                    dt.id AS detail_id, dt.line_no, dt.item_id, dt.item_code, dt.item_name, dt.uom_id,
-                   dt.qty_requested, dt.estimated_unit_cost, u.uom_code,
+                   dt.qty_requested, dt.estimated_unit_cost, u.uom_code, u.uom_name_th, u.uom_name_en, dt.conversion_factor,
                    COALESCE((
                        SELECT SUM(pod.qty_ordered) FROM po_transaction_detail pod
                        JOIN po_transaction po ON po.id = pod.header_id
@@ -570,14 +586,22 @@ const fetchConvertibleLines = async (req, res) => {
 // --- Cross-module helpers, called from poTransactionController.js's line-save path ---
 
 // มิเรอร์ validatePoReceivableQty ใน poTransactionController.js ทุกประการ — ดูเหตุผลเรื่อง computed-on-read ที่นั่น
-const validatePrConvertibleQty = async (client, { refPrDetailId, requestedQty }) => {
+// uomId = หน่วยของบรรทัด PO (หลัง normalize, ไม่ระบุ = หน่วยหลัก) — ต้องตรงกับหน่วยของบรรทัดใบขอซื้อ
+// (จำนวนคงเหลือที่แปลงได้นับในหน่วยของใบขอซื้อ)
+const validatePrConvertibleQty = async (client, { refPrDetailId, requestedQty, uomId }) => {
     const origRes = await client.query(`
-        SELECT prd.qty_requested, prd.item_code, prd.header_id, pr.status AS pr_status
+        SELECT prd.qty_requested, prd.item_code, prd.header_id, pr.status AS pr_status,
+               COALESCE(prd.uom_id, i.base_uom_id) AS uom_id, u.uom_code
         FROM pr_transaction_detail prd JOIN pr_transaction pr ON pr.id = prd.header_id
+        JOIN im_item i ON i.id = prd.item_id
+        LEFT JOIN im_uom u ON u.id = COALESCE(prd.uom_id, i.base_uom_id)
         WHERE prd.id = $1
     `, [refPrDetailId]);
     if (origRes.rows.length === 0) throw new Error('ไม่พบรายการใบขอซื้อต้นฉบับที่อ้างอิง');
     const orig = origRes.rows[0];
+    if (uomId !== undefined && Number(uomId || 0) !== Number(orig.uom_id || 0)) {
+        throw new Error(`รายการ ${orig.item_code} ที่ดึงจากใบขอซื้อต้องใช้หน่วยเดียวกับใบขอซื้อ (${orig.uom_code || '-'})`);
+    }
     if (!['Approved', 'PartiallyConverted'].includes(orig.pr_status)) {
         throw new Error(`ใบขอซื้อ ${orig.item_code} ต้องอยู่สถานะ Approved หรือ PartiallyConverted เท่านั้นจึงจะแปลงเป็น PO เพิ่มได้`);
     }

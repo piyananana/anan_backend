@@ -1,6 +1,7 @@
 // controllers/po/poReplenishmentController.js — ใบแนะนำสั่งซื้อเพื่อเติมสต็อก (Purchase Replenishment Suggestion)
 const { today } = require('../../utils/dateUtil');
 const { ensurePoPriceColumns, netUnitPriceSql } = require('../../utils/vatCalc');
+const { poReceivedSql } = require('../../utils/imLineUom');
 // อ่านอย่างเดียว ไม่เขียนอะไรเลย — ใช้ min_stock_qty/max_stock_qty/reorder_point ที่มีอยู่แล้วใน im_item/
 // im_item_warehouse (เดิมไม่เคยถูกใช้คำนวณอะไรเลย) ผสมกับยอดขายจริงจาก DLN ('30'/'31'/'32') ในช่วงย้อนหลังที่เลือก
 // เพื่อประมาณจำนวนที่ต้องสั่งให้พอสำหรับช่วงเวลาข้างหน้าที่เลือก — สูตรและเหตุผลแต่ละขั้นดู plan ตอนออกแบบ
@@ -57,12 +58,9 @@ const fetchSuggestions = async (req, res) => {
             -- จำนวนคงเหลือที่ยังไม่รับของ PO ที่ Approved/PartiallyReceived ต่อ (item, คลังปลายทางของ PO เอง) — มิเรอร์
             -- fetchReceivableLines ใน poTransactionController.js ทุกประการ ต่างกันแค่ group by item_id+warehouse_id
             incoming AS (
+                -- คงเหลือรับตามหน่วยของบรรทัด × อัตราแปลง = หน่วยหลัก (เทียบกับยอดคงเหลือ/ยอดขายที่เป็นหน่วยหลัก)
                 SELECT pod.item_id, po.warehouse_id, SUM(
-                    pod.qty_ordered - COALESCE((
-                        SELECT SUM(ABS(imd.qty)) FROM im_transaction_detail imd
-                        JOIN im_transaction imt ON imt.id = imd.header_id
-                        WHERE imd.ref_po_detail_id = pod.id AND imt.status IN ('Posted', 'Received')
-                    ), 0)
+                    (pod.qty_ordered - ${poReceivedSql('pod')}) * pod.conversion_factor
                 ) AS qty
                 FROM po_transaction_detail pod
                 JOIN po_transaction po ON po.id = pod.header_id

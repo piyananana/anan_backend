@@ -189,4 +189,12 @@ const soDeliveredSql = (sod = 'sod') => `COALESCE((
     WHERE imd.ref_so_detail_id = ${sod}.id AND imt.status IN ('Posted', 'Delivered')
 ), 0)`;
 
-module.exports = { purposeOf, normalizeImLines, lineEffFactor, toBasePrice, ensureImLineUomColumns, toDocUnitLines, resolveOrderLineUom, soDeliveredSql, PRICE_FIELDS };
+/** จำนวนที่รับแล้วของบรรทัดใบสั่งซื้อ (alias pod) เป็นหน่วยของใบสั่งซื้อ — สูตรเดียวกับ soDeliveredSql (Posted/Received) */
+const poReceivedSql = (pod = 'pod') => `COALESCE((
+    SELECT SUM(CASE WHEN imd.uom_qty IS NOT NULL AND imd.uom_id IS NOT DISTINCT FROM ${pod}.uom_id THEN ABS(imd.uom_qty)
+                    ELSE ABS(imd.qty) / NULLIF(${pod}.conversion_factor, 0) END)
+    FROM im_transaction_detail imd JOIN im_transaction imt ON imt.id = imd.header_id
+    WHERE imd.ref_po_detail_id = ${pod}.id AND imt.status IN ('Posted', 'Received')
+), 0)`;
+
+module.exports = { purposeOf, normalizeImLines, lineEffFactor, toBasePrice, ensureImLineUomColumns, toDocUnitLines, resolveOrderLineUom, soDeliveredSql, poReceivedSql, PRICE_FIELDS };

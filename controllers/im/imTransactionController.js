@@ -2273,7 +2273,7 @@ const postDetailLines = async (client, headerId, header, docNo) => {
         // (varianceQty) เหมือนกลไกตรวจ return ข้างบนทุกประการ อยู่ใน client transaction เดียวกันจึง rollback ได้ทัน
         if (['10', '11', '12'].includes(sysDocType) && d.ref_po_detail_id) {
             const { poTransactionId } = await validatePoReceivableQty(client, {
-                refPoDetailId: d.ref_po_detail_id, requestedQty: Math.abs(varianceQty), vendorId: header.vendor_id,
+                refPoDetailId: d.ref_po_detail_id, requestedQty: Math.abs(varianceQty), uomId: d.uom_id, uomQty: d.uom_qty, vendorId: header.vendor_id,
                 currencyCode: header.currency_code || await getBaseCurrencyCode(client),
             });
             touchedPoIds.add(poTransactionId);

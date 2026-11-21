@@ -5,6 +5,7 @@
 'use strict';
 
 const { ensurePoPriceColumns, netUnitPriceSql } = require('../../utils/vatCalc');
+const { poReceivedSql } = require('../../utils/imLineUom');
 
 const fetchReport = async (req, res) => {
     const { po_date_from, po_date_to, due_date_from, due_date_to, vendor_ids, item_ids, sort_due_date } = req.query;
@@ -21,15 +22,15 @@ const fetchReport = async (req, res) => {
                 po.exchange_rate,
                 pod.id AS po_detail_id, pod.item_id, pod.item_code, pod.item_name,
                 pod.qty_ordered, ${netUnitPriceSql('pod.unit_price_fc', 'pod', 'po')} AS unit_price_fc,
-                COALESCE((
-                    SELECT SUM(ABS(imd.qty)) FROM im_transaction_detail imd
-                    JOIN im_transaction imt ON imt.id = imd.header_id
-                    WHERE imd.ref_po_detail_id = pod.id AND imt.status IN ('Posted','Received')
-                ), 0) AS qty_received,
+                -- จำนวนตามหน่วยของบรรทัดใบสั่งซื้อ (สั่ง/รับแล้ว/ค้างรับ) + ชื่อหน่วย
+                ${poReceivedSql('pod')} AS qty_received,
+                uu.uom_code, uu.uom_name_th, uu.uom_name_en,
                 v.vendor_code, v.vendor_name_th, v.vendor_name_en,
                 w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en
             FROM po_transaction_detail pod
             JOIN po_transaction po ON po.id = pod.header_id
+            LEFT JOIN im_item ii ON ii.id = pod.item_id
+            LEFT JOIN im_uom uu ON uu.id = COALESCE(pod.uom_id, ii.base_uom_id)
             LEFT JOIN ap_vendor v  ON v.id = po.vendor_id
             LEFT JOIN im_warehouse w ON w.id = po.warehouse_id
             WHERE po.status IN ('Approved','PartiallyReceived','FullyReceived')
