@@ -24,6 +24,8 @@ const PENDING_SELECT = `
         v.vendor_code, v.vendor_name_th, v.tax_id AS vendor_tax_id,
         st.id AS sale_txn_id, st.doc_no AS sale_doc_no, st.doc_date AS sale_doc_date,
         it.id AS item_id, it.item_code, it.item_name_th, it.item_name_en,
+        -- จำนวนที่ขายไป (im_stock_layer_consumption.qty) เป็นหน่วยหลักของสินค้าเสมอ
+        bu.uom_code, bu.uom_name_th, bu.uom_name_en,
         gs.consignment_payable_account_id
     FROM im_stock_layer_consumption c
     JOIN im_stock_layer l          ON l.id = c.layer_id
@@ -31,6 +33,7 @@ const PENDING_SELECT = `
     JOIN sa_module_document rd     ON rd.doc_code = rt.doc_code AND rd.sys_doc_type = '13'
     JOIN im_transaction st         ON st.id = c.header_id
     JOIN im_item it                ON it.id = l.item_id
+    LEFT JOIN im_uom bu            ON bu.id = it.base_uom_id
     LEFT JOIN ap_vendor v          ON v.id = rt.vendor_id
     LEFT JOIN im_gl_account_setup gs ON gs.doc_code = rt.doc_code
     WHERE c.settlement_ap_transaction_id IS NULL
@@ -219,7 +222,7 @@ const postSettlement = async (req, res) => {
             const unitCostFc = unitCostLc / docExchangeRate;
             const qty = Number(r.qty);
             return {
-                itemCode: r.item_code, itemName: r.item_name_th,
+                itemCode: r.item_code, itemName: r.item_name_th, unitCode: r.uom_code || null,
                 quantity: qty, unitPriceFc: unitCostFc, amountLc: qty * unitCostLc, amountFc: qty * unitCostFc,
                 consignmentPayableAccountId: Number(r.consignment_payable_account_id),
             };
@@ -250,9 +253,9 @@ const postSettlement = async (req, res) => {
             await client.query(`
                 INSERT INTO ap_transaction_detail
                 (header_id, line_no, description, quantity, unit_price_fc, subtotal_fc, vat_type, vat_rate, vat_amount_fc, total_amount_fc,
-                 expense_account_id, subtotal_lc, vat_amount_lc, total_amount_lc)
-                VALUES ($1,$2,$3,$4,$5,$6,'NOVAT',0,0,$6,$7,$8,0,$8)
-            `, [apTransactionId, lineNo++, l.itemName || l.itemCode, l.quantity, l.unitPriceFc, l.amountFc, l.consignmentPayableAccountId, l.amountLc]);
+                 expense_account_id, subtotal_lc, vat_amount_lc, total_amount_lc, unit_code)
+                VALUES ($1,$2,$3,$4,$5,$6,'NOVAT',0,0,$6,$7,$8,0,$8,$9)
+            `, [apTransactionId, lineNo++, l.itemName || l.itemCode, l.quantity, l.unitPriceFc, l.amountFc, l.consignmentPayableAccountId, l.amountLc, l.unitCode]);
         }
 
         await client.query(

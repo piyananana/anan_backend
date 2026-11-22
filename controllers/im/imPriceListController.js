@@ -568,6 +568,8 @@ const updateRow = async (req, res) => {
             return res.status(400).json({ message: overlapErr });
         }
 
+        // ประเภทตารางเดิม — เปลี่ยนขาย<->ซื้อ ต้องตรวจหน่วยของทุกบรรทัดใหม่ตามงานใหม่
+        const prevType = (await client.query(`SELECT list_type FROM im_price_list WHERE id = $1`, [id])).rows[0]?.list_type;
         const result = await client.query(
             `UPDATE im_price_list SET
                 price_list_name = $1,
@@ -595,7 +597,8 @@ const updateRow = async (req, res) => {
         // จะเห็นว่าใครแก้ล่าสุดเมื่อไหร่ ไม่ใช่ทุกบรรทัดโดนเขียนทับเป็น "ตอนนี้" หมดทุกครั้งที่กดบันทึก)
         const existingIdsRes = await client.query(`SELECT id, item_id, uom_id FROM im_price_list_detail WHERE price_list_id = $1`, [id]);
         const existingIds = new Set(existingIdsRes.rows.map(r => r.id));
-        await assertPriceLineUoms(client, b.list_type || 'SALES', b.details, new Map(existingIdsRes.rows.map(r => [Number(r.id), r])));
+        await assertPriceLineUoms(client, b.list_type || 'SALES', b.details,
+            prevType === (b.list_type || 'SALES') ? new Map(existingIdsRes.rows.map(r => [Number(r.id), r])) : new Map());
         const incomingIds = new Set((b.details || []).filter(d => d.id).map(d => d.id));
         const removedIds = [...existingIds].filter(x => !incomingIds.has(x));
 

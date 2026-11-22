@@ -122,6 +122,15 @@ const UOM_COUNTS_SQL = `COALESCE((
     FROM im_stock_count_detail_uom x JOIN im_uom xu ON xu.id = x.uom_id WHERE x.detail_id = d.id
 ), '[]'::json) AS uom_counts`;
 
+// หน่วยอื่นของสินค้าที่ใช้ตรวจนับได้ (ไม่รวมหน่วยหลักของบรรทัด) หน่วยใหญ่ก่อน — ใบพิมพ์สำหรับนับเว้นช่องให้กรอกแยกหน่วย
+const COUNT_UNITS_SQL = `COALESCE((
+    SELECT json_agg(json_build_object('uom_id', cu.uom_id, 'uom_code', uu.uom_code, 'uom_name_th', uu.uom_name_th,
+                                      'uom_name_en', uu.uom_name_en, 'qty', 0, 'conversion_factor', cu.conversion_factor)
+                    ORDER BY cu.conversion_factor DESC, uu.uom_code)
+    FROM im_uom_conversion cu JOIN im_uom uu ON uu.id = cu.uom_id
+    WHERE cu.item_id = d.item_id AND cu.is_active IS NOT FALSE AND cu.uom_id IS DISTINCT FROM d.uom_id
+), '[]'::json) AS count_units`;
+
 // ยอดนับหลายหน่วย → จำนวนหน่วยหลัก: หน่วยต้องเป็นหน่วยของสินค้าที่ยังเปิดใช้งาน (งานตรวจนับ) จำนวนตรงทศนิยมของหน่วย
 // ผลรวมปัดตามทศนิยมของหน่วยหลัก — คืน { counted, rows } (rows = แถวที่จะเก็บ ไม่รวมจำนวน 0)
 const resolveUomCounts = async (client, itemId, uomCounts) => {
@@ -210,7 +219,7 @@ const fetchRowById = async (pool, id) => {
     if (hRes.rows.length === 0) return null;
     const dRes = await pool.query(`
         SELECT d.*, u.uom_code, u.uom_name_th, u.uom_name_en, l.location_code, l.sort_order AS location_sort_order,
-               ${UOM_COUNTS_SQL}
+               ${UOM_COUNTS_SQL}, ${COUNT_UNITS_SQL}
         FROM im_stock_count_detail d
         LEFT JOIN im_uom u      ON u.id = d.uom_id
         LEFT JOIN im_location l ON l.id = d.location_id
@@ -850,6 +859,7 @@ const fetchVarianceReport = async (req, res) => {
                    w.warehouse_code, w.warehouse_name_th,
                    d.item_id, d.item_code, d.item_name, d.location_id, l.location_code,
                    d.lot_no, d.serial_no, d.system_qty, d.counted_qty,
+                   u.uom_code, u.uom_name_th, u.uom_name_en, ${UOM_COUNTS_SQL},
                    (COALESCE(d.counted_qty,0) - COALESCE(d.system_qty,0)) AS variance_qty,
                    d.unit_cost,
                    ((COALESCE(d.counted_qty,0) - COALESCE(d.system_qty,0)) * COALESCE(d.unit_cost,0)) AS variance_value
@@ -857,6 +867,7 @@ const fetchVarianceReport = async (req, res) => {
             JOIN im_stock_count c    ON c.id = d.header_id
             LEFT JOIN im_warehouse w ON w.id = c.warehouse_id
             LEFT JOIN im_location l  ON l.id = d.location_id
+            LEFT JOIN im_uom u       ON u.id = d.uom_id
             ${where}
             ORDER BY c.count_date DESC, d.item_code
         `, params);
