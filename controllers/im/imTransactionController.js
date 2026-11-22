@@ -2808,21 +2808,37 @@ const fetchRows = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await ensureImTransactionTable(client);
-        const { doc_code, status, warehouse_id, date_from, date_to, search, ref_mo_id } = req.query;
+        const { doc_code, status, warehouse_id, date_from, date_to, search, ref_mo_id, include_deleted } = req.query;
+        // หน้ารายการแสดงคลังปลายทาง (โอน) / คู่ค้า (ชื่อไทย+อังกฤษ) / เอกสารอ้างอิง — join เหมือนหน้ารายละเอียด
         let query = `
             SELECT t.id, t.doc_no, t.doc_date, t.status, t.warehouse_id,
                    w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
+                   t.to_warehouse_id, tw.warehouse_code AS to_warehouse_code,
+                   tw.warehouse_name_th AS to_warehouse_name_th, tw.warehouse_name_en AS to_warehouse_name_en,
+                   t.vendor_id, v.vendor_code, v.vendor_name_th, v.vendor_name_en,
+                   t.customer_id, c.customer_code, c.customer_name_th, c.customer_name_en,
                    t.total_qty, t.total_value_lc, t.ref_no, t.description, t.ref_mo_id,
+                   to_jsonb(t)->>'customer_po_no' AS customer_po_no,
+                   reft.doc_no AS ref_im_transaction_doc_no, refpo.doc_no AS ref_po_doc_no,
+                   refso.doc_no AS ref_so_doc_no, refmo.doc_no AS ref_mo_doc_no,
                    d.doc_code, d.doc_name_thai, d.doc_name_eng, d.sys_doc_type
             FROM im_transaction t
             JOIN sa_module_document d ON d.id = t.doc_id
             LEFT JOIN im_warehouse w  ON w.id = t.warehouse_id
+            LEFT JOIN im_warehouse tw ON tw.id = t.to_warehouse_id
+            LEFT JOIN ap_vendor v     ON v.id = t.vendor_id
+            LEFT JOIN ar_customer c   ON c.id = t.customer_id
+            LEFT JOIN im_transaction reft ON reft.id = t.ref_im_transaction_id
+            LEFT JOIN po_transaction refpo ON refpo.id = t.ref_po_id
+            LEFT JOIN so_transaction refso ON refso.id = t.ref_so_id
+            LEFT JOIN mo_header refmo ON refmo.id = t.ref_mo_id
             WHERE 1=1`;
         const params = [];
         let pi = 1;
         if (doc_code)     { params.push(doc_code);     query += ` AND d.doc_code = $${pi++}`; }
+        // include_deleted=1: ทุกสถานะรวมที่ลบแล้ว (หน้ารายการกรองสถานะเอง เลือกได้หลายสถานะ)
         if (status)       { params.push(status);       query += ` AND t.status = $${pi++}`; }
-        else query += ` AND t.status <> 'Deleted'`;
+        else if (!['1', 'true'].includes(String(include_deleted || ''))) query += ` AND t.status <> 'Deleted'`;
         if (warehouse_id) { params.push(warehouse_id); query += ` AND t.warehouse_id = $${pi++}`; }
         if (date_from)    { params.push(date_from);    query += ` AND t.doc_date >= $${pi++}`; }
         if (date_to)      { params.push(date_to);      query += ` AND t.doc_date <= $${pi++}`; }
