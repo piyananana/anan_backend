@@ -1189,7 +1189,8 @@ const fetchRowById = async (pool, id) => {
 
 // --- GET list ---
 const fetchRows = async (req, res) => {
-    const { vendor_id, doc_code, status, date_from, date_to, search } = req.query;
+    const { vendor_id, doc_code, doc_type, status, date_from, date_to, search, include_deleted } = req.query;
+    const { branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id } = req.query;
     try {
         let query = `
             SELECT t.id, t.doc_no, t.doc_date, t.due_date, t.status,
@@ -1208,8 +1209,15 @@ const fetchRows = async (req, res) => {
         let pi = 1;
         if (vendor_id)  { params.push(vendor_id);  query += ` AND t.vendor_id = $${pi++}`; }
         if (doc_code)   { params.push(doc_code);   query += ` AND d.doc_code = $${pi++}`; }
+        // หน้ารายการส่ง doc_type (sys_doc_type) / สาขา / มิติ — เดิมไม่ได้กรอง (เงื่อนไขเหล่านี้บนหน้าจอไม่มีผล)
+        if (doc_type)   { params.push(doc_type);   query += ` AND d.sys_doc_type = $${pi++}`; }
+        if (branch_id)  { params.push(branch_id);  query += ` AND t.branch_id = $${pi++}`; }
+        for (const [k, v] of Object.entries({ dim1_id, dim2_id, dim3_id, dim4_id, dim5_id })) {
+            if (v) { params.push(v); query += ` AND t.${k} = $${pi++}`; }
+        }
+        // include_deleted=1: ทุกสถานะรวมที่ลบแล้ว (หน้ารายการกรองสถานะเอง เลือกได้หลายสถานะ)
         if (status)     { params.push(status);     query += ` AND t.status = $${pi++}`; }
-        else            { query += ` AND t.status <> 'Deleted'`; }
+        else if (!['1', 'true'].includes(String(include_deleted || ''))) { query += ` AND t.status <> 'Deleted'`; }
         if (date_from)  { params.push(date_from);  query += ` AND t.doc_date >= $${pi++}`; }
         if (date_to)    { params.push(date_to);    query += ` AND t.doc_date <= $${pi++}`; }
         if (search) {

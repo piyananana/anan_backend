@@ -704,16 +704,31 @@ const fetchRows = async (req, res) => {
             return res.status(200).json(result.rows);
         }
 
+        // หน้ารายการแสดงบัญชีธนาคาร (โอน: ต้นทาง → ปลายทาง) ชื่อไทย/อังกฤษ + รหัสคู่ค้า + เลขที่อ้างอิง
         let query = `
             SELECT t.id, t.doc_no, t.doc_date, t.status,
                    t.total_amount_lc, t.currency_code, t.exchange_rate,
-                   t.counterparty_name, t.balance_amount_lc,
+                   t.counterparty_name, t.balance_amount_lc, t.ref_no, t.description,
+                   to_jsonb(t)->>'party_code' AS party_code,
+                   bb.account_number AS bank_account_number,
+                   COALESCE(bcb.bank_name_thai, bb.account_name_th) AS bank_name, bcb.bank_name_eng AS bank_name_eng,
+                   fb.account_number AS from_account_number,
+                   COALESCE(fcb.bank_name_thai, fb.account_name_th) AS from_bank_name, fcb.bank_name_eng AS from_bank_name_eng,
+                   tb.account_number AS to_account_number,
+                   COALESCE(tcb.bank_name_thai, tb.account_name_th) AS to_bank_name, tcb.bank_name_eng AS to_bank_name_eng,
                    d.doc_code, d.doc_name_thai, d.doc_name_eng, d.sys_doc_type
             FROM cm_transaction t
             JOIN sa_module_document d ON d.id = t.doc_id
+            LEFT JOIN cm_bank_account fb ON fb.id = t.from_bank_account_id
+            LEFT JOIN cm_bank_account tb ON tb.id = t.to_bank_account_id
+            LEFT JOIN cm_bank_account bb ON bb.id = t.bank_account_id
+            LEFT JOIN cd_bank fcb ON fcb.id = fb.bank_id
+            LEFT JOIN cd_bank tcb ON tcb.id = tb.bank_id
+            LEFT JOIN cd_bank bcb ON bcb.id = bb.bank_id
             WHERE 1=1`;
         const params = []; let pi = 1;
-        if (status !== 'Deleted') query += ` AND t.status <> 'Deleted'`;
+        // include_deleted=1: ทุกสถานะรวมที่ลบแล้ว (หน้ารายการกรองสถานะเอง เลือกได้หลายสถานะ)
+        if (status !== 'Deleted' && !['1', 'true'].includes(String(req.query.include_deleted || ''))) query += ` AND t.status <> 'Deleted'`;
         if (doc_type)  { params.push(doc_type);  query += ` AND d.sys_doc_type = $${pi++}`; }
         if (status)    { params.push(status);    query += ` AND t.status = $${pi++}`; }
         if (date_from) { params.push(date_from); query += ` AND t.doc_date >= $${pi++}`; }

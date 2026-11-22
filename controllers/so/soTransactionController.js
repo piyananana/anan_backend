@@ -162,20 +162,23 @@ const fetchRows = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await ensureSoTransactionTable(client);
-        const { status, customer_id, date_from, date_to, search } = req.query;
+        const { status, customer_id, date_from, date_to, search, include_deleted } = req.query;
         let query = `
             SELECT t.id, t.doc_no, t.doc_date, t.status, t.customer_id, t.customer_code, t.customer_name_th,
+                   cx.customer_name_en, to_jsonb(t)->>'customer_po_no' AS customer_po_no,
                    t.warehouse_id, w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
                    t.total_qty, t.total_value_lc, t.total_amount_lc, t.due_date, t.description,
                    d.doc_code, d.doc_name_thai, d.doc_name_eng
             FROM so_transaction t
             JOIN sa_module_document d ON d.id = t.doc_id
             LEFT JOIN im_warehouse w  ON w.id = t.warehouse_id
+            LEFT JOIN ar_customer cx  ON cx.id = t.customer_id
             WHERE 1=1`;
         const params = [];
         let pi = 1;
-        if (status)      { params.push(status);      query += ` AND t.status = $${pi++}`; }
-        else query += ` AND t.status <> 'Deleted'`; // ใบที่ลบแล้วแสดงเฉพาะเมื่อเลือกสถานะ Deleted
+        // include_deleted=1: ทุกสถานะรวมที่ลบแล้ว (หน้ารายการกรองสถานะเอง เลือกได้หลายสถานะ)
+        if (status)      { params.push(status);      query += ` AND t.status = ${pi++}`; }
+        else if (!['1', 'true'].includes(String(include_deleted || ''))) query += ` AND t.status <> 'Deleted'`; // ใบที่ลบแล้วแสดงเฉพาะเมื่อเลือกสถานะ Deleted
         if (customer_id) { params.push(customer_id);  query += ` AND t.customer_id = $${pi++}`; }
         if (date_from)   { params.push(date_from);    query += ` AND t.doc_date >= $${pi++}`; }
         if (date_to)     { params.push(date_to);      query += ` AND t.doc_date <= $${pi++}`; }

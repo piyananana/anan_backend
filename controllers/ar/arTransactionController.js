@@ -1927,7 +1927,7 @@ const deleteTransaction = async (req, res) => {
 
 // --- 5. Fetch List ---
 const fetchRows = async (req, res) => {
-    const { search, status, doc_type, customer_id, date_from, date_to } = req.query;
+    const { search, status, doc_type, customer_id, date_from, date_to, include_deleted } = req.query;
     const { branch_id, dim1_id, dim2_id, dim3_id, dim4_id, dim5_id } = req.query;
     let sql = `
         SELECT t.id, t.doc_no, t.doc_date, t.due_date, t.status,
@@ -1952,7 +1952,8 @@ const fetchRows = async (req, res) => {
         WHERE d.sys_module = '11'
     `;
     const params = [];
-    if (status !== 'Deleted') sql += ` AND t.status != 'Deleted'`;
+    // include_deleted=1: ทุกสถานะรวมที่ลบแล้ว (หน้ารายการกรองสถานะเอง เลือกได้หลายสถานะ)
+    if (status !== 'Deleted' && !['1', 'true'].includes(String(include_deleted || ''))) sql += ` AND t.status != 'Deleted'`;
 
     if (doc_type) {
         sql += ` AND d.sys_doc_type = $${params.length + 1}`;

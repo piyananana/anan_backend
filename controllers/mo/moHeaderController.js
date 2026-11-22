@@ -272,7 +272,7 @@ const fetchRows = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await ensureMoHeaderTable(client);
-        const { status, warehouse_id, date_from, date_to, search } = req.query;
+        const { status, warehouse_id, date_from, date_to, search, include_deleted } = req.query;
         let query = `
             SELECT h.id, h.doc_no, h.doc_date, h.status, h.warehouse_id, h.order_qty, h.due_date, h.description,
                    w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
@@ -290,7 +290,7 @@ const fetchRows = async (req, res) => {
         const params = [];
         let pi2 = 1;
         if (status)       { params.push(status);       query += ` AND h.status = $${pi2++}`; }
-        else query += ` AND h.status <> 'Deleted'`;
+        else if (!['1', 'true'].includes(String(include_deleted || ''))) query += ` AND h.status <> 'Deleted'`; // include_deleted=1: รวมที่ลบแล้ว (หน้ารายการกรองสถานะเอง)
         if (warehouse_id)  { params.push(warehouse_id);  query += ` AND h.warehouse_id = $${pi2++}`; }
         if (date_from)     { params.push(date_from);     query += ` AND h.doc_date >= $${pi2++}`; }
         if (date_to)       { params.push(date_to);       query += ` AND h.doc_date <= $${pi2++}`; }

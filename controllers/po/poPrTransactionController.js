@@ -140,9 +140,9 @@ const fetchRows = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await ensurePrTransactionTable(client);
-        const { status, vendor_id, requested_by, date_from, date_to, search } = req.query;
+        const { status, vendor_id, requested_by, date_from, date_to, search, include_deleted } = req.query;
         let query = `
-            SELECT t.id, t.doc_no, t.doc_date, t.status, t.vendor_id, t.vendor_code, t.vendor_name_th,
+            SELECT t.id, t.doc_no, t.doc_date, t.status, t.vendor_id, t.vendor_code, t.vendor_name_th, vx.vendor_name_en,
                    t.warehouse_id, w.warehouse_code, w.warehouse_name_th, w.warehouse_name_en,
                    t.requested_by, u.user_name AS requested_by_name,
                    t.total_qty, t.total_value_lc, t.description,
@@ -151,11 +151,13 @@ const fetchRows = async (req, res) => {
             JOIN sa_module_document d ON d.id = t.doc_id
             LEFT JOIN im_warehouse w  ON w.id = t.warehouse_id
             LEFT JOIN sa_user u       ON u.id = t.requested_by
+            LEFT JOIN ap_vendor vx    ON vx.id = t.vendor_id
             WHERE 1=1`;
         const params = [];
         let pi = 1;
-        if (status)       { params.push(status);       query += ` AND t.status = $${pi++}`; }
-        else query += ` AND t.status <> 'Deleted'`; // ใบที่ลบแล้วแสดงเฉพาะเมื่อเลือกสถานะ Deleted
+        // include_deleted=1: ทุกสถานะรวมที่ลบแล้ว (หน้ารายการกรองสถานะเอง เลือกได้หลายสถานะ)
+        if (status)       { params.push(status);       query += ` AND t.status = ${pi++}`; }
+        else if (!['1', 'true'].includes(String(include_deleted || ''))) query += ` AND t.status <> 'Deleted'`; // ใบที่ลบแล้วแสดงเฉพาะเมื่อเลือกสถานะ Deleted
         if (vendor_id)    { params.push(vendor_id);    query += ` AND t.vendor_id = $${pi++}`; }
         if (requested_by) { params.push(requested_by); query += ` AND t.requested_by = $${pi++}`; }
         if (date_from)    { params.push(date_from);    query += ` AND t.doc_date >= $${pi++}`; }
