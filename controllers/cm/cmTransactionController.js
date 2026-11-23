@@ -14,6 +14,7 @@ const { headerDims, lineDims, ensureDetailDimColumns, detailDimParams, assertReq
 const { logReverse, getReverseHistory } = require('../../utils/reverseLog');
 const { checkCmPeriodOpen } = require('./cmPeriodCheckHelper');
 const { ensureCheckbookColumns, assignCheckNumbers } = require('../../utils/cmCheckbook');
+const { bankBalanceLc } = require('../../utils/cmBankBalance');
 const { syncCmBankItems, voidBankItems, deleteBankItems, bankItemsClearedSql, ensureBankItemColumns } = require('../../utils/cmBankItems');
 const {
     TAX_LINE_TYPES, ensureCmTaxColumns, resolveParty, calcTaxDoc, calcWht, saveTaxExtras, assertTaxPostable, assertVoucherLinesPostable,
@@ -765,9 +766,19 @@ const fetchRow = async (req, res) => {
 const fetchReceiptView = async (req, res) => {
     const { id } = req.params;
     try {
+        // หน้าจออ่านอย่างเดียว: บัญชีธนาคาร ช่องทาง และเอกสารต้นทาง AR (เปิดดู + รายการบัญชีของเอกสารนั้น)
         const result = await req.dbPool.query(
-            `SELECT r.*, 'รายรับจาก AR' AS doc_name_thai, '15' AS sys_doc_type
-             FROM cm_receipt r WHERE r.id = $1`, [id]);
+            `SELECT r.*, 'รายรับจาก AR' AS doc_name_thai, '15' AS sys_doc_type,
+                    ba.account_code AS bank_account_code, ba.account_name_th AS bank_account_name_th,
+                    pm.method_code AS payment_method_code, pm.method_name_th AS payment_method_name_th,
+                    src.id AS source_id, src.doc_no AS source_doc_no, src.doc_date AS source_doc_date,
+                    src.description AS source_description, COALESCE(r.gl_entry_id, src.gl_entry_id) AS source_gl_entry_id
+             FROM cm_receipt r
+             LEFT JOIN cm_bank_account ba ON ba.id = r.bank_account_id
+             LEFT JOIN cm_payment_method pm ON pm.id = r.payment_method_id
+             LEFT JOIN ar_transaction src ON src.id = COALESCE(r.ar_transaction_id,
+                 (SELECT t.id FROM ar_transaction t WHERE t.doc_no = r.ar_doc_no ORDER BY t.id DESC LIMIT 1))
+             WHERE r.id = $1`, [id]);
         if (result.rows.length === 0) return res.status(404).json({ message: 'Not found.' });
         res.status(200).json(result.rows[0]);
     } catch (error) {
@@ -780,13 +791,37 @@ const fetchReceiptView = async (req, res) => {
 const fetchPaymentView = async (req, res) => {
     const { id } = req.params;
     try {
+        // หน้าจออ่านอย่างเดียว: บัญชีธนาคาร ช่องทาง และเอกสารต้นทาง AP (เปิดดู + รายการบัญชีของเอกสารนั้น)
         const result = await req.dbPool.query(
-            `SELECT p.*, 'รายจ่ายจาก AP' AS doc_name_thai, '25' AS sys_doc_type
-             FROM cm_payment p WHERE p.id = $1`, [id]);
+            `SELECT p.*, 'รายจ่ายจาก AP' AS doc_name_thai, '25' AS sys_doc_type,
+                    ba.account_code AS bank_account_code, ba.account_name_th AS bank_account_name_th,
+                    pm.method_code AS payment_method_code, pm.method_name_th AS payment_method_name_th,
+                    src.id AS source_id, src.doc_no AS source_doc_no, src.doc_date AS source_doc_date,
+                    src.description AS source_description, COALESCE(p.gl_entry_id, src.gl_entry_id) AS source_gl_entry_id
+             FROM cm_payment p
+             LEFT JOIN cm_bank_account ba ON ba.id = p.bank_account_id
+             LEFT JOIN cm_payment_method pm ON pm.id = p.payment_method_id
+             LEFT JOIN ap_transaction src ON src.id = COALESCE(p.ap_transaction_id,
+                 (SELECT t.id FROM ap_transaction t WHERE t.doc_no = p.ap_doc_no ORDER BY t.id DESC LIMIT 1))
+             WHERE p.id = $1`, [id]);
         if (result.rows.length === 0) return res.status(404).json({ message: 'Not found.' });
         res.status(200).json(result.rows[0]);
     } catch (error) {
         console.error('Error fetching cm_payment view:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    }
+};
+
+// --- GET ยอดคงเหลือของบัญชีธนาคาร/เงินสดย่อย ณ วันที่ (สกุลเงินหลัก) — ป้ายช่องบัญชีของเอกสารโอนเงิน (50) ---
+const fetchBankBalance = async (req, res) => {
+    const id = parseInt(req.params.bank_account_id, 10);
+    if (!id) return res.status(400).json({ message: 'bank_account_id required' });
+    const date = /^d{4}-d{2}-d{2}$/.test(req.query.date || '') ? req.query.date : todayYmd();
+    try {
+        const balance = await bankBalanceLc(req.dbPool, id, date);
+        res.status(200).json({ bank_account_id: id, date, balance_lc: Math.round(balance * 100) / 100 });
+    } catch (error) {
+        console.error('Error fetching bank balance:', error);
         res.status(500).json({ message: 'Internal server error' });
     }
 };
@@ -1368,7 +1403,7 @@ const fetchMyPending = async (req, res) => {
 };
 
 module.exports = {
-    fetchRows, fetchRow, fetchReceiptView, fetchPaymentView, fetchOpenVouchers,
+    fetchRows, fetchRow, fetchReceiptView, fetchPaymentView, fetchBankBalance, fetchOpenVouchers,
     createTransaction, updateTransaction, voidTransaction, reverseTransaction, deleteTransaction,
     submitTransaction, approveTransaction, rejectTransaction, postTransaction, fetchMyPending,
 };

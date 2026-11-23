@@ -91,6 +91,7 @@ router.put('/cm_transaction/:id/reject',      cmTransactionController.rejectTran
 router.put('/cm_transaction/:id/post',        cmTransactionController.postTransaction);
 router.get('/cm_transaction/receipt_view/:id', cmTransactionController.fetchReceiptView);
 router.get('/cm_transaction/payment_view/:id', cmTransactionController.fetchPaymentView);
+router.get('/cm_transaction/bank_balance/:bank_account_id', cmTransactionController.fetchBankBalance);
 router.get('/cm_transaction',                 cmTransactionController.fetchRows);
 router.get('/cm_transaction/:id',             cmTransactionController.fetchRow);
 router.post('/cm_transaction',                cmTransactionController.createTransaction);
