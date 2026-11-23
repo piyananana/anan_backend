@@ -24,7 +24,8 @@ const ensureDepositRefColumns = async (db) => {
     if (dbName) ensured.add(dbName);
 };
 
-// บันทึกใบสั่งที่อ้างอิงหลัง INSERT/UPDATE หัวเอกสาร — เฉพาะใบมัดจำ ('60') ประเภทอื่นล้างค่าเสมอ
+// บันทึกใบสั่งที่อ้างอิงหลัง INSERT/UPDATE หัวเอกสาร — ใบมัดจำ ('60') และใบตั้งหนี้ AP ('10') ประเภทอื่นล้างค่าเสมอ
+// ใบตั้งหนี้อ้างอิงใบสั่งซื้อที่ปิดแล้วได้ (ห้ามเฉพาะยกเลิก/ลบ/ถูกปฏิเสธ)
 const saveDepositRef = async (client, side, headerId, header) => {
     const s = SIDES[side];
     await ensureDepositRefColumns(client);
@@ -33,7 +34,9 @@ const saveDepositRef = async (client, side, headerId, header) => {
     if (refId) {
         const dt = await client.query(`SELECT d.sys_doc_type FROM ${s.table} t JOIN sa_module_document d ON d.id = t.doc_id
             WHERE t.id=$1`, [headerId]);
-        if (dt.rows[0]?.sys_doc_type !== '60') {
+        const sdt = dt.rows[0]?.sys_doc_type;
+        const isInvoice = side === 'ap' && sdt === '10';
+        if (sdt !== '60' && !isInvoice) {
             await client.query(`UPDATE ${s.table} SET ${s.idCol}=NULL, ${s.noCol}=NULL WHERE id=$1`, [headerId]);
             return;
         }
@@ -41,7 +44,7 @@ const saveDepositRef = async (client, side, headerId, header) => {
         if (o.rows.length === 0) throw new Error(`ไม่พบ${s.label}ที่อ้างอิง`);
         const r = o.rows[0];
         if (Number(r.party_id) !== Number(header[s.party])) throw new Error(`${s.label} ${r.doc_no} เป็นของ${s.partyLabel}อื่น`);
-        if (CLOSED_ORDER_STATUSES.includes(r.status)) throw new Error(`${s.label} ${r.doc_no} อยู่สถานะ ${r.status} — อ้างอิงไม่ได้`);
+        if ((isInvoice ? ['Void', 'Deleted', 'Rejected'] : CLOSED_ORDER_STATUSES).includes(r.status)) throw new Error(`${s.label} ${r.doc_no} อยู่สถานะ ${r.status} — อ้างอิงไม่ได้`);
         docNo = r.doc_no;
     }
     await client.query(`UPDATE ${s.table} SET ${s.idCol}=$1, ${s.noCol}=$2 WHERE id=$3`, [docNo ? refId : null, docNo, headerId]);

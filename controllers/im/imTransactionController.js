@@ -1482,6 +1482,12 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
         await client.query(`UPDATE ap_transaction SET gl_entry_id = $1 WHERE id = $2`, [apGlEntryId, apTransactionId]);
     }
 
+    // ใบตั้งหนี้อ้างอิงใบสั่งซื้อของเอกสาร IM (การ์ดจับคู่ชำระหนี้ / หัวเอกสาร AP)
+    if (header.ref_po_id) {
+        await client.query(`ALTER TABLE ap_transaction ADD COLUMN IF NOT EXISTS ref_po_id INTEGER, ADD COLUMN IF NOT EXISTS ref_po_doc_no VARCHAR(50)`);
+        await client.query(`UPDATE ap_transaction t SET ref_po_id = po.id, ref_po_doc_no = po.doc_no
+                              FROM po_transaction po WHERE po.id = $1 AND t.id = $2`, [header.ref_po_id, apTransactionId]);
+    }
     return apTransactionId;
 };
 

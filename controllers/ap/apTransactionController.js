@@ -111,7 +111,18 @@ const MUST_APPROVE_MSG = 'เอกสารประเภทนี้ต้อ
 const ensureTaxInvoiceColumns = async (q) => {
     await q.query(`ALTER TABLE ap_transaction ADD COLUMN IF NOT EXISTS tax_invoice_no VARCHAR(50)`);
     await q.query(`ALTER TABLE ap_transaction ADD COLUMN IF NOT EXISTS tax_invoice_date DATE`);
+    // ระยะเครดิต (เดือน/วัน) ของเอกสาร — ค่าเริ่มต้นจากผู้ขาย แก้ได้ (แบบ AR)
+    await q.query(`ALTER TABLE ap_transaction ADD COLUMN IF NOT EXISTS credit_term_months INTEGER, ADD COLUMN IF NOT EXISTS credit_term_days INTEGER`);
 };
+// ระยะเครดิต: จำนวนเต็มไม่ติดลบ, ว่าง = null
+const termInt = (v) => {
+    if (v === null || v === undefined || v === '') return null;
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) && n >= 0 ? n : null;
+};
+const saveCreditTerm = (client, id, header) => client.query(
+    `UPDATE ap_transaction SET credit_term_months=$1, credit_term_days=$2 WHERE id=$3`,
+    [termInt(header.credit_term_months), termInt(header.credit_term_days), id]);
 const taxInvoiceOf = (header) => {
     const no = (header.tax_invoice_no || '').toString().trim();
     return no ? [no, header.tax_invoice_date || header.doc_date || null] : [null, null];
@@ -1184,7 +1195,39 @@ const fetchRowById = async (pool, id) => {
         void_block: vBlock ? vBlock.code : null,
         void_block_ref: vBlock ? (vBlock.ref || null) : null,
         reverse_history: await getReverseHistory(pool, 'ap_transaction', id),
+        cash_purchase: await loadCashPurchasePayment(pool, id),
     };
+};
+
+// ใบตั้งหนี้ที่ซื้อเงินสด IM ('14') สร้าง → ใบจ่ายชำระที่สร้างคู่กัน + วิธีจ่าย/ภาษีหัก ณ ที่จ่าย (การ์ดจ่ายชำระแบบอ่านอย่างเดียว)
+const loadCashPurchasePayment = async (db, invoiceId) => {
+    const ok = (await db.query(`SELECT to_regclass('im_transaction') IS NOT NULL AS ok`)).rows[0].ok;
+    if (!ok) return null;
+    const src = (await db.query(`
+        SELECT i.id AS im_id, i.doc_no AS im_doc_no,
+               (to_jsonb(i)->>'linked_ap_payment_id')::int AS payment_id,
+               to_jsonb(i)->>'tax_invoice_kind' AS tax_invoice_kind
+          FROM im_transaction i
+          JOIN sa_module_document d ON d.id = i.doc_id
+         WHERE i.linked_ap_transaction_id = $1 AND d.sys_doc_type = '14'
+         ORDER BY i.id DESC LIMIT 1`, [invoiceId])).rows[0];
+    if (!src) return null;
+    let payment = null, payments = [], whts = [];
+    if (src.payment_id) {
+        payment = (await db.query(`SELECT id, doc_no, doc_date, status, total_amount_fc, total_amount_lc, currency_code
+                                     FROM ap_transaction WHERE id = $1`, [src.payment_id])).rows[0] || null;
+        await ensurePaymentTable(db);
+        payments = (await db.query(`
+            SELECT p.*, ba.account_code AS bank_account_code, ba.account_name_th AS bank_account_name_th,
+                   b.bank_name_thai AS bank_name_th
+              FROM ap_transaction_payment p
+              LEFT JOIN cm_bank_account ba ON ba.id = p.cm_bank_account_id
+              LEFT JOIN cd_bank b ON b.id = ba.bank_id
+             WHERE p.header_id = $1 ORDER BY p.line_no, p.id`, [src.payment_id])).rows;
+        whts = (await db.query(`SELECT * FROM ap_transaction_wht WHERE header_id = $1 ORDER BY id`, [src.payment_id])
+            .catch(() => ({ rows: [] }))).rows;
+    }
+    return { ...src, payment, payments, whts };
 };
 
 // --- GET list ---
@@ -1276,8 +1319,17 @@ const fetchOpenInvoices = async (req, res) => {
     const { vendor_id } = req.query;
     if (!vendor_id) return res.status(400).json({ message: 'vendor_id required' });
     try {
+        await ensureTaxInvoiceColumns(req.dbPool);
+        await ensureDepositRefColumns(req.dbPool);
+        const hasPo = (await req.dbPool.query(`SELECT to_regclass('po_transaction') IS NOT NULL AND to_regclass('im_transaction') IS NOT NULL AS ok`)).rows[0].ok;
+        const poSql = hasPo
+            ? `COALESCE(NULLIF(t.ref_po_doc_no, ''),
+                 (SELECT po.doc_no FROM im_transaction it JOIN po_transaction po ON po.id = (to_jsonb(it)->>'ref_po_id')::int
+                   WHERE it.linked_ap_transaction_id = t.id ORDER BY it.id LIMIT 1))`
+            : `NULLIF(t.ref_po_doc_no, '')`;
         const result = await req.dbPool.query(`
             SELECT t.id, t.doc_no, t.doc_date, t.due_date, t.ref_no,
+                   t.tax_invoice_no, ${poSql} AS ref_po_doc_no,
                    t.total_amount_lc, t.balance_amount_lc, t.total_amount_fc,
                    t.currency_code, t.exchange_rate,
                    d.doc_code, d.sys_doc_type,
@@ -1516,7 +1568,8 @@ const insertApTransaction = async (client, { header, details, applies, payments,
     const newHeaderId = hRes.rows[0].id;
     await client.query(`UPDATE ap_transaction SET price_includes_vat=$1, tax_invoice_no=$3, tax_invoice_date=$4 WHERE id=$2`,
         [header.price_includes_vat === true, newHeaderId, ...taxInvoiceOf(header)]);
-    // ใบมัดจำอ้างอิงใบสั่งซื้อ (utils/depositRef.js)
+    await saveCreditTerm(client, newHeaderId, header);
+    // ใบมัดจำ/ใบตั้งหนี้อ้างอิงใบสั่งซื้อ (utils/depositRef.js)
     await saveDepositRef(client, 'ap', newHeaderId, header);
 
     // Insert details — expense_account_id = บัญชีที่ใช้ลงบัญชีของบรรทัด (เลือกได้ ค่าเริ่มต้นจากประเภทเอกสาร) + มิติของบรรทัด
@@ -1722,6 +1775,7 @@ const updateTransaction = async (req, res) => {
             header.price_includes_vat === true,
             ...taxInvoiceOf(header),
         ]);
+        await saveCreditTerm(client, id, header);
         await saveDepositRef(client, 'ap', id, header);
 
         // คืนยอดคงค้างของใบตั้งหนี้ตาม apply เดิม (เดิมลบ apply โดยไม่คืนยอด ทำให้ยอดค้างของใบตั้งหนี้ผิด)
