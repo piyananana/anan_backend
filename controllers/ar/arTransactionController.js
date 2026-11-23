@@ -1320,7 +1320,9 @@ const insertArTransaction = async (client, { header, details, applies, payments,
         ADD COLUMN IF NOT EXISTS expected_payment_date DATE,
         ADD COLUMN IF NOT EXISTS customer_po_no VARCHAR(50),
         ADD COLUMN IF NOT EXISTS customer_po_date DATE,
-        ADD COLUMN IF NOT EXISTS price_includes_vat BOOLEAN NOT NULL DEFAULT false
+        ADD COLUMN IF NOT EXISTS price_includes_vat BOOLEAN NOT NULL DEFAULT false,
+        ADD COLUMN IF NOT EXISTS credit_term_months INTEGER,
+        ADD COLUMN IF NOT EXISTS credit_term_days INTEGER
     `);
 
     // Insert header
@@ -1364,6 +1366,9 @@ const insertArTransaction = async (client, { header, details, applies, payments,
     await saveDocSalespersons(client, 'ar_transaction_salesperson', 'header_id', newHeaderId, salespersons);
     // ราคาที่กรอกรวม VAT (ยอดที่เก็บทุกช่องเป็นยอดก่อน VAT เหมือนเดิม — ดู lib/utils/vat_calc.dart)
     await client.query(`UPDATE ar_transaction SET price_includes_vat=$1 WHERE id=$2`, [header.price_includes_vat === true, newHeaderId]);
+    // ระยะเครดิต (เดือน/วัน) ของเอกสาร — ค่าเริ่มต้นจากลูกค้า แก้ได้ (แบบธุรกรรม IM)
+    await client.query(`UPDATE ar_transaction SET credit_term_months=$1, credit_term_days=$2 WHERE id=$3`,
+        [termInt(header.credit_term_months), termInt(header.credit_term_days), newHeaderId]);
     await saveArBillDiscount(client, newHeaderId, header);
     // ใบมัดจำอ้างอิงใบสั่งขาย (utils/depositRef.js)
     await saveDepositRef(client, 'ar', newHeaderId, header);
@@ -1539,7 +1544,9 @@ const updateTransaction = async (req, res) => {
             ADD COLUMN IF NOT EXISTS expected_payment_date DATE,
             ADD COLUMN IF NOT EXISTS customer_po_no VARCHAR(50),
             ADD COLUMN IF NOT EXISTS customer_po_date DATE,
-            ADD COLUMN IF NOT EXISTS price_includes_vat BOOLEAN NOT NULL DEFAULT false
+            ADD COLUMN IF NOT EXISTS price_includes_vat BOOLEAN NOT NULL DEFAULT false,
+            ADD COLUMN IF NOT EXISTS credit_term_months INTEGER,
+            ADD COLUMN IF NOT EXISTS credit_term_days INTEGER
         `);
         await client.query(`
             UPDATE ar_transaction SET
@@ -1572,6 +1579,8 @@ const updateTransaction = async (req, res) => {
             (header.customer_po_no || '').trim() || null, header.customer_po_date || null,
             header.price_includes_vat === true,
         ]);
+        await client.query(`UPDATE ar_transaction SET credit_term_months=$1, credit_term_days=$2 WHERE id=$3`,
+            [termInt(header.credit_term_months), termInt(header.credit_term_days), id]);
 
         await saveDocSalespersons(client, 'ar_transaction_salesperson', 'header_id', id, req.body.salespersons);
         await saveDepositRef(client, 'ar', id, header);
@@ -1925,6 +1934,13 @@ const deleteTransaction = async (req, res) => {
     }
 };
 
+// ระยะเครดิต: จำนวนเต็มไม่ติดลบ, ว่าง = null
+const termInt = (v) => {
+    if (v === null || v === undefined || v === '') return null;
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) && n >= 0 ? n : null;
+};
+
 // --- 5. Fetch List ---
 const fetchRows = async (req, res) => {
     const { search, status, doc_type, customer_id, date_from, date_to, include_deleted } = req.query;
@@ -2063,6 +2079,8 @@ const fetchRow = async (req, res) => {
         await ensureArWhtTable(req.dbPool);
         const whtRows = (await req.dbPool.query(`SELECT * FROM ar_transaction_wht WHERE header_id=$1 ORDER BY line_no, id`, [id])).rows;
 
+        const cashSale = await loadCashSaleReceipt(req.dbPool, id);
+
         const info = (await queryARReverseInfo(req.dbPool, id)).rows[0];
         const rBlock = info ? getArReverseBlock(info) : null;
         const vBlock = info ? getArVoidBlock(info) : null;
@@ -2081,10 +2099,43 @@ const fetchRow = async (req, res) => {
             reverse_history: history,
             salespersons,
             credit_approvals: creditApprovals,
+            cash_sale: cashSale,
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
+};
+
+// ใบแจ้งหนี้ที่ขายเงินสด IM ('33') สร้าง → ใบเสร็จที่สร้างคู่กัน + วิธีรับชำระ/ภาษีถูกหัก (การ์ดรับชำระแบบอ่านอย่างเดียว)
+const loadCashSaleReceipt = async (db, invoiceId) => {
+    const ok = (await db.query(`SELECT to_regclass('im_transaction') IS NOT NULL AS ok`)).rows[0].ok;
+    if (!ok) return null;
+    const src = (await db.query(`
+        SELECT i.id AS im_id, i.doc_no AS im_doc_no,
+               (to_jsonb(i)->>'linked_ar_receipt_id')::int AS receipt_id,
+               COALESCE((to_jsonb(i)->>'cash_received')::numeric, 0) AS cash_received,
+               COALESCE((to_jsonb(i)->>'change_amount')::numeric, 0) AS change_amount
+          FROM im_transaction i
+          JOIN sa_module_document d ON d.id = i.doc_id
+         WHERE i.linked_ar_transaction_id = $1 AND d.sys_doc_type = '33'
+         ORDER BY i.id DESC LIMIT 1`, [invoiceId])).rows[0];
+    if (!src) return null;
+    let receipt = null, payments = [], whts = [];
+    if (src.receipt_id) {
+        receipt = (await db.query(`SELECT id, doc_no, doc_date, status, total_amount_fc, total_amount_lc, currency_code
+                                     FROM ar_transaction WHERE id = $1`, [src.receipt_id])).rows[0] || null;
+        await ensurePaymentTable(db);
+        payments = (await db.query(`
+            SELECT p.*, ba.account_code AS bank_account_code, ba.account_name_th AS bank_account_name_th,
+                   b.bank_name_thai AS bank_name_th
+              FROM ar_transaction_payment p
+              LEFT JOIN cm_bank_account ba ON ba.id = p.cm_bank_account_id
+              LEFT JOIN cd_bank b ON b.id = ba.bank_id
+             WHERE p.header_id = $1 ORDER BY p.line_no, p.id`, [src.receipt_id])).rows;
+        await ensureArWhtTable(db);
+        whts = (await db.query(`SELECT * FROM ar_transaction_wht WHERE header_id = $1 ORDER BY line_no, id`, [src.receipt_id])).rows;
+    }
+    return { ...src, receipt, payments, whts };
 };
 
 // --- 7. Fetch open invoices for a customer (for Receipt application) ---
@@ -2092,9 +2143,17 @@ const fetchOpenInvoices = async (req, res) => {
     const { customer_id } = req.query;
     if (!customer_id) return res.status(400).json({ error: 'customer_id required' });
     try {
+        // ใบสั่งขาย: อ้างอิงที่ใบแจ้งหนี้ (ref_so_doc_no) หรือใบส่งสินค้า IM ที่สร้างใบแจ้งหนี้นี้ (ถ้ามีโมดูล SO)
+        const hasSo = (await req.dbPool.query(`SELECT to_regclass('so_transaction') IS NOT NULL AND to_regclass('im_transaction') IS NOT NULL AS ok`)).rows[0].ok;
+        const soSql = hasSo
+            ? `COALESCE(NULLIF(to_jsonb(t)->>'ref_so_doc_no', ''),
+                 (SELECT so.doc_no FROM im_transaction it JOIN so_transaction so ON so.id = it.ref_so_id
+                   WHERE it.linked_ar_transaction_id = t.id ORDER BY it.id LIMIT 1))`
+            : `NULLIF(to_jsonb(t)->>'ref_so_doc_no', '')`;
         const result = await req.dbPool.query(`
             SELECT t.id, t.doc_no, t.doc_date, t.billing_date, t.due_date,
                    t.expected_payment_date,
+                   ${soSql} AS ref_so_doc_no, to_jsonb(t)->>'customer_po_no' AS customer_po_no,
                    t.currency_code, t.exchange_rate,
                    t.total_amount_fc, t.total_amount_lc,
                    t.paid_amount_lc, t.balance_amount_lc,
