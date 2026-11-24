@@ -198,6 +198,9 @@ const ensureMoHeaderTable = async (client) => {
     await client.query(`ALTER TABLE mo_header ADD COLUMN IF NOT EXISTS conversion_factor NUMERIC(18,6) NOT NULL DEFAULT 1`);
     await client.query(`ALTER TABLE mo_component_detail ADD COLUMN IF NOT EXISTS conversion_factor NUMERIC(18,6) NOT NULL DEFAULT 1`);
     await client.query(`ALTER TABLE mo_output_detail ADD COLUMN IF NOT EXISTS conversion_factor NUMERIC(18,6) NOT NULL DEFAULT 1`);
+    // หมายเหตุต่อบรรทัด (user-approved 2026-11-24 หน้ารายละเอียดใหม่)
+    await client.query(`ALTER TABLE mo_component_detail ADD COLUMN IF NOT EXISTS remark TEXT`);
+    await client.query(`ALTER TABLE mo_output_detail ADD COLUMN IF NOT EXISTS remark TEXT`);
 };
 
 const HEADER_SELECT = `
@@ -223,7 +226,8 @@ const COMPONENT_SELECT = `
     SELECT c.*,
            ci.item_code AS component_item_code, ci.item_name_th AS component_item_name_th, ci.item_name_en AS component_item_name_en,
            u.uom_code, u.uom_name_th, u.uom_name_en,
-           l.location_code, l.location_name
+           l.location_code, l.location_name,
+           EXISTS (SELECT 1 FROM mo_bom_header bh WHERE bh.parent_item_id = c.component_item_id AND bh.is_active = true) AS has_bom
     FROM mo_component_detail c
     LEFT JOIN im_item ci ON ci.id = c.component_item_id
     LEFT JOIN im_uom u   ON u.id  = c.uom_id
@@ -264,6 +268,37 @@ const fetchRowById = async (pool, id) => {
     return {
         ...hRes.rows[0], components: components.rows, outputs: outputs.rows, operations: operations.rows,
         approvals: await DA.loadApprovals(pool, KIND, Number(id)),
+        cost_summary: await fetchMoCostSummary(pool, id, hRes.rows[0]),
+    };
+};
+
+// ต้นทุนสะสมของใบสั่งผลิตสำหรับการ์ดสรุปในหน้ารายละเอียด — ยอดเดียวกับที่ refreshMoStatus ใช้คำนวณ wip_balance_lc
+// (วัตถุดิบที่เบิก + ค่าแรง/เครื่องจักร+โสหุ้ยจากบันทึกเวลา + โสหุ้ยแบบ % ที่ปันตอนรับ − มูลค่าที่รับเข้าคลัง) ยอดรวม − โอนออก
+// จึงเท่ากับ WIP คงเหลือเสมอ; ต้นทุนเฉลี่ยต่อหน่วยสั่งผลิต = สูตรเดียวกับรายงานต้นทุน/ผลต่าง
+const fetchMoCostSummary = async (pool, id, h) => {
+    const posted = (detailCol) => `FROM im_transaction_detail imd JOIN im_transaction imt ON imt.id = imd.header_id
+                WHERE imt.ref_mo_id = $1 AND imd.${detailCol} IS NOT NULL AND imt.status = 'Posted'`;
+    const timeLog = `FROM mo_operation_time_log WHERE header_id = $1 AND gl_entry_id IS NOT NULL AND reversed_at IS NULL`;
+    const r = (await pool.query(`
+        SELECT
+            COALESCE((SELECT SUM(ABS(imd.qty) * imd.unit_cost) ${posted('ref_mo_component_detail_id')}), 0) AS material_cost,
+            COALESCE((SELECT SUM(labor_cost) ${timeLog}), 0) AS labor_cost,
+            COALESCE((SELECT SUM(overhead_cost) ${timeLog}), 0) AS machine_overhead_cost,
+            COALESCE((SELECT SUM(ABS(imd.qty) * imd.mo_applied_overhead_unit_cost) ${posted('ref_mo_output_detail_id')}), 0) AS percent_overhead_cost,
+            COALESCE((SELECT SUM(ABS(imd.qty) * COALESCE(imd.mo_actual_unit_cost, imd.unit_cost)) ${posted('ref_mo_output_detail_id')}), 0) AS transferred_cost,
+            COALESCE((SELECT SUM(ABS(imd.qty)) ${posted('ref_mo_output_detail_id')}), 0) AS received_base_qty,
+            COALESCE((SELECT SUM(ABS(imd.qty) * imd.unit_cost) ${posted('ref_mo_output_detail_id')}), 0) AS output_weighted_value
+    `, [id]).catch((e) => { console.error('MO cost summary:', e.message); return { rows: [{}] }; })).rows[0];
+    const n = (v) => Number(v) || 0;
+    const material = n(r.material_cost), labor = n(r.labor_cost), machineOverhead = n(r.machine_overhead_cost);
+    const percentOverhead = n(r.percent_overhead_cost), transferred = n(r.transferred_cost);
+    const total = material + labor + machineOverhead + percentOverhead;
+    const receivedQty = n(r.received_base_qty) / (n(h.conversion_factor) || 1);
+    return {
+        material_cost: material, labor_cost: labor, machine_overhead_cost: machineOverhead,
+        percent_overhead_cost: percentOverhead, total_cost: total, transferred_cost: transferred,
+        wip_balance: total - transferred,
+        avg_unit_cost: receivedQty > 0 ? n(r.output_weighted_value) / receivedQty : 0,
     };
 };
 
@@ -594,18 +629,18 @@ const createTransaction = async (req, res) => {
         for (const c of components) {
             if (!c.component_item_id) continue;
             await client.query(`
-                INSERT INTO mo_component_detail (header_id, line_no, component_item_id, item_code, item_name, planned_qty, uom_id, location_id, conversion_factor)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-            `, [headerId, lineNo++, c.component_item_id, c.item_code || null, c.item_name || null, c.planned_qty ?? 0, c.uom_id || null, c.location_id || null, c.conversion_factor ?? 1]);
+                INSERT INTO mo_component_detail (header_id, line_no, component_item_id, item_code, item_name, planned_qty, uom_id, location_id, conversion_factor, remark)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            `, [headerId, lineNo++, c.component_item_id, c.item_code || null, c.item_name || null, c.planned_qty ?? 0, c.uom_id || null, c.location_id || null, c.conversion_factor ?? 1, c.remark || null]);
         }
 
         let outLineNo = 1;
         for (const o of outputs) {
             if (!o.output_item_id) continue;
             await client.query(`
-                INSERT INTO mo_output_detail (header_id, line_no, output_item_id, item_code, item_name, planned_qty, uom_id, is_primary_output, conversion_factor)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-            `, [headerId, outLineNo++, o.output_item_id, o.item_code || null, o.item_name || null, o.planned_qty ?? 0, o.uom_id || null, o.is_primary_output ?? false, o.conversion_factor ?? 1]);
+                INSERT INTO mo_output_detail (header_id, line_no, output_item_id, item_code, item_name, planned_qty, uom_id, is_primary_output, conversion_factor, remark)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            `, [headerId, outLineNo++, o.output_item_id, o.item_code || null, o.item_name || null, o.planned_qty ?? 0, o.uom_id || null, o.is_primary_output ?? false, o.conversion_factor ?? 1, o.remark || null]);
         }
 
         let opLineNo = 1;
@@ -674,9 +709,9 @@ const updateTransaction = async (req, res) => {
         for (const c of components) {
             if (!c.component_item_id) continue;
             await client.query(`
-                INSERT INTO mo_component_detail (header_id, line_no, component_item_id, item_code, item_name, planned_qty, uom_id, location_id, conversion_factor)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-            `, [id, lineNo++, c.component_item_id, c.item_code || null, c.item_name || null, c.planned_qty ?? 0, c.uom_id || null, c.location_id || null, c.conversion_factor ?? 1]);
+                INSERT INTO mo_component_detail (header_id, line_no, component_item_id, item_code, item_name, planned_qty, uom_id, location_id, conversion_factor, remark)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            `, [id, lineNo++, c.component_item_id, c.item_code || null, c.item_name || null, c.planned_qty ?? 0, c.uom_id || null, c.location_id || null, c.conversion_factor ?? 1, c.remark || null]);
         }
 
         await client.query(`DELETE FROM mo_output_detail WHERE header_id = $1`, [id]);
@@ -684,9 +719,9 @@ const updateTransaction = async (req, res) => {
         for (const o of outputs) {
             if (!o.output_item_id) continue;
             await client.query(`
-                INSERT INTO mo_output_detail (header_id, line_no, output_item_id, item_code, item_name, planned_qty, uom_id, is_primary_output, conversion_factor)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-            `, [id, outLineNo++, o.output_item_id, o.item_code || null, o.item_name || null, o.planned_qty ?? 0, o.uom_id || null, o.is_primary_output ?? false, o.conversion_factor ?? 1]);
+                INSERT INTO mo_output_detail (header_id, line_no, output_item_id, item_code, item_name, planned_qty, uom_id, is_primary_output, conversion_factor, remark)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            `, [id, outLineNo++, o.output_item_id, o.item_code || null, o.item_name || null, o.planned_qty ?? 0, o.uom_id || null, o.is_primary_output ?? false, o.conversion_factor ?? 1, o.remark || null]);
         }
 
         await client.query(`DELETE FROM mo_operation_detail WHERE header_id = $1`, [id]);
