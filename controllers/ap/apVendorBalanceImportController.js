@@ -1,5 +1,6 @@
 // controllers/ap/apVendorBalanceImportController.js
 const XLSX = require('xlsx');
+const { withEnSheet, withEnSheets, isEnglishReq, labelRow, colWidths } = require('../../utils/importLabels');
 const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const multer = require('multer');
 const { templateDimColumns, loadDimLookup, parseRowDims } = require('../../utils/importDims');
@@ -22,6 +23,7 @@ const TEMPLATE_SHEET = {
     { key: 'exchange_rate',  label: 'อัตราแลกเปลี่ยน (ว่าง = 1)',                 required: false, example: '1' },
     { key: 'amount',         label: 'ยอดคงเหลือ',                                 required: true,  example: '50000' },
     { key: 'description',    label: 'คำอธิบาย/หมายเหตุ',                          required: false, example: 'ยอดยกมาจากระบบเดิม' },
+    { key: 'branch_code',    label: 'รหัสสาขา (ว่าง = ไม่ระบุ)',                   required: false, example: '', optional: true },
   ],
 };
 
@@ -32,12 +34,12 @@ const sheetDef = async (db) => ({ ...TEMPLATE_SHEET, columns: [...TEMPLATE_SHEET
 const getTemplate = async (req, res) => {
   try {
     const docTypesR = await req.dbPool.query(
-      `SELECT doc_code, doc_name_thai, sys_doc_type FROM sa_module_document
+      `SELECT doc_code, doc_name_thai, doc_name_eng, sys_doc_type FROM sa_module_document
        WHERE sys_module = '21' AND sys_doc_type = ANY($1) AND is_active = true AND is_doc_type = true
        ORDER BY doc_code`,
       [AP_BILL_DOC_TYPES]
     );
-    res.json({ sheet: await sheetDef(req.dbPool), docTypes: docTypesR.rows });
+    res.json({ sheet: withEnSheet('ap_vendor_balance', await sheetDef(req.dbPool)), docTypes: docTypesR.rows });
   } catch (err) {
     console.error('getTemplate error:', err);
     res.status(500).json({ message: 'เกิดข้อผิดพลาด: ' + err.message });
@@ -46,11 +48,12 @@ const getTemplate = async (req, res) => {
 
 // GET /ap_vendor_balance/import/template/download
 const downloadTemplate = async (req, res) => {
-  const def = await sheetDef(req.dbPool);
+  const def = withEnSheet('ap_vendor_balance', await sheetDef(req.dbPool));
+  const en = isEnglishReq(req);
   const headers = def.columns.map(c => c.key);
-  const labels  = def.columns.map(c => `(${c.label}${c.required ? ' *' : ''})`);
+  const labels  = labelRow(def.columns, en);
   const ws = XLSX.utils.aoa_to_sheet([headers, labels]);
-  ws['!cols'] = def.columns.map(c => ({ wch: Math.max(c.key.length, c.label.length) + 4 }));
+  ws['!cols'] = colWidths(def.columns, en);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, TEMPLATE_SHEET.name);
   const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
@@ -128,7 +131,7 @@ const validateFile = [
         });
       }
 
-      const [vendorsR, groupsR, currenciesR, docTypesR, periodR] = await Promise.all([
+      const [vendorsR, groupsR, currenciesR, docTypesR, periodR, branchesR] = await Promise.all([
         req.dbPool.query(
           `SELECT id, vendor_code, vendor_name_th, ap_account_id, vendor_group_id, credit_term_months, credit_term_days
            FROM ap_vendor WHERE is_active = true`
@@ -145,6 +148,7 @@ const validateFile = [
           `SELECT id FROM gl_posting_period
            WHERE CURRENT_DATE BETWEEN period_start_date AND period_end_date AND gl_status = 'OPEN' LIMIT 1`
         ),
+        req.dbPool.query(`SELECT id, branch_code FROM cd_branch WHERE is_active = true`),
       ]);
 
       if (periodR.rows.length === 0) {
@@ -156,6 +160,7 @@ const validateFile = [
       for (const g of groupsR.rows) groupMap[g.id] = g;
       const currencyMap = buildCodeMap(currenciesR.rows, 'currency_code');
       const docTypeMap  = buildCodeMap(docTypesR.rows, 'doc_code');
+      const branchMap   = buildCodeMap(branchesR.rows, 'branch_code');
 
       const dimLookup = await loadDimLookup(req.dbPool);
       const errors = [];
@@ -259,6 +264,14 @@ const validateFile = [
         const description = trunc(getStr('description'), 500);
         const { dims, label: dimLabel } = parseRowDims(getStr, dimLookup, rowErrors);
 
+        // สาขา (ว่าง = ไม่ระบุ)
+        const branchCode = getStr('branch_code').toUpperCase();
+        let branchId = null;
+        if (branchCode) {
+          branchId = branchMap[branchCode]?.id || null;
+          if (!branchId) rowErrors.push({ column: 'branch_code', message: `ไม่พบรหัสสาขา "${branchCode}"` });
+        }
+
         if (rowErrors.length > 0) {
           errors.push({ row: rowNum, vendorCode: vendorCode || '-', errors: rowErrors });
           continue;
@@ -282,6 +295,8 @@ const validateFile = [
           description,
           ...dims,
           dim_label:      dimLabel,
+          branch_id:      branchId,
+          branch_code:    branchCode || null,
         });
       }
 
@@ -382,13 +397,13 @@ const confirmImport = async (req, res) => {
               subtotal_lc, discount_amount_lc, before_vat_lc, vat_amount_lc, total_amount_lc,
               paid_amount_lc, balance_amount_lc,
               description, status, created_by, updated_by,
-              dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
+              dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
                    $13,0,$13,0,$13,
                    $14,0,$14,0,$14,
                    0,$14,
                    $15,'Posted',$16,$16,
-                   $17,$18,$19,$20,$21)`,
+                   $17,$18,$19,$20,$21,$22)`,
           [
             r.doc_id, trunc(r.doc_no, 30), r.doc_date, r.due_date || null, periodId,
             r.vendor_id, trunc(r.vendor_code, 20), trunc(r.vendor_name_th, 200),
@@ -398,6 +413,7 @@ const confirmImport = async (req, res) => {
             trunc(r.description, 500),
             userName,
             r.dim1_id || null, r.dim2_id || null, r.dim3_id || null, r.dim4_id || null, r.dim5_id || null,
+            parseInt(r.branch_id, 10) || null,
           ]
         );
 

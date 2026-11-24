@@ -5,11 +5,17 @@
 'use strict';
 
 const XLSX = require('xlsx');
+const { withEnSheet, withEnSheets, isEnglishReq, labelRow, colWidths } = require('../../utils/importLabels');
 const multer = require('multer');
 const upload = multer({ storage: multer.memoryStorage() });
 
 const { ensureImStockBalanceTable } = require('./imStockBalanceController');
 const { ensureImStockLayerTable } = require('./imStockLayerController');
+const { checkDecimals } = require('../../utils/uom');
+
+// ทศนิยมของหน่วยนับหลักของสินค้า — จำนวนยอดยกมาเกินทศนิยมที่หน่วยกำหนด = แจ้งข้อผิดพลาด (ไม่ปัดให้ ผู้ใช้ตรวจข้อมูลก่อน, user-approved 2026-11-24)
+const BASE_UOM_SQL = `SELECT i.id, COALESCE(u.uom_code, '') AS base_uom_code, COALESCE(u.decimal_places, 0) AS base_decimals
+                        FROM im_item i LEFT JOIN im_uom u ON u.id = i.base_uom_id`;
 const { STOCK_BALANCE_KEY, upsertStockBalance, recomputeBalanceFromLayers } = require('./imTransactionController');
 
 const ensureImOpeningBalanceBatchTable = async (client) => {
@@ -67,7 +73,7 @@ const TEMPLATE_SHEETS = [
             { key: 'location_code',  label: 'รหัสตำแหน่งจัดเก็บ (ไม่บังคับ)',                     required: false, example: 'A-01-01' },
             { key: 'lot_no',         label: 'เลขที่ล็อต (บังคับถ้าสินค้าติดตามล็อต)',              required: false, example: 'LOT202601' },
             { key: 'serial_no',      label: 'Serial No. (บังคับถ้า costing เป็น SPECIFIC)',        required: false, example: 'SN00001' },
-            { key: 'qty',            label: 'จำนวน',                                              required: true,  example: '100' },
+            { key: 'qty',            label: 'จำนวน (หน่วยนับหลักของสินค้า, ทศนิยมไม่เกินที่หน่วยกำหนด)',                                              required: true,  example: '100' },
             { key: 'unit_cost',      label: 'ต้นทุนต่อหน่วย (บังคับ ยกเว้น costing=STANDARD)',     required: false, example: '25.50' },
         ],
     },
@@ -75,17 +81,18 @@ const TEMPLATE_SHEETS = [
 
 // GET /im_opening_balance/import/template
 const getTemplate = (req, res) => {
-    res.json({ sheets: TEMPLATE_SHEETS });
+    res.json({ sheets: withEnSheets('im_opening_balance', TEMPLATE_SHEETS) });
 };
 
 // GET /im_opening_balance/import/template/download
 const downloadTemplate = (req, res) => {
     const wb = XLSX.utils.book_new();
-    for (const sheet of TEMPLATE_SHEETS) {
+    const en = isEnglishReq(req);
+  for (const sheet of withEnSheets('im_opening_balance', TEMPLATE_SHEETS)) {
         const headers = sheet.columns.map(c => c.key);
-        const labels  = sheet.columns.map(c => `(${c.label}${c.required ? ' *' : ''})`);
+        const labels  = labelRow(sheet.columns, en);
         const ws = XLSX.utils.aoa_to_sheet([headers, labels]);
-        ws['!cols'] = sheet.columns.map(c => ({ wch: Math.max(c.key.length, c.label.length) + 4 }));
+        ws['!cols'] = colWidths(sheet.columns, en);
         XLSX.utils.book_append_sheet(wb, ws, sheet.name);
     }
     const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
@@ -174,7 +181,10 @@ const validateFile = [
             }
 
             const [itemsR, warehousesR, locationsR, openSerialsR] = await Promise.all([
-                req.dbPool.query(`SELECT id, item_code, old_item_code, costing_method, is_lot_tracked, standard_cost, is_active FROM im_item WHERE old_item_code IS NOT NULL AND old_item_code != ''`),
+                req.dbPool.query(`SELECT i.id, i.item_code, i.old_item_code, i.costing_method, i.is_lot_tracked, i.standard_cost, i.is_active,
+                                          COALESCE(u.uom_code, '') AS base_uom_code, COALESCE(u.decimal_places, 0) AS base_decimals
+                                     FROM im_item i LEFT JOIN im_uom u ON u.id = i.base_uom_id
+                                    WHERE i.old_item_code IS NOT NULL AND i.old_item_code != ''`),
                 req.dbPool.query(`SELECT id, warehouse_code FROM im_warehouse WHERE is_active = true`),
                 req.dbPool.query(`SELECT id, warehouse_id, location_code FROM im_location`),
                 req.dbPool.query(`SELECT item_id, serial_no FROM im_stock_layer WHERE serial_no IS NOT NULL AND remaining_qty > 0`),
@@ -235,6 +245,10 @@ const validateFile = [
 
                 const qty = Number(qtyStr);
                 if (!qtyStr || Number.isNaN(qty) || qty <= 0) rowErrors.push({ column: 'qty', message: 'จำนวนต้องเป็นตัวเลขมากกว่า 0' });
+                else if (item) {
+                    const decErr = checkDecimals(qty, item.base_decimals, item.base_uom_code);
+                    if (decErr) rowErrors.push({ column: 'qty', message: decErr });
+                }
 
                 let unitCost = unitCostStr ? Number(unitCostStr) : null;
                 if (item && item.costing_method === 'STANDARD') {
@@ -328,6 +342,9 @@ const confirmImport = async (req, res) => {
                 const item = itemRes.rows[0];
                 const costingMethod = item.costing_method;
                 const qty = Number(r.qty);
+                const uomRow = (await client.query(`${BASE_UOM_SQL} WHERE i.id = $1`, [item.id])).rows[0];
+                const decErr = checkDecimals(qty, uomRow?.base_decimals, uomRow?.base_uom_code);
+                if (decErr) throw new Error(decErr);
                 const unitCost = costingMethod === 'STANDARD' ? (Number(item.standard_cost) || 0) : Number(r.unit_cost);
 
                 if (costingMethod === 'AVG' || costingMethod === 'STANDARD') {

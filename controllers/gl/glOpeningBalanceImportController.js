@@ -1,6 +1,8 @@
 // controllers/gl/glOpeningBalanceImportController.js
 const XLSX = require('xlsx');
 const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
+const { assertRequiredBranch } = require('../../utils/glDims');
+const { withEnSheet, isEnglishReq, labelRow, colWidths } = require('../../utils/importLabels');
 const multer = require('multer');
 
 const upload = multer({ storage: multer.memoryStorage() });
@@ -64,6 +66,7 @@ const DETAIL_BASE_COLUMNS = [
   { key: 'header_ref',    label: 'เลขอ้างอิง (ต้องตรงกับ sheet "header")',  required: true,  example: '1' },
   { key: 'account_code',  label: 'รหัสบัญชี (ต้องเป็นบัญชีปฏิบัติการที่ใช้งานอยู่)', required: true,  example: '111100' },
   { key: 'description',   label: 'คำอธิบายรายการ',                          required: false, example: 'เงินสดยกมา' },
+  { key: 'branch_code',   label: 'รหัสสาขาของบรรทัด (ว่าง = ใช้สาขาจาก sheet header, บังคับถ้าบัญชีกำหนดให้ระบุสาขา)', required: false, example: '', optional: true },
   { key: 'debit',         label: 'เดบิต (ระบุอย่างใดอย่างหนึ่งกับเครดิต)',  required: false, example: '50000' },
   { key: 'credit',        label: 'เครดิต',                                  required: false, example: '' },
 ];
@@ -92,7 +95,8 @@ const readSheetByName = (workbook, sheetName, columns, fallbackIndex) => {
 
   const headers = aoa[0].map(h => String(h || '').trim());
   const expectedKeys = columns.map(c => c.key);
-  const missing = expectedKeys.filter(k => !headers.includes(k));
+  const optionalKeys = new Set(columns.filter(c => c.optional).map(c => c.key)); // คอลัมน์ที่เพิ่มภายหลัง — เทมเพลตเก่าไม่มีได้
+  const missing = expectedKeys.filter(k => !headers.includes(k) && !optionalKeys.has(k));
   if (missing.length > 0) {
     throw new ImportTemplateError(`Sheet "${sheetName}" ไม่ตรงตามเทมเพลต ขาดคอลัมน์: ${missing.join(', ')}`);
   }
@@ -242,9 +246,9 @@ const generateDocNo = async (client, docId, date, branchId = null) => {
 const getTemplate = async (req, res) => {
   try {
     const [dimTypesR, branchesR, currenciesR] = await Promise.all([
-      req.dbPool.query(`SELECT type_code, name_thai, slot_no FROM gl_dimension_type WHERE is_active = true ORDER BY slot_no ASC`),
-      req.dbPool.query(`SELECT branch_code, branch_name_thai FROM cd_branch WHERE is_active = true ORDER BY branch_code ASC`),
-      req.dbPool.query(`SELECT currency_code, currency_name_th, base_rate, base_currency_flag FROM cd_currency WHERE is_active = true ORDER BY currency_code ASC`),
+      req.dbPool.query(`SELECT type_code, name_thai, name_eng, slot_no FROM gl_dimension_type WHERE is_active = true ORDER BY slot_no ASC`),
+      req.dbPool.query(`SELECT branch_code, branch_name_thai, branch_name_eng FROM cd_branch WHERE is_active = true ORDER BY branch_code ASC`),
+      req.dbPool.query(`SELECT currency_code, currency_name_th, currency_name_en, base_rate, base_currency_flag FROM cd_currency WHERE is_active = true ORDER BY currency_code ASC`),
     ]);
 
     const dimensionTypes = [];
@@ -256,6 +260,7 @@ const getTemplate = async (req, res) => {
       dimensionTypes.push({
         type_code: dt.type_code,
         label: dt.name_thai,
+        label_en: dt.name_eng || dt.name_thai,
         slot_no: dt.slot_no,
         values: valuesR.rows.map(v => ({ code: v.value_code, label: v.value_name_thai })),
       });
@@ -266,6 +271,7 @@ const getTemplate = async (req, res) => {
       detailColumns.push({
         key: `dim_${dt.type_code}`,
         label: `${dt.label} (รหัสจาก gl_dimension_value, บังคับถ้าบัญชีกำหนดไว้)`,
+        label_en: `${dt.label_en} (code from gl_dimension_value, required if the account requires it)`,
         required: false,
         example: dt.values[0]?.code || '',
       });
@@ -273,11 +279,11 @@ const getTemplate = async (req, res) => {
 
     res.json({
       sheets: {
-        header: { key: SHEET_DEFS.header.key, name: SHEET_DEFS.header.name, columns: HEADER_COLUMNS },
-        detail: { key: SHEET_DEFS.detail.key, name: SHEET_DEFS.detail.name, columns: detailColumns },
+        header: withEnSheet('gl_opening_balance', { key: SHEET_DEFS.header.key, name: SHEET_DEFS.header.name, columns: HEADER_COLUMNS }),
+        detail: withEnSheet('gl_opening_balance', { key: SHEET_DEFS.detail.key, name: SHEET_DEFS.detail.name, columns: detailColumns }),
       },
-      branches: branchesR.rows.map(b => ({ code: b.branch_code, label: b.branch_name_thai })),
-      currencies: currenciesR.rows.map(c => ({ code: c.currency_code, label: c.currency_name_th, base_rate: c.base_rate, base_currency_flag: c.base_currency_flag })),
+      branches: branchesR.rows.map(b => ({ code: b.branch_code, label: b.branch_name_thai, label_en: b.branch_name_eng || b.branch_name_thai })),
+      currencies: currenciesR.rows.map(c => ({ code: c.currency_code, label: c.currency_name_th, label_en: c.currency_name_en || c.currency_name_th, base_rate: c.base_rate, base_currency_flag: c.base_currency_flag })),
       dimensionTypes,
     });
   } catch (err) {
@@ -292,25 +298,27 @@ const getTemplate = async (req, res) => {
 const downloadTemplate = async (req, res) => {
   try {
     const dimTypesR = await req.dbPool.query(
-      `SELECT type_code, name_thai FROM gl_dimension_type WHERE is_active = true ORDER BY slot_no ASC`
+      `SELECT type_code, name_thai, name_eng FROM gl_dimension_type WHERE is_active = true ORDER BY slot_no ASC`
     );
-    const detailColumns = [...DETAIL_BASE_COLUMNS];
+    const en = isEnglishReq(req);
+    const headerCols = withEnSheet('gl_opening_balance', SHEET_DEFS.header).columns;
+    const detailColumns = withEnSheet('gl_opening_balance', SHEET_DEFS.detail).columns;
     for (const dt of dimTypesR.rows) {
-      detailColumns.push({ key: `dim_${dt.type_code}`, label: dt.name_thai, required: false, example: '' });
+      detailColumns.push({ key: `dim_${dt.type_code}`, label: dt.name_thai, label_en: dt.name_eng || dt.name_thai, required: false, example: '' });
     }
 
     const wb = XLSX.utils.book_new();
 
-    const headerHeaders = HEADER_COLUMNS.map(c => c.key);
-    const headerLabels  = HEADER_COLUMNS.map(c => `(${c.label}${c.required ? ' *' : ''})`);
+    const headerHeaders = headerCols.map(c => c.key);
+    const headerLabels  = labelRow(headerCols, en);
     const wsHeader = XLSX.utils.aoa_to_sheet([headerHeaders, headerLabels]);
-    wsHeader['!cols'] = HEADER_COLUMNS.map(c => ({ wch: Math.max(c.key.length, 20) + 4 }));
+    wsHeader['!cols'] = colWidths(headerCols, en);
     XLSX.utils.book_append_sheet(wb, wsHeader, 'header');
 
     const detailHeaders = detailColumns.map(c => c.key);
-    const detailLabels  = detailColumns.map(c => `(${c.label}${c.required ? ' *' : ''})`);
+    const detailLabels  = labelRow(detailColumns, en);
     const wsDetail = XLSX.utils.aoa_to_sheet([detailHeaders, detailLabels]);
-    wsDetail['!cols'] = detailColumns.map(c => ({ wch: Math.max(c.key.length, 20) + 4 }));
+    wsDetail['!cols'] = colWidths(detailColumns, en);
     XLSX.utils.book_append_sheet(wb, wsDetail, 'detail');
 
     const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
@@ -366,7 +374,7 @@ const validateFile = [
         req.dbPool.query(`SELECT id, period_start_date, period_end_date, gl_status FROM gl_posting_period`),
         req.dbPool.query(`SELECT id, branch_code FROM cd_branch WHERE is_active = true`),
         req.dbPool.query(`SELECT id, currency_code, base_rate, base_currency_flag FROM cd_currency WHERE is_active = true`),
-        req.dbPool.query(`SELECT id, account_code, account_name_thai, account_name_eng, is_active, is_normal_account FROM gl_account`),
+        req.dbPool.query(`SELECT id, account_code, account_name_thai, account_name_eng, is_active, is_normal_account, branch_required FROM gl_account`),
         req.dbPool.query(`SELECT account_id, type_code FROM gl_account_dim_rule WHERE is_required = true`),
         req.dbPool.query(`SELECT id, type_code, value_code FROM gl_dimension_value WHERE is_active = true`),
         req.dbPool.query(`SELECT doc_no FROM gl_entry_header`),
@@ -567,6 +575,17 @@ const validateFile = [
           rowErrors.push({ column: 'debit', message: 'ระบุเดบิตหรือเครดิตอย่างใดอย่างหนึ่ง' });
         }
 
+        // branch_code ของบรรทัด (ว่าง = ใช้สาขาจาก header) — บัญชีที่บังคับสาขาต้องมีสาขาอย่างใดอย่างหนึ่ง
+        const lineBranchRaw = get('branch_code');
+        let lineBranchId = null;
+        if (lineBranchRaw) {
+          lineBranchId = branchMap[lineBranchRaw.toUpperCase()] || null;
+          if (!lineBranchId) rowErrors.push({ column: 'branch_code', message: `ไม่พบรหัสสาขา "${lineBranchRaw}"` });
+        }
+        if (account && account.branch_required && !lineBranchRaw && headerEntry && !headerEntry.branch_id) {
+          rowErrors.push({ column: 'branch_code', message: `บัญชี "${accountCode}" บังคับระบุสาขา — ระบุ branch_code ที่บรรทัดหรือที่ sheet header` });
+        }
+
         // dimensions (dynamic, per active gl_dimension_type)
         const dims = {}; // slot_no -> dimension_value.id
         const dimLabels = {}; // type_code -> value_code (uppercased)
@@ -594,6 +613,8 @@ const validateFile = [
           account_name_thai: account ? account.account_name_thai : null,
           account_name_eng: account ? account.account_name_eng : null,
           description: trunc(get('description'), 255),
+          branch_id: lineBranchId,
+          branch_code: lineBranchRaw ? lineBranchRaw.toUpperCase() : null,
           debit_fc: debit,
           credit_fc: credit,
           dim1_id: dims[1] || null,
@@ -668,6 +689,8 @@ const validateFile = [
           account_name_thai: d.account_name_thai,
           account_name_eng: d.account_name_eng,
           description: d.description,
+          branch_id: d.branch_id,
+          branch_code: d.branch_code,
           debit_fc: d.debit_fc,
           credit_fc: d.credit_fc,
           dim1_id: d.dim1_id,
@@ -752,6 +775,8 @@ const confirmImport = async (req, res) => {
       `SELECT id FROM gl_account WHERE id = ANY($1::int[]) AND is_active = TRUE AND is_normal_account = TRUE`,
       [[...new Set(detailsList.map(d => parseInt(d.account_id, 10)).filter(Number.isInteger))]]);
     const validAccountIds = new Set(acctRes.rows.map(r => r.id));
+    const branchRes = await client.query(`SELECT id FROM cd_branch WHERE is_active = TRUE`);
+    const validBranchIds = new Set(branchRes.rows.map(r => r.id));
 
     for (let idx = 0; idx < headers.length; idx++) {
       const h = headers[idx];
@@ -780,6 +805,9 @@ const confirmImport = async (req, res) => {
           const dr = Number(d.debit_fc) || 0, cr = Number(d.credit_fc) || 0;
           if (!validAccountIds.has(parseInt(d.account_id, 10))) {
             throw new Error(`บรรทัดที่ ${i + 1}: บัญชี ${d.account_code || d.account_id} ต้องเป็นบัญชีปฏิบัติการที่ใช้งานอยู่`);
+          }
+          if (d.branch_id && !validBranchIds.has(parseInt(d.branch_id, 10))) {
+            throw new Error(`บรรทัดที่ ${i + 1}: ไม่พบสาขาที่ระบุ`);
           }
           if (dr < 0 || cr < 0 || (dr > 0) === (cr > 0)) {
             throw new Error(`บรรทัดที่ ${i + 1}: ระบุเดบิตหรือเครดิตอย่างใดอย่างหนึ่ง และต้องไม่ติดลบ`);
@@ -833,19 +861,21 @@ const confirmImport = async (req, res) => {
             `INSERT INTO gl_entry_detail
                (header_id, line_no, account_id, description,
                 debit_fc, credit_fc, debit_lc, credit_lc,
-                dim1_id, dim2_id, dim3_id, dim4_id, dim5_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, branch_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
              RETURNING *`,
             [
               headerId, lineNo++, d.account_id, d.description || null,
               debitFc, creditFc, debitLc, creditLc,
               d.dim1_id || null, d.dim2_id || null, d.dim3_id || null, d.dim4_id || null, d.dim5_id || null,
+              parseInt(d.branch_id, 10) || null,
             ]
           );
           insertedDetails.push(detailRes.rows[0]);
         }
 
         await validateDimRules(client, insertedDetails);
+        await assertRequiredBranch(client, insertedDetails, h.branch_id);
 
         await client.query(`RELEASE SAVEPOINT ${savepointName}`);
         imported++;

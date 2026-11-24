@@ -1,7 +1,8 @@
 // controllers/im/imLocationImportController.js
 const XLSX = require('xlsx');
+const { withEnSheet, withEnSheets, isEnglishReq, labelRow, colWidths } = require('../../utils/importLabels');
 const multer = require('multer');
-const { ensureImLocationTable } = require('./imLocationController');
+const { ensureImLocationTable, saveDefaultFlag } = require('./imLocationController');
 
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -19,29 +20,32 @@ const TEMPLATE_SHEETS = [
       { key: 'warehouse_code', label: 'รหัสคลังสินค้า',                                          required: true,  example: 'WH01' },
       { key: 'location_code',  label: 'รหัสตำแหน่ง (ไม่ซ้ำในคลังเดียวกัน)',                       required: true,  example: 'A-01-01' },
       { key: 'parent_code',    label: 'รหัสตำแหน่งแม่ (ว่าง = ระดับบนสุด, ต้องเป็นชนิด GROUP)',    required: false, example: 'A' },
-      { key: 'location_type',  label: `ชนิดตำแหน่ง (${LOCATION_TYPES.join('/')})`,                required: true,  example: 'BIN' },
+      { key: 'location_type',  label: `ชนิดตำแหน่ง (${LOCATION_TYPES.join('/')})`, label_en: `Location type (${LOCATION_TYPES.join('/')})`,                required: true,  example: 'BIN' },
       { key: 'location_name',  label: 'ชื่อตำแหน่ง (ภาษาไทย)',                                    required: false, example: 'ชั้น 1 แถว A ช่อง 01' },
       // allowMissing: เทมเพลตเก่าที่ยังไม่มีคอลัมน์นี้ยังนำเข้าได้
       { key: 'location_name_en', label: 'ชื่อตำแหน่ง (ภาษาอังกฤษ)',                              required: false, example: 'Floor 1 Aisle A Bin 01', allowMissing: true },
       { key: 'category_code',  label: 'รหัสหมวดหมู่สินค้าที่ควรเก็บ (เฉพาะชนิด BIN)',             required: false, example: 'CAT01' },
       { key: 'is_active',      label: 'ใช้งาน (Y/N)',                                             required: false, example: 'Y' },
+      { key: 'is_default',     label: 'ตำแหน่งหลักของคลัง (Y/N, เฉพาะชนิด BIN ที่ใช้งาน, คลังละ 1 ตำแหน่ง — แทนตำแหน่งหลักเดิม)', required: false, example: 'N', allowMissing: true },
+      { key: 'sort_order',     label: 'ลำดับการเดินตรวจนับ (ตัวเลข, ว่าง = เรียงตามรหัส)',          required: false, example: '', allowMissing: true },
     ],
   },
 ];
 
 // GET /im_location/import/template
 const getTemplate = (req, res) => {
-  res.json({ sheets: TEMPLATE_SHEETS });
+  res.json({ sheets: withEnSheets('im_location', TEMPLATE_SHEETS) });
 };
 
 // GET /im_location/import/template/download
 const downloadTemplate = (req, res) => {
   const wb = XLSX.utils.book_new();
-  for (const sheet of TEMPLATE_SHEETS) {
+  const en = isEnglishReq(req);
+  for (const sheet of withEnSheets('im_location', TEMPLATE_SHEETS)) {
     const headers = sheet.columns.map(c => c.key);
-    const labels  = sheet.columns.map(c => `(${c.label}${c.required ? ' *' : ''})`);
+    const labels  = labelRow(sheet.columns, en);
     const ws = XLSX.utils.aoa_to_sheet([headers, labels]);
-    ws['!cols'] = sheet.columns.map(c => ({ wch: Math.max(c.key.length, c.label.length) + 4 }));
+    ws['!cols'] = colWidths(sheet.columns, en);
     XLSX.utils.book_append_sheet(wb, ws, sheet.name);
   }
   const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
@@ -136,6 +140,7 @@ const validateFile = [
       const errors = [];
       const rowsData = [];
       const batchMap = {}; // `${WAREHOUSE_CODE}|${CODE}` -> rowData (only rows w/o basic errors)
+      const defaultByWarehouse = {}; // WAREHOUSE_CODE -> แถวที่ระบุเป็นตำแหน่งหลัก (คลังละ 1)
 
       // ── Pass 1: per-row field validation ──────────────────────────────────
       for (let i = 0; i < sheet.rows.length; i++) {
@@ -151,6 +156,8 @@ const validateFile = [
         const locationNameEn  = get('location_name_en');
         const categoryCode    = get('category_code').toUpperCase();
         const isActiveStr     = get('is_active');
+        const isDefaultStr    = get('is_default');
+        const sortOrderStr    = get('sort_order');
 
         if (!warehouseCode && !locationCode) continue;
 
@@ -184,6 +191,24 @@ const validateFile = [
           }
         }
 
+        const isActive  = isActiveStr ? parseBool(isActiveStr) : true;
+        const isDefault = isDefaultStr ? parseBool(isDefaultStr) : false;
+        if (isDefault && locationType !== 'BIN') {
+          rowErrors.push({ column: 'is_default', message: 'ตำแหน่งหลักของคลังต้องเป็นชนิด BIN' });
+        } else if (isDefault && !isActive) {
+          rowErrors.push({ column: 'is_default', message: 'ตำแหน่งที่ไม่ใช้งานเป็นตำแหน่งหลักของคลังไม่ได้' });
+        } else if (isDefault && warehouseCode && defaultByWarehouse[warehouseCode]) {
+          rowErrors.push({ column: 'is_default', message: `คลัง "${warehouseCode}" ระบุตำแหน่งหลักซ้ำ (แถวที่ ${defaultByWarehouse[warehouseCode]}) — มีได้คลังละ 1 ตำแหน่ง` });
+        }
+        let sortOrder = null;
+        if (sortOrderStr) {
+          sortOrder = Number(sortOrderStr);
+          if (!Number.isInteger(sortOrder) || sortOrder < 0) {
+            rowErrors.push({ column: 'sort_order', message: 'ลำดับต้องเป็นจำนวนเต็มไม่ติดลบ' });
+            sortOrder = null;
+          }
+        }
+
         const batchKey = (warehouseCode && locationCode) ? `${warehouseCode}|${locationCode}` : null;
         if (batchKey && batchMap[batchKey]) {
           rowErrors.push({ column: 'location_code', message: `รหัสตำแหน่ง "${locationCode}" ซ้ำกับแถวก่อนหน้าในคลังเดียวกัน` });
@@ -195,6 +220,7 @@ const validateFile = [
           errors.push({ row: rowNum, itemCode: locationCode || '-', errors: rowErrors });
           continue;
         }
+        if (isDefault) defaultByWarehouse[warehouseCode] = rowNum;
 
         const rowData = {
           __rowNum: rowNum,
@@ -207,7 +233,9 @@ const validateFile = [
           location_name_en: locationNameEn || null,
           category_code: locationType === 'BIN' ? (categoryCode || null) : null,
           category_id: locationType === 'BIN' ? (resolvedCategory?.id || null) : null,
-          is_active: isActiveStr ? parseBool(isActiveStr) : true,
+          is_active: isActive,
+          is_default: isDefault,
+          sort_order: sortOrder,
           level: null, // null = unresolved, -1 = failed, >0 = resolved
         };
         rowsData.push(rowData);
@@ -350,8 +378,8 @@ const confirmImport = async (req, res) => {
         const result = await client.query(
           `INSERT INTO im_location
              (warehouse_id, location_code, location_name, parent_id, level, location_type, category_id, is_active,
-              created_by, updated_by, location_name_en)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$10)
+              created_by, updated_by, location_name_en, sort_order)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$10,$11)
            RETURNING id`,
           [
             r.warehouse_id, trunc(locationCode, 20), trunc(r.location_name, 200),
@@ -359,10 +387,15 @@ const confirmImport = async (req, res) => {
             r.is_active !== undefined ? r.is_active : true,
             userName,
             trunc(r.location_name_en, 200),
+            Number.isInteger(r.sort_order) ? r.sort_order : null,
           ]
         );
 
         idMap[key] = result.rows[0].id;
+        // ตำแหน่งหลักของคลัง — แทนตำแหน่งหลักเดิมของคลังเดียวกัน (กฎเดียวกับหน้าผังตำแหน่ง)
+        if (r.is_default === true) {
+          await saveDefaultFlag(client, result.rows[0].id, r.warehouse_id, true, r.location_type || 'BIN', r.is_active !== false);
+        }
         await client.query(`RELEASE SAVEPOINT ${savepointName}`);
         imported++;
       } catch (rowErr) {

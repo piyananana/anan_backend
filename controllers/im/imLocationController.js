@@ -276,7 +276,7 @@ const deleteRow = async (req, res) => {
 };
 
 module.exports = {
-    ensureImLocationTable,
+    ensureImLocationTable, saveDefaultFlag,
     fetchRows, fetchActiveRows, fetchRow, addRow, updateRow, deleteRow,
     LOCATION_TYPES,
 };

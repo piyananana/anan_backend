@@ -1,5 +1,6 @@
 // controllers/im/imItemImportController.js
 const XLSX = require('xlsx');
+const { withEnSheet, withEnSheets, isEnglishReq, labelRow, colWidths } = require('../../utils/importLabels');
 const multer = require('multer');
 const { generateNextCode } = require('./imItemRunningController');
 const { generateNextCodeForCategory } = require('./imItemCategoryController');
@@ -33,9 +34,9 @@ const TEMPLATE_SHEETS = [
       { key: 'item_name_en',        label: 'ชื่อสินค้า (อังกฤษ)',                           required: false, example: 'Sample Item' },
       { key: 'barcode',             label: 'บาร์โค้ด',                                      required: false, example: '' },
       { key: 'description',         label: 'คำอธิบาย',                                      required: false, example: '' },
-      { key: 'item_type',           label: `ประเภทสินค้า (${ITEM_TYPES.join('/')})`,        required: false, example: 'STOCK' },
+      { key: 'item_type',           label: `ประเภทสินค้า (${ITEM_TYPES.join('/')})`, label_en: `Item type (${ITEM_TYPES.join('/')})`,        required: false, example: 'STOCK' },
       { key: 'base_uom_code',       label: 'รหัสหน่วยนับหลัก',                              required: false, example: 'PCS' },
-      { key: 'costing_method',      label: `วิธีคำนวณต้นทุน (${COSTING_METHODS.join('/')})`, required: false, example: 'AVG' },
+      { key: 'costing_method',      label: `วิธีคำนวณต้นทุน (${COSTING_METHODS.join('/')})`, label_en: `Costing method (${COSTING_METHODS.join('/')})`, required: false, example: 'AVG' },
       { key: 'accounting_mode',     label: 'โหมดบัญชีสินค้า (PERPETUAL/PERIODIC, ว่าง = ตามหมวดสินค้า/คลัง/ค่าตั้งต้น)', required: false, example: '', optional: true },
       { key: 'standard_cost',       label: 'ต้นทุนมาตรฐาน',                                 required: false, example: '0' },
       { key: 'is_purchase_item',    label: 'ซื้อได้ (Y/N)',                                 required: false, example: 'Y' },
@@ -106,7 +107,7 @@ const TEMPLATE_SHEETS = [
       { key: 'uom_code',        label: 'รหัสหน่วยนับ (ว่าง = ใช้ได้ทุกหน่วยของสินค้า, ไม่ว่างต้องเป็นหน่วยหลักหรือหน่วยทางเลือกของสินค้านี้)', required: false, example: '' },
       { key: 'min_qty',         label: 'จำนวนขั้นต่ำ',                                             required: false, example: '0' },
       { key: 'unit_price_fc',   label: 'ราคาต่อหน่วย (รวม VAT หรือไม่ ตามที่ตั้งไว้ในตารางราคา)',                                          required: true,  example: '100' },
-      { key: 'price_type',      label: `ชนิดราคา (${PRICE_TYPES.join('/')})`,                      required: false, example: 'STANDARD' },
+      { key: 'price_type',      label: `ชนิดราคา (${PRICE_TYPES.join('/')})`, label_en: `Price type (${PRICE_TYPES.join('/')})`,                      required: false, example: 'STANDARD' },
       { key: 'effective_from',  label: 'มีผลตั้งแต่ (YYYY-MM-DD)',                                 required: false, example: '' },
       { key: 'effective_to',    label: 'มีผลถึง (YYYY-MM-DD)',                                     required: false, example: '' },
     ],
@@ -146,17 +147,18 @@ const getTemplate = async (req, res) => {
     autoNumbering = !!runningR.rows[0]?.is_auto_numbering;
     autoGroupCodes = groupsR.rows.map(r => r.code);
   }
-  res.json({ sheets: TEMPLATE_SHEETS, auto_numbering: autoNumbering, auto_group_codes: autoGroupCodes });
+  res.json({ sheets: withEnSheets('im_item', TEMPLATE_SHEETS), auto_numbering: autoNumbering, auto_group_codes: autoGroupCodes });
 };
 
 // GET /im_item/import/template/download
 const downloadTemplate = (req, res) => {
   const wb = XLSX.utils.book_new();
-  for (const sheet of TEMPLATE_SHEETS) {
+  const en = isEnglishReq(req);
+  for (const sheet of withEnSheets('im_item', TEMPLATE_SHEETS)) {
     const headers = sheet.columns.map(c => c.key);
-    const labels  = sheet.columns.map(c => `(${c.label}${c.required ? ' *' : ''})`);
+    const labels  = labelRow(sheet.columns, en);
     const ws = XLSX.utils.aoa_to_sheet([headers, labels]);
-    ws['!cols'] = sheet.columns.map(c => ({ wch: Math.max(c.key.length, c.label.length) + 4 }));
+    ws['!cols'] = colWidths(sheet.columns, en);
     XLSX.utils.book_append_sheet(wb, ws, sheet.name);
   }
   const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });

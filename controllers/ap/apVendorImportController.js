@@ -1,5 +1,6 @@
 // controllers/ap/apVendorImportController.js
 const XLSX = require('xlsx');
+const { withEnSheet, withEnSheets, isEnglishReq, labelRow, colWidths } = require('../../utils/importLabels');
 const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const multer = require('multer');
 const { generateNextCode } = require('./apVendorRunningController');
@@ -109,17 +110,18 @@ const getTemplate = async (req, res) => {
     autoNumbering = !!runningR.rows[0]?.is_auto_numbering;
     autoGroupCodes = groupsR.rows.map(r => r.code);
   }
-  res.json({ sheets: TEMPLATE_SHEETS, auto_numbering: autoNumbering, auto_group_codes: autoGroupCodes });
+  res.json({ sheets: withEnSheets('ap_vendor', TEMPLATE_SHEETS), auto_numbering: autoNumbering, auto_group_codes: autoGroupCodes });
 };
 
 // GET /ap_vendor/import/template/download
 const downloadTemplate = (req, res) => {
   const wb = XLSX.utils.book_new();
-  for (const sheet of TEMPLATE_SHEETS) {
+  const en = isEnglishReq(req);
+  for (const sheet of withEnSheets('ap_vendor', TEMPLATE_SHEETS)) {
     const headers = sheet.columns.map(c => c.key);
-    const labels  = sheet.columns.map(c => `(${c.label}${c.required ? ' *' : ''})`);
+    const labels  = labelRow(sheet.columns, en);
     const ws = XLSX.utils.aoa_to_sheet([headers, labels]);
-    ws['!cols'] = sheet.columns.map(c => ({ wch: Math.max(c.key.length, c.label.length) + 4 }));
+    ws['!cols'] = colWidths(sheet.columns, en);
     XLSX.utils.book_append_sheet(wb, ws, sheet.name);
   }
   const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });

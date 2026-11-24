@@ -3,11 +3,12 @@
 // คอลัมน์เป็น optional: เทมเพลตรุ่นเก่าที่ไม่มีคอลัมน์มิติยังนำเข้าได้
 
 const activeDimTypes = async (db) => (await db.query(
-    `SELECT type_code, name_thai, slot_no FROM gl_dimension_type WHERE is_active = true ORDER BY slot_no`)).rows;
+    `SELECT type_code, name_thai, name_eng, slot_no FROM gl_dimension_type WHERE is_active = true ORDER BY slot_no`)).rows;
 
 const templateDimColumns = async (db) => (await activeDimTypes(db)).map(t => ({
     key: `dim_${t.type_code}`,
     label: `มิติ: ${t.name_thai} (รหัสค่ามิติ, ว่าง = ไม่ระบุ)`,
+    label_en: `Dimension: ${t.name_eng || t.name_thai} (dimension value code, blank = none)`,
     required: false, example: '', optional: true,
 }));
 

@@ -1,5 +1,6 @@
 // controllers/gl/glAccountImportController.js
 const XLSX = require('xlsx');
+const { withEnSheet, withEnSheets, isEnglishReq, labelRow, colWidths } = require('../../utils/importLabels');
 const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const multer = require('multer');
 
@@ -40,10 +41,10 @@ const YES_VALUES = ['y', 'yes', 'true', '1', 'ใช่'];
 const getTemplate = async (req, res) => {
   try {
     const dimTypesR = await req.dbPool.query(
-      `SELECT type_code, name_thai FROM gl_dimension_type WHERE is_active = true ORDER BY sort_order ASC`
+      `SELECT type_code, name_thai, name_eng FROM gl_dimension_type WHERE is_active = true ORDER BY sort_order ASC`
     );
     res.json({
-      sheet: { key: SHEET_DEF.key, name: SHEET_DEF.name, columns: TEMPLATE_COLUMNS },
+      sheet: withEnSheet('gl_account', SHEET_DEF),
       accountTypes: ACCOUNT_TYPES,
       dimensionTypes: dimTypesR.rows,
     });
@@ -55,10 +56,12 @@ const getTemplate = async (req, res) => {
 
 // GET /gl_account/import/template/download — ส่งไฟล์ xlsx เทมเพลต
 const downloadTemplate = (req, res) => {
-  const headers = TEMPLATE_COLUMNS.map(c => c.key);
-  const labels = TEMPLATE_COLUMNS.map(c => `(${c.label}${c.required ? ' *' : ''})`);
+  const en = isEnglishReq(req);
+  const cols = withEnSheet('gl_account', SHEET_DEF).columns;
+  const headers = cols.map(c => c.key);
+  const labels = labelRow(cols, en);
   const ws = XLSX.utils.aoa_to_sheet([headers, labels]);
-  ws['!cols'] = TEMPLATE_COLUMNS.map(c => ({ wch: Math.max(c.key.length, c.label.length) + 4 }));
+  ws['!cols'] = colWidths(cols, en);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, SHEET_DEF.name);
   const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });

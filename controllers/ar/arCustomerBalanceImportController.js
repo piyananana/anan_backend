@@ -1,8 +1,10 @@
 // controllers/ar/arCustomerBalanceImportController.js
 const XLSX = require('xlsx');
+const { withEnSheet, withEnSheets, isEnglishReq, labelRow, colWidths } = require('../../utils/importLabels');
 const { getBaseCurrencyCode } = require('../../utils/baseCurrency');
 const multer = require('multer');
 const { templateDimColumns, loadDimLookup, parseRowDims } = require('../../utils/importDims');
+const { ensureSalespersonTable, saveDocSalespersons } = require('../../utils/docSalesperson');
 
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -27,6 +29,8 @@ const TEMPLATE_SHEET = {
     { key: 'description', label: 'คำอธิบาย/หมายเหตุ', required: false, example: 'ยอดยกมาจากระบบเดิม' },
     { key: 'billing_date', label: 'วันวางบิล (YYYY-MM-DD, ว่าง = ยังไม่วางบิล)', required: false, example: '', optional: true },
     { key: 'expected_payment_date', label: 'วันคาดว่าจะได้รับชำระ (YYYY-MM-DD)', required: false, example: '', optional: true },
+    { key: 'branch_code', label: 'รหัสสาขา (ว่าง = ไม่ระบุ)', required: false, example: '', optional: true },
+    { key: 'salesperson_code', label: 'รหัสพนักงานขาย (หลายคนคั่นด้วย , คนแรก = คนหลัก, ว่าง = ไม่ระบุ)', required: false, example: 'SP001', optional: true },
   ],
 };
 
@@ -37,12 +41,12 @@ const sheetDef = async (db) => ({ ...TEMPLATE_SHEET, columns: [...TEMPLATE_SHEET
 const getTemplate = async (req, res) => {
   try {
     const docTypesR = await req.dbPool.query(
-      `SELECT doc_code, doc_name_thai, sys_doc_type FROM sa_module_document
+      `SELECT doc_code, doc_name_thai, doc_name_eng, sys_doc_type FROM sa_module_document
        WHERE sys_module = '11' AND sys_doc_type = ANY($1) AND is_active = true AND is_doc_type = true
        ORDER BY doc_code`,
       [DR_DOC_TYPES]
     );
-    res.json({ sheet: await sheetDef(req.dbPool), docTypes: docTypesR.rows });
+    res.json({ sheet: withEnSheet('ar_customer_balance', await sheetDef(req.dbPool)), docTypes: docTypesR.rows });
   } catch (err) {
     console.error('getTemplate error:', err);
     res.status(500).json({ message: 'เกิดข้อผิดพลาด: ' + err.message });
@@ -51,11 +55,12 @@ const getTemplate = async (req, res) => {
 
 // GET /ar_customer_balance/import/template/download — ส่งไฟล์ xlsx เทมเพลต
 const downloadTemplate = async (req, res) => {
-  const def = await sheetDef(req.dbPool);
+  const def = withEnSheet('ar_customer_balance', await sheetDef(req.dbPool));
+  const en = isEnglishReq(req);
   const headers = def.columns.map(c => c.key);
-  const labels = def.columns.map(c => `(${c.label}${c.required ? ' *' : ''})`);
+  const labels = labelRow(def.columns, en);
   const ws = XLSX.utils.aoa_to_sheet([headers, labels]);
-  ws['!cols'] = def.columns.map(c => ({ wch: Math.max(c.key.length, c.label.length) + 4 }));
+  ws['!cols'] = colWidths(def.columns, en);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, TEMPLATE_SHEET.name);
   const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
@@ -140,7 +145,7 @@ const validateFile = [
       }
 
       // ── Pre-fetch lookup tables ────────────────────────────────────────
-      const [customersR, groupsR, currenciesR, docTypesR, periodR] = await Promise.all([
+      const [customersR, groupsR, currenciesR, docTypesR, periodR, branchesR, salespersonsR] = await Promise.all([
         req.dbPool.query(`SELECT id, customer_code, customer_name_th, ar_account_id, customer_group_id, credit_term_months, credit_term_days FROM ar_customer WHERE is_active = true`),
         req.dbPool.query(`SELECT id, gl_account_id FROM ar_customer_group`),
         req.dbPool.query(`SELECT id, currency_code FROM cd_currency WHERE is_active = true`),
@@ -148,6 +153,8 @@ const validateFile = [
                           FROM sa_module_document d LEFT JOIN ar_gl_account_setup s ON s.doc_code = d.doc_code
                          WHERE d.sys_module = '11' AND d.sys_doc_type = ANY($1) AND d.is_active = true AND d.is_doc_type = true`, [DR_DOC_TYPES]),
         req.dbPool.query(`SELECT id FROM gl_posting_period WHERE CURRENT_DATE BETWEEN period_start_date AND period_end_date AND gl_status = 'OPEN' LIMIT 1`),
+        req.dbPool.query(`SELECT id, branch_code FROM cd_branch WHERE is_active = true`),
+        req.dbPool.query(`SELECT id, salesperson_code FROM cd_salesperson WHERE is_active = true`),
       ]);
 
       if (periodR.rows.length === 0) {
@@ -159,6 +166,8 @@ const validateFile = [
       for (const g of groupsR.rows) groupMap[g.id] = g;
       const currencyMap = buildCodeMap(currenciesR.rows, 'currency_code');
       const docTypeMap = buildCodeMap(docTypesR.rows, 'doc_code');
+      const branchMap = buildCodeMap(branchesR.rows, 'branch_code');
+      const salespersonMap = buildCodeMap(salespersonsR.rows, 'salesperson_code');
 
       const dimLookup = await loadDimLookup(req.dbPool);
       const errors = [];
@@ -284,6 +293,24 @@ const validateFile = [
         const expectedPaymentDate = optDate('expected_payment_date', 'วันคาดว่าจะได้รับชำระ');
         const { dims, label: dimLabel } = parseRowDims(getStr, dimLookup, rowErrors);
 
+        // สาขา (ว่าง = ไม่ระบุ)
+        const branchCode = getStr('branch_code').toUpperCase();
+        let branchId = null;
+        if (branchCode) {
+          branchId = branchMap[branchCode]?.id || null;
+          if (!branchId) rowErrors.push({ column: 'branch_code', message: `ไม่พบรหัสสาขา "${branchCode}"` });
+        }
+
+        // พนักงานขาย — หลายคนคั่นด้วย , คนแรกเป็นคนหลัก (สัดส่วนดึงจากข้อมูลลูกหนี้ตอนบันทึก เหมือนใบแจ้งหนี้)
+        const spCodes = getStr('salesperson_code').split(',').map(x => x.trim().toUpperCase()).filter(Boolean);
+        const salespersons = [];
+        for (const code of spCodes) {
+          const sp = salespersonMap[code];
+          if (!sp) rowErrors.push({ column: 'salesperson_code', message: `ไม่พบรหัสพนักงานขาย "${code}"` });
+          else if (salespersons.some(x => x.salesperson_id === sp.id)) rowErrors.push({ column: 'salesperson_code', message: `รหัสพนักงานขาย "${code}" ซ้ำ` });
+          else salespersons.push({ salesperson_id: sp.id, salesperson_code: code, is_primary: salespersons.length === 0 });
+        }
+
         if (rowErrors.length > 0) {
           errors.push({ row: rowNum, customerCode: customerCode || '-', errors: rowErrors });
           continue;
@@ -309,6 +336,10 @@ const validateFile = [
           expected_payment_date: expectedPaymentDate,
           ...dims,
           dim_label: dimLabel,
+          branch_id: branchId,
+          branch_code: branchCode || null,
+          salespersons,
+          salesperson_codes: spCodes.join(', ') || null,
         });
       }
 
@@ -372,6 +403,7 @@ const confirmImport = async (req, res) => {
   let imported = 0, skipped = 0;
   const importErrors = [];
   try {
+    await ensureSalespersonTable(req.dbPool, 'ar_transaction_salesperson', 'ar_transaction', 'header_id');
     await client.query('BEGIN');
 
     const periodR = await client.query(
@@ -401,7 +433,7 @@ const confirmImport = async (req, res) => {
         const exchangeRate = Number(r.exchange_rate) || 1;
         const amountLc = Math.round(amount * exchangeRate * 100) / 100;
 
-        await client.query(
+        const ins = await client.query(
           `INSERT INTO ar_transaction
              (doc_id, doc_no, doc_date, due_date, period_id,
               customer_id, customer_code, customer_name_th,
@@ -410,13 +442,14 @@ const confirmImport = async (req, res) => {
               subtotal_lc, discount_amount_lc, before_vat_lc, vat_amount_lc, total_amount_lc,
               paid_amount_lc, balance_amount_lc,
               description, status, created_by, updated_by,
-              dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, billing_date, expected_payment_date)
+              dim1_id, dim2_id, dim3_id, dim4_id, dim5_id, billing_date, expected_payment_date, branch_id)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
                    $13,0,$13,0,$13,
                    $14,0,$14,0,$14,
                    0,$14,
                    $15,'Posted',$16,$16,
-                   $17,$18,$19,$20,$21,$22,$23)`,
+                   $17,$18,$19,$20,$21,$22,$23,$24)
+           RETURNING id`,
           [
             r.doc_id, trunc(r.doc_no, 30), r.doc_date, r.due_date || null, periodId,
             r.customer_id, trunc(r.customer_code, 20), trunc(r.customer_name_th, 200),
@@ -427,8 +460,12 @@ const confirmImport = async (req, res) => {
             userName,
             r.dim1_id || null, r.dim2_id || null, r.dim3_id || null, r.dim4_id || null, r.dim5_id || null,
             r.billing_date || null, r.expected_payment_date || null,
+            parseInt(r.branch_id, 10) || null,
           ]
         );
+        if (Array.isArray(r.salespersons) && r.salespersons.length) {
+          await saveDocSalespersons(client, 'ar_transaction_salesperson', 'header_id', ins.rows[0].id, r.salespersons);
+        }
 
         await client.query(`RELEASE SAVEPOINT ${savepointName}`);
         imported++;
