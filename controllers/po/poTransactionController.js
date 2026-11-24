@@ -102,7 +102,18 @@ const ensurePoTransactionTable = async (client) => {
             ADD COLUMN IF NOT EXISTS submitted_by  VARCHAR(100)`);
     // ราคารวม VAT / ส่วนลด % / VAT ต่อบรรทัด (user-approved 2026-10-31) — total_value_lc = หลังส่วนลด ก่อน VAT
     await ensurePoPriceColumns(client);
+    // ระยะเครดิต (เดือน/วัน) ของใบสั่งซื้อ — ค่าเริ่มต้นจากผู้ขาย แก้ได้ (แบบ AR/AP); ใบตั้งหนี้ที่ GRN สร้างใช้ค่านี้
+    await client.query(`ALTER TABLE po_transaction ADD COLUMN IF NOT EXISTS credit_term_months INTEGER, ADD COLUMN IF NOT EXISTS credit_term_days INTEGER`);
 };
+// ระยะเครดิต: จำนวนเต็มไม่ติดลบ, ว่าง = null
+const termInt = (v) => {
+    if (v === null || v === undefined || v === '') return null;
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) && n >= 0 ? n : null;
+};
+const savePoCreditTerm = (client, id, header) => client.query(
+    `UPDATE po_transaction SET credit_term_months=$1, credit_term_days=$2 WHERE id=$3`,
+    [termInt(header.credit_term_months), termInt(header.credit_term_days), id]);
 
 // --- Fetch helpers ---
 const fetchRowById = async (pool, id) => {
@@ -123,9 +134,12 @@ const fetchRowById = async (pool, id) => {
     if (hRes.rows.length === 0) return null;
     const dRes = await pool.query(`
         SELECT dt.*, u.uom_code, u.uom_name_th, u.uom_name_en,
-               ${poReceivedSql('dt')} AS qty_received
+               ${poReceivedSql('dt')} AS qty_received,
+               prh.id AS ref_pr_id, prh.doc_no AS ref_pr_doc_no
         FROM po_transaction_detail dt
         LEFT JOIN im_uom u ON u.id = dt.uom_id
+        LEFT JOIN pr_transaction_detail prd ON prd.id = dt.ref_pr_detail_id
+        LEFT JOIN pr_transaction prh ON prh.id = prd.header_id
         WHERE dt.header_id = $1 ORDER BY dt.line_no`, [id]);
     await DA.ensureDocApprovalSchema(pool);
     // ใบมัดจำผู้ขาย (AP 60) ที่อ้างอิงใบสั่งซื้อนี้ — เตือนตอนปิดถ้ายังมียอดคงเหลือ
@@ -228,6 +242,7 @@ const createTransaction = async (req, res) => {
             header.branch_id || null, header.created_by || null, header.price_includes_vat === true,
         ]);
         const headerId = hRes.rows[0].id;
+        await savePoCreditTerm(client, headerId, header);
 
         // อ้างอิงบรรทัด PR (ถ้ามี) — ตรวจคงเหลือที่แปลงได้ก่อนบันทึกทุกบรรทัด แล้วรีเฟรชสถานะ PR ต้นทางทั้งหมด
         // ที่ถูกอ้างอิงหลังบันทึกครบ (lazy require กัน circular กับ poPrTransactionController.js ที่ require
@@ -306,15 +321,16 @@ const updateTransaction = async (req, res) => {
                 doc_date=$1, vendor_id=$2, vendor_code=$3, vendor_name_th=$4, warehouse_id=$5,
                 currency_id=$6, currency_code=$7, exchange_rate=$8, due_date=$9, description=$10,
                 dim1_id=$11, dim2_id=$12, dim3_id=$13, dim4_id=$14, dim5_id=$15, branch_id=$16,
-                updated_by=$17, updated_at=NOW(), price_includes_vat=$19
+                updated_by=$17, updated_at=NOW(), price_includes_vat=$19, ref_pr_id=$20
             WHERE id=$18
         `, [
             header.doc_date, header.vendor_id, vendor.vendor_code, vendor.vendor_name_th, header.warehouse_id,
             header.currency_id || null, header.currency_code || await getBaseCurrencyCode(client), header.exchange_rate || 1,
             header.due_date || null, header.description || null,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
-            header.branch_id || null, header.updated_by || null, id, header.price_includes_vat === true,
+            header.branch_id || null, header.updated_by || null, id, header.price_includes_vat === true, header.ref_pr_id || null,
         ]);
+        await savePoCreditTerm(client, id, header);
 
         const { validatePrConvertibleQty, refreshPrStatus } = require('./poPrTransactionController');
         const affectedPrIds = new Set();

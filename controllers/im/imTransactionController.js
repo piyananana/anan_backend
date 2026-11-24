@@ -1291,8 +1291,17 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
     // วันที่ใบกำกับผู้ขาย = วันที่/งวดของใบตั้งหนี้ AP และฐานวันครบกำหนด (เดือน + วันตามเครดิตเทอมผู้ขาย เหมือนหน้าจอ AP)
     // ว่าง = วันที่รับสินค้า (เอกสารเก่า) — วันที่รับสินค้าของ IM/สต็อกไม่เปลี่ยน
     const billDate = ymd(header.vendor_invoice_date || header.doc_date);
-    const termMonths = Number(vendorRow.rows[0]?.credit_term_months) || 0;
-    const termDays = Number(vendorRow.rows[0]?.credit_term_days) || 0;
+    // ระยะเครดิต: ใบสั่งซื้อที่อ้างอิง (ถ้าระบุไว้) → ผู้ขาย
+    let termMonths = Number(vendorRow.rows[0]?.credit_term_months) || 0;
+    let termDays = Number(vendorRow.rows[0]?.credit_term_days) || 0;
+    if (header.ref_po_id) {
+        const po = (await client.query(`SELECT to_jsonb(p)->>'credit_term_months' AS m, to_jsonb(p)->>'credit_term_days' AS d
+                                         FROM po_transaction p WHERE p.id = $1`, [header.ref_po_id])).rows[0];
+        if (po && (po.m != null || po.d != null)) {
+            termMonths = Number(po.m) || 0;
+            termDays = Number(po.d) || 0;
+        }
+    }
     const dueDate = termMonths || termDays
         ? (await client.query(`SELECT ($1::date + make_interval(months => $2) + make_interval(days => $3))::date::text AS d`, [billDate, termMonths, termDays])).rows[0].d
         : null;
@@ -1374,6 +1383,10 @@ const postApBillFromGrn = async (client, { header, details, docNo, vendorInvoice
     await setAutoDocDims(client, 'ap_transaction', apTransactionId, header);
     await client.query(`UPDATE ap_transaction SET tax_invoice_no = $1, tax_invoice_date = $2 WHERE id = $3`,
         [vendorInvoiceNo, billDate, apTransactionId]);
+    // ระยะเครดิตที่ใช้คำนวณวันครบกำหนด (แสดงในหน้าใบตั้งหนี้)
+    await client.query(`ALTER TABLE ap_transaction ADD COLUMN IF NOT EXISTS credit_term_months INTEGER, ADD COLUMN IF NOT EXISTS credit_term_days INTEGER`);
+    await client.query(`UPDATE ap_transaction SET credit_term_months = $1, credit_term_days = $2 WHERE id = $3`,
+        [termMonths || null, termDays || null, apTransactionId]);
 
     let lineNo = 1;
     for (const l of lineRows) {
