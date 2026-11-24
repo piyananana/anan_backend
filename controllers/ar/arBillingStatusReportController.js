@@ -71,11 +71,13 @@ const getBillingStatusReport = async (req, res) => {
                 bc.customer_id,
                 bc.customer_code,
                 bc.customer_name_th,
+                c.customer_name_en,
                 bc.total_amount_lc,
                 bc.balance_amount_lc,
                 bc.status,
                 d.doc_code,
                 d.doc_name_thai,
+                d.doc_name_eng,
                 d.sys_doc_type
             FROM ar_transaction bc
             JOIN sa_module_document d ON d.id = bc.doc_id
@@ -100,6 +102,7 @@ const getBillingStatusReport = async (req, res) => {
                 inv.balance_amount_lc AS inv_balance,
                 ta.applied_amount_lc AS applied_amount,
                 inv_d.doc_name_thai AS inv_doc_name,
+                inv_d.doc_name_eng  AS inv_doc_name_eng,
                 inv_d.sys_doc_type  AS inv_sys_doc_type
             FROM ar_transaction_apply ta
             JOIN ar_transaction inv       ON inv.id   = ta.applied_to_id
@@ -118,6 +121,7 @@ const getBillingStatusReport = async (req, res) => {
                 doc_date:       row.inv_doc_date,
                 ref_doc_no:     row.inv_ref_doc_no || '',
                 doc_name_thai:  row.inv_doc_name,
+                doc_name_eng:   row.inv_doc_name_eng || '',
                 sys_doc_type:   row.inv_sys_doc_type,
                 applied_amount: Number(row.applied_amount || 0),
                 inv_balance:    Number(row.inv_balance    || 0),
@@ -131,11 +135,13 @@ const getBillingStatusReport = async (req, res) => {
             customer_id:       bc.customer_id,
             customer_code:     bc.customer_code,
             customer_name_th:  bc.customer_name_th,
+            customer_name_en:  bc.customer_name_en || '',
             total_amount_lc:   Number(bc.total_amount_lc   || 0),
             balance_amount_lc: Number(bc.balance_amount_lc || 0),
             status:            bc.status,
             doc_code:          bc.doc_code,
             doc_name_thai:     bc.doc_name_thai,
+            doc_name_eng:      bc.doc_name_eng || '',
             sys_doc_type:      bc.sys_doc_type,
             invoices:          invMap.get(bc.bc_id) || [],
         }));
