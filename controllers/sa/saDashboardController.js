@@ -89,4 +89,65 @@ const getDbSize = async (req, res) => {
     }
 };
 
-module.exports = { getStats, getDbSize };
+// GET /api/sa/dashboard/home_kpi — แถวตัวเลขสรุปบนหน้าแรก (งานรออนุมัตินับฝั่ง Flutter จากรายการกระดิ่ง)
+//   my_drafts: เอกสารร่างที่ผู้ใช้ (header UserId/UserName) สร้าง แยกตามโมดูล
+//   so_pending: ใบสั่งขายที่ยังส่งไม่ครบ (Approved / PartiallyDelivered)
+//   po_pending: ใบสั่งซื้อที่ยังรับไม่ครบ (Approved / PartiallyReceived)
+//   mo_active: ใบสั่งผลิตที่กำลังผลิต (Released / InProgress)
+// ตารางที่ยังไม่มีในฐานข้อมูลนั้น (โมดูลยังไม่เคยใช้) นับเป็น 0
+const getHomeKpi = async (req, res) => {
+    const pool = req.dbPool;
+    const userId = parseInt(req.headers['userid'], 10) || 0;
+    const userName = req.headers['username'] || '';
+    const exists = async (t) => (await pool.query(`SELECT to_regclass($1) IS NOT NULL AS ok`, [t])).rows[0].ok;
+    const count = async (sql, params) => {
+        try { return (await pool.query(sql, params)).rows[0]; } catch (e) { console.error('home_kpi:', e.message); return null; }
+    };
+    try {
+        // created_by: gl_entry_header เก็บ id ผู้ใช้, ตารางอื่นเก็บชื่อผู้ใช้ (บางที่อาจเก็บ id เป็นข้อความ)
+        const draftTables = [
+            ['GL', 'gl_entry_header', true], ['AR', 'ar_transaction'], ['AP', 'ap_transaction'],
+            ['IM', 'im_transaction'], ['CM', 'cm_transaction'], ['PO', 'pr_transaction'], ['PO', 'po_transaction'],
+            ['SO', 'quote_transaction'], ['SO', 'so_transaction'], ['MO', 'mo_header'],
+        ];
+        const byModule = {};
+        let drafts = 0;
+        for (const [mod, table, byId] of draftTables) {
+            if (!(await exists(table))) continue;
+            const r = byId
+                ? await count(`SELECT COUNT(*)::int n FROM ${table} WHERE status = 'Draft' AND created_by = $1`, [userId])
+                : await count(`SELECT COUNT(*)::int n FROM ${table} WHERE status = 'Draft' AND created_by IN ($1, $2)`, [userName, String(userId)]);
+            const n = r?.n || 0;
+            if (n) byModule[mod] = (byModule[mod] || 0) + n;
+            drafts += n;
+        }
+
+        const zero = { total: 0, partial: 0 };
+        const so = (await exists('so_transaction'))
+            ? (await count(`SELECT COUNT(*)::int total, COUNT(*) FILTER (WHERE status = 'PartiallyDelivered')::int partial
+                            FROM so_transaction WHERE status IN ('Approved', 'PartiallyDelivered')`)) || zero
+            : zero;
+        const po = (await exists('po_transaction'))
+            ? (await count(`SELECT COUNT(*)::int total, COUNT(*) FILTER (WHERE status = 'PartiallyReceived')::int partial
+                            FROM po_transaction WHERE status IN ('Approved', 'PartiallyReceived')`)) || zero
+            : zero;
+        const mo = (await exists('mo_header'))
+            ? (await count(`SELECT COUNT(*)::int total,
+                                   COUNT(*) FILTER (WHERE status = 'InProgress')::int in_progress,
+                                   COUNT(*) FILTER (WHERE status = 'Released')::int released
+                            FROM mo_header WHERE status IN ('Released', 'InProgress')`)) || { total: 0, in_progress: 0, released: 0 }
+            : { total: 0, in_progress: 0, released: 0 };
+
+        res.json({
+            my_drafts: { total: drafts, by_module: byModule },
+            so_pending: so,
+            po_pending: po,
+            mo_active: mo,
+        });
+    } catch (err) {
+        console.error('getHomeKpi error:', err);
+        res.status(500).json({ error: err.message });
+    }
+};
+
+module.exports = { getStats, getDbSize, getHomeKpi };

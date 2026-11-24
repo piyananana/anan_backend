@@ -19,6 +19,8 @@ const saUserMenuController = require('../controllers/sa/saUserMenuController');
 const saModuleApproverController = require('../controllers/sa/saModuleApproverController');
 const saSmtpConfigController     = require('../controllers/sa/saSmtpConfigController');
 const saDashboardController      = require('../controllers/sa/saDashboardController');
+const saFavoriteMenuController   = require('../controllers/sa/saFavoriteMenuController');
+const saLoginBrandingController  = require('../controllers/sa/saLoginBrandingController');
 const saUserAuditLogController   = require('../controllers/sa/saUserAuditLogController');
 const saSystemResetController = require('../controllers/sa/saSystemResetController');
 const saAttachmentController     = require('../controllers/sa/saAttachmentController');
@@ -199,6 +201,30 @@ router.put('/sa_smtp_config',  saSmtpConfigController.upsertConfig);
 // For saDashboardController
 router.get('/dashboard/stats',   saDashboardController.getStats);
 router.get('/dashboard/db_size', saDashboardController.getDbSize);
+router.get('/dashboard/home_kpi', saDashboardController.getHomeKpi);
+
+// เมนูโปรดของผู้ใช้ (หน้าหลัก)
+router.get('/sa_favorite_menu', saFavoriteMenuController.getFavorites);
+router.put('/sa_favorite_menu', saFavoriteMenuController.saveFavorites);
+
+// ตั้งค่าหน้าล็อกอิน (ใช้ร่วมทุกฐานข้อมูล) — GET สาธารณะ, PUT เฉพาะผู้พัฒนาระบบ; โลโก้ ≤ 1MB (ตรวจใน controller), พื้นหลัง ≤ 3MB
+saLoginBrandingController.ensureDirs();
+const brandingUpload = multer({
+    storage: multer.diskStorage({
+        destination: (req, file, cb) => cb(null, saLoginBrandingController.IMAGE_DIR),
+        filename: (req, file, cb) => cb(null, `login_${file.fieldname === 'logo' ? 'logo' : 'bg'}_${Date.now()}${path.extname(file.originalname).toLowerCase()}`),
+    }),
+    limits: { fileSize: 3 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+        if (!['image/jpeg', 'image/png'].includes(file.mimetype)) return cb(new Error('Only PNG or JPG images are allowed.'), false);
+        cb(null, true);
+    },
+}).fields([{ name: 'logo', maxCount: 1 }, { name: 'background', maxCount: 1 }]);
+router.get('/login_branding', saLoginBrandingController.getBranding);
+router.put('/login_branding', saAuthController.requireDeveloper, (req, res, next) => brandingUpload(req, res, (err) => {
+    if (err) return res.status(400).json({ message: err.code === 'LIMIT_FILE_SIZE' ? 'ไฟล์ใหญ่เกิน 3 MB' : err.message });
+    next();
+}), saLoginBrandingController.saveBranding);
 
 // For saUserAuditLogController
 router.get('/user_audit_log',              saAuthController.injectUserRole, saUserAuditLogController.getList);
