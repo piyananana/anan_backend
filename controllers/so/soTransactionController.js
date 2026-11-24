@@ -108,7 +108,18 @@ const ensureSoTransactionTable = async (client) => {
             ADD COLUMN IF NOT EXISTS customer_po_date DATE`);
     // ราคารวม VAT / ส่วนลด % / VAT ต่อบรรทัด (user-approved 2026-10-31) — total_value_lc = หลังส่วนลด ก่อน VAT
     await ensureSoPriceColumns(client);
+    // ระยะเครดิต (เดือน/วัน) ของใบสั่งขาย — ค่าเริ่มต้นจากลูกค้า แก้ได้ (แบบ AR/PO); ใบส่งสินค้าที่ดึงรายการใช้ค่านี้
+    await client.query(`ALTER TABLE so_transaction ADD COLUMN IF NOT EXISTS credit_term_months INTEGER, ADD COLUMN IF NOT EXISTS credit_term_days INTEGER`);
 };
+// ระยะเครดิต: จำนวนเต็มไม่ติดลบ, ว่าง = null
+const termInt = (v) => {
+    if (v === null || v === undefined || v === '') return null;
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) && n >= 0 ? n : null;
+};
+const saveSoCreditTerm = (client, id, header) => client.query(
+    `UPDATE so_transaction SET credit_term_months=$1, credit_term_days=$2 WHERE id=$3`,
+    [termInt(header.credit_term_months), termInt(header.credit_term_days), id]);
 
 // บันทึกบรรทัด/ยอดรวม: helper ร่วมของใบสั่งใน utils/vatCalc.js (ใบเสนอราคาใช้ร่วม, qty = จำนวน)
 const soLineValues = orderLineValues;
@@ -141,9 +152,12 @@ const fetchRowById = async (pool, id) => {
     if (hRes.rows.length === 0) return null;
     const dRes = await pool.query(`
         SELECT dt.*, u.uom_code, u.uom_name_th, u.uom_name_en,
-               ${soDeliveredSql('dt')} AS qty_delivered
+               ${soDeliveredSql('dt')} AS qty_delivered,
+               qh.id AS ref_quote_id, qh.doc_no AS ref_quote_doc_no
         FROM so_transaction_detail dt
         LEFT JOIN im_uom u ON u.id = dt.uom_id
+        LEFT JOIN quote_transaction_detail qd ON qd.id = dt.ref_quote_detail_id
+        LEFT JOIN quote_transaction qh ON qh.id = qd.header_id
         WHERE dt.header_id = $1 ORDER BY dt.line_no`, [id]);
     await ensureDocSalesperson(pool);
     const salespersons = await loadSalespersons(pool, 'so_transaction_salesperson', 'header_id', id);
@@ -256,6 +270,7 @@ const createTransaction = async (req, res) => {
             (header.customer_po_no || '').trim() || null, header.customer_po_date || null, header.price_includes_vat === true,
         ]);
         const headerId = hRes.rows[0].id;
+        await saveSoCreditTerm(client, headerId, header);
         await normalizeSoLines(client, details);
         // ส่วนลดขั้นบันได + เงินของรายการ + ท้ายบิล (% และเงินสด) ปันเข้ารายการ — ยอดบรรทัดคิดจาก discount_amount
         applyOrderSalesDiscounts(header, details, d => d.qty_ordered);
@@ -338,7 +353,7 @@ const updateTransaction = async (req, res) => {
                 doc_date=$1, customer_id=$2, customer_code=$3, customer_name_th=$4, warehouse_id=$5,
                 currency_id=$6, currency_code=$7, exchange_rate=$8, due_date=$9, description=$10,
                 dim1_id=$11, dim2_id=$12, dim3_id=$13, dim4_id=$14, dim5_id=$15, branch_id=$16,
-                updated_by=$17, updated_at=NOW(), customer_po_no=$19, customer_po_date=$20, price_includes_vat=$21
+                updated_by=$17, updated_at=NOW(), customer_po_no=$19, customer_po_date=$20, price_includes_vat=$21, ref_quote_id=$22
             WHERE id=$18
         `, [
             header.doc_date, header.customer_id, customer.customer_code, customer.customer_name_th, header.warehouse_id,
@@ -346,8 +361,9 @@ const updateTransaction = async (req, res) => {
             header.due_date || null, header.description || null,
             header.dim1_id || null, header.dim2_id || null, header.dim3_id || null, header.dim4_id || null, header.dim5_id || null,
             header.branch_id || null, header.updated_by || null, id,
-            (header.customer_po_no || '').trim() || null, header.customer_po_date || null, header.price_includes_vat === true,
+            (header.customer_po_no || '').trim() || null, header.customer_po_date || null, header.price_includes_vat === true, header.ref_quote_id || null,
         ]);
+        await saveSoCreditTerm(client, id, header);
 
         await normalizeSoLines(client, details);
         applyOrderSalesDiscounts(header, details, d => d.qty_ordered);
