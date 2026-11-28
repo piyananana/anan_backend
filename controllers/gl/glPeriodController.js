@@ -216,7 +216,10 @@ const deleteHeaderRow = async (req, res) => {
     const { id } = req.params;
     try {
         // เนื่องจาก gl_posting_period มี ON DELETE CASCADE หากลบปีงบประมาณ 
-        // รอบบัญชีที่เกี่ยวข้องจะถูกลบตามไปด้วย
+        // รอบบัญชีที่เกี่ยวข้องจะถูกลบตามไปด้วย — ปีที่มีรายการบัญชีแล้วลบไม่ได้ (2026-11-28)
+        const used = await req.dbPool.query(`
+            SELECT 1 FROM gl_entry_header h JOIN gl_posting_period p ON p.id = h.period_id WHERE p.fiscal_year_id = $1 LIMIT 1`, [id]);
+        if (used.rows.length) return res.status(409).json({ message: 'ลบไม่ได้: ปีบัญชีนี้มีรายการบัญชีแล้ว' });
         const result = await req.dbPool.query('DELETE FROM gl_fiscal_year WHERE id = $1 RETURNING id', [id]);
         
         if (result.rows.length === 0) {

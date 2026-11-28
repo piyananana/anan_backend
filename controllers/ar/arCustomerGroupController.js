@@ -1,9 +1,11 @@
 // controllers/ar/arCustomerGroupController.js
+const { firstFreeCode } = require('./arCustomerRunningController');
 
 const GROUP_SELECT = `
     SELECT g.*,
            a.account_code  AS gl_account_code,
-           a.account_name_thai AS gl_account_name_thai
+           a.account_name_thai AS gl_account_name_thai,
+           (SELECT COUNT(*) FROM ar_customer c WHERE c.customer_group_id = g.id)::int AS customer_count
     FROM ar_customer_group g
     LEFT JOIN gl_account a ON a.id = g.gl_account_id
 `;
@@ -24,9 +26,10 @@ const formatGroupCode = (g) => {
         }
     }
     if (g.running_separator) code += g.running_separator;
-    code += g.running_next_number.toString().padStart(g.running_length, '0');
+    code += Number(g.running_next_number).toString().padStart(g.running_length, '0');
     return code;
 };
+const groupFmtAt = (g) => (no) => formatGroupCode({ ...g, running_next_number: no });
 
 // Helper: fetch full group row (with conditions)
 const fetchGroupById = async (pool, id) => {
@@ -139,7 +142,18 @@ const previewGroupCode = async (req, res) => {
         if (!g.is_auto_number) {
             return res.status(400).json({ error: 'กลุ่มนี้ไม่ได้เปิดใช้รหัสอัตโนมัติ' });
         }
-        res.json({ customer_code: formatGroupCode(g) });
+        // 3 รหัสถัดไปที่จะออกจริง (ข้ามรหัสที่มีลูกค้าใช้แล้ว) + รหัสล่าสุดที่กลุ่มนี้ออก
+        const next = [];
+        let no = Number(g.running_next_number) || 1;
+        for (let i = 0; i < 3; i++) {
+            const f = await firstFreeCode(req.dbPool, groupFmtAt(g), no);
+            next.push(f.code);
+            no = f.no + 1;
+        }
+        const last = await req.dbPool.query(
+            `SELECT customer_code FROM ar_customer WHERE customer_group_id = $1 AND COALESCE(is_code_auto_generated, false)
+              ORDER BY created_at DESC NULLS LAST, id DESC LIMIT 1`, [id]).catch(() => ({ rows: [] }));
+        res.json({ customer_code: next[0], next_codes: next, last_code: last.rows[0]?.customer_code || null });
     } catch (err) {
         console.error('Error previewing group code:', err);
         res.status(500).json({ error: 'Internal server error' });
@@ -359,10 +373,10 @@ const generateNextCodeForGroup = async (client, groupId) => {
     );
     if (result.rows.length === 0 || !result.rows[0].is_auto_number) return null;
     const g = result.rows[0];
-    const code = formatGroupCode(g);
+    const { code, no } = await firstFreeCode(client, groupFmtAt(g), g.running_next_number);
     await client.query(
-        `UPDATE ar_customer_group SET running_next_number = running_next_number + 1 WHERE id = $1`,
-        [groupId]
+        `UPDATE ar_customer_group SET running_next_number = $2 WHERE id = $1`,
+        [groupId, no + 1]
     );
     return code;
 };

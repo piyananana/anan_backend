@@ -49,6 +49,14 @@ const upsert = async (req, res) => {
         return res.status(400).json({ error: 'slot_no, type_code, name_thai required' });
     }
     try {
+        // รหัสเดิมที่มีค่ามิติหรือบัญชีอ้างอยู่แล้ว เปลี่ยนไม่ได้ (ค่า/กฎบัญชีอ้างด้วย type_code)
+        const cur = (await req.dbPool.query(`SELECT type_code FROM gl_dimension_type WHERE slot_no = $1`, [slot_no])).rows[0];
+        if (cur && cur.type_code !== type_code) {
+            const used = (await req.dbPool.query(`
+                SELECT EXISTS (SELECT 1 FROM gl_dimension_value WHERE type_code = $1)
+                    OR EXISTS (SELECT 1 FROM gl_account_dim_rule WHERE type_code = $1) AS used`, [cur.type_code])).rows[0].used;
+            if (used) return res.status(409).json({ error: `เปลี่ยนรหัส ${cur.type_code} ไม่ได้ เพราะมีค่ามิติหรือบัญชีที่อ้างอยู่แล้ว` });
+        }
         const result = await req.dbPool.query(`
             INSERT INTO gl_dimension_type (slot_no, type_code, name_thai, name_eng, is_active, sort_order, updated_at)
             VALUES ($1, $2, $3, $4, $5, $6, NOW())

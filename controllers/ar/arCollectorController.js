@@ -2,7 +2,9 @@
 
 const COLLECTOR_SELECT = `
   SELECT ac.*,
-         br.branch_name_thai
+         br.branch_name_thai,
+         (SELECT COUNT(*) FROM ar_customer c WHERE c.billing_collector_id = ac.id)::int    AS billing_customer_count,
+         (SELECT COUNT(*) FROM ar_customer c WHERE c.collection_collector_id = ac.id)::int AS collection_customer_count
     FROM ar_collector ac
     LEFT JOIN cd_branch br ON ac.branch_id = br.id
 `;

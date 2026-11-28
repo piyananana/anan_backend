@@ -26,14 +26,17 @@ const arYearEndSetupController   = require('../controllers/ar/arYearEndSetupCont
 const arPreCloseCheckController  = require('../controllers/ar/arPreCloseCheckController');
 const arFxRevaluationController  = require('../controllers/ar/arFxRevaluationController');
 const arAllowanceRunController   = require('../controllers/ar/arAllowanceRunController');
+const arCustomerToolsController  = require('../controllers/ar/arCustomerToolsController');
 
 // Router สำหรับตั้งค่ารหัสลูกหนี้อัตโนมัติ
+router.get('/ar_customer_running/summary', arCustomerRunningController.getSummary);
 router.get('/ar_customer_running/preview_code', arCustomerRunningController.previewCode);
 router.get('/ar_customer_running', arCustomerRunningController.fetchConfig);
 router.post('/ar_customer_running', arCustomerRunningController.saveConfig);
 
 // Router สำหรับจัดการข้อมูลผู้วางบิล/รับชำระ
 router.get('/ar_collector', arCollectorController.fetchRows);
+router.get('/ar_collector/:id/summary', arCustomerToolsController.fetchCollectorSummary);
 router.get('/ar_collector/:id', arCollectorController.fetchRow);
 router.post('/ar_collector', arCollectorController.addRow);
 router.put('/ar_collector/:id', arCollectorController.updateRow);
@@ -42,6 +45,7 @@ router.delete('/ar_collector/:id', arCollectorController.deleteRow);
 // Router สำหรับจัดการข้อมูลกลุ่มลูกค้า
 router.get('/ar_customer_group/active', arCustomerGroupController.fetchActiveRows);
 router.get('/ar_customer_group', arCustomerGroupController.fetchRows);
+router.get('/ar_customer_group/:id/summary', arCustomerToolsController.fetchGroupSummary);
 router.get('/ar_customer_group/:id/preview_code', arCustomerGroupController.previewGroupCode);
 router.get('/ar_customer_group/:id', arCustomerGroupController.fetchRow);
 router.post('/ar_customer_group', arCustomerGroupController.addRow);
@@ -62,6 +66,8 @@ router.post('/ar_customer_balance/import/validate', arCustomerBalanceImportContr
 router.post('/ar_customer_balance/import/confirm', arCustomerBalanceImportController.confirmImport);
 
 // Router สำหรับจัดการข้อมูลลูกหนี้การค้า
+router.get('/ar_customer/balances', arCustomerToolsController.fetchBalances);
+router.get('/ar_customer/:id/summary', arCustomerToolsController.fetchSummary);
 router.get('/ar_customer', arCustomerController.fetchRows);
 router.get('/ar_customer/:id', arCustomerController.fetchRow);
 router.post('/ar_customer', arCustomerController.addRow);
@@ -112,6 +118,7 @@ router.post('/ar_gl_account_setup/:doc_code', rejectHeaderAccounts, arGlAccountS
 
 // ── AR Year-End Closing ────────────────────────────────────────────────────────
 // Setup & Allowance Rules
+router.get('/ar_year_end_setup/summary', arCustomerToolsController.fetchYearEndSummary);
 router.get('/ar_year_end_setup',    arYearEndSetupController.fetchSetup);
 router.put('/ar_year_end_setup',    rejectHeaderAccounts, arYearEndSetupController.upsertSetup);
 router.get('/ar_allowance_rule',    arYearEndSetupController.fetchAllowanceRules);

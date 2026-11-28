@@ -231,6 +231,17 @@ const updateRow = async (req, res) => {
         }
 
         await client.query('BEGIN');
+        // บัญชีที่มีรายการลงบัญชีแล้ว: เปลี่ยนประเภทบัญชี หรือเปลี่ยนเป็นหัวบัญชีไม่ได้ (ยอดเดิมจะผิดงบ/ลงรายการไม่ได้)
+        const cur = (await client.query(`SELECT account_type, is_normal_account,
+                EXISTS (SELECT 1 FROM gl_entry_detail WHERE account_id = $1) OR EXISTS (SELECT 1 FROM gl_balance_accum WHERE account_id = $1) AS posted
+              FROM gl_account WHERE id = $1`, [id])).rows[0];
+        if (cur && cur.posted && (cur.account_type !== account_type || (cur.is_normal_account && is_normal_account === false))) {
+            await client.query('ROLLBACK');
+            await unlock(req, id, userId);
+            return res.status(409).json({ message: cur.account_type !== account_type
+                ? 'เปลี่ยนประเภทบัญชีไม่ได้ เพราะบัญชีนี้มีรายการลงบัญชีแล้ว'
+                : 'เปลี่ยนเป็นหัวบัญชีไม่ได้ เพราะบัญชีนี้มีรายการลงบัญชีแล้ว' });
+        }
         const result = await client.query(
             `UPDATE gl_account SET
                 account_code = $1,

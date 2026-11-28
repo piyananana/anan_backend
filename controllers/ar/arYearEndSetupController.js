@@ -93,6 +93,21 @@ const fetchAllowanceRules = async (req, res) => {
 const saveAllowanceRules = async (req, res) => {
     const rules = req.body; // array of { age_from_days, age_to_days, rate, sort_order, is_active }
     if (!Array.isArray(rules)) return res.status(400).json({ error: 'Expected array' });
+    // ช่วงอายุหนี้ที่ใช้งานต้องไม่ทับกัน (user 2026-11-28) — ทับกันแล้วระบบใช้ช่วงแรกที่เข้าตามลำดับ ทำให้อัตราที่ตั้งไม่ตรงที่เห็น
+    const act = rules.filter(r => r.is_active !== false)
+        .map(r => ({ from: Number(r.age_from_days), to: r.age_to_days == null || r.age_to_days === '' ? Infinity : Number(r.age_to_days) }));
+    for (const r of act) {
+        if (!Number.isFinite(r.from) || r.from < 0 || r.to < r.from) {
+            return res.status(400).json({ error: 'ช่วงอายุหนี้ไม่ถูกต้อง (ถึงวัน ต้องไม่น้อยกว่า ตั้งแต่วัน)' });
+        }
+    }
+    for (let i = 0; i < act.length; i++) {
+        for (let j = i + 1; j < act.length; j++) {
+            if (act[i].from <= act[j].to && act[j].from <= act[i].to) {
+                return res.status(400).json({ error: 'ช่วงอายุหนี้ทับกัน — แก้ให้แต่ละช่วงไม่ซ้อนกันก่อนบันทึก' });
+            }
+        }
+    }
     const client = await req.dbPool.connect();
     try {
         await client.query('BEGIN');

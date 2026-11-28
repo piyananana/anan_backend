@@ -2,12 +2,14 @@
 const express = require('express');
 const router = express.Router();
 const glAccountController = require('../controllers/gl/glAccountController');
+const glAccountToolsController = require('../controllers/gl/glAccountToolsController');
 const glAccountImportController = require('../controllers/gl/glAccountImportController');
 const glOpeningBalanceImportController = require('../controllers/gl/glOpeningBalanceImportController');
 const glEntryController = require('../controllers/gl/glEntryController');
 const glFinancialReportEngineController = require('../controllers/gl/glFinancialReportEngineController');
 const glGeneralLedgerReportController = require('../controllers/gl/glGeneralLedgerReportController');
 const glPeriodController = require('../controllers/gl/glPeriodController');
+const glPeriodToolsController = require('../controllers/gl/glPeriodToolsController');
 const glTrialBalanceReportController = require('../controllers/gl/glTrialBalanceReportController');
 const glFinancialReportBuilderController = require('../controllers/gl/glFinancialReportBuilderController');
 const glFinancialReportTransferController = require('../controllers/gl/glFinancialReportTransferController');
@@ -19,6 +21,7 @@ const glIncomeStatementController = require('../controllers/gl/glIncomeStatement
 const glDailyTransactionController = require('../controllers/gl/glDailyTransactionController');
 const glDimensionTypeController = require('../controllers/gl/glDimensionTypeController');
 const glDimensionValueController = require('../controllers/gl/glDimensionValueController');
+const glDimensionToolsController = require('../controllers/gl/glDimensionToolsController');
 const glResetController = require('../controllers/gl/glResetController');
 
 // กำหนดที่เก็บไฟล์ชั่วคราวสำหรับอัปโหลด
@@ -29,6 +32,10 @@ const fileUpload = multer({ dest: 'public/gl/' });
 router.get('/gl_account', glAccountController.fetchRows);
 router.get('/gl_account/all', glAccountController.fetchAllRows);
 router.get('/gl_account/control_account', glAccountController.fetchRowsControlAccount);
+// หน้าจอผังบัญชีแบบใหม่ (2026-11-28): ยอดบนต้นไม้, สรุปบัญชี (ยอดรายงวด + ที่ตั้งค่าใช้บัญชี), ลากย้ายใต้หัวบัญชี
+router.get('/gl_account/balances', glAccountToolsController.fetchBalances);
+router.get('/gl_account/:id/summary', glAccountToolsController.fetchSummary);
+router.put('/gl_account/:id/move', glAccountToolsController.moveNode);
 router.post('/gl_account', glAccountController.addRow);
 router.put('/gl_account/:id', glAccountController.updateRow);
 router.delete('/gl_account/:id', glAccountController.deleteRow);
@@ -71,6 +78,9 @@ router.get('/gl_general_ledger', glGeneralLedgerReportController.getGeneralLedge
 router.get('/gl_report_beginning_balance', glGeneralLedgerReportController.getReportBeginningBalance);
 // Router สำหรับจัดการปีงบประมาณและรอบบัญชี
 router.get('/gl_fiscal_year', glPeriodController.fetchHeaderRows);
+// หน้าจอปีบัญชีแบบใหม่ (2026-11-28): เอกสาร Draft ต่องวด/โมดูล + สร้างปีบัญชีถัดไป
+router.post('/gl_fiscal_year/next', glPeriodToolsController.createNextYear);
+router.get('/gl_fiscal_year/:id/summary', glPeriodToolsController.fetchYearSummary);
 router.get('/gl_fiscal_year/:id', glPeriodController.fetchHeaderRowById);
 router.post('/gl_fiscal_year', glPeriodController.addHeaderRow);
 router.put('/gl_fiscal_year/:id', glPeriodController.updateHeaderRow);
@@ -130,17 +140,25 @@ router.delete('/gl_fin_report_col/:id', glFinancialReportBuilderController.delet
 
 // Router สำหรับ GL Dimension Framework
 router.get('/gl_dimension_type/active', glDimensionTypeController.fetchActiveRows);
+// หน้าจอประเภทมิติแบบใหม่ (2026-11-28): ตัวเลขต่อช่องบนการ์ดซ้าย + สรุปของช่องที่เลือก
+router.get('/gl_dimension_type/usage', glDimensionToolsController.fetchTypeUsage);
+router.get('/gl_dimension_type/:slot_no/summary', glDimensionToolsController.fetchTypeSummary);
 router.get('/gl_dimension_type', glDimensionTypeController.fetchRows);
 router.get('/gl_dimension_type/:slot_no', glDimensionTypeController.fetchRow);
 router.post('/gl_dimension_type', glDimensionTypeController.upsert);
 
 router.get('/gl_dimension_value', glDimensionValueController.fetchRows);
+// หน้าจอค่ามิติแบบต้นไม้ (2026-11-28): จำนวนบรรทัดต่อค่า, สรุปค่า (รวมค่าย่อย), ลากย้ายระดับ
+router.get('/gl_dimension_value/usage', glDimensionToolsController.fetchValueUsage);
+router.get('/gl_dimension_value/:id/summary', glDimensionToolsController.fetchValueSummary);
+router.put('/gl_dimension_value/:id/move', glDimensionToolsController.moveValue);
 router.get('/gl_dimension_value/:id', glDimensionValueController.fetchRow);
 router.post('/gl_dimension_value', glDimensionValueController.addRow);
 router.put('/gl_dimension_value/:id', glDimensionValueController.updateRow);
 router.delete('/gl_dimension_value/:id', glDimensionValueController.deleteRow);
 
 // Year-End Closing Config
+router.get('/gl_closing_config/summary', glClosingConfigController.fetchSummary); // หน้าจอตั้งค่าปิดบัญชีแบบใหม่ 2026-11-28
 router.get('/gl_closing_config', glClosingConfigController.getConfig);
 router.post('/gl_closing_config', glClosingConfigController.saveConfig);
 
