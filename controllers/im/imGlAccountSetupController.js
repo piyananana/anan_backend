@@ -290,4 +290,63 @@ const resolveReceiptDoc = async (client, imDocCode) => {
     return { id: row.t_id, doc_code: row.t_code };
 };
 
-module.exports = { ensureImGlAccountSetupTable, fetchRows, fetchRow, upsertRow, fetchSetupByDocCode, resolveTargetDoc, resolveReceiptDoc, DOC_TYPE_TARGET };
+// GET /im_gl_account_setup/:doc_code/summary?target_doc_id= — ข้อมูลประกอบหน้าตั้งค่า (redesign 2026-11-26)
+//   usage: จำนวนเอกสาร IM ที่ใช้ประเภทนี้ตามสถานะ + เอกสารล่าสุด
+//   fallback: ค่าที่ใช้เมื่อช่องในหน้านี้ว่าง — บัญชีสต็อก/ต้นทุนขาย = ค่าเริ่มต้นบริษัท (im_accounting_setting),
+//             VAT ซื้อ/ขาย = บัญชี VAT ของการตั้งค่าบัญชี AP/AR ของประเภทเอกสารปลายทาง (target_doc_id ที่เลือกอยู่ ยังไม่บันทึกก็ได้)
+const fetchSummary = async (req, res) => {
+    const { doc_code } = req.params;
+    const targetDocId = Number(req.query.target_doc_id) || null;
+    const client = await req.dbPool.connect();
+    try {
+        const exists = async (t) => !!(await client.query(`SELECT to_regclass($1) AS t`, [t])).rows[0].t;
+        const acct = async (id) => {
+            if (!id) return null;
+            const r = await client.query(`SELECT id, account_code, account_name_thai, account_name_eng FROM gl_account WHERE id = $1`, [id]);
+            return r.rows[0] || null;
+        };
+
+        let usage = { total: 0, by_status: {}, last_doc: null };
+        if (await exists('im_transaction')) {
+            const r = await client.query(
+                `SELECT status, COUNT(*)::int AS n FROM im_transaction WHERE doc_code = $1 GROUP BY status`, [doc_code]);
+            for (const x of r.rows) { usage.by_status[x.status] = x.n; usage.total += x.n; }
+            const l = await client.query(`
+                SELECT doc_no, doc_date::text AS doc_date, status FROM im_transaction
+                 WHERE doc_code = $1 ORDER BY doc_date DESC, id DESC LIMIT 1`, [doc_code]);
+            usage.last_doc = l.rows[0] || null;
+        }
+
+        const company = (await exists('im_accounting_setting'))
+            ? (await client.query(`SELECT inventory_account_id, cogs_account_id FROM im_accounting_setting ORDER BY id LIMIT 1`)).rows[0] || {}
+            : {};
+
+        let targetVat = null;
+        if (targetDocId) {
+            const t = (await client.query(`SELECT doc_code, sys_module FROM sa_module_document WHERE id = $1`, [targetDocId])).rows[0];
+            if (t) {
+                const isAp = t.sys_module === '21';
+                const table = isAp ? 'ap_gl_account_setup' : 'ar_gl_account_setup';
+                const col = isAp ? 'vat_input_account_id' : 'vat_output_account_id';
+                if (await exists(table)) {
+                    const s = (await client.query(`SELECT ${col} AS v FROM ${table} WHERE doc_code = $1`, [t.doc_code])).rows[0];
+                    targetVat = { module: isAp ? 'AP' : 'AR', doc_code: t.doc_code, account: await acct(s?.v) };
+                }
+            }
+        }
+
+        res.status(200).json({
+            usage,
+            fallback: {
+                inventory: await acct(company.inventory_account_id),
+                cogs: await acct(company.cogs_account_id),
+                target_vat: targetVat,
+            },
+        });
+    } catch (error) {
+        console.error('Error fetching im_gl_account_setup summary:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    } finally { client.release(); }
+};
+
+module.exports = { ensureImGlAccountSetupTable, fetchRows, fetchRow, upsertRow, fetchSetupByDocCode, resolveTargetDoc, resolveReceiptDoc, DOC_TYPE_TARGET, fetchSummary };

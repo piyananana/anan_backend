@@ -1,5 +1,6 @@
 // routes/mo.js — Manufacturing Order (sys_module='61')
 const express = require('express');
+const { makeUsageSummary } = require('../utils/glSetupUsage');
 const router = express.Router();
 const moBomController = require('../controllers/mo/moBomController');
 const moWorkCenterController = require('../controllers/mo/moWorkCenterController');
@@ -53,6 +54,7 @@ router.put('/mo_header/:moId/time_logs/:logId/reverse', moHeaderController.rever
 
 // mo_gl_account_setup (บัญชีของประเภทเอกสารใบสั่งผลิต — WIP/ผลต่าง/ค่าแรงและโสหุ้ยที่ปันเข้างาน)
 router.get('/mo_gl_account_setup', moGlAccountSetupController.fetchRows);
+router.get('/mo_gl_account_setup/:doc_code/summary', makeUsageSummary('mo_header', 'mo_gl_account_setup'));
 router.post('/mo_gl_account_setup/:doc_code', rejectHeaderAccounts, moGlAccountSetupController.upsertRow);
 
 module.exports = router;

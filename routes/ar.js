@@ -1,6 +1,7 @@
 // routes/ar.js
 const express = require('express');
 const { rejectHeaderAccounts } = require('../utils/glAccountGuard');
+const { makeUsageSummary } = require('../utils/glSetupUsage');
 const router = express.Router();
 const arCustomerController = require('../controllers/ar/arCustomerController');
 const arCustomerGroupController = require('../controllers/ar/arCustomerGroupController');
@@ -105,6 +106,7 @@ router.post('/ar_bulk_billing',        arBulkBillingController.createBulkBilling
 
 // Router สำหรับตั้งค่ารหัสบัญชี GL ต่อ doc_code ของ AR
 router.get('/ar_gl_account_setup', arGlAccountSetupController.fetchRows);
+router.get('/ar_gl_account_setup/:doc_code/summary', makeUsageSummary('ar_transaction', 'ar_gl_account_setup'));
 router.get('/ar_gl_account_setup/:doc_code', arGlAccountSetupController.fetchRow);
 router.post('/ar_gl_account_setup/:doc_code', rejectHeaderAccounts, arGlAccountSetupController.upsertRow);
 

@@ -25,7 +25,13 @@ const fetchRows = async (req, res) => {
     const client = await req.dbPool.connect();
     try {
         await ensureImPriceGroupTable(client);
-        const result = await client.query(`SELECT * FROM im_price_group ORDER BY price_group_code`);
+        // with_usage=1 (หน้าจอกลุ่มราคา): จำนวนตารางราคาที่แปะกลุ่มนี้
+        const withUsage = ['1', 'true'].includes(String(req.query.with_usage || ''));
+        const hasList = withUsage && !!(await client.query(`SELECT to_regclass('public.im_price_list') AS t`)).rows[0].t;
+        const result = await client.query(hasList
+            ? `SELECT g.*, (SELECT COUNT(*)::int FROM im_price_list l WHERE l.price_group_id = g.id) AS price_list_count
+                 FROM im_price_group g ORDER BY g.price_group_code`
+            : `SELECT * FROM im_price_group ORDER BY price_group_code`);
         res.status(200).json(result.rows);
     } catch (error) {
         console.error('Error fetching im_price_group:', error);

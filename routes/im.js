@@ -37,11 +37,17 @@ const imConsignmentSettlementController = require('../controllers/im/imConsignme
 
 // im_gl_account_setup (per doc-type GL fallback, for the future im_transaction module)
 router.get('/im_gl_account_setup',           imGlAccountSetupController.fetchRows);
+router.get('/im_gl_account_setup/:doc_code/summary', imGlAccountSetupController.fetchSummary);
 router.get('/im_gl_account_setup/:doc_code', imGlAccountSetupController.fetchRow);
 router.post('/im_gl_account_setup/:doc_code', rejectHeaderAccounts, imGlAccountSetupController.upsertRow);
 
 // im_price_list (im_price_list + im_price_list_detail)
 router.get('/im_price_list',                     imPriceListController.fetchRows);
+// เครื่องมือหน้าจอตารางราคา (นำเข้าราคา / สินค้าที่ยังไม่มีราคา) — ต้องมาก่อน /:id
+const imPriceListToolsController = require('../controllers/im/imPriceListToolsController');
+router.get('/im_price_list/import/template/download', imPriceListToolsController.downloadTemplate);
+router.post('/im_price_list/import/parse',            imPriceListToolsController.parseFile);
+router.get('/im_price_list/:id/missing_items',        imPriceListToolsController.fetchMissingItems);
 router.get('/im_price_list/resolve_price',       imPriceListController.resolvePriceHandler); // ต้องมาก่อน /:id ด้านล่าง ไม่งั้น "resolve_price" จะถูกจับเป็นค่า :id
 router.get('/im_price_list/:id',                 imPriceListController.fetchRow);
 router.get('/im_price_list_detail/by_item/:itemId', imPriceListController.fetchByItem);
@@ -71,6 +77,7 @@ router.get('/im_price_change_report',            imPriceChangeReportController.f
 // im_warehouse
 router.get('/im_warehouse',        imWarehouseController.fetchRows);
 router.get('/im_warehouse/active', imWarehouseController.fetchActiveRows);
+router.get('/im_warehouse/:id/summary', require('../controllers/im/imWarehouseSummaryController').fetchSummary);
 router.get('/im_warehouse/:id',    imWarehouseController.fetchRow);
 router.post('/im_warehouse',       imWarehouseController.addRow);
 router.put('/im_warehouse/:id',    imWarehouseController.updateRow);
@@ -79,6 +86,8 @@ router.delete('/im_warehouse/:id', imWarehouseController.deleteRow);
 // im_location (ผังตำแหน่งจัดเก็บ — โซน/แถว/ช่องเก็บ ต่อคลังสินค้า)
 router.get('/im_location',        imLocationController.fetchRows);
 router.get('/im_location/active', imLocationController.fetchActiveRows);
+router.get('/im_location/:id/summary', require('../controllers/im/imLocationToolsController').fetchSummary);
+router.put('/im_location/:id/move',    require('../controllers/im/imLocationToolsController').moveNode);
 router.get('/im_location/:id',    imLocationController.fetchRow);
 router.post('/im_location',       imLocationController.addRow);
 router.put('/im_location/:id',    imLocationController.updateRow);
@@ -143,6 +152,7 @@ router.put('/im_transaction/:id/reverse_to_draft', imTransactionController.rever
 router.delete('/im_transaction/:id',     imTransactionController.deleteTransaction);
 
 // im_accounting_setting (โหมดบัญชีสินค้า PERPETUAL/PERIODIC ระดับบริษัท)
+router.get('/im_accounting_setting/summary', imAccountingSettingController.getSummary);
 router.get('/im_accounting_setting',  imAccountingSettingController.getSetting);
 router.put('/im_accounting_setting',  rejectHeaderAccounts, imAccountingSettingController.upsertSetting);
 
@@ -191,6 +201,7 @@ router.post('/im_stock_count/:id/import/confirm',  imStockCountController.import
 // im_uom
 router.get('/im_uom',        imUomController.fetchRows);
 router.get('/im_uom/active', imUomController.fetchActiveRows);
+router.get('/im_uom/:id/summary', require('../controllers/im/imUomSummaryController').fetchSummary);
 router.get('/im_uom/:id',    imUomController.fetchRow);
 router.post('/im_uom',       imUomController.addRow);
 router.put('/im_uom/:id',    imUomController.updateRow);
@@ -211,6 +222,8 @@ router.delete('/im_price_group/:id', imPriceGroupController.deleteRow);
 // im_item_category
 router.get('/im_item_category',        imItemCategoryController.fetchRows);
 router.get('/im_item_category/active', imItemCategoryController.fetchActiveRows);
+router.get('/im_item_category/:id/summary', require('../controllers/im/imItemCategoryToolsController').fetchSummary);
+router.put('/im_item_category/:id/move',    require('../controllers/im/imItemCategoryToolsController').moveNode);
 router.get('/im_item_category/:id',    imItemCategoryController.fetchRow);
 router.post('/im_item_category',       imItemCategoryController.addRow);
 router.put('/im_item_category/:id',    imItemCategoryController.updateRow);
@@ -225,6 +238,7 @@ router.post('/im_item/import/confirm',          imItemImportController.confirmIm
 // im_item
 router.get('/im_item',        imItemController.fetchRows);
 router.get('/im_item/:id/uoms', imItemController.fetchItemUoms);
+router.get('/im_item/:id/summary', require('../controllers/im/imItemSummaryController').fetchSummary);
 router.get('/im_item/:id',    imItemController.fetchRow);
 router.post('/im_item',       imItemController.addRow);
 router.put('/im_item/:id',    imItemController.updateRow);
@@ -232,6 +246,7 @@ router.delete('/im_item/:id', imItemController.deleteRow);
 
 // im_item_running (auto-numbering settings)
 router.get('/im_item_running/preview_code', imItemRunningController.previewCode);
+router.get('/im_item_running/summary',      imItemRunningController.getSummary);
 router.get('/im_item_running',              imItemRunningController.fetchConfig);
 router.post('/im_item_running',             imItemRunningController.saveConfig);
 

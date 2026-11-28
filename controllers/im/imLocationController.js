@@ -77,6 +77,12 @@ const fetchRows = async (req, res) => {
         if (warehouse_id) { params.push(warehouse_id); where += ` AND l.warehouse_id = $${params.length}`; }
         if (active !== undefined) { params.push(active === 'true'); where += ` AND l.is_active = $${params.length}`; }
         const result = await client.query(`${LOCATION_SELECT} ${where} ORDER BY l.level, l.location_code`, params);
+        // with_usage=1 (หน้าจอตำแหน่งจัดเก็บ): สินค้าที่มียอด / ตั้งเป็นตำแหน่งเริ่มต้น ต่อตำแหน่ง
+        if (['1', 'true'].includes(String(req.query.with_usage || ''))) {
+            const counts = await require('./imLocationToolsController').usageCounts(client, warehouse_id ? Number(warehouse_id) : null);
+            return res.status(200).json(result.rows.map(r => ({ ...r,
+                item_count: counts[r.id]?.item_count || 0, default_count: counts[r.id]?.default_count || 0 })));
+        }
         res.status(200).json(result.rows);
     } catch (error) {
         console.error('Error fetching im_location:', error);

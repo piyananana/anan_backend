@@ -1,6 +1,7 @@
 // routes/ap.js
 const express = require('express');
 const { rejectHeaderAccounts } = require('../utils/glAccountGuard');
+const { makeUsageSummary } = require('../utils/glSetupUsage');
 const router  = express.Router();
 
 const apVendorRunningController  = require('../controllers/ap/apVendorRunningController');
@@ -84,6 +85,7 @@ router.delete('/ap_vendor/:id', apVendorController.deleteRow);
 
 // ── GL Account Setup ───────────────────────────────────────────────────────
 router.get('/ap_gl_account_setup',            apGlAccountSetupController.fetchRows);
+router.get('/ap_gl_account_setup/:doc_code/summary', makeUsageSummary('ap_transaction', 'ap_gl_account_setup'));
 router.get('/ap_gl_account_setup/:doc_code',  apGlAccountSetupController.fetchRow);
 router.post('/ap_gl_account_setup/:doc_code', rejectHeaderAccounts, apGlAccountSetupController.upsertRow);
 

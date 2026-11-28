@@ -19,7 +19,8 @@ const ensureImItemRunningTable = async (client) => {
     `);
 };
 
-const formatItemCode = (config) => {
+// number = เลขรันที่จะใช้ (ไม่ระบุ = next_running_number)
+const formatItemCode = (config, number) => {
     let code = config.format_prefix || '';
     if (config.format_suffix_date) {
         const now = new Date();
@@ -35,7 +36,7 @@ const formatItemCode = (config) => {
         }
     }
     if (config.format_separator) code += config.format_separator;
-    code += config.next_running_number.toString().padStart(config.running_length, '0');
+    code += String(number ?? config.next_running_number).padStart(config.running_length, '0');
     return code;
 };
 
@@ -121,12 +122,98 @@ const generateNextCode = async (client) => {
     );
     if (result.rows.length === 0 || !result.rows[0].is_auto_numbering) return null;
     const config = result.rows[0];
-    const code = formatItemCode(config);
+    // ข้ามเลขที่ชนรหัสสินค้าที่มีอยู่แล้ว (เช่น ผู้ใช้ป้อนรหัสเองที่ตรงรูปแบบ) — ไม่งั้นบันทึกสินค้าใหม่ล้มด้วยรหัสซ้ำ
+    const num = await findFreeNumber(client, config, Number(config.next_running_number));
+    const code = formatItemCode(config, num);
     await client.query(
-        `UPDATE im_item_running SET next_running_number = next_running_number + 1 WHERE id = $1`,
-        [config.id]
+        `UPDATE im_item_running SET next_running_number = $2 WHERE id = $1`,
+        [config.id, num + 1]
     );
     return code;
 };
 
-module.exports = { ensureImItemRunningTable, fetchConfig, saveConfig, previewCode, generateNextCode };
+const MAX_SCAN = 10000;
+const codeExists = async (client, code) =>
+    (await client.query(`SELECT 1 FROM im_item WHERE UPPER(item_code) = UPPER($1) LIMIT 1`, [code])).rows.length > 0;
+
+// เลขรันแรกตั้งแต่ start ที่รหัสยังไม่มีในระบบ (สแกนสูงสุด MAX_SCAN เลข แล้วคืน start ถ้าหาไม่เจอ)
+const findFreeNumber = async (client, config, start) => {
+    const s = Math.max(1, Number(start) || 1);
+    const BATCH = 500;
+    for (let offset = 0; offset < MAX_SCAN; offset += BATCH) {
+        const batch = Array.from({ length: BATCH }, (_, i) => formatItemCode(config, s + offset + i).toUpperCase());
+        const used = new Set((await client.query(
+            `SELECT UPPER(item_code) AS c FROM im_item WHERE UPPER(item_code) = ANY($1::text[])`, [batch])).rows.map(r => r.c));
+        const i = batch.findIndex(c => !used.has(c));
+        if (i >= 0) return s + offset + i;
+    }
+    return s;
+};
+
+const escapeRe = (s) => String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const DATE_LEN = { YY: 2, YYYY: 4, YYMM: 4, YYYYMM: 6, YYMMDD: 6 };
+
+// GET /im_item_running/summary?prefix=&separator=&suffix_date=&length=&next= — ข้อมูลประกอบหน้าตั้งค่า (redesign 2026-11-26)
+// ค่าที่ส่งมาแทนค่าที่บันทึกไว้ (ดูผลของรูปแบบที่กำลังแก้ได้ก่อนบันทึก)
+//   next_codes: 4 รหัสที่จะออกจริงถัดไป (ข้ามรหัสที่มีอยู่แล้ว), collision: รหัสของเลขรันถัดไปมีอยู่แล้ว + เลขว่างถัดไป
+//   last_issued: สินค้าล่าสุดที่ออกรหัสอัตโนมัติตามรูปแบบนี้, categories: หมวดที่ออกรหัสเอง (ใช้แทนรูปแบบหน้านี้)
+const getSummary = async (req, res) => {
+    const client = await req.dbPool.connect();
+    try {
+        await ensureImItemRunningTable(client);
+        const saved = (await client.query(`SELECT * FROM im_item_running ORDER BY id LIMIT 1`)).rows[0] || {};
+        const q = req.query;
+        const config = {
+            format_prefix: q.prefix !== undefined ? String(q.prefix).toUpperCase() : (saved.format_prefix ?? 'ITEM'),
+            format_separator: q.separator !== undefined ? String(q.separator) : (saved.format_separator ?? '-'),
+            format_suffix_date: q.suffix_date !== undefined ? String(q.suffix_date) : (saved.format_suffix_date ?? ''),
+            running_length: Math.min(10, Math.max(1, Number(q.length ?? saved.running_length ?? 4) || 4)),
+            next_running_number: Math.max(1, Number(q.next ?? saved.next_running_number ?? 1) || 1),
+        };
+        const next = config.next_running_number;
+        const nextCode = formatItemCode(config, next);
+
+        let collision = null;
+        if (await codeExists(client, nextCode)) {
+            const it = (await client.query(
+                `SELECT item_code, item_name_th, item_name_en FROM im_item WHERE UPPER(item_code) = UPPER($1) LIMIT 1`, [nextCode])).rows[0];
+            collision = { code: nextCode, item_code: it.item_code, item_name_th: it.item_name_th, item_name_en: it.item_name_en,
+                next_free: await findFreeNumber(client, config, next) };
+        }
+
+        const nextCodes = [];
+        let n = collision ? collision.next_free : next;
+        while (nextCodes.length < 4) {
+            n = await findFreeNumber(client, config, n);
+            nextCodes.push(formatItemCode(config, n));
+            n += 1;
+        }
+
+        // รหัสล่าสุดที่ตรงรูปแบบ: คำนำหน้า + วันที่ (ตัวเลขตามความยาวของรูปแบบวันที่) + ตัวคั่น + เลขรัน
+        const dl = DATE_LEN[config.format_suffix_date] || 0;
+        const re = `^${escapeRe(config.format_prefix)}${dl ? `[0-9]{${dl}}` : ''}${escapeRe(config.format_separator)}[0-9]{${config.running_length},}$`;
+        const last = (await client.query(`
+            SELECT item_code, item_name_th, item_name_en, created_at FROM im_item
+             WHERE is_code_auto_generated = true AND UPPER(item_code) ~ $1
+             ORDER BY created_at DESC, id DESC LIMIT 1`, [re.toUpperCase()]).catch(() => ({ rows: [] }))).rows[0] || null;
+
+        const categories = (await client.query(`
+            SELECT c.id, c.category_code, c.category_name_th, c.category_name_en,
+                   c.running_prefix, c.running_separator, c.running_suffix_date, c.running_length, c.running_next_number,
+                   (SELECT COUNT(*)::int FROM im_item i WHERE i.category_id = c.id) AS item_count
+              FROM im_item_category c
+             WHERE c.is_auto_number = true
+             ORDER BY c.category_code`).catch(() => ({ rows: [] }))).rows.map(c => ({
+            ...c,
+            sample_code: formatItemCode({ format_prefix: c.running_prefix, format_separator: c.running_separator,
+                format_suffix_date: c.running_suffix_date, running_length: c.running_length, next_running_number: c.running_next_number }),
+        }));
+
+        res.status(200).json({ next_codes: nextCodes, collision, last_issued: last, categories });
+    } catch (error) {
+        console.error('Error fetching im_item_running summary:', error);
+        res.status(500).json({ message: 'Internal server error' });
+    } finally { client.release(); }
+};
+
+module.exports = { ensureImItemRunningTable, fetchConfig, saveConfig, previewCode, generateNextCode, getSummary };

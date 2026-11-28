@@ -3,6 +3,12 @@
 
 const xlsx = require('xlsx'); // Import xlsx
 
+// สีธีมของเมนู (user 2026-11-27): เก็บเป็นรหัสสี ไม่ใช่ hex — NULL = ตามเมนูแม่ (บนสุดไม่ตั้ง = teal)
+// ต้องตรงกับ ScreenTheme.themes ใน lib/sa/utils/sa_menu_theme.dart
+const THEME_KEYS = ['teal', 'blue', 'purple', 'slate', 'plum', 'brown', 'petrol', 'indigo', 'wine', 'forest'];
+const themeOrNull = (v) => (THEME_KEYS.includes(v) ? v : null);
+const ensureThemeColumn = (db) => db.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS theme_color VARCHAR(20)');
+
 // API เพื่อดึงรายการเมนูทั้งหมด (สำหรับสร้าง Tree View)
 // ไม่ต้องใช้ verifyToken เพราะเป็น public view
 const getAllMenu = async (req, res) => {
@@ -17,6 +23,7 @@ const getAllMenu = async (req, res) => {
         await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_description TEXT');
         await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_description_en TEXT');
         await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS no_approver_action VARCHAR(10) DEFAULT 'ALLOW'");
+        await ensureThemeColumn(req.dbPool);
 
         const isDeveloper = req.isDeveloper ?? false;
         // include_inactive=true — ใช้โดยหน้าจอจัดการเมนู (sa_menu_screen) เท่านั้น เพื่อให้ยังหาเมนูที่ถูกปิด
@@ -58,6 +65,7 @@ const getMenuByUserId = async (req, res) => {
             ALTER TABLE sa_user_menu ADD COLUMN IF NOT EXISTS can_export  BOOLEAN DEFAULT FALSE;
         `);
 
+        await ensureThemeColumn(req.dbPool);
         // Look up target user's role
         const userRole = await req.dbPool.query('SELECT user_type FROM sa_user WHERE id = $1', [userId]);
         const targetIsDeveloper = userRole.rows[0]?.user_type === 'developer';
@@ -168,8 +176,9 @@ const getMenuContentById = async (req, res) => {
 
 // API สำหรับเพิ่มเมนูใหม่
 const createMenu = async (req, res) => {
-    const { parent_id, menu_name, menu_name_en, menu_type, target_path, sort_order, is_system, content_type, content_data, requires_approval } = req.body;
+    const { parent_id, menu_name, menu_name_en, menu_type, target_path, sort_order, is_system, content_type, content_data, requires_approval, theme_color } = req.body;
     try {
+        await ensureThemeColumn(req.dbPool);
         await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS menu_name_en TEXT DEFAULT ''");
         await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS requires_approval BOOLEAN DEFAULT FALSE');
         await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL'");
@@ -189,10 +198,10 @@ const createMenu = async (req, res) => {
         // ไม่ได้ตั้งค่าที่นี่ (หน้าจอจัดการเมนู) — ใช้ค่า default ของคอลัมน์แล้วไปตั้งค่าจริง
         // ที่หน้าจอ sa_module_approver_screen ผ่าน endpoint /sa_menu/:id/approval_config แทน
         const menuResult = await req.dbPool.query(
-            `INSERT INTO sa_menu (parent_id, menu_name, menu_name_en, menu_type, target_path, sort_order, is_active, is_system, requires_approval)
-             VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $8) RETURNING *`,
+            `INSERT INTO sa_menu (parent_id, menu_name, menu_name_en, menu_type, target_path, sort_order, is_active, is_system, requires_approval, theme_color)
+             VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $8, $9) RETURNING *`,
             [parent_id, menu_name, menu_name_en ?? '', menu_type, target_path, actual_sort_order, is_system ?? false,
-             requires_approval ?? false]
+             requires_approval ?? false, themeOrNull(theme_color)]
         );
         const newMenu = menuResult.rows[0];
 
@@ -215,8 +224,9 @@ const createMenu = async (req, res) => {
 // API สำหรับแก้ไขเมนู
 const updateMenu = async (req, res) => {
     const { id } = req.params;
-    const { menu_name, menu_name_en, menu_type, target_path, sort_order, is_active, is_system, content_type, content_data, requires_approval } = req.body;
+    const { menu_name, menu_name_en, menu_type, target_path, sort_order, is_active, is_system, content_type, content_data, requires_approval, theme_color } = req.body;
     try {
+        await ensureThemeColumn(req.dbPool);
         await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS menu_name_en TEXT DEFAULT ''");
         await req.dbPool.query('ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS requires_approval BOOLEAN DEFAULT FALSE');
         await req.dbPool.query("ALTER TABLE sa_menu ADD COLUMN IF NOT EXISTS approval_mode VARCHAR(10) DEFAULT 'ALL'");
@@ -236,10 +246,11 @@ const updateMenu = async (req, res) => {
                 is_active = $6,
                 is_system = $7,
                 requires_approval = $8,
+                theme_color = $10,
                 updated_at = CURRENT_TIMESTAMP
              WHERE id = $9 RETURNING *`,
             [menu_name, menu_name_en ?? '', menu_type, target_path, sort_order, is_active, is_system ?? false,
-             requires_approval ?? false, id]
+             requires_approval ?? false, id, themeOrNull(theme_color)]
         );
 
         if (menuResult.rows.length === 0) {
@@ -459,6 +470,7 @@ const importMenu = async (req, res) => {
         const jsonData = xlsx.utils.sheet_to_json(worksheet);
 
         client = await req.dbPool.connect();
+        await ensureThemeColumn(client);
 
         await client.query('BEGIN'); // เริ่ม transaction
 
@@ -479,6 +491,9 @@ const importMenu = async (req, res) => {
                 }
 
                 const menuName = row.menuName;
+                const menuNameEn = row.menuNameEn ? String(row.menuNameEn) : '';
+                const themeColor = themeOrNull(row.themeColor ? String(row.themeColor).trim() : null);
+                const isSystem = String(row.isSystem).toLowerCase() === 'true';
                 const menuType = row.menuType;
                 const targetPath = (row.targetPath === undefined || String(row.targetPath).trim() === '' || String(row.targetPath).trim().toLowerCase() === 'null') ? null : String(row.targetPath);
 
@@ -505,9 +520,9 @@ const importMenu = async (req, res) => {
 
                 // เพิ่มเมนู
                 const menuInsertResult = await client.query(
-                    `INSERT INTO sa_menu (parent_id, menu_name, menu_type, target_path, sort_order, is_active)
-                     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-                    [parentId, menuName, menuType, targetPath, sortOrder, isActive]
+                    `INSERT INTO sa_menu (parent_id, menu_name, menu_type, target_path, sort_order, is_active, menu_name_en, theme_color, is_system)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+                    [parentId, menuName, menuType, targetPath, sortOrder, isActive, menuNameEn, themeColor, isSystem]
                 );
                 const newMenu = menuInsertResult.rows[0];
 
@@ -564,10 +579,13 @@ const exportMenu = async (req, res) => {
                 id: menu.id,
                 parentId: menu.parent_id,
                 menuName: menu.menu_name,
+                menuNameEn: menu.menu_name_en ?? '',
                 menuType: menu.menu_type,
                 targetPath: menu.target_path,
                 sortOrder: menu.sort_order,
                 isActive: menu.is_active,
+                isSystem: menu.is_system ?? false,
+                themeColor: menu.theme_color ?? null,
                 contentType: content ? content.content_type : null,
                 contentData: content ? content.content_data : null,
             };
@@ -591,7 +609,87 @@ const exportMenu = async (req, res) => {
     }
 };
 
+// GET /sa_menu/:id/summary — ตัวเลขสรุปของหน้าจอจัดการเมนู (redesign 2026-11-27)
+//   เมนู: กลุ่มผู้ใช้ที่มีสิทธิ์ (สิทธิ์แต่ละข้อ + จำนวนสมาชิก), ผู้ใช้ที่มีสิทธิ์ (sa_user_menu), จำนวนที่เพิ่มเป็นเมนูโปรด
+//   โฟลเดอร์: นับจากทุกเมนูใต้โฟลเดอร์ (กลุ่ม/ผู้ใช้ที่เห็นอย่างน้อย 1 เมนูข้างใน)
+const getMenuSummary = async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ message: 'Invalid menu id.' });
+    const client = await req.dbPool.connect();
+    try {
+        const exists = async (t) => !!(await client.query('SELECT to_regclass($1) AS t', [t])).rows[0].t;
+        const ids = (await client.query(`
+            WITH RECURSIVE sub AS (SELECT id FROM sa_menu WHERE id = $1
+                UNION ALL SELECT m.id FROM sa_menu m JOIN sub ON m.parent_id = sub.id)
+            SELECT id FROM sub`, [id])).rows.map((r) => r.id);
+        if (ids.length === 0) return res.status(404).json({ message: 'Menu not found.' });
+
+        let groups = [];
+        if (await exists('sa_group_menu') && await exists('sa_group')) {
+            const hasGu = await exists('sa_group_user');
+            groups = (await client.query(`
+                SELECT g.id, g.name,
+                       ${hasGu ? '(SELECT COUNT(*)::int FROM sa_group_user gu WHERE gu.group_id = g.id)' : '0'} AS user_count,
+                       BOOL_OR(COALESCE(gm.can_view, TRUE)) AS can_view, BOOL_OR(COALESCE(gm.can_create, FALSE)) AS can_create,
+                       BOOL_OR(COALESCE(gm.can_edit, FALSE)) AS can_edit, BOOL_OR(COALESCE(gm.can_delete, FALSE)) AS can_delete,
+                       BOOL_OR(COALESCE(gm.can_print, FALSE)) AS can_print, BOOL_OR(COALESCE(gm.can_approve, FALSE)) AS can_approve
+                  FROM sa_group_menu gm JOIN sa_group g ON g.id = gm.group_id
+                 WHERE gm.menu_id = ANY($1::int[])
+                 GROUP BY g.id, g.name ORDER BY g.name`, [ids])).rows;
+        }
+        const userCount = (await exists('sa_user_menu'))
+            ? (await client.query('SELECT COUNT(DISTINCT user_id)::int AS n FROM sa_user_menu WHERE menu_id = ANY($1::int[])', [ids])).rows[0].n : 0;
+        const favoriteCount = (await exists('sa_user_favorite_menu'))
+            ? (await client.query('SELECT COUNT(DISTINCT user_id)::int AS n FROM sa_user_favorite_menu WHERE menu_id = ANY($1::int[])', [ids])).rows[0].n : 0;
+        res.json({ groups, user_count: userCount, favorite_count: favoriteCount });
+    } catch (err) {
+        console.error('Error fetching menu summary:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    } finally { client.release(); }
+};
+
+// PUT /sa_menu/:id/move { parent_id, before_id } — ลากย้าย/เรียงลำดับในต้นไม้ (user 2026-11-27)
+//   parent_id = โฟลเดอร์ใหม่ (null = บนสุด), before_id = วางก่อนเมนูนี้ (null = ท้ายสุด) แล้วเรียงลำดับพี่น้องใหม่ทีละ 10
+const moveMenu = async (req, res) => {
+    const id = Number(req.params.id);
+    const parentId = req.body.parent_id == null ? null : Number(req.body.parent_id);
+    const beforeId = req.body.before_id == null ? null : Number(req.body.before_id);
+    const client = await req.dbPool.connect();
+    const fail = async (code, message) => { await client.query('ROLLBACK'); return res.status(code).json({ message }); };
+    try {
+        await client.query('BEGIN');
+        const me = (await client.query('SELECT id FROM sa_menu WHERE id = $1', [id])).rows[0];
+        if (!me) return fail(404, 'Menu not found.');
+        if (parentId != null) {
+            const p = (await client.query('SELECT menu_type FROM sa_menu WHERE id = $1', [parentId])).rows[0];
+            if (!p) return fail(400, 'ไม่พบโฟลเดอร์ปลายทาง');
+            if (p.menu_type !== 'folder') return fail(400, 'ย้ายเข้าได้เฉพาะโฟลเดอร์');
+            const loop = await client.query(`
+                WITH RECURSIVE sub AS (SELECT id FROM sa_menu WHERE id = $1
+                    UNION ALL SELECT m.id FROM sa_menu m JOIN sub ON m.parent_id = sub.id)
+                SELECT 1 FROM sub WHERE id = $2`, [id, parentId]);
+            if (loop.rows.length) return fail(400, 'ย้ายเมนูเข้าไปใต้ตัวเองไม่ได้');
+        }
+        const sibs = (await client.query(
+            'SELECT id FROM sa_menu WHERE parent_id IS NOT DISTINCT FROM $1 AND id <> $2 ORDER BY sort_order, id', [parentId, id])).rows.map((r) => r.id);
+        const at = beforeId != null ? sibs.indexOf(beforeId) : -1;
+        if (at >= 0) sibs.splice(at, 0, id); else sibs.push(id);
+        await client.query('UPDATE sa_menu SET parent_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [parentId, id]);
+        for (let i = 0; i < sibs.length; i++) {
+            await client.query('UPDATE sa_menu SET sort_order = $1 WHERE id = $2', [(i + 1) * 10, sibs[i]]);
+        }
+        await client.query('COMMIT');
+        res.json({ id, parent_id: parentId, order: sibs });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Error moving menu:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    } finally { client.release(); }
+};
+
 module.exports = {
+    getMenuSummary,
+    moveMenu,
     getAllMenu,
     getMenuByUserId,
     getMenuByGroupId,

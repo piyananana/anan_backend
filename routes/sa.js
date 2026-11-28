@@ -139,9 +139,12 @@ router.get('/sa_menu/content/:id', saMenuController.getMenuContentById);
 router.get('/sa_menu/export', saAuthController.requireDeveloper, saMenuController.exportMenu);
 router.post('/sa_menu', saAuthController.requireDeveloper, saMenuController.createMenu);
 router.post('/sa_menu/import', saAuthController.requireDeveloper, fileUpload.single('excelFile'), saMenuController.importMenu);
+router.get('/sa_menu/:id/summary', saAuthController.requireDeveloper, saMenuController.getMenuSummary);
+router.put('/sa_menu/:id/move', saAuthController.requireDeveloper, saMenuController.moveMenu);
 router.put('/sa_menu/:id', saAuthController.requireDeveloper, saMenuController.updateMenu);
-router.delete('/sa_menu/:id', saAuthController.requireDeveloper, saMenuController.deleteMenu);
+// /all ต้องมาก่อน /:id — เดิมอยู่หลัง ทำให้ DELETE /sa_menu/all ถูกจับเป็น id='all'
 router.delete('/sa_menu/all', saAuthController.requireDeveloper, saMenuController.deleteAllMenu);
+router.delete('/sa_menu/:id', saAuthController.requireDeveloper, saMenuController.deleteMenu);
 // ตั้งค่ารูปแบบ/คำอธิบายการอนุมัติ + การ์ดประเภทเอกสาร — ใช้จากหน้าจอ sa_module_approver_screen (ระดับ admin/user ไม่ใช่ developer)
 router.put('/sa_menu/:id/approval_config', saMenuController.updateMenuApprovalConfig);
 router.get('/sa_menu/:menuId/doc_types', saMenuController.getMenuDocTypes);

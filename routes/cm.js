@@ -1,6 +1,7 @@
 // routes/cm.js — Cash Management
 const express = require('express');
 const { rejectHeaderAccounts } = require('../utils/glAccountGuard');
+const { makeUsageSummary } = require('../utils/glSetupUsage');
 const router = express.Router();
 const cmBankAccountController      = require('../controllers/cm/cmBankAccountController');
 const cmPaymentMethodController    = require('../controllers/cm/cmPaymentMethodController');
@@ -102,6 +103,7 @@ router.delete('/cm_transaction/:id',          cmTransactionController.deleteTran
 
 // cm_transaction_gl_setup — ตั้งค่าบัญชี GL ต่อประเภทเอกสาร (คู่กับ cm_transaction ด้านบน)
 router.get('/cm_transaction_gl_setup',           cmTransactionGlSetupController.fetchRows);
+router.get('/cm_transaction_gl_setup/:doc_code/summary', makeUsageSummary('cm_transaction', 'cm_transaction_gl_setup'));
 router.get('/cm_transaction_gl_setup/:doc_code', cmTransactionGlSetupController.fetchRow);
 router.post('/cm_transaction_gl_setup/:doc_code', rejectHeaderAccounts, cmTransactionGlSetupController.upsertRow);
 

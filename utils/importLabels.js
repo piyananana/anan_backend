@@ -160,6 +160,16 @@ const TEMPLATES = {
     effective_from: 'Effective from (YYYY-MM-DD)',
     effective_to: 'Effective to (YYYY-MM-DD)',
   },
+  im_price_list: {
+    'sheet:prices': 'Prices',
+    item_code: 'Item code (or old item code)',
+    uom_code: "Unit code (blank = the item's base unit)",
+    min_qty: 'Minimum quantity (blank = 0)',
+    unit_price_fc: 'Unit price (VAT-inclusive or not, as set on the price list)',
+    price_type: 'Price type STANDARD / PROMOTION (blank = STANDARD)',
+    effective_from: 'Effective from (YYYY-MM-DD)',
+    effective_to: 'Effective to (YYYY-MM-DD)',
+  },
   gl_account: {
     'sheet:coa': 'Chart of accounts',
     account_code: 'Account code',

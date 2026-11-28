@@ -135,7 +135,30 @@ const fetchRows = async (req, res) => {
             where += ` AND (i.item_code ILIKE $${pi} OR i.old_item_code ILIKE $${pi} OR i.item_name_th ILIKE $${pi} OR i.item_name_en ILIKE $${pi} OR i.barcode ILIKE $${pi})`;
             params.push(`%${keyword}%`); pi++;
         }
-        const result = await client.query(`${ITEM_SELECT} ${where} ORDER BY i.item_code`, params);
+        // with_stock=1 (หน้าจอข้อมูลสินค้า): คงเหลือรวมทุกคลัง + ต่ำกว่าจุดสั่งซื้อ (คลังที่ตั้งจุดสั่งซื้อเองเทียบรายคลัง,
+        // จุดสั่งซื้อระดับสินค้าเทียบยอดรวม) — ตารางยอด/ตั้งค่าคลังยังไม่มี (ฐานข้อมูลใหม่) = ไม่มียอด
+        const withStock = ['1', 'true'].includes(String(req.query.with_stock || ''));
+        let sql = `${ITEM_SELECT} ${where} ORDER BY i.item_code`;
+        if (withStock) {
+            const reg = async (t) => !!(await client.query(`SELECT to_regclass($1) AS t`, [`public.${t}`])).rows[0].t;
+            const hasBal = await reg('im_stock_balance');
+            const hasIw = await reg('im_item_warehouse');
+            const bal = hasBal
+                ? `SELECT item_id, warehouse_id, SUM(qty_on_hand) AS qty, SUM(total_value) AS value FROM im_stock_balance GROUP BY item_id, warehouse_id`
+                : `SELECT NULL::int AS item_id, NULL::int AS warehouse_id, 0::numeric AS qty, 0::numeric AS value WHERE false`;
+            const iwBelow = hasIw
+                ? `EXISTS (SELECT 1 FROM im_item_warehouse iw LEFT JOIN wb ON wb.item_id = iw.item_id AND wb.warehouse_id = iw.warehouse_id
+                            WHERE iw.item_id = x.id AND iw.reorder_point > 0 AND COALESCE(wb.qty, 0) < iw.reorder_point)`
+                : 'false';
+            sql = `WITH wb AS (${bal}),
+                       tot AS (SELECT item_id, SUM(qty) AS qty, SUM(value) AS value FROM wb GROUP BY item_id)
+                  SELECT x.*, COALESCE(tot.qty, 0) AS on_hand_qty, COALESCE(tot.value, 0) AS on_hand_value,
+                         ((x.reorder_point > 0 AND COALESCE(tot.qty, 0) < x.reorder_point) OR ${iwBelow}) AS below_reorder
+                    FROM (${ITEM_SELECT} ${where}) x
+                    LEFT JOIN tot ON tot.item_id = x.id
+                   ORDER BY x.item_code`;
+        }
+        const result = await client.query(sql, params);
         res.status(200).json(result.rows);
     } catch (error) {
         console.error('Error fetching im_item:', error);

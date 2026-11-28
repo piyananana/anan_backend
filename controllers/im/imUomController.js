@@ -52,6 +52,11 @@ const fetchRows = async (req, res) => {
     try {
         await ensureImUomTable(client);
         const result = await client.query(`SELECT * FROM im_uom ORDER BY uom_code`);
+        // with_usage=1 (หน้าจอหน่วยนับ): จำนวนสินค้าที่ใช้เป็นหน่วยหลัก/หน่วยรอง
+        if (['1', 'true'].includes(String(req.query.with_usage || ''))) {
+            const counts = await require('./imUomSummaryController').usageCounts(client);
+            return res.status(200).json(result.rows.map(r => ({ ...r, base_item_count: counts[r.id]?.base_count || 0, alt_item_count: counts[r.id]?.alt_count || 0 })));
+        }
         res.status(200).json(result.rows);
     } catch (error) {
         console.error('Error fetching im_uom:', error);

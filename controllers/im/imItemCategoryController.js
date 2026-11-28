@@ -73,6 +73,11 @@ const fetchRows = async (req, res) => {
     try {
         await ensureImItemCategoryTable(client);
         const result = await client.query(`${CATEGORY_SELECT} ORDER BY c.level, c.category_code`);
+        // with_usage=1 (หน้าจอหมวดหมู่): จำนวนสินค้าที่อยู่ในหมวดนี้โดยตรง
+        if (['1', 'true'].includes(String(req.query.with_usage || ''))) {
+            const counts = await require('./imItemCategoryToolsController').usageCounts(client);
+            return res.status(200).json(result.rows.map(r => ({ ...r, item_count: counts[r.id] || 0 })));
+        }
         res.status(200).json(result.rows);
     } catch (error) {
         console.error('Error fetching im_item_category:', error);

@@ -60,6 +60,12 @@ const fetchRows = async (req, res) => {
     try {
         await ensureImWarehouseTable(client);
         const result = await client.query(`${WAREHOUSE_SELECT} ORDER BY w.warehouse_code`);
+        // with_stock=1 (หน้าจอคลังสินค้า): จำนวนสินค้ามียอด, มูลค่า, สินค้าต่ำกว่าจุดสั่งซื้อ ต่อคลัง
+        if (['1', 'true'].includes(String(req.query.with_stock || ''))) {
+            const t = await require('./imWarehouseSummaryController').warehouseTotals(client);
+            return res.status(200).json(result.rows.map(r => ({ ...r,
+                item_count: t[r.id]?.item_count || 0, total_value: t[r.id]?.total_value || 0, below_count: t[r.id]?.below_count || 0 })));
+        }
         res.status(200).json(result.rows);
     } catch (error) {
         console.error('Error fetching im_warehouse:', error);

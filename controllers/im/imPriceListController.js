@@ -137,6 +137,8 @@ const ensureImPriceListTable = async (client) => {
     // resolveItemPrice แปลงราคาให้ตรงกับเอกสารเมื่อผู้เรียกส่งค่ารวม VAT ของเอกสาร + อัตรา VAT ของบรรทัดมา
     await client.query(`ALTER TABLE im_price_list ADD COLUMN IF NOT EXISTS price_includes_vat BOOLEAN NOT NULL DEFAULT false`).catch(() => {});
     await client.query(`DROP INDEX IF EXISTS idx_price_list_central_uq`).catch(() => {});
+    // ชื่อตารางราคาภาษาอังกฤษ (user 2026-11-25)
+    await client.query(`ALTER TABLE im_price_list ADD COLUMN IF NOT EXISTS price_list_name_en VARCHAR(200)`).catch(() => {});
 
     // unique index กันความกำกวมตอน resolveItemPrice — ลิสต์ default ได้ใบเดียวต่อ list_type (price_group_id ไม่
     // เกี่ยวเลย — เป็นแค่ป้ายกำกับ ไม่ใช่ targeting; การจับคู่ผู้ขาย/ลูกค้ากับลิสต์เฉพาะทำผ่าน ap_vendor.price_list_id/
@@ -508,14 +510,15 @@ const addRow = async (req, res) => {
         const header = await client.query(
             `INSERT INTO im_price_list
                 (price_list_code, price_list_name, list_type, currency_id,
-                 price_group_id, is_default, is_active, created_by, updated_by, price_includes_vat)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9)
+                 price_group_id, is_default, is_active, created_by, updated_by, price_includes_vat, price_list_name_en)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9,$10)
              RETURNING id`,
             [
                 b.price_list_code.trim().toUpperCase(), b.price_list_name.trim(),
                 b.list_type || 'SALES', b.currency_id || null,
                 b.price_group_id || null, b.is_default ?? false,
                 b.is_active ?? true, userName, b.price_includes_vat === true,
+                (b.price_list_name_en || '').trim() || null,
             ]
         );
         const headerId = header.rows[0].id;
@@ -580,12 +583,14 @@ const updateRow = async (req, res) => {
                 is_active       = $6,
                 updated_by      = $7,
                 updated_at      = NOW(),
-                price_includes_vat = $9
+                price_includes_vat = $9,
+                price_list_name_en = $10
              WHERE id = $8
              RETURNING id`,
             [b.price_list_name || '', b.list_type || 'SALES', b.currency_id || null,
              b.price_group_id || null, b.is_default ?? false,
-             b.is_active ?? true, userName, id, b.price_includes_vat === true]
+             b.is_active ?? true, userName, id, b.price_includes_vat === true,
+             (b.price_list_name_en || '').trim() || null]
         );
         if (result.rows.length === 0) {
             await client.query('ROLLBACK');
